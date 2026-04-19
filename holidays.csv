@@ -1,0 +1,24 @@
+# NSE trading holidays — one YYYY-MM-DD per line.
+# Lines starting with '#' and blank lines are ignored.
+# Optional label after a comma is discarded by the loader.
+#
+# Source of truth: the official NSE circular "Holidays — Trading" for the
+# calendar year (nseindia.com > Resources > Exchange Communication > Holidays).
+# You MUST verify this list against the NSE circular before each year begins —
+# lunar-calendar holidays (Holi, Ram Navami, Id-ul-Fitr, Bakri Id, Muharram,
+# Diwali-Laxmi Pujan, Diwali-Balipratipada, Guru Nanak Jayanti) shift annually.
+# Weekends are auto-excluded by run_paper.py; do not list them here.
+#
+# --- 2026 entries below (VERIFY AGAINST NSE CIRCULAR) ---
+2026-01-26,Republic Day
+2026-04-03,Good Friday
+2026-04-14,Dr. Ambedkar Jayanti
+2026-05-01,Maharashtra Day
+2026-10-02,Gandhi Jayanti
+2026-12-25,Christmas
+#
+# TODO — fill in the lunar/variable holidays from the NSE circular:
+#   Mahashivratri, Holi, Ram Navami, Id-ul-Fitr, Bakri Id,
+#   Muharram, Ganesh Chaturthi, Dussehra, Diwali-Laxmi Pujan,
+#   Diwali-Balipratipada, Guru Nanak Jayanti, and any special trading
+#   sessions (muhurat) or mid-year additions.

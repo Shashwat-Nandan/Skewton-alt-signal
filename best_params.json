@@ -1,0 +1,19 @@
+{
+  "best_params": {
+    "rehedge_delta_threshold": 0.15,
+    "gamma_scalp_band_pct": 1.5,
+    "position_size_pct": 11.6,
+    "vega_limit": 4000.0,
+    "max_holding_period_hours": 22.0,
+    "entry_iv_percentile_min": 10.0,
+    "entry_iv_percentile_max": 85.0,
+    "max_entry_alpha": 143013.0,
+    "mc_worst_path_loss_pct": 3.0,
+    "cost_hurdle_factor": 1.3624
+  },
+  "best_metric": {
+    "net_pnl": 10815.137838740011
+  },
+  "total_experiments": 40,
+  "timestamp": "2026-04-18T21:29:26.356229"
+}

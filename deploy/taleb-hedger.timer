@@ -1,0 +1,24 @@
+[Unit]
+Description=Fire taleb-hedger.service Mon–Fri at 09:10 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:10 IST gives the service ~5 min to auth + warm up before the 09:15 bell.
+# systemd evaluates the calendar in the unit's timezone: TZ=Asia/Kolkata is set
+# in the service, but timers are matched in the system's local TZ unless we
+# pin it here. Pin explicitly so VPSes in UTC still fire at the right wall-clock.
+OnCalendar=Mon..Fri *-*-* 09:10:00 Asia/Kolkata
+
+# If the VPS was asleep or systemd missed the window (e.g. reboot at 10:00),
+# run once to catch up. run_paper.py self-gates: starts trading from whatever
+# time it wakes, flattens at 15:25, exits 0. It refuses if launched after 15:30.
+Persistent=true
+
+# Jitter (0–60s) to avoid hammering Kite login at the exact same second if you
+# ever run multiple accounts on one VPS.
+RandomizedDelaySec=60
+
+Unit=taleb-hedger.service
+
+[Install]
+WantedBy=timers.target
