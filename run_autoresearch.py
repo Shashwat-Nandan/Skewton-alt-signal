@@ -25,7 +25,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 
 from backtest import generate_synthetic_data, MockKite, run_backtest
-from dynamic_hedger import TalebHedger
+from strategies import TalebKarpathyStrategy
 from autoresearch_loop import HedgeResearchLoop
 
 logging.basicConfig(
@@ -129,8 +129,7 @@ def main():
     # Bootstrap a hedger instance (autoresearch only uses it for param storage)
     dummy_data = generate_synthetic_data(days=1, ticks_per_day=1)
     dummy_kite = MockKite(dummy_data, args.underlying)
-    hedger = TalebHedger(dummy_kite, config_path="config.ini")
-    hedger._is_paper_mode = True
+    hedger = TalebKarpathyStrategy(dummy_kite, config_path="config.ini", mode="paper")
 
     # Override autoresearch config for this run
     loop = HedgeResearchLoop(hedger, config_path="config.ini")

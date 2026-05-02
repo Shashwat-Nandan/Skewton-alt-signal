@@ -141,7 +141,7 @@ def main():
     log.info("=" * 60)
 
     from kite_auth import KiteAuthManager
-    from dynamic_hedger import TalebHedger
+    from strategies import TalebKarpathyStrategy
 
     log.info("Authenticating...")
     auth = KiteAuthManager(CONFIG_PATH)
@@ -149,10 +149,9 @@ def main():
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
 
-    hedger = TalebHedger(kite, config_path=CONFIG_PATH)
-    if not hedger._is_paper_mode:
-        log.error("config.ini has trading_mode != paper. Refusing to run.")
-        return 2
+    # Force paper mode regardless of config — this script is the unattended
+    # daily paper-trade runner; live execution belongs to a separate path.
+    hedger = TalebKarpathyStrategy(kite, config_path=CONFIG_PATH, mode="paper")
     log.info("Mode: PAPER  underlying=%s  capital=%.0f",
              hedger.underlying, hedger.immutable_params["total_capital"])
     log.info("Tunable params: %s", hedger.tunable_params)

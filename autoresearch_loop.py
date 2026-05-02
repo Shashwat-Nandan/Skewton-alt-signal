@@ -73,7 +73,7 @@ class HedgeResearchLoop:
     def __init__(self, hedger, config_path: str = "config.ini"):
         """
         Args:
-            hedger: TalebHedger instance (the "train.py" equivalent)
+            hedger: BaseStrategy instance (the "train.py" equivalent)
             config_path: Path to configuration file
         """
         self.hedger = hedger
@@ -503,4 +503,4 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python autoresearch_loop.py plot     — Generate progress.png")
         print("  python autoresearch_loop.py analyze  — Print results summary")
-        print("\nTo run the loop, use the TalebHedger integration (see SKILL.md)")
+        print("\nTo run the loop, use the strategy integration (see SKILL.md)")

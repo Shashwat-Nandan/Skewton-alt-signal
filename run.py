@@ -42,10 +42,10 @@ def main():
     logger.info("Exchanges: %s", ", ".join(profile["exchanges"]))
 
     # ── Step 2: Initialize hedger ──
-    from dynamic_hedger import TalebHedger
+    from strategies import TalebKarpathyStrategy
     logger.info("[2/3] Initializing Taleb Dynamic Hedger...")
-    hedger = TalebHedger(kite, config_path=CONFIG_PATH)
-    logger.info("Mode: %s", "PAPER" if hedger._is_paper_mode else "LIVE")
+    hedger = TalebKarpathyStrategy(kite, config_path=CONFIG_PATH)
+    logger.info("Mode: %s", hedger.mode.upper())
     logger.info("Underlying: %s", hedger.underlying)
     logger.info("Capital: ₹%s", f"{hedger.immutable_params['total_capital']:,.0f}")
     logger.info("Tunable params: %s", hedger.tunable_params)

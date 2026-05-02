@@ -1,11 +1,13 @@
-"""Tests for dynamic_hedger.py — position management, netting, costs, metrics."""
+"""Tests for the Taleb-Karpathy strategy — position management, netting, costs, metrics."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
 from unittest.mock import MagicMock, patch
-from dynamic_hedger import TalebHedger, HedgeState, estimate_transaction_cost
+from strategies.taleb_karpathy import (
+    TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
+)
 from trade_proposer import TradeProposal
 from greeks_engine import OptionContract
 
@@ -37,38 +39,27 @@ class TestPositionNetting:
 
     @pytest.fixture
     def mock_hedger(self):
-        """Create a TalebHedger with mocked Kite."""
+        """Create a TalebKarpathyStrategy with mocked Kite (bypassing __init__)."""
         kite = MagicMock()
         kite.instruments.return_value = [
             {"name": "NIFTY", "instrument_type": "CE", "lot_size": 25,
              "tradingsymbol": "NIFTY26403CE22000", "expiry": "2026-04-03"},
         ]
-        with patch("dynamic_hedger.configparser.ConfigParser") as mock_cfg:
-            cfg = MagicMock()
-            cfg.__getitem__ = MagicMock(return_value={
-                "underlying": "NIFTY", "exchange": "NFO", "trading_mode": "paper",
-            })
-            cfg.getfloat = MagicMock(return_value=0.15)
-            cfg.getboolean = MagicMock(return_value=True)
-            cfg.getint = MagicMock(return_value=6)
-            cfg.read = MagicMock()
-            mock_cfg.return_value = cfg
-
-            hedger = TalebHedger.__new__(TalebHedger)
-            hedger.kite = kite
-            hedger.state = HedgeState()
-            hedger._is_paper_mode = True
-            hedger.underlying = "NIFTY"
-            hedger.exchange = "NFO"
-            hedger._cached_lot_size = 25
-            hedger._cached_futures_symbol = None
-            hedger._clock = lambda: __import__("datetime").datetime(2026, 3, 29, 10, 0)
-            hedger.immutable_params = {"total_capital": 500000}
-            hedger.tunable_params = {}
-            hedger.greeks = MagicMock()
-            hedger.greeks.compute_portfolio_greeks = MagicMock(
-                return_value=MagicMock(net_delta=0, net_shadow_theta=0)
-            )
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.kite = kite
+        hedger.state = HedgeState()
+        hedger.mode = "paper"
+        hedger.underlying = "NIFTY"
+        hedger.exchange = "NFO"
+        hedger._cached_lot_size = 25
+        hedger._cached_futures_symbol = None
+        hedger._clock = lambda: __import__("datetime").datetime(2026, 3, 29, 10, 0)
+        hedger.immutable_params = {"total_capital": 500000}
+        hedger.tunable_params = {}
+        hedger.greeks = MagicMock()
+        hedger.greeks.compute_portfolio_greeks = MagicMock(
+            return_value=MagicMock(net_delta=0, net_shadow_theta=0)
+        )
         return hedger
 
     def test_new_position_added(self, mock_hedger):
@@ -137,10 +128,10 @@ class TestFailedOrderGuard:
             {"name": "NIFTY", "instrument_type": "CE", "lot_size": 25,
              "tradingsymbol": "NIFTY26403CE22000", "expiry": "2026-04-03"},
         ]
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = False  # LIVE mode
+        hedger.mode = "live"  # LIVE mode
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -196,10 +187,10 @@ class TestFuturesPnL:
     @pytest.fixture
     def mock_hedger(self):
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -234,7 +225,7 @@ class TestFuturesPnL:
 
 class TestResetAndMetrics:
     def test_reset_clears_state(self):
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.state = HedgeState()
         hedger.state.total_pnl = 1000
         hedger.state.positions.append(MagicMock())
@@ -251,7 +242,7 @@ class TestResetAndMetrics:
     def test_get_strategy_metrics_daily_aggregation(self):
         """P2: Sharpe/Sortino should be based on daily returns, not tick-level."""
         from datetime import date
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.state = HedgeState()
         # Simulate 5 daily returns already flushed
         hedger.state.daily_pnl_history = [100, -50, 200, -30, 150]
@@ -277,9 +268,9 @@ class TestDailyPnLAggregation:
 
     def test_ticks_same_day_not_appended_individually(self):
         from datetime import datetime
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -300,9 +291,9 @@ class TestDailyPnLAggregation:
 
     def test_day_change_flushes_daily_pnl(self):
         from datetime import datetime
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -362,10 +353,10 @@ class TestFlatBookPnL:
     @pytest.fixture
     def mock_hedger(self):
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -464,8 +455,7 @@ class TestOptimizerRangeCoverage:
     def test_no_dead_tunables_in_hedger(self):
         """delta_bump_pct was removed — verify it's gone."""
         import inspect
-        from dynamic_hedger import TalebHedger
-        source = inspect.getsource(TalebHedger.__init__)
+        source = inspect.getsource(TalebKarpathyStrategy.__init__)
         assert "delta_bump_pct" not in source
 
 
@@ -476,10 +466,10 @@ class TestDailyLossStop:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -537,10 +527,10 @@ class TestDrawdownConsistency:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -621,10 +611,10 @@ class TestConsecutiveLossReset:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -724,10 +714,10 @@ class TestSameBarRoundTripGuard:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -785,10 +775,10 @@ class TestPreEntryVegaGate:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -901,10 +891,10 @@ class TestMCSizingSubLotGate:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -1009,10 +999,10 @@ class TestPerTradeAttribution:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
@@ -1109,7 +1099,7 @@ class TestRealizedVolEstimator:
 
     def _make_hedger(self):
         from datetime import datetime
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger._spot_history = []
         hedger._spot_history_max_size = 2000
         hedger._clock = lambda: datetime(2026, 4, 19, 15, 30)
@@ -1179,10 +1169,10 @@ class TestRVIVGate:
     def mock_hedger(self):
         from datetime import datetime
         kite = MagicMock()
-        hedger = TalebHedger.__new__(TalebHedger)
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
         hedger.state = HedgeState()
-        hedger._is_paper_mode = True
+        hedger.mode = "paper"
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25

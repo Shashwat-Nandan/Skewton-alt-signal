@@ -26,7 +26,9 @@ import numpy as np
 import pandas as pd
 
 from greeks_engine import GreeksEngine, OptionContract, implied_volatility_bisect
-from dynamic_hedger import TalebHedger, HedgeState, estimate_transaction_cost
+from strategies.taleb_karpathy import (
+    TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,8 +243,7 @@ def run_backtest(
         data["timestamp"] = data["timestamp"].dt.tz_localize(None)
 
     mock_kite = MockKite(data, underlying)
-    hedger = TalebHedger(mock_kite, config_path=config_path)
-    hedger._is_paper_mode = True  # Force paper mode for backtest
+    hedger = TalebKarpathyStrategy(mock_kite, config_path=config_path, mode="paper")
     # Backtests should not leak IV state between experiments; each run
     # builds its own rolling history from the replay ticks.
     hedger._persist_iv_history = False

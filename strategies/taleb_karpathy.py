@@ -14,7 +14,6 @@ import time
 import json
 import hashlib
 import logging
-import configparser
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -32,6 +31,8 @@ from risk_analyzer import (
     RiskAnalyzer, MonteCarloReport, StabilityReport,
     BleedForecast, HedgeDecision,
 )
+
+from .base import BaseStrategy, ExecutionMode
 
 logger = logging.getLogger(__name__)
 
@@ -131,29 +132,29 @@ class HedgeState:
     monte_carlo_report: Optional[MonteCarloReport] = None
 
 
-class TalebHedger:
+class TalebKarpathyStrategy(BaseStrategy):
     """
-    Main hedging engine v2 with full Taleb compliance.
-    
-    Key changes from v1:
-    1. RiskAnalyzer integration for pre-trade and continuous risk assessment
-    2. Bleed forecasting before market close
-    3. Soft vs hard delta decision based on gamma profile
-    4. Path dependence Monte Carlo for position sizing
-    5. Three-level neutrality monitoring
+    Taleb-Karpathy long-gamma straddle hedger.
+
+    Long an ATM straddle, delta-rebalance via futures around a gamma-scalp band,
+    Karpathy-style autoresearch tunes the parameters between sessions. See
+    SKILL.md for the full theoretical framework.
     """
 
-    def __init__(self, kite, config_path: str = "config.ini"):
-        self.kite = kite
-        self.config = configparser.ConfigParser()
-        self.config.read(config_path)
+    name = "taleb_karpathy"
+
+    def __init__(
+        self,
+        kite,
+        config_path: str = "config.ini",
+        mode: Optional[ExecutionMode] = None,
+    ):
+        super().__init__(kite, config_path=config_path, mode=mode)
 
         self.greeks = GreeksEngine(risk_free_rate=0.065)
         self.risk = RiskAnalyzer(self.greeks)
         self.proposer = TradeProposer(kite, config_path)
         self.state = HedgeState()
-
-        self._is_paper_mode = self.config["mode"]["trading_mode"] == "paper"
 
         # ── Tunable parameters (autoresearch can modify) ──
         self.tunable_params = {
@@ -654,6 +655,11 @@ class TalebHedger:
         self.state.theta_decay_paid += abs(self.state.portfolio_greeks.net_shadow_theta)
 
     def execute_proposals(self, proposals):
+        # signals mode: emit each proposal to the dashboard JSONL feed and
+        # return without mutating any P&L / position state.
+        if self.is_signals_mode:
+            return [self._emit_signal(p) for p in proposals]
+
         results = []
         realized_pnl_before = self.state.realized_pnl
         costs_before = self.state.total_transaction_costs
@@ -665,7 +671,7 @@ class TalebHedger:
         had_any_close = False
 
         for prop in proposals:
-            result = self._paper_execute(prop) if self._is_paper_mode else self._live_execute(prop)
+            result = self._paper_execute(prop) if self.is_paper_mode else self._live_execute(prop)
             results.append(result)
 
             # Skip state mutation if the live order failed
