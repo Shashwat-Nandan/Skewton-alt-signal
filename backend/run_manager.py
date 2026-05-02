@@ -101,12 +101,18 @@ class RunManager:
         strategy_cls = get_strategy(strategy_name)
         kwargs = {k: v for k, v in params.items()
                   if k in ("symbol_a", "symbol_b", "hedge_ratio")}
+        # max_leg_notional is sourced from config in __init__; if the dashboard
+        # passed it as a param, push it onto the strategy after construction so
+        # the form override beats the config default.
+        max_leg = params.get("max_leg_notional")
         strategy = strategy_cls(
             kite=kite,
             config_path=str(get_settings().config_path),
             mode=mode,
             **kwargs,
         )
+        if max_leg is not None and hasattr(strategy, "max_leg_notional"):
+            strategy.max_leg_notional = float(max_leg)
 
         run = Run(
             id=str(uuid.uuid4()),

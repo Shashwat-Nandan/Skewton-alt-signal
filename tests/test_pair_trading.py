@@ -31,6 +31,8 @@ def _make_strategy(
     exit_z: float = 0.5,
     stop_z: float = 4.0,
     spread_history=None,
+    max_leg_notional=None,
+    lots_per_leg: int = 1,
 ) -> PairTradingStrategy:
     """Build a PairTradingStrategy with __init__ bypassed — fully controllable for unit tests."""
     s = PairTradingStrategy.__new__(PairTradingStrategy)
@@ -45,8 +47,9 @@ def _make_strategy(
     s.exit_z = exit_z
     s.stop_z = stop_z
     s.lookback_days = 30
-    s.lots_per_leg = 1
+    s.lots_per_leg = lots_per_leg
     s.max_holding_days = 10
+    s.max_leg_notional = max_leg_notional
     s.total_capital = 500_000
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
@@ -370,6 +373,83 @@ class TestApplyFill:
 # ──────────────────────────────────────────────────────────
 # EOD report
 # ──────────────────────────────────────────────────────────
+
+class TestNotionalCap:
+    """A high-β pair can deploy huge notional with lots_per_leg=1 — the cap
+    scales both legs down (preserving the hedge ratio) or skips the entry."""
+
+    def _seed_priced_quotes(self, s, price_a=1000.0, price_b=2000.0):
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": price_a}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": price_b}}
+        )
+        s._spread_history = [-1.0, 1.0] * 30
+
+    def test_no_cap_means_no_change(self):
+        # β=0.5, prices 1000/2000, lot 100/200, lots_per_leg=1
+        # natural notional A=1*100*1000=100k, B=1*200*2000=400k → max 400k
+        # max ≤ |β| means qty_b derived from |β|*100k/400k = 0.125 → 1 lot
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=None)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+        a = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a.quantity == 1
+        assert b.quantity == 1
+
+    def test_cap_scales_high_beta_down(self):
+        # β=10, lots_per_leg=1, price_a=100, lot_a=100 → notional_a = 10k
+        # target_notional_b = 10 * 10k = 100k. Cap at 50k → scale = 0.5
+        # qty_a scales to round(1*0.5)=1 (but 1 lot still gives notional_a=10k OK)
+        # target_notional_b after scaling = 10 * 10k = 100k > 50k still
+        # Hmm: scaling qty_a doesn't help when the OUTSIZE leg is B and qty_a is already 1.
+        # What we want: the cap forces a refusal because 1 lot of A implies 100k of B.
+        # Use price_a = 50 so 1 lot of A = 5k notional, β=10 → target B = 50k = cap exactly.
+        s = _make_strategy(hedge_ratio=10.0, max_leg_notional=50_000.0, lots_per_leg=1)
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 50.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 100.0}}
+        )
+        s._spread_history = [-1.0, 1.0] * 30
+        # spread = 50 - 10*101 = -960 (way below mean) → LONG_SPREAD entry
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 50.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 101.0}}
+        )
+        proposals = s.scan_and_propose()
+        # 1 lot of A → notional 5k; β=10 → target B = 50k; cap 50k OK; entry succeeds
+        assert len(proposals) == 2
+        a = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a.quantity == 1
+        # qty_b = round(50k / (200*101)) = round(2.475) = 2
+        assert b.quantity == 2
+
+    def test_cap_skips_entry_when_one_lot_busts_it(self):
+        # 1 lot of A alone is 100k; cap 50k → must refuse
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=50_000.0, lots_per_leg=1)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        # spread far below mean → would normally enter LONG_SPREAD
+        proposals = s.scan_and_propose()
+        assert proposals == []
+        assert s.state.position == "FLAT"
+
+    def test_cap_scales_lots_per_leg_down(self):
+        # lots_per_leg=5, price 1000/2000, lot 100/200, β=0.5
+        # notional_a = 5*100*1000 = 500k, target_b = 0.5*500k = 250k → max 500k
+        # Cap 200k → scale = 200k/500k = 0.4 → qty_a = round(5*0.4) = 2
+        # New notional_a = 2*100*1000 = 200k → fits cap exactly
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=200_000.0, lots_per_leg=5)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+        a = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a.quantity == 2
+        # target_b after scaling = 0.5 * 200k = 100k; per_lot_b = 200*2010 = 402k → qty_b = max(round(0.249), 1) = 1
+        assert b.quantity == 1
+
 
 class TestEODReport:
     def test_eod_report_keys(self):

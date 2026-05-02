@@ -40,6 +40,9 @@ PARAM_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
          "description": "|z| threshold for mean-revert exit"},
         {"name": "stop_z", "type": "float", "default": 4.0,
          "description": "|z| threshold for stop-loss exit"},
+        {"name": "max_leg_notional", "type": "float", "default": None,
+         "description": "Cap per-leg notional in ₹. Leave blank for no cap. "
+                        "High-β pairs deploy huge amounts otherwise."},
     ],
 }
 

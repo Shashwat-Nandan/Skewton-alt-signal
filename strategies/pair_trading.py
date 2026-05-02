@@ -117,6 +117,14 @@ class PairTradingStrategy(BaseStrategy):
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
         self.max_holding_days = int(cfg.get("max_holding_days", 10))
 
+        # Optional per-leg notional cap (₹). Without it, high-β pairs can
+        # silently deploy huge amounts (e.g. β=10 with 1 lot of A → ~10 lots
+        # of B by notional). When set, sizing scales BOTH legs down so the
+        # hedge ratio is preserved; if even 1 lot of the larger leg breaks
+        # the cap, the entry is skipped.
+        mln = cfg.get("max_leg_notional", "").strip()
+        self.max_leg_notional: Optional[float] = float(mln) if mln else None
+
         # Shared sizing/risk knobs from [strategy]
         self.total_capital = self.config.getfloat("strategy", "total_capital", fallback=500000)
 
@@ -272,18 +280,40 @@ class PairTradingStrategy(BaseStrategy):
         LONG_SPREAD  → buy A, sell hedge-equivalent B (expect spread to rise)
         SHORT_SPREAD → sell A, buy hedge-equivalent B (expect spread to fall)
         Hedge is sized so leg-B notional ≈ |hedge_ratio| × leg-A notional.
+        If max_leg_notional is set, scale both legs down to fit.
         """
         fut_a = self._resolve_futures(self.symbol_a)
         fut_b = self._resolve_futures(self.symbol_b)
         if not (fut_a and fut_b):
             return []
 
-        qty_a = self.lots_per_leg
-        # Match notional via |β|·(price_a/price_b)·(lot_a/lot_b), rounded to ≥1 lot.
-        notional_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
-        per_lot_b = fut_b["lot_size"] * prices[self.symbol_b]
-        qty_b = max(int(round(abs(self.hedge_ratio) * notional_a / per_lot_b)), 1)
+        # Refuse the entry if even 1 lot of the larger leg would bust the cap —
+        # we can't go fractional in lots, so silently oversizing is the wrong call.
+        if self.max_leg_notional:
+            one_lot_a = fut_a["lot_size"] * prices[self.symbol_a]
+            min_max_natural = one_lot_a * max(1.0, abs(self.hedge_ratio))
+            if min_max_natural > self.max_leg_notional:
+                logger.warning(
+                    "%s/%s: 1-lot pair would deploy ₹%.0f, exceeds cap ₹%.0f — skipping entry",
+                    self.symbol_a, self.symbol_b, min_max_natural, self.max_leg_notional,
+                )
+                return []
 
+        qty_a = self.lots_per_leg
+        notional_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
+        target_notional_b = abs(self.hedge_ratio) * notional_a
+        per_lot_b = fut_b["lot_size"] * prices[self.symbol_b]
+
+        # Apply the cap by scaling qty_a down (preserves hedge ratio).
+        if self.max_leg_notional:
+            max_natural = max(notional_a, target_notional_b)
+            if max_natural > self.max_leg_notional:
+                scale = self.max_leg_notional / max_natural
+                qty_a = max(int(round(qty_a * scale)), 1)
+                notional_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
+                target_notional_b = abs(self.hedge_ratio) * notional_a
+
+        qty_b = max(int(round(target_notional_b / per_lot_b)), 1)
         # Sign convention: spread = A - β·B
         # LONG_SPREAD wants spread to rise → +A, sign of -β on B
         # SHORT_SPREAD wants spread to fall → -A, sign of +β on B
