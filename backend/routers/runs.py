@@ -1,0 +1,96 @@
+"""Run lifecycle endpoints."""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Literal, Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from strategies import STRATEGIES, VALID_MODES
+
+from .. import kite_oauth
+from ..run_manager import get_run_manager
+from ..settings import get_settings
+
+router = APIRouter(prefix="/runs", tags=["runs"])
+
+
+class CreateRunRequest(BaseModel):
+    strategy: str
+    # NOTE: live is intentionally excluded — see backend.settings.allow_live_mode.
+    mode: Literal["signals", "paper", "live"]
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RunSummary(BaseModel):
+    id: str
+    strategy_name: str
+    mode: str
+    params: Dict[str, Any]
+    status: str
+    created_at: str
+    stopped_at: Optional[str] = None
+    last_tick_at: Optional[str] = None
+    tick_count: int = 0
+    error: Optional[str] = None
+    n_signals: int = 0
+    n_trades: int = 0
+    last_eod_report: Optional[Dict[str, Any]] = None
+
+
+class RunDetail(RunSummary):
+    signals: List[Dict[str, Any]] = Field(default_factory=list)
+    trades: List[Dict[str, Any]] = Field(default_factory=list)
+    pnl_history: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("", response_model=RunSummary, status_code=201)
+async def create_run(req: CreateRunRequest):
+    if req.strategy not in STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"Unknown strategy {req.strategy!r}")
+    if req.mode not in VALID_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {VALID_MODES}")
+    if req.mode == "live" and not get_settings().allow_live_mode:
+        raise HTTPException(
+            status_code=403,
+            detail="Live mode is disabled in this build. Use signals or paper.",
+        )
+
+    kite = kite_oauth.get_authenticated_kite()
+    if kite is None:
+        raise HTTPException(status_code=401, detail="Not authenticated with Kite — log in first")
+
+    manager = get_run_manager()
+    try:
+        run = manager.create_run(req.strategy, req.mode, req.params, kite=kite)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create run: {e}")
+    return RunSummary(**run.to_dict())
+
+
+@router.get("", response_model=List[RunSummary])
+def list_runs():
+    return [RunSummary(**r.to_dict()) for r in get_run_manager().list_runs()]
+
+
+@router.get("/{run_id}", response_model=RunDetail)
+def get_run(run_id: str):
+    run = get_run_manager().get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunDetail(
+        **run.to_dict(),
+        signals=run.signals,
+        trades=run.trades,
+        pnl_history=run.pnl_history,
+    )
+
+
+@router.post("/{run_id}/stop", response_model=RunSummary)
+async def stop_run(run_id: str):
+    manager = get_run_manager()
+    ok = await manager.stop_run(run_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run = manager.get_run(run_id)
+    return RunSummary(**run.to_dict())

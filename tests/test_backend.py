@@ -1,0 +1,189 @@
+"""
+Backend API tests via FastAPI TestClient.
+
+Strategy instantiation is mocked so tests don't need a real Kite session,
+real bhavcopy, or real options chain. Auth is also stubbed at the
+kite_oauth boundary.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from backend.main import create_app
+from backend import run_manager as rm
+
+
+@pytest.fixture
+def client():
+    # Reset the run manager singleton so each test sees an empty registry.
+    # We don't need to monkeypatch the token cache path because every test that
+    # touches auth mocks kite_oauth.get_authenticated_kite at the boundary —
+    # the real .kite_session.json is never read or written.
+    rm._manager = None
+    app = create_app()
+    with TestClient(app) as c:
+        yield c
+
+
+# ──────────────────────────────────────────────────────────
+# Meta + strategies
+# ──────────────────────────────────────────────────────────
+
+class TestMeta:
+    def test_root(self, client):
+        r = client.get("/")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["version"] == "0.1.0"
+        assert body["live_mode_enabled"] is False
+
+    def test_strategies_list(self, client):
+        r = client.get("/strategies")
+        assert r.status_code == 200
+        names = [s["name"] for s in r.json()]
+        assert "taleb_karpathy" in names
+        assert "pair_trading" in names
+
+    def test_strategies_params_known(self, client):
+        r = client.get("/strategies/pair_trading/params")
+        assert r.status_code == 200
+        param_names = {p["name"] for p in r.json()}
+        assert {"entry_z", "exit_z", "stop_z"}.issubset(param_names)
+
+    def test_strategies_params_unknown(self, client):
+        r = client.get("/strategies/bogus/params")
+        assert r.status_code == 404
+
+
+# ──────────────────────────────────────────────────────────
+# Auth
+# ──────────────────────────────────────────────────────────
+
+class TestAuth:
+    def test_status_unauthenticated(self, client):
+        # No token cached → not authed
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
+            r = client.get("/auth/status")
+        assert r.status_code == 200
+        assert r.json()["authenticated"] is False
+
+    def test_status_authenticated(self, client):
+        fake_kite = MagicMock()
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=fake_kite), \
+             patch("backend.kite_oauth.verify_token", return_value={
+                 "user_id": "AB1234", "user_name": "Test User", "email": "test@example.com",
+             }):
+            r = client.get("/auth/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["authenticated"] is True
+        assert body["user_id"] == "AB1234"
+        assert body["user_name"] == "Test User"
+
+    def test_login_url_missing_creds(self, client):
+        # Settings has no api_key → 500 with helpful message
+        with patch("backend.kite_oauth.get_login_url",
+                   side_effect=RuntimeError("KITE_API_KEY is not set...")):
+            r = client.get("/auth/login")
+        assert r.status_code == 500
+        assert "KITE_API_KEY" in r.json()["detail"]
+
+    def test_login_url_ok(self, client):
+        with patch("backend.kite_oauth.get_login_url",
+                   return_value="https://kite.zerodha.com/connect/login?api_key=XYZ&v=3"):
+            r = client.get("/auth/login")
+        assert r.status_code == 200
+        assert r.json()["login_url"].startswith("https://kite.zerodha.com")
+
+    def test_callback_missing_token(self, client):
+        r = client.get("/auth/callback?status=error")
+        assert r.status_code == 400
+
+    def test_logout_clears_session(self, client):
+        with patch("backend.kite_oauth.clear_cached_session") as mock_clear:
+            r = client.post("/auth/logout")
+        assert r.status_code == 200
+        mock_clear.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────
+# Runs lifecycle
+# ──────────────────────────────────────────────────────────
+
+class TestRuns:
+    def test_list_runs_empty(self, client):
+        r = client.get("/runs")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_create_run_unknown_strategy(self, client):
+        r = client.post("/runs", json={
+            "strategy": "bogus", "mode": "paper", "params": {},
+        })
+        assert r.status_code == 400
+
+    def test_create_run_live_rejected(self, client):
+        r = client.post("/runs", json={
+            "strategy": "pair_trading", "mode": "live", "params": {},
+        })
+        assert r.status_code == 403
+        assert "Live mode is disabled" in r.json()["detail"]
+
+    def test_create_run_unauthenticated(self, client):
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
+            r = client.post("/runs", json={
+                "strategy": "pair_trading", "mode": "paper", "params": {},
+            })
+        assert r.status_code == 401
+
+    def test_create_run_lifecycle(self, client):
+        # Stub the strategy class so create_run doesn't hit Kite or bhavcopy
+        fake_strategy = MagicMock()
+        fake_strategy.scan_and_propose.return_value = []
+        fake_strategy.check_and_rehedge.return_value = []
+        fake_strategy.generate_eod_report.return_value = {"strategy": "fake"}
+
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=MagicMock()), \
+             patch("backend.run_manager.get_strategy",
+                   return_value=lambda **kw: fake_strategy):
+            # Create
+            r = client.post("/runs", json={
+                "strategy": "pair_trading", "mode": "paper", "params": {},
+            })
+            assert r.status_code == 201
+            run_id = r.json()["id"]
+            assert r.json()["status"] == "RUNNING"
+
+            # List shows it
+            r = client.get("/runs")
+            assert any(run["id"] == run_id for run in r.json())
+
+            # Detail
+            r = client.get(f"/runs/{run_id}")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["id"] == run_id
+            assert body["strategy_name"] == "pair_trading"
+            assert "signals" in body
+            assert "trades" in body
+            assert "pnl_history" in body
+
+            # Stop
+            r = client.post(f"/runs/{run_id}/stop")
+            assert r.status_code == 200
+            assert r.json()["status"] in ("STOPPING", "STOPPED")
+
+    def test_get_run_not_found(self, client):
+        r = client.get("/runs/does-not-exist")
+        assert r.status_code == 404
+
+    def test_stop_run_not_found(self, client):
+        r = client.post("/runs/does-not-exist/stop")
+        assert r.status_code == 404
