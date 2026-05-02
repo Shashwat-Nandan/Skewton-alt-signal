@@ -239,6 +239,7 @@ def fetch_option_chain_data(
     interval: str = "30minute",
     n_strikes: int = 10,
     expiry: Optional[str] = None,
+    instruments_cache: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Fetch complete option chain historical data with rolling expiry and
@@ -261,7 +262,13 @@ def fetch_option_chain_data(
         to_date = datetime.now()
 
     # ── Step 1: Instrument master ──
-    instruments_df = fetch_instrument_master(kite, underlying)
+    if instruments_cache:
+        logger.info("Using cached instrument master: %s", instruments_cache)
+        instruments_df = pd.read_csv(instruments_cache)
+        instruments_df["expiry"] = pd.to_datetime(instruments_df["expiry"])
+        instruments_df["strike"] = instruments_df["strike"].astype(float)
+    else:
+        instruments_df = fetch_instrument_master(kite, underlying)
 
     # ── Step 2: Fetch spot data ──
     spot_token = get_spot_token(kite, underlying)
@@ -496,6 +503,10 @@ def main():
                         help="Output CSV path. Default: data_cache/{underlying}_{dates}.csv")
     parser.add_argument("--config", type=str, default="config.ini",
                         help="Config file path (default: config.ini)")
+    parser.add_argument("--instruments-cache", type=str, default=None,
+                        help="Path to a previously-saved instrument master CSV. "
+                             "Use this when the live master no longer contains the "
+                             "required (expired) contracts.")
     args = parser.parse_args()
 
     # Parse dates
@@ -526,6 +537,7 @@ def main():
         interval=args.interval,
         n_strikes=args.strikes,
         expiry=args.expiry,
+        instruments_cache=args.instruments_cache,
     )
 
     # Save

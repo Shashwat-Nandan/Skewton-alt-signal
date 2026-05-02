@@ -7,6 +7,7 @@ config.ini
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # Logs and data
 logs/

@@ -1,0 +1,18 @@
+[Unit]
+Description=Fire taleb-autoresearch.service weekly (Saturday 10:00 IST)
+
+[Timer]
+# Saturday morning: NSE is closed (no Kite contention), Friday's bars are
+# settled, and the operator has the weekend to review candidate_params.
+OnCalendar=Sat *-*-* 10:00:00 Asia/Kolkata
+
+# If the VPS was offline at 10:00 Saturday, run as soon as it comes up.
+Persistent=true
+
+# Spread load if multiple boxes ever share infra.
+RandomizedDelaySec=300
+
+Unit=taleb-autoresearch.service
+
+[Install]
+WantedBy=timers.target
