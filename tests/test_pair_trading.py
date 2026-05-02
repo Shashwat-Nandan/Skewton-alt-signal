@@ -1,0 +1,399 @@
+"""Tests for the pair trading strategy — z-score, entry/exit logic, mode dispatch, fill handling."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from strategies.pair_trading import (
+    PairLeg,
+    PairState,
+    PairTradingStrategy,
+)
+from trade_proposer import TradeProposal
+
+
+# ──────────────────────────────────────────────────────────
+# Fixtures
+# ──────────────────────────────────────────────────────────
+
+def _make_strategy(
+    *, mode: str = "paper",
+    hedge_ratio: float = 0.5,
+    entry_z: float = 2.0,
+    exit_z: float = 0.5,
+    stop_z: float = 4.0,
+    spread_history=None,
+) -> PairTradingStrategy:
+    """Build a PairTradingStrategy with __init__ bypassed — fully controllable for unit tests."""
+    s = PairTradingStrategy.__new__(PairTradingStrategy)
+    s.kite = MagicMock()
+    s.config = MagicMock()
+    s.config_path = "config.ini"
+    s.mode = mode
+    s.symbol_a = "AAA"
+    s.symbol_b = "BBB"
+    s.hedge_ratio = hedge_ratio
+    s.entry_z = entry_z
+    s.exit_z = exit_z
+    s.stop_z = stop_z
+    s.lookback_days = 30
+    s.lots_per_leg = 1
+    s.max_holding_days = 10
+    s.total_capital = 500_000
+    s.state = PairState()
+    s._spread_history = list(spread_history) if spread_history is not None else []
+    s._cached_futures = {
+        "AAA": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
+                "expiry": "2026-04-28", "instrument_token": 111},
+        "BBB": {"tradingsymbol": "BBB26APRFUT", "lot_size": 200,
+                "expiry": "2026-04-28", "instrument_token": 222},
+    }
+    s._clock = lambda: datetime(2026, 4, 21, 10, 30)
+    return s
+
+
+# ──────────────────────────────────────────────────────────
+# Z-score
+# ──────────────────────────────────────────────────────────
+
+class TestZScore:
+    def test_empty_history_returns_none(self):
+        s = _make_strategy(spread_history=[])
+        assert s._z_score(100.0) is None
+
+    def test_too_thin_history_returns_none(self):
+        s = _make_strategy(spread_history=[10.0] * 5)
+        assert s._z_score(10.0) is None
+
+    def test_zero_std_returns_none(self):
+        # Constant history → std = 0 → z is undefined
+        s = _make_strategy(spread_history=[5.0] * 50)
+        assert s._z_score(5.0) is None
+
+    def test_known_z_value(self):
+        # Build a history with mean=0, std=1 → spread of 2 should give z≈2
+        # (excluding the current bar from the rolling window)
+        history = [-1.0, 1.0] * 25  # mean 0, std 1
+        s = _make_strategy(spread_history=history + [2.0])
+        z = s._z_score(2.0)
+        assert z is not None
+        assert abs(z - 2.0) < 0.05
+
+    def test_recent_window_only(self):
+        # Old observations far from new ones — z should reflect the recent window
+        s = _make_strategy(
+            spread_history=[1000.0] * 200 + [0.0] * 60,
+            entry_z=2.0,
+        )
+        s.lookback_days = 30  # recent window: last 30 of [0.0]*60
+        z = s._z_score(0.0)
+        # All recent observations are 0 → std = 0 → returns None
+        assert z is None
+
+
+# ──────────────────────────────────────────────────────────
+# Entry logic
+# ──────────────────────────────────────────────────────────
+
+class TestEntry:
+    def _seed_priced_quotes(self, s, price_a=1000.0, price_b=2000.0):
+        """Mock the kite quote calls so _observe_spread returns deterministic prices."""
+        def fake_quote(syms):
+            assert len(syms) == 1
+            sym = syms[0]
+            if "AAA" in sym:
+                return {sym: {"last_price": price_a}}
+            return {sym: {"last_price": price_b}}
+        s.kite.quote = fake_quote
+        # Prepend a stable history so the z-score is computable
+        s._spread_history = [0.0, 1.0] * 30
+
+    def test_no_entry_when_already_in_position(self):
+        s = _make_strategy()
+        s.state.position = "LONG_SPREAD"
+        proposals = s.scan_and_propose()
+        assert proposals == []
+
+    def test_long_spread_when_z_below_minus_entry(self):
+        # Spread well below the rolling mean → z negative → LONG_SPREAD
+        s = _make_strategy(hedge_ratio=0.5)
+        # Establish mean ~= 0, std ~= 1 over recent history
+        s._spread_history = [-1.0, 1.0] * 30
+        # current price puts spread at -5 (way below mean)
+        # spread = price_a - β*price_b; pick price_a, price_b so spread = -5
+        # 1000 - 0.5*2010 = -5 → price_b = 2010
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+        # Leg A is BUY (long the spread = long A)
+        a_leg = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a_leg.transaction_type == "BUY"
+        # Positive β with LONG_SPREAD → SELL B
+        assert b_leg.transaction_type == "SELL"
+        # Both legs are FUT
+        assert a_leg.option_type == "FUT"
+        assert b_leg.option_type == "FUT"
+
+    def test_short_spread_when_z_above_plus_entry(self):
+        s = _make_strategy(hedge_ratio=0.5)
+        s._spread_history = [-1.0, 1.0] * 30
+        # spread = 1000 - 0.5*1990 = +5 (well above mean)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=1990.0)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+        a_leg = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a_leg.transaction_type == "SELL"
+        assert b_leg.transaction_type == "BUY"
+
+    def test_negative_hedge_ratio_flips_leg_b_side(self):
+        # With β<0, LONG_SPREAD wants both legs BUY (since "−β·B" with β<0 means +|β|·B)
+        s = _make_strategy(hedge_ratio=-0.5)
+        s._spread_history = [-1.0, 1.0] * 30
+        # spread = price_a - (-0.5)*price_b = price_a + 0.5*price_b
+        # mean of seed = 0, std = 1; want spread ≈ -5 → price_a + 0.5*price_b = -5
+        # use price_a = 0, price_b = -10 (negative price isn't realistic but the
+        # math is what we're testing); easier: shift mean to a positive value first.
+        s._spread_history = [995.0, 1005.0] * 30  # mean 1000, std 5
+        # spread for LONG entry: well below 1000 - entry_z*5 = 990
+        # set price_a + 0.5*price_b = 980 → price_a = 80, price_b = 1800
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 80.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1800.0}}
+        )
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+        a_leg = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a_leg.transaction_type == "BUY"
+        # Negative β → both BUY for LONG_SPREAD
+        assert b_leg.transaction_type == "BUY"
+
+    def test_hedge_qty_matches_notional(self):
+        s = _make_strategy(hedge_ratio=0.5)
+        s._spread_history = [-1.0, 1.0] * 30
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        proposals = s.scan_and_propose()
+        a_leg = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        # Notional A = 1 * 100 * 1000 = 100,000
+        # Target |β| * A_notional / per_lot_b = 0.5 * 100000 / (200*2010) ≈ 0.124 → max(round, 1) = 1
+        assert a_leg.quantity == 1
+        assert b_leg.quantity == 1
+
+
+# ──────────────────────────────────────────────────────────
+# Exit logic
+# ──────────────────────────────────────────────────────────
+
+class TestExit:
+    def _open_long_spread(self, s, price_a=1000.0, price_b=2000.0):
+        s.state.position = "LONG_SPREAD"
+        s.state.entry_time = s._clock()
+        s.state.entry_z = -2.5
+        s.state.entry_spread = -5.0
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
+                    quantity=1, entry_price=price_a, current_price=price_a),
+            PairLeg(symbol="BBB", tradingsymbol="BBB26APRFUT", lot_size=200,
+                    quantity=-1, entry_price=price_b, current_price=price_b),
+        ]
+
+    def _set_quote(self, s, price_a, price_b):
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": price_a}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": price_b}}
+        )
+
+    def test_no_exit_when_flat(self):
+        s = _make_strategy()
+        proposals = s.check_and_rehedge()
+        assert proposals == []
+
+    def test_mean_revert_exit(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
+        s._spread_history = [-1.0, 1.0] * 30  # mean 0, std 1
+        self._open_long_spread(s)
+        # Set prices so spread is near 0 → |z| < exit_z
+        self._set_quote(s, price_a=1000.0, price_b=2000.0)  # spread = 0
+        proposals = s.check_and_rehedge()
+        assert len(proposals) == 2
+        # Exit proposals reverse the open legs
+        a_exit = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
+        b_exit = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
+        assert a_exit.transaction_type == "SELL"  # closes long
+        assert b_exit.transaction_type == "BUY"   # closes short
+        assert "MEAN_REVERT" in a_exit.rationale
+
+    def test_stop_exit(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        # Spread blew out further negative → |z| >= stop_z
+        # spread = 1000 - 0.5*2010 = -5  (z = -5)
+        self._set_quote(s, price_a=1000.0, price_b=2010.0)
+        proposals = s.check_and_rehedge()
+        assert len(proposals) == 2
+        assert any("STOP" in p.rationale for p in proposals)
+
+    def test_max_hold_exit(self):
+        s = _make_strategy()
+        s.max_holding_days = 1
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        # Push entry_time back 5 days
+        s.state.entry_time = s._clock() - timedelta(days=5)
+        self._set_quote(s, price_a=1000.0, price_b=1999.5)  # z neither exit nor stop
+        proposals = s.check_and_rehedge()
+        assert len(proposals) == 2
+        assert any("MAX_HOLD" in p.rationale for p in proposals)
+
+    def test_no_exit_inside_band(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        # Spread = 1.5 → z=1.5, between exit_z (0.5) and stop_z (4.0)
+        self._set_quote(s, price_a=1000.0, price_b=1997.0)  # spread = 1.5
+        proposals = s.check_and_rehedge()
+        assert proposals == []
+
+
+# ──────────────────────────────────────────────────────────
+# Mode dispatch / signals JSONL
+# ──────────────────────────────────────────────────────────
+
+class TestModeDispatch:
+    def test_signals_mode_emits_jsonl_and_skips_state(self, tmp_path, monkeypatch):
+        s = _make_strategy(mode="signals")
+        # Point _emit_signal at tmp dir by stubbing config.get for log_dir
+        s.config.get = MagicMock(return_value=str(tmp_path))
+        prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0, margin_required=20000,
+            rationale="test entry",
+        )
+        results = s.execute_proposals([prop])
+        assert len(results) == 1
+        assert results[0]["status"] == "SIGNAL_LOGGED"
+        assert results[0]["mode"] == "signals"
+        # State must remain pristine
+        assert s.state.position == "FLAT"
+        assert s.state.legs == []
+        assert s.state.realized_pnl == 0.0
+        # JSONL was written
+        files = list(tmp_path.glob("signals-*.jsonl"))
+        assert len(files) == 1
+        record = json.loads(files[0].read_text().strip())
+        assert record["strategy"] == "pair_trading"
+        assert record["tradingsymbol"] == "AAA26APRFUT"
+
+    def test_paper_mode_updates_state(self):
+        s = _make_strategy(mode="paper")
+        prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0, margin_required=20000,
+            rationale="test entry",
+        )
+        results = s.execute_proposals([prop])
+        assert results[0]["status"] == "COMPLETE"
+        assert results[0]["mode"] == "paper"
+        assert len(s.state.legs) == 1
+        assert s.state.legs[0].symbol == "AAA"
+        assert s.state.legs[0].quantity == 1
+        # Costs deducted from realized_pnl
+        assert s.state.total_transaction_costs > 0
+        assert s.state.realized_pnl < 0  # only costs so far
+
+
+# ──────────────────────────────────────────────────────────
+# Fill handling / position netting
+# ──────────────────────────────────────────────────────────
+
+class TestApplyFill:
+    def test_close_removes_leg_and_books_pnl(self):
+        s = _make_strategy(mode="paper")
+        # Open
+        open_prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0, margin_required=20000, rationale="open",
+        )
+        s.execute_proposals([open_prop])
+        assert len(s.state.legs) == 1
+
+        # Close at +50 → realized = 50 * 1 * 100 = 5000 (minus costs)
+        close_prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1050.0, transaction_type="SELL",
+            iv=0, bid_ask_spread_pct=0, margin_required=0, rationale="close",
+        )
+        s.execute_proposals([close_prop])
+        assert len(s.state.legs) == 0
+        # 5000 minus round-trip costs should still be solidly positive
+        assert s.state.realized_pnl > 4000
+
+    def test_partial_close_books_pnl_on_closed_portion(self):
+        s = _make_strategy(mode="paper")
+        # Open 3 lots
+        s.state.legs = [PairLeg(
+            symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
+            quantity=3, entry_price=1000.0, current_price=1000.0,
+        )]
+        # Close 1 of 3 lots at 1100 → realized = 100 * 1 * 100 = 10,000 minus costs
+        close_prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1100.0, transaction_type="SELL",
+            iv=0, bid_ask_spread_pct=0, margin_required=0, rationale="partial close",
+        )
+        s._apply_fill(close_prop)
+        assert len(s.state.legs) == 1
+        assert s.state.legs[0].quantity == 2  # 3 - 1
+        assert s.state.realized_pnl > 9000
+
+
+# ──────────────────────────────────────────────────────────
+# EOD report
+# ──────────────────────────────────────────────────────────
+
+class TestEODReport:
+    def test_eod_report_keys(self):
+        s = _make_strategy()
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 2000.0}}
+        )
+        s._spread_history = [-1.0, 1.0] * 30
+        report = s.generate_eod_report()
+        assert report["strategy"] == "pair_trading"
+        assert report["pair"] == ("AAA", "BBB")
+        assert report["position"] == "FLAT"
+        assert "current_z" in report
+        assert "realized_pnl" in report
+        assert "spread_history_size" in report
+
+
+# ──────────────────────────────────────────────────────────
+# Registry
+# ──────────────────────────────────────────────────────────
+
+class TestRegistry:
+    def test_strategy_registered(self):
+        from strategies import STRATEGIES, get_strategy
+        assert "pair_trading" in STRATEGIES
+        assert get_strategy("pair_trading") is PairTradingStrategy
