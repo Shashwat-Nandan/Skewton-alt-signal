@@ -78,8 +78,11 @@ def callback(
         logger.exception("Failed to exchange request_token: %s", e)
         raise HTTPException(status_code=502, detail=f"Kite token exchange failed: {e}")
 
-    # Bounce the browser back to the SPA root with a success query.
-    target = f"{get_settings().dev_origin}/?login=success&user={session.get('user_id', '')}"
+    # Bounce the browser back to the SPA root. The ?login=success query
+    # tells the SPA to invalidate its cached auth state and re-fetch the
+    # profile (which is now valid). The SPA strips the query from the URL
+    # after handling so the user lands on a clean "/".
+    target = f"{get_settings().dashboard_url.rstrip('/')}/?login=success"
     return RedirectResponse(url=target, status_code=302)
 
 

@@ -41,8 +41,10 @@ class Settings(BaseSettings):
     # Tick cadence for the per-run async loop (seconds).
     tick_interval_seconds: int = 60
 
-    # Where the dashboard SPA lives in dev — the backend allows CORS from here.
-    dev_origin: str = "http://localhost:5173"
+    # Public URL the user opens in their browser to use the dashboard.
+    # Used both for the OAuth post-callback redirect AND for CORS. Override
+    # in prod to your real hostname (e.g. https://dashboard.example.com).
+    dashboard_url: str = "http://localhost:5173"
 
     # Per Q1: dashboard is signals + paper only. Live mode is rejected at the
     # run-create endpoint regardless of strategy. Set true only with eyes open.

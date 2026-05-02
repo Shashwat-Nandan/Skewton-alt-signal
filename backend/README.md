@@ -48,7 +48,11 @@ that the VPS daemon uses. Register a Kite Connect app once:
    KITE_API_KEY=<your_api_key>
    KITE_API_SECRET=<your_api_secret>
    KITE_REDIRECT_URL=http://127.0.0.1:8000/auth/callback
+   # DASHBOARD_URL=http://localhost:5173   # default — override in prod
    ```
+   `DASHBOARD_URL` is the public URL where the SPA is served. The
+   backend redirects browsers there after the OAuth callback. Default
+   `http://localhost:5173` matches the Vite dev server out of the box.
 4. Start the backend, open <http://localhost:8000/auth/login> in a browser,
    complete login on Kite — you'll be redirected back to `/auth/callback`,
    token cached to `.kite_session.json`, ready for `POST /runs`.

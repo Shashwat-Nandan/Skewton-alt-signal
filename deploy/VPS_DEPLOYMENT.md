@@ -432,7 +432,12 @@ screen-scrape that the headless services use). One-time setup:
    KITE_API_KEY=...
    KITE_API_SECRET=...
    KITE_REDIRECT_URL=https://dashboard.example.com/auth/callback
+   DASHBOARD_URL=https://dashboard.example.com
    ```
+   `DASHBOARD_URL` is the public origin where users open the SPA — the
+   backend redirects browsers there after the OAuth callback completes,
+   and CORS allows it. Default is `http://localhost:5173` (Vite dev),
+   so override it for any non-local install.
 4. `chmod 600 .env` (still gitignored).
 
 The existing `KITE_USER_ID`/`KITE_PASSWORD`/`KITE_TOTP_KEY` entries
