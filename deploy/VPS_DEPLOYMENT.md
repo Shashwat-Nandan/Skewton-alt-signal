@@ -17,8 +17,9 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `taleb-hedger.service`        | Oneshot, ~6 hours             | Runs `run_paper.py` — auths, sleeps to 09:15, ticks until 15:25, flattens, exits     |
 | `taleb-autoresearch.timer`    | Sat 10:00 IST + jitter        | Fires `taleb-autoresearch.service`                                                   |
 | `taleb-autoresearch.service`  | Oneshot, up to 2h             | Runs `deploy/run_weekly_autoresearch.sh` — fetches data, sweeps params, logs result  |
+| `dashboard-backend.service`   | Long-running, restart=always  | `uvicorn backend.main:app` on 127.0.0.1:8000 — see [section 10](#10-strategy-dashboard) |
 
-The daily timer never collides with the weekly one (different days). Authentication is handled inside the Python process via TOTP (`kite_auth.py`), so neither unit needs interactive input.
+The daily timer never collides with the weekly one (different days). The headless paper/autoresearch jobs authenticate inside the Python process via TOTP (`kite_auth.py`); the dashboard backend uses the OAuth redirect flow instead and stores its token in the same `.kite_session.json` cache.
 
 ---
 
@@ -400,14 +401,160 @@ Then in `config.ini` set `trading_mode = paper` and commit. The live unit files 
 
 ---
 
-## 10. File map
+## 10. Strategy dashboard
+
+The dashboard is a separate runtime: a long-lived FastAPI backend and a
+React SPA built once per deploy. It exposes the same `BaseStrategy`
+implementations that the headless daemon runs, but lets you start an
+ad-hoc paper or signals run from a browser, watch live signals/trades/
+P&L, and stop. Live trading is **not** wired into the dashboard —
+that path stays on the headless `taleb-hedger.service` setup above.
+
+State persists in SQLite at `data_cache/dashboard.db` (created on first
+boot). A backend restart marks any in-flight runs as `STOPPED` with an
+explanatory error; their historical proposals and P&L history remain
+queryable through the SPA.
+
+### 10.1 Kite Connect OAuth app
+
+The dashboard uses Kite's OAuth redirect flow (distinct from the TOTP
+screen-scrape that the headless services use). One-time setup:
+
+1. Sign in at <https://developers.kite.trade/> and create a new app.
+2. Set **Redirect URL** to *exactly* the URL nginx will serve, e.g.:
+   ```
+   https://dashboard.example.com/auth/callback
+   ```
+   For a same-host VPS without HTTPS yet, `http://<vps-ip>/auth/callback`
+   works for testing — Kite enforces an exact string match.
+3. Copy the API key + secret into `/opt/taleb-karpathy-kite/.env`:
+   ```
+   KITE_API_KEY=...
+   KITE_API_SECRET=...
+   KITE_REDIRECT_URL=https://dashboard.example.com/auth/callback
+   ```
+4. `chmod 600 .env` (still gitignored).
+
+The existing `KITE_USER_ID`/`KITE_PASSWORD`/`KITE_TOTP_KEY` entries
+keep the headless TOTP path working — they coexist.
+
+### 10.2 Install the backend service
+
+```bash
+sudo cp deploy/dashboard-backend.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dashboard-backend.service
+sudo systemctl status dashboard-backend.service
+```
+
+Confirm it's up:
+
+```bash
+curl -s http://127.0.0.1:8000/    # → {"name":"...", "live_mode_enabled":false}
+journalctl -u dashboard-backend.service -f
+```
+
+The service binds to `127.0.0.1:8000` only; nginx fronts the public
+traffic in 10.4.
+
+### 10.3 Build the SPA
+
+Node 20+ and `npm` are required on the VPS once.
+
+```bash
+sudo apt-get install -y nodejs npm   # or use nvm / nodesource
+
+# As the taleb user — npm writes lockfiles owned by it
+sudo -u taleb -i bash -c '
+  cd /opt/taleb-karpathy-kite
+  ./deploy/build-frontend.sh
+'
+```
+
+The script runs `npm ci` (reproducible from `frontend/package-lock.json`)
+then `npm run build`. Output lands in `frontend/dist/` — nginx serves
+it directly, no daemon needed.
+
+Re-run after every `git pull` that changes `frontend/`. The script is
+idempotent and takes ~30 s on a 2 vCPU box.
+
+### 10.4 nginx site
+
+`deploy/nginx-dashboard.conf.example` is the template — three rules:
+proxy `/auth`, `/strategies`, `/runs` to the backend, serve everything
+else from `frontend/dist/` with HTML5-router fallback to `index.html`.
+
+```bash
+sudo apt-get install -y nginx
+sudo cp deploy/nginx-dashboard.conf.example /etc/nginx/sites-available/dashboard
+sudo $EDITOR /etc/nginx/sites-available/dashboard   # set server_name
+sudo ln -s /etc/nginx/sites-available/dashboard /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+For HTTPS:
+
+```bash
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d dashboard.example.com
+```
+
+Certbot edits the server block in place to add `listen 443 ssl;` and
+the certificate paths.
+
+### 10.5 Verify end-to-end
+
+1. Open `https://dashboard.example.com/` — you should see the login
+   card.
+2. Click **Login with Kite** — redirects to `kite.zerodha.com`, you
+   enter credentials + 2FA, and Kite redirects back to your callback.
+3. Pick a strategy + mode (signals or paper) + start.
+4. The run page should poll every 2s and show ticks accumulating.
+
+If `/auth/login` fails with `KITE_API_KEY is not set`, the systemd unit
+isn't reading `.env` — check the `EnvironmentFile=` line in
+`dashboard-backend.service` matches your repo path. If the redirect
+back from Kite errors with "redirect URI mismatch", the URL in the
+Kite app console must match `KITE_REDIRECT_URL` byte-for-byte.
+
+### 10.6 Operations
+
+```bash
+# Restart after a code update
+sudo systemctl restart dashboard-backend.service
+
+# Tail logs
+journalctl -u dashboard-backend.service -f
+
+# Inspect the SQLite store
+sqlite3 /opt/taleb-karpathy-kite/data_cache/dashboard.db \
+  'SELECT id, strategy_name, mode, status, tick_count FROM runs ORDER BY created_at DESC LIMIT 10;'
+
+# Force a clean DB (loses run history — usually you don't want this)
+sudo systemctl stop dashboard-backend.service
+mv /opt/taleb-karpathy-kite/data_cache/dashboard.db{,.bak}
+sudo systemctl start dashboard-backend.service
+```
+
+The dashboard never trades real money in this build (`POST /runs` with
+`mode=live` returns 403). To unlock live, set `ALLOW_LIVE_MODE=true`
+in `.env` and restart — but the recommended live path remains the
+headless `taleb-hedger.service` above, which has the audit trail and
+TOTP automation that browser-driven sessions don't.
+
+---
+
+## 11. File map
 
 ```
 deploy/
 ├── VPS_DEPLOYMENT.md              # this guide
-├── taleb-hedger.service           # daily live trading oneshot
+├── taleb-hedger.service           # daily paper trading oneshot
 ├── taleb-hedger.timer             # Mon–Fri 09:10 IST trigger
 ├── taleb-autoresearch.service     # weekly param sweep oneshot
 ├── taleb-autoresearch.timer       # Sat 10:00 IST trigger
-└── run_weekly_autoresearch.sh     # wrapper: fetch → sweep → stage candidate
+├── run_weekly_autoresearch.sh     # wrapper: fetch → sweep → stage candidate
+├── dashboard-backend.service      # long-running uvicorn (FastAPI)
+├── nginx-dashboard.conf.example   # nginx site for SPA + API proxy
+└── build-frontend.sh              # npm ci + npm run build wrapper
 ```

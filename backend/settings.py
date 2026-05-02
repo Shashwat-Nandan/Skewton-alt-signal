@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # Project config (consumed by strategies for risk rails, capital, etc.)
     config_path: Path = REPO_ROOT / "config.ini"
 
+    # SQLite store for runs/proposals/pnl history. Survives restarts; orphan
+    # RUNNING rows are marked STOPPED on backend boot since their in-memory
+    # tick loops are gone.
+    db_path: Path = REPO_ROOT / "data_cache" / "dashboard.db"
+
     # Tick cadence for the per-run async loop (seconds).
     tick_interval_seconds: int = 60
 

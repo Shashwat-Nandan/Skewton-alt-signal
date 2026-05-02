@@ -17,19 +17,22 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backend.main import create_app
-from backend import run_manager as rm
+from backend import db, run_manager as rm
 
 
 @pytest.fixture
-def client():
+def client(tmp_path):
     # Reset the run manager singleton so each test sees an empty registry.
-    # We don't need to monkeypatch the token cache path because every test that
-    # touches auth mocks kite_oauth.get_authenticated_kite at the boundary —
-    # the real .kite_session.json is never read or written.
+    # Bind the SQLite singleton to a tmp path so we never touch the real
+    # data_cache/dashboard.db. Every auth-touching test mocks
+    # kite_oauth.get_authenticated_kite at the boundary so the real
+    # .kite_session.json is never read or written either.
     rm._manager = None
+    db.reset_for_tests(tmp_path / "test.db")
     app = create_app()
     with TestClient(app) as c:
         yield c
+    db.reset_for_tests(None)
 
 
 # ──────────────────────────────────────────────────────────

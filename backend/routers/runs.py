@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from strategies import STRATEGIES, VALID_MODES
 
-from .. import kite_oauth
+from .. import db, kite_oauth
 from ..run_manager import get_run_manager
 from ..settings import get_settings
 
@@ -70,19 +70,19 @@ async def create_run(req: CreateRunRequest):
 
 @router.get("", response_model=List[RunSummary])
 def list_runs():
-    return [RunSummary(**r.to_dict()) for r in get_run_manager().list_runs()]
+    return [RunSummary(**r) for r in get_run_manager().list_runs()]
 
 
 @router.get("/{run_id}", response_model=RunDetail)
 def get_run(run_id: str):
-    run = get_run_manager().get_run(run_id)
-    if run is None:
+    run_dict = get_run_manager().get_run_dict(run_id)
+    if run_dict is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return RunDetail(
-        **run.to_dict(),
-        signals=run.signals,
-        trades=run.trades,
-        pnl_history=run.pnl_history,
+        **run_dict,
+        signals=db.get_proposals(run_id, source="signal"),
+        trades=db.get_proposals(run_id, source="trade"),
+        pnl_history=db.get_pnl_history(run_id),
     )
 
 
@@ -92,5 +92,7 @@ async def stop_run(run_id: str):
     ok = await manager.stop_run(run_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Run not found")
-    run = manager.get_run(run_id)
-    return RunSummary(**run.to_dict())
+    run_dict = manager.get_run_dict(run_id)
+    if run_dict is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunSummary(**run_dict)

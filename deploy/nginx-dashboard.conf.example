@@ -1,0 +1,46 @@
+# Nginx site config for the strategy dashboard.
+#
+# Serves the SPA (frontend/dist) as static files and proxies API calls
+# to the uvicorn backend listening on 127.0.0.1:8000. Drop into
+# /etc/nginx/sites-available/dashboard, symlink to sites-enabled, and
+# reload nginx.
+#
+# Replace dashboard.example.com with your real hostname. For HTTPS,
+# add cert paths under listen 443 ssl; certbot's --nginx will edit
+# this file in place.
+
+server {
+    listen 80;
+    server_name dashboard.example.com;
+
+    # Backend API — three prefixes only. Anything else falls through
+    # to the SPA.
+    location ~ ^/(auth|strategies|runs)(/|$) {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Backend is internal — close on idle to keep the FD pool small.
+        proxy_http_version 1.1;
+        proxy_read_timeout 60s;
+    }
+
+    # SPA static + HTML5 router fallback. The SPA bundle is hashed by
+    # Vite, so /assets/* can be cached aggressively.
+    root /opt/taleb-karpathy-kite/frontend/dist;
+    index index.html;
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri /index.html;
+    }
+
+    # Block direct access to the dotfiles that live in the project root.
+    location ~ /\. { deny all; return 404; }
+}

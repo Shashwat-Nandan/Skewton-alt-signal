@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import db
 from .routers import auth, runs, strategies
 from .run_manager import get_run_manager
 from .settings import get_settings
@@ -28,6 +29,8 @@ logger = logging.getLogger("backend")
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    db.init_schema()
+    get_run_manager().hydrate_from_db()
     yield
     await get_run_manager().shutdown()
     logger.info("All runs cancelled.")
