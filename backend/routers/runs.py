@@ -1,6 +1,7 @@
 """Run lifecycle endpoints."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -12,6 +13,7 @@ from .. import db, kite_oauth
 from ..run_manager import get_run_manager
 from ..settings import get_settings
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 
@@ -64,6 +66,7 @@ async def create_run(req: CreateRunRequest):
     try:
         run = manager.create_run(req.strategy, req.mode, req.params, kite=kite)
     except Exception as e:
+        logger.exception("create_run failed for strategy=%s mode=%s", req.strategy, req.mode)
         raise HTTPException(status_code=500, detail=f"Failed to create run: {e}")
     return RunSummary(**run.to_dict())
 
