@@ -120,6 +120,7 @@ export function RunPage() {
             <TabsContent value="primary">
               <ProposalTable
                 rows={primaryRows}
+                strategyName={run.strategy_name}
                 emptyMessage={
                   isSignalsMode
                     ? "No signals emitted yet."
