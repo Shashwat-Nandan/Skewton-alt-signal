@@ -44,6 +44,35 @@ PARAM_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
          "description": "Cap per-leg notional in ₹. Leave blank for no cap. "
                         "High-β pairs deploy huge amounts otherwise."},
     ],
+    "arbitrage": [
+        {"name": "risk_free_rate", "type": "float", "default": 0.07,
+         "description": "Annualized risk-free rate used in cost-of-carry F* = S·exp((r-q)·T)"},
+        {"name": "dividend_yield_default", "type": "float", "default": 0.0,
+         "description": "Annualized dividend yield assumed for every name. "
+                        "Bump up for high-yield stocks to avoid fake cash-rich signals."},
+        {"name": "basis_entry_annual", "type": "float", "default": 0.015,
+         "description": "|annualized cash-futures basis| above which to emit a basis signal "
+                        "(signals-only — cash leg is never lifted to a live order)"},
+        {"name": "calendar_entry_annual", "type": "float", "default": 0.020,
+         "description": "|implied carry − fair carry| (annualized) to open a calendar spread"},
+        {"name": "calendar_exit_annual", "type": "float", "default": 0.005,
+         "description": "|implied carry − fair carry| at which an open calendar mean-reverts out"},
+        {"name": "calendar_max_holding_days", "type": "int", "default": 15,
+         "description": "Days after which a calendar spread is force-exited"},
+        {"name": "calendar_max_leg_basis", "type": "float", "default": 0.10,
+         "description": "Cleanliness gate: skip calendars where EITHER leg's "
+                        "annualized cash-futures basis exceeds this. "
+                        "Filters out dividend-pinned names."},
+        {"name": "lots_per_leg", "type": "int", "default": 1,
+         "description": "Lots traded per calendar leg"},
+        {"name": "max_open_calendars", "type": "int", "default": 5,
+         "description": "Cap on simultaneous open calendar trades"},
+        {"name": "max_leg_notional", "type": "float", "default": None,
+         "description": "Per-leg notional cap (₹). Skips entries where 1 lot busts the cap."},
+        {"name": "disable_calendar", "type": "bool", "default": False,
+         "description": "Pure basis-monitoring mode: emits dislocation signals "
+                        "but never proposes calendar entries. Recommended for retail."},
+    ],
 }
 
 
