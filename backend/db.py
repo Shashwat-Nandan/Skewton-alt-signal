@@ -77,6 +77,42 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pnl_run_id ON pnl_snapshots (run_id, id);
+
+-- ──────────────────────────────────────────────────────────
+-- Market Profile data
+-- ──────────────────────────────────────────────────────────
+-- bars_universe: every symbol whose 30-min bars we want to track. Populated
+-- by fetch_bars.py on first --backfill run; the dashboard reads this to
+-- populate the symbol selector.
+CREATE TABLE IF NOT EXISTS bars_universe (
+    symbol TEXT PRIMARY KEY,
+    instrument_token INTEGER NOT NULL,
+    exchange TEXT NOT NULL,
+    name TEXT,
+    last_backfilled_at TEXT,
+    last_update_at TEXT,
+    earliest_bar_ts TEXT,
+    latest_bar_ts TEXT
+);
+
+-- bars: OHLCV candles. The PK collapses duplicates so re-runs of fetch_bars
+-- are idempotent. `interval_minutes` is stored explicitly so we can
+-- co-mingle different period bars in the same table if we ever extend
+-- beyond 30-min, without an "intervals" join.
+CREATE TABLE IF NOT EXISTS bars (
+    instrument_token INTEGER NOT NULL,
+    interval_minutes INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (instrument_token, interval_minutes, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bars_token_ts
+    ON bars (instrument_token, interval_minutes, ts);
 """
 
 

@@ -18,6 +18,7 @@ export default defineConfig({
       "/auth": BACKEND,
       "/strategies": BACKEND,
       "/runs": BACKEND,
+      "/market-profile": BACKEND,
     },
   },
 });

@@ -65,3 +65,71 @@ export type RunDetail = RunSummary & {
   trades: ProposalEntry[];
   pnl_history: PnlSnapshot[];
 };
+
+// ── Market Profile ──
+
+export type MarketProfileSymbol = {
+  symbol: string;
+  instrument_token: number;
+  exchange: string;
+  name?: string | null;
+  last_backfilled_at?: string | null;
+  last_update_at?: string | null;
+  earliest_bar_ts?: string | null;
+  latest_bar_ts?: string | null;
+};
+
+export type ProfileBin = {
+  price_low: number;
+  price_high: number;
+  price_mid: number;
+  tpo_count: number;
+  letters: string;
+  in_value_area: boolean;
+  is_poc: boolean;
+};
+
+export type CompositeProfile = {
+  bins: ProfileBin[];
+  poc: number;
+  vah: number;
+  val: number;
+  high: number;
+  low: number;
+  total_tpos: number;
+  total_volume: number;
+  n_days: number;
+  n_periods: number;
+};
+
+export type DayProfile = {
+  day: string;
+  bins: ProfileBin[];
+  poc: number;
+  vah: number;
+  val: number;
+  ib_high: number | null;
+  ib_low: number | null;
+  open: number;
+  close: number;
+  high: number;
+  low: number;
+  n_periods: number;
+  total_tpos: number;
+  total_volume: number;
+};
+
+export type MarketProfileResponse = {
+  symbol: string;
+  name?: string | null;
+  instrument_token: number;
+  exchange: string;
+  period_minutes: number;
+  lookback_days: number;
+  value_area_pct: number;
+  first_bar_ts: string;
+  last_bar_ts: string;
+  n_bars: number;
+  composite: CompositeProfile | null;
+  daily?: DayProfile[];
+};

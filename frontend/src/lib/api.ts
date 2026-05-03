@@ -1,5 +1,7 @@
 import type {
   AuthStatus,
+  MarketProfileResponse,
+  MarketProfileSymbol,
   RunDetail,
   RunSummary,
   StrategyInfo,
@@ -44,4 +46,20 @@ export const api = {
   createRun: (body: { strategy: string; mode: string; params: Record<string, unknown> }) =>
     http<RunSummary>("/runs", { method: "POST", body: JSON.stringify(body) }),
   stopRun: (id: string) => http<RunSummary>(`/runs/${id}/stop`, { method: "POST" }),
+
+  marketProfileSymbols: () =>
+    http<MarketProfileSymbol[]>("/market-profile/symbols"),
+  marketProfile: (
+    symbol: string,
+    params: { days?: number; period_minutes?: number; mode?: "composite" | "daily" } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    if (params.period_minutes != null) q.set("period_minutes", String(params.period_minutes));
+    if (params.mode) q.set("mode", params.mode);
+    const qs = q.toString();
+    return http<MarketProfileResponse>(
+      `/market-profile/${encodeURIComponent(symbol)}${qs ? `?${qs}` : ""}`,
+    );
+  },
 };

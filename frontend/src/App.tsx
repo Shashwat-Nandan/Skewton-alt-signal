@@ -3,6 +3,7 @@ import { Routes, Route } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Header } from "@/components/Header";
 import { Home } from "@/pages/Home";
+import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { RunPage } from "@/pages/RunPage";
 
 export default function App() {
@@ -26,6 +27,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/runs/:runId" element={<RunPage />} />
+          <Route path="/market-profile" element={<MarketProfilePage />} />
         </Routes>
       </main>
     </div>

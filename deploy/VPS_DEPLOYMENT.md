@@ -17,6 +17,8 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `taleb-hedger.service`        | Oneshot, ~6 hours             | Runs `run_paper.py` — auths, sleeps to 09:15, ticks until 15:25, flattens, exits     |
 | `taleb-autoresearch.timer`    | Sat 10:00 IST + jitter        | Fires `taleb-autoresearch.service`                                                   |
 | `taleb-autoresearch.service`  | Oneshot, up to 2h             | Runs `deploy/run_weekly_autoresearch.sh` — fetches data, sweeps params, logs result  |
+| `fetch-bars.timer`            | Daily 16:30 IST + jitter      | Fires `fetch-bars.service`                                                           |
+| `fetch-bars.service`          | Oneshot, ~1–4 min             | Runs `deploy/run_daily_bars_update.sh` — incremental 30-min bars for Market Profile  |
 | `dashboard-backend.service`   | Long-running, restart=always  | `uvicorn backend.main:app` on 127.0.0.1:8000 — see [section 10](#10-strategy-dashboard) |
 
 The daily timer never collides with the weekly one (different days). The headless paper/autoresearch jobs authenticate inside the Python process via TOTP (`kite_auth.py`); the dashboard backend uses the OAuth redirect flow instead and stores its token in the same `.kite_session.json` cache.
@@ -77,33 +79,38 @@ If that prints `Authenticated as <name>` and exits cleanly, you are good.
 
 ## 3. Install the systemd units
 
-Copy all four unit files into `/etc/systemd/system/`:
+Copy all six unit files into `/etc/systemd/system/`:
 
 ```bash
 sudo cp deploy/taleb-hedger.service       /etc/systemd/system/
 sudo cp deploy/taleb-hedger.timer         /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.service /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.timer   /etc/systemd/system/
+sudo cp deploy/fetch-bars.service         /etc/systemd/system/
+sudo cp deploy/fetch-bars.timer           /etc/systemd/system/
 
 sudo systemctl daemon-reload
 ```
 
 Each `.service` file hardcodes `User=taleb` and `WorkingDirectory=/opt/taleb-karpathy-kite`. **Edit them in `/etc/systemd/system/` (or the originals before copying) if your VPS differs.**
 
-Enable both timers:
+Enable all three timers:
 
 ```bash
 sudo systemctl enable --now taleb-hedger.timer
 sudo systemctl enable --now taleb-autoresearch.timer
+sudo systemctl enable --now fetch-bars.timer
 ```
 
 Confirm they are scheduled:
 
 ```bash
-systemctl list-timers taleb-*.timer
+systemctl list-timers 'taleb-*.timer' 'fetch-bars.timer'
 ```
 
-You should see two rows with `NEXT` columns at the next 09:10 IST and the next Saturday 10:00 IST.
+You should see three rows with `NEXT` columns at the next 09:10 IST (hedger), the next 16:30 IST (bars update), and the next Saturday 10:00 IST (autoresearch).
+
+The `fetch-bars` timer requires `bars_universe` to already be populated — see [section 11](#11-market-profile-bars-ingestion) for the one-time backfill.
 
 ---
 
@@ -549,7 +556,60 @@ TOTP automation that browser-driven sessions don't.
 
 ---
 
-## 11. File map
+## 11. Market Profile bars ingestion
+
+The `/market-profile` dashboard tab reads 30-min OHLCV bars stored in
+`data_cache/dashboard.db` (`bars` and `bars_universe` tables). The
+`fetch-bars.timer` keeps the corpus current, but it only runs the
+**incremental** path — first you need a one-time backfill to populate
+the universe:
+
+```bash
+cd /opt/taleb-karpathy-kite
+
+# Option A — every NIFTY-50 spot, 90 days back
+./.venv/bin/python fetch_bars.py --backfill --days 90
+
+# Option B — every F&O STF (recommended), sourced from your bhavcopy archive
+./.venv/bin/python fetch_bars.py --backfill --days 90 \
+    --symbols "$(awk -F',' '$5=="STF"{print $8}' \
+                  data_cache/bhavcopy_raw/bhavcopy_fo_*.csv \
+                  | sort -u | paste -sd,)"
+```
+
+Kite's intraday history is typically capped to ~60-90 days for retail
+subscriptions, so the `--days 90` ceiling above is real. The corpus
+extends forward indefinitely from the daily timer.
+
+After the first backfill the timer takes over:
+
+```bash
+sudo systemctl enable --now fetch-bars.timer
+journalctl -u fetch-bars.service -f         # watch tonight's run
+```
+
+Each daily run:
+1. Iterates every symbol in `bars_universe` (no need to re-edit the list — backfilling new symbols later just adds them);
+2. Pulls bars from the latest stored `ts` to now (small chunks, ~50ms each);
+3. Inserts via `INSERT OR IGNORE` so a re-run is safe.
+
+Holidays and weekends are no-ops — Kite returns an empty bar list and
+the script logs `inserted 0 new` for every symbol.
+
+To inspect coverage:
+
+```bash
+./.venv/bin/python -c "
+from backend import db, bars as bdb
+db.init_schema()
+for r in bdb.list_universe()[:5]:
+    print(r['symbol'], r['earliest_bar_ts'], '->', r['latest_bar_ts'])
+"
+```
+
+---
+
+## 12. File map
 
 ```
 deploy/
@@ -559,6 +619,9 @@ deploy/
 ├── taleb-autoresearch.service     # weekly param sweep oneshot
 ├── taleb-autoresearch.timer       # Sat 10:00 IST trigger
 ├── run_weekly_autoresearch.sh     # wrapper: fetch → sweep → stage candidate
+├── fetch-bars.service             # daily 30-min bars updater oneshot
+├── fetch-bars.timer               # daily 16:30 IST trigger
+├── run_daily_bars_update.sh       # wrapper: fetch_bars.py --update + log
 ├── dashboard-backend.service      # long-running uvicorn (FastAPI)
 ├── nginx-dashboard.conf.example   # nginx site for SPA + API proxy
 └── build-frontend.sh              # npm ci + npm run build wrapper

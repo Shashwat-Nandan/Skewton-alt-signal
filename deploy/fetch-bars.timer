@@ -1,0 +1,21 @@
+[Unit]
+Description=Fire fetch-bars.service daily after NSE close (16:30 IST)
+
+[Timer]
+# NSE closes at 15:30 IST; Kite typically has the final 30-min candle
+# settled within ~30 minutes. 16:30 IST gives that headroom on a weekday.
+# On weekends and holidays the script is a no-op so we still fire daily —
+# simpler than maintaining an India holiday calendar in the timer.
+OnCalendar=*-*-* 16:30:00 Asia/Kolkata
+
+# If the VPS was offline at 16:30, run as soon as it comes up. The script
+# is idempotent so a delayed run still does the right thing.
+Persistent=true
+
+# Spread load if multiple boxes ever share infra.
+RandomizedDelaySec=180
+
+Unit=fetch-bars.service
+
+[Install]
+WantedBy=timers.target
