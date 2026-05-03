@@ -1,0 +1,33 @@
+[Unit]
+Description=Taleb-Karpathy — weekly pair-trading cointegration screen
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+ExecStart=/opt/taleb-karpathy-kite/deploy/run_weekly_pair_screen.sh
+# -------------------------------
+
+# bhavcopy fetch ~3 min for 60 days; screen ~1 min. 15 min ceiling is generous.
+TimeoutStartSec=15min
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

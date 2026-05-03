@@ -1,0 +1,21 @@
+[Unit]
+Description=Fire screen-pairs.service weekly (Sunday 12:00 IST)
+
+[Timer]
+# Sunday noon IST: NSE is closed all weekend, the bhavcopy refresh won't
+# step on weekday Kite traffic, and operators have the rest of the day
+# to review candidate changes before Monday open. The autoresearch timer
+# fires Saturday 10:00 — keeping these on different days makes the logs
+# easier to reason about.
+OnCalendar=Sun *-*-* 12:00:00 Asia/Kolkata
+
+# If the VPS was offline at 12:00 Sunday, run as soon as it comes up.
+Persistent=true
+
+# Spread load if multiple boxes ever share infra.
+RandomizedDelaySec=300
+
+Unit=screen-pairs.service
+
+[Install]
+WantedBy=timers.target
