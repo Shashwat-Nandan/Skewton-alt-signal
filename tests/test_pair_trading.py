@@ -103,6 +103,77 @@ class TestZScore:
 
 
 # ──────────────────────────────────────────────────────────
+# _observe_spread: dedup against stale closed-market repeats
+# ──────────────────────────────────────────────────────────
+
+class TestObserveSpreadDedup:
+    """
+    When the market is closed, Kite returns a fixed last-traded price every
+    tick. Without a dedup guard, the rolling spread history fills with
+    duplicates → std collapses → z drifts on every tick despite no real
+    move. Operator-visible bug. The dedup keeps history as a true
+    distribution of distinct observations.
+    """
+
+    def _stub_quotes(self, s, price_a, price_b):
+        def fake_quote(syms):
+            sym = syms[0]
+            return {sym: {"last_price": price_a if "AAA" in sym else price_b}}
+        s.kite.quote = fake_quote
+
+    def test_repeated_identical_observations_are_not_appended(self):
+        s = _make_strategy(hedge_ratio=0.5, spread_history=[])
+        self._stub_quotes(s, 1000.0, 2000.0)  # spread = 0
+        s._observe_spread()
+        s._observe_spread()
+        s._observe_spread()
+        s._observe_spread()
+        # Only the first call should have appended.
+        assert len(s._spread_history) == 1
+
+    def test_real_move_is_appended(self):
+        s = _make_strategy(hedge_ratio=0.5, spread_history=[])
+        self._stub_quotes(s, 1000.0, 2000.0)
+        s._observe_spread()
+        # Move price_a by ₹5 → spread changes by 5 → above the 1-paisa epsilon
+        self._stub_quotes(s, 1005.0, 2000.0)
+        s._observe_spread()
+        assert len(s._spread_history) == 2
+
+    def test_subpaisa_jitter_is_filtered(self):
+        # Quote engines sometimes flicker by sub-paisa noise even on closed
+        # markets. The 1-paisa epsilon should swallow that.
+        s = _make_strategy(hedge_ratio=0.5, spread_history=[])
+        self._stub_quotes(s, 1000.0, 2000.0)
+        s._observe_spread()
+        self._stub_quotes(s, 1000.0001, 2000.0)
+        s._observe_spread()
+        assert len(s._spread_history) == 1
+
+    def test_closed_market_does_not_destabilize_z(self):
+        """End-to-end: 200 stale ticks at the same price → z stays put."""
+        s = _make_strategy(
+            hedge_ratio=0.5,
+            # Seed with realistic variation so std > 0.
+            spread_history=[float(x) for x in range(-30, 30)],
+        )
+        self._stub_quotes(s, 1000.0, 2010.0)  # spread = 1000 - 0.5*2010 = -5
+        # First call appends -5 (different from last seed value 29)
+        s._observe_spread()
+        z_first = s._z_score(s._spread_history[-1])
+        # Now tick 200 more times with no price move
+        for _ in range(200):
+            s._observe_spread()
+        # History should not have grown beyond the one new observation.
+        assert len(s._spread_history) == 60 + 1
+        z_after = s._z_score(s._spread_history[-1])
+        # And z should be identical to the first observation.
+        assert z_first is not None
+        assert z_after is not None
+        assert abs(z_first - z_after) < 1e-12
+
+
+# ──────────────────────────────────────────────────────────
 # Entry logic
 # ──────────────────────────────────────────────────────────
 

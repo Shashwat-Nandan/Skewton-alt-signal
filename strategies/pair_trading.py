@@ -236,8 +236,22 @@ class PairTradingStrategy(BaseStrategy):
     # SPREAD / Z-SCORE
     # ══════════════════════════════════════════════════════════
 
+    # Spreads quoted in ₹; treat values within 1 paisa as the same observation
+    # so intraday tick noise around an unchanged closing print doesn't queue
+    # a new bar. Conservative: real intraday spread moves are typically
+    # several paisa even on quiet names.
+    _SPREAD_EPSILON = 0.01
+
     def _observe_spread(self) -> Tuple[Optional[float], Dict[str, float]]:
-        """Fetch live front-month quotes for both legs and return (spread, prices)."""
+        """Fetch live front-month quotes for both legs and return (spread, prices).
+
+        Only appends to `_spread_history` when the spread has actually moved
+        from the previous observation. Without this guard, an off-hours tick
+        loop keeps re-appending the same closing spread; the rolling window
+        fills with repeats, std collapses toward 0, and z drifts on every
+        tick despite no real price change. Operator-visible symptom:
+        z-score changing on every dashboard refresh while NSE is closed.
+        """
         prices = {}
         for sym in (self.symbol_a, self.symbol_b):
             fut = self._resolve_futures(sym)
@@ -248,11 +262,16 @@ class PairTradingStrategy(BaseStrategy):
                 return None, {}
             prices[sym] = quote
         spread = prices[self.symbol_a] - self.hedge_ratio * prices[self.symbol_b]
-        self._spread_history.append(spread)
-        # cap memory — only the most recent lookback*2 observations matter
-        max_keep = max(self.lookback_days * 2, 500)
-        if len(self._spread_history) > max_keep:
-            self._spread_history = self._spread_history[-max_keep:]
+
+        if (
+            not self._spread_history
+            or abs(spread - self._spread_history[-1]) > self._SPREAD_EPSILON
+        ):
+            self._spread_history.append(spread)
+            # cap memory — only the most recent lookback*2 observations matter
+            max_keep = max(self.lookback_days * 2, 500)
+            if len(self._spread_history) > max_keep:
+                self._spread_history = self._spread_history[-max_keep:]
         return spread, prices
 
     def _z_score(self, spread_now: float) -> Optional[float]:
