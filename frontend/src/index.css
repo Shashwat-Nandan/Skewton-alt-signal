@@ -14,6 +14,12 @@
     --foreground: 222 47% 11%;
     --card: 0 0% 100%;
     --card-foreground: 222 47% 11%;
+    /* Popover surface (Select / Combobox / Tooltip dropdowns). Must be
+       distinct from --background so floating menus visually lift off the
+       page; without these variables the Select content rendered with
+       transparent bg and was unreadable. */
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
     --primary: 217 91% 60%;
     --primary-foreground: 210 40% 98%;
     --secondary: 210 40% 96%;
@@ -37,6 +43,11 @@
     --foreground: 210 40% 96%;
     --card: 222 47% 9%;
     --card-foreground: 210 40% 96%;
+    /* Popover sits one notch above --card (9% → 14%) so dropdown menus
+       visibly float over StrategyForm / MarketProfile cards rather than
+       blending into the same charcoal. */
+    --popover: 222 47% 14%;
+    --popover-foreground: 210 40% 96%;
     --primary: 217 91% 60%;
     --primary-foreground: 222 47% 11%;
     --secondary: 217 33% 17%;
