@@ -19,7 +19,8 @@
 
 ## Sort ISO timestamps with localeCompare, not Date()
 
-- `RunSummary.created_at` and other API timestamps in this repo are ISO-8601 strings with timezone (e.g. `2026-05-04T19:00:00+05:30`). They sort correctly lexically — use `b.created_at.localeCompare(a.created_at)` for newest-first. Avoid `new Date(a) - new Date(b)` for two reasons: it allocates two Date objects per compare, and it's less obvious what ordering means at a glance.
+- API timestamps in this repo (e.g. `RunSummary.created_at`) come from `datetime.now().isoformat()` on the Python side — **naive** ISO-8601 like `2026-05-04T19:00:00.123456`, no timezone suffix. They sort correctly lexically because every record uses the same shape and the same implicit (server-local) timezone. Use `b.created_at.localeCompare(a.created_at)` for newest-first. Avoid `new Date(a) - new Date(b)` — it allocates two Date objects per compare and is less obvious at a glance.
+- Footnote: the backend really should emit timezone-aware ISO (`datetime.now(timezone.utc).isoformat()`) so cross-machine comparisons stay correct. Out of scope for issue #2.
 
 ## Don't rely on backend response order
 
