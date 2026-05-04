@@ -1,0 +1,253 @@
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { ArrowDown, ArrowUp } from "lucide-react";
+import { api } from "@/lib/api";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Badge } from "@/components/ui/badge";
+import { cn, formatNum } from "@/lib/utils";
+import type { PairCandidate } from "@/lib/types";
+
+type SortKey =
+  | "symbol_a"
+  | "latest_z_score"
+  | "rank_score"
+  | "coint_pvalue"
+  | "half_life_days"
+  | "correlation"
+  | "spread_vol_pct"
+  | "hedge_ratio";
+
+type SortDir = "asc" | "desc";
+
+const COLUMNS: { key: SortKey; label: string; align?: "right"; help?: string }[] = [
+  { key: "symbol_a", label: "Pair" },
+  { key: "latest_z_score", label: "Z-score", align: "right", help: "Latest spread vs panel mean/std" },
+  { key: "rank_score", label: "Rank", align: "right", help: "Lower is better — composite of p, half-life, vol" },
+  { key: "coint_pvalue", label: "Coint p", align: "right", help: "Engle-Granger p-value" },
+  { key: "half_life_days", label: "Half-life", align: "right", help: "Days for spread to revert halfway" },
+  { key: "correlation", label: "Corr", align: "right", help: "|Pearson corr| of leg prices" },
+  { key: "spread_vol_pct", label: "Vol %", align: "right", help: "Spread σ / avg leg price" },
+  { key: "hedge_ratio", label: "β", align: "right", help: "OLS hedge ratio (long-leg β · short-leg)" },
+];
+
+function formatScreenedAt(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleString("en-IN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+function compareSafe(av: number | string | null, bv: number | string | null, dir: SortDir): number {
+  // Nulls always sort to the bottom regardless of direction.
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  if (typeof av === "string" && typeof bv === "string") {
+    return dir === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
+  }
+  const an = Number(av);
+  const bn = Number(bv);
+  return dir === "asc" ? an - bn : bn - an;
+}
+
+function sortKeyValue(c: PairCandidate, key: SortKey): number | string | null {
+  if (key === "symbol_a") return `${c.symbol_a}/${c.symbol_b}`;
+  if (key === "latest_z_score") {
+    return c.latest_z_score == null ? null : Math.abs(c.latest_z_score);
+  }
+  return c[key] as number | null;
+}
+
+export function PairCandidatesPage() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["pair-candidates"],
+    queryFn: api.pairCandidates,
+    refetchInterval: 5 * 60 * 1000, // CSV updates daily; re-poll every 5 min is generous.
+  });
+
+  // Default: highest |z-score| first — most actionable rows on top.
+  const [sortKey, setSortKey] = useState<SortKey>("latest_z_score");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [minAbsZ, setMinAbsZ] = useState<string>("");
+
+  const rows = useMemo(() => {
+    if (!data?.candidates) return [];
+    const minZ = Number(minAbsZ);
+    const filtered =
+      minAbsZ !== "" && !Number.isNaN(minZ)
+        ? data.candidates.filter(
+            (c) => c.latest_z_score != null && Math.abs(c.latest_z_score) >= minZ,
+          )
+        : data.candidates;
+    return [...filtered].sort((a, b) =>
+      compareSafe(sortKeyValue(a, sortKey), sortKeyValue(b, sortKey), sortDir),
+    );
+  }, [data, sortKey, sortDir, minAbsZ]);
+
+  function toggleSort(key: SortKey) {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      // Symbol sorts asc by default; numeric columns desc (most-extreme first).
+      setSortDir(key === "symbol_a" ? "asc" : "desc");
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-xl font-semibold">Pair candidates</h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Cointegrated single-stock-futures pairs from the daily Engle-Granger screen.
+        </p>
+      </div>
+
+      <Card>
+        <CardHeader className="flex flex-row flex-wrap items-end justify-between gap-3 pb-3">
+          <div>
+            <CardTitle className="text-base">Latest screen</CardTitle>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Generated at {formatScreenedAt(data?.generated_at)}
+              {data?.candidates?.[0]?.last_data_date
+                ? ` · last bar ${data.candidates[0].last_data_date}`
+                : ""}
+            </p>
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label htmlFor="min-abs-z" className="text-xs">
+              Min |z-score|
+            </Label>
+            <Input
+              id="min-abs-z"
+              type="number"
+              inputMode="decimal"
+              step="0.1"
+              placeholder="any"
+              value={minAbsZ}
+              onChange={(e) => setMinAbsZ(e.target.value)}
+              className="h-8 w-28"
+            />
+          </div>
+        </CardHeader>
+        <CardContent>
+          {error ? (
+            <p className="text-sm text-destructive">
+              {error instanceof Error ? error.message : "Failed to load candidates."}
+            </p>
+          ) : isLoading ? (
+            <div className="space-y-2">
+              <Skeleton className="h-10" />
+              <Skeleton className="h-10" />
+              <Skeleton className="h-10" />
+            </div>
+          ) : rows.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              {data?.candidates?.length === 0
+                ? "No candidates yet — has screen_pairs.py run?"
+                : "No candidates match the current filter."}
+            </p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  {COLUMNS.map((col) => {
+                    const active = col.key === sortKey;
+                    const Arrow = sortDir === "asc" ? ArrowUp : ArrowDown;
+                    return (
+                      <TableHead
+                        key={col.key}
+                        className={cn(
+                          "cursor-pointer select-none",
+                          col.align === "right" && "text-right",
+                        )}
+                        onClick={() => toggleSort(col.key)}
+                        title={col.help}
+                      >
+                        <span
+                          className={cn(
+                            "inline-flex items-center gap-1",
+                            active && "text-foreground",
+                          )}
+                        >
+                          {col.label}
+                          {active && <Arrow className="h-3 w-3" />}
+                        </span>
+                      </TableHead>
+                    );
+                  })}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((c) => (
+                  <TableRow key={`${c.symbol_a}-${c.symbol_b}`}>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{c.symbol_a}</span>
+                        <span className="text-muted-foreground">/</span>
+                        <span className="font-medium">{c.symbol_b}</span>
+                      </div>
+                      <div className="mt-0.5 text-xs text-muted-foreground tabular-nums">
+                        {c.last_close_a != null && c.last_close_b != null
+                          ? `${formatNum(c.last_close_a)} / ${formatNum(c.last_close_b)}`
+                          : "—"}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {c.latest_z_score == null ? (
+                        <span className="text-muted-foreground">—</span>
+                      ) : (
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "tabular-nums",
+                            Math.abs(c.latest_z_score) >= 2 && "border-primary text-primary",
+                          )}
+                        >
+                          {formatNum(c.latest_z_score)}
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatNum(c.rank_score, 3)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatNum(c.coint_pvalue, 4)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {Number.isFinite(c.half_life_days)
+                        ? `${formatNum(c.half_life_days, 1)}d`
+                        : "—"}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatNum(c.correlation, 3)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatNum(c.spread_vol_pct, 2)}%
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatNum(c.hedge_ratio, 3)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

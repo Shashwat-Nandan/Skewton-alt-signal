@@ -2,6 +2,7 @@ import type {
   AuthStatus,
   MarketProfileResponse,
   MarketProfileSymbol,
+  PairCandidatesResponse,
   RunDetail,
   RunSummary,
   StrategyInfo,
@@ -46,6 +47,8 @@ export const api = {
   createRun: (body: { strategy: string; mode: string; params: Record<string, unknown> }) =>
     http<RunSummary>("/runs", { method: "POST", body: JSON.stringify(body) }),
   stopRun: (id: string) => http<RunSummary>(`/runs/${id}/stop`, { method: "POST" }),
+
+  pairCandidates: () => http<PairCandidatesResponse>("/pair-candidates"),
 
   marketProfileSymbols: () =>
     http<MarketProfileSymbol[]>("/market-profile/symbols"),

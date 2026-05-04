@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
-from .routers import auth, market_profile, runs, strategies
+from .routers import auth, market_profile, pair_candidates, runs, strategies
 from .run_manager import get_run_manager
 from .settings import get_settings
 
@@ -60,6 +60,7 @@ def create_app() -> FastAPI:
     app.include_router(strategies.router)
     app.include_router(runs.router)
     app.include_router(market_profile.router)
+    app.include_router(pair_candidates.router)
 
     @app.get("/", tags=["meta"])
     def root():

@@ -119,6 +119,32 @@ export type DayProfile = {
   total_volume: number;
 };
 
+// ── Pair Candidates ──
+
+export type PairCandidate = {
+  symbol_a: string;
+  symbol_b: string;
+  correlation: number;
+  hedge_ratio: number;
+  coint_pvalue: number;
+  half_life_days: number;
+  spread_vol_pct: number;
+  spread_mean: number;
+  spread_std: number;
+  latest_spread: number | null;
+  latest_z_score: number | null;
+  last_close_a: number | null;
+  last_close_b: number | null;
+  last_data_date: string | null;
+  n_obs: number;
+  rank_score: number;
+};
+
+export type PairCandidatesResponse = {
+  generated_at: string | null;
+  candidates: PairCandidate[];
+};
+
 export type MarketProfileResponse = {
   symbol: string;
   name?: string | null;
