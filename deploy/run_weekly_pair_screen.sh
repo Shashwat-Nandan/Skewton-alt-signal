@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Weekly pair-trading screen.
+# Daily pair-trading screen.
 #
-# Refreshes the F&O bhavcopy archive (~2 months), then re-runs the
-# Engle-Granger cointegration screen and writes data_cache/pair_candidates.csv.
-# Pair relationships drift, so without periodic refresh the live pair_trading
-# strategy works off a stale candidate list.
+# Tops up the F&O bhavcopy archive (60-day fetch is idempotent — already-cached
+# days are skipped) and re-runs the Engle-Granger cointegration screen, writing
+# data_cache/pair_candidates.csv. Cointegration relationships drift; running
+# daily keeps the live pair_trading strategy off a stale candidate list.
 #
 # Source data is NSE bhavcopy (free, public — no Kite auth needed).
 set -euo pipefail

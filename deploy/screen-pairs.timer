@@ -1,15 +1,15 @@
 [Unit]
-Description=Fire screen-pairs.service weekly (Sunday 12:00 IST)
+Description=Fire screen-pairs.service every weekday evening (19:00 IST)
 
 [Timer]
-# Sunday noon IST: NSE is closed all weekend, the bhavcopy refresh won't
-# step on weekday Kite traffic, and operators have the rest of the day
-# to review candidate changes before Monday open. The autoresearch timer
-# fires Saturday 10:00 — keeping these on different days makes the logs
-# easier to reason about.
-OnCalendar=Sun *-*-* 12:00:00 Asia/Kolkata
+# Weekday 19:00 IST: NSE close is 15:30 and the F&O bhavcopy is typically
+# published by ~18:00, so an hour of slack covers normal publish lag. Fresh
+# candidates land well before next-morning open. Weekends skipped — no new
+# bhavcopy is published. Daily cadence keeps the candidate list responsive
+# to drift in cointegration relationships.
+OnCalendar=Mon..Fri *-*-* 19:00:00 Asia/Kolkata
 
-# If the VPS was offline at 12:00 Sunday, run as soon as it comes up.
+# If the VPS was offline at the scheduled fire, run as soon as it comes up.
 Persistent=true
 
 # Spread load if multiple boxes ever share infra.
