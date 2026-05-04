@@ -16,20 +16,23 @@ export function Header() {
 
   return (
     <header className="border-b border-border bg-card/40 backdrop-blur-sm">
-      <div className="container flex h-14 items-center justify-between">
-        <div className="flex items-center gap-6">
-          <Link to="/" className="flex items-center gap-2 font-semibold">
+      <div className="container flex h-14 items-center justify-between gap-2 sm:gap-4">
+        <div className="flex min-w-0 items-center gap-3 sm:gap-6">
+          <Link to="/" className="flex shrink-0 items-center gap-2 font-semibold">
             <Activity className="h-5 w-5 text-primary" />
-            <span>Strategy Dashboard</span>
-            <Badge variant="outline" className="ml-2 text-[10px]">v0.1</Badge>
+            <span className="hidden sm:inline">Strategy Dashboard</span>
+            <span className="sm:hidden">Dashboard</span>
+            <Badge variant="outline" className="ml-1 hidden text-[10px] sm:inline-flex">
+              v0.1
+            </Badge>
           </Link>
-          <nav className="flex items-center gap-1 text-sm">
+          <nav className="-mx-1 flex min-w-0 items-center gap-1 overflow-x-auto px-1 text-sm">
             <NavLink
               to="/"
               end
               className={({ isActive }) =>
                 cn(
-                  "rounded-md px-2 py-1 text-muted-foreground hover:text-foreground",
+                  "shrink-0 rounded-md px-2 py-1 text-muted-foreground hover:text-foreground",
                   isActive && "text-foreground font-medium",
                 )
               }
@@ -40,20 +43,21 @@ export function Header() {
               to="/market-profile"
               className={({ isActive }) =>
                 cn(
-                  "flex items-center gap-1.5 rounded-md px-2 py-1 text-muted-foreground hover:text-foreground",
+                  "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-muted-foreground hover:text-foreground",
                   isActive && "text-foreground font-medium",
                 )
               }
             >
               <BarChart3 className="h-3.5 w-3.5" />
-              Market Profile
+              <span className="hidden sm:inline">Market Profile</span>
+              <span className="sm:hidden">Profile</span>
             </NavLink>
           </nav>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-2 sm:gap-3">
           {auth?.authenticated ? (
             <>
-              <div className="text-right text-sm leading-tight">
+              <div className="hidden text-right text-sm leading-tight sm:block">
                 <div className="font-medium">{auth.user_name}</div>
                 <div className="text-xs text-muted-foreground">{auth.user_id}</div>
               </div>
@@ -62,9 +66,10 @@ export function Header() {
                 size="sm"
                 onClick={() => logout.mutate()}
                 disabled={logout.isPending}
+                aria-label="Logout"
               >
-                <LogOut className="mr-2 h-4 w-4" />
-                Logout
+                <LogOut className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Logout</span>
               </Button>
             </>
           ) : (

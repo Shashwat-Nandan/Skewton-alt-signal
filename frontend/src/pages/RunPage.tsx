@@ -63,13 +63,13 @@ export function RunPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="space-y-1">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1 space-y-1">
           <Button asChild variant="link" size="sm" className="-ml-3 h-auto p-0 text-muted-foreground">
             <Link to="/"><ArrowLeft className="mr-1 h-3 w-3" />All runs</Link>
           </Button>
-          <div className="flex items-center gap-2">
-            <h1 className="text-xl font-semibold">{run.strategy_name}</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-lg font-semibold sm:text-xl">{run.strategy_name}</h1>
             <Badge variant="outline" className="uppercase">{run.mode}</Badge>
             <Badge variant={STATUS_VARIANT[run.status]}>{run.status}</Badge>
           </div>
@@ -82,7 +82,12 @@ export function RunPage() {
           </div>
         </div>
         {isRunning && (
-          <Button variant="destructive" onClick={() => stop.mutate()} disabled={stop.isPending}>
+          <Button
+            variant="destructive"
+            onClick={() => stop.mutate()}
+            disabled={stop.isPending}
+            className="shrink-0"
+          >
             <Square className="mr-2 h-4 w-4" />
             {stop.isPending ? "Stopping…" : "Stop run"}
           </Button>
