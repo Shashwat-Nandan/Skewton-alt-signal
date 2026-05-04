@@ -15,6 +15,8 @@ const STATUS_VARIANT: Record<RunStatus, "default" | "secondary" | "destructive" 
   ERRORED: "destructive",
 };
 
+const RUN_LIST_LIMIT = 10;
+
 export function RunsList() {
   const { data: runs, isLoading } = useQuery({
     queryKey: ["runs"],
@@ -37,34 +39,37 @@ export function RunsList() {
           <p className="text-sm text-muted-foreground">No runs yet.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {[...runs].reverse().map((r) => (
-              <li key={r.id}>
-                <Link
-                  to={`/runs/${r.id}`}
-                  className="flex items-center justify-between gap-3 py-3 transition-colors hover:bg-accent/40 -mx-2 px-2 rounded-md"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium">{r.strategy_name}</span>
-                      <Badge variant="outline" className="text-[10px] uppercase">
-                        {r.mode}
-                      </Badge>
-                      <Badge variant={STATUS_VARIANT[r.status]} className="text-[10px]">
-                        {r.status}
-                      </Badge>
+            {[...runs]
+              .sort((a, b) => b.created_at.localeCompare(a.created_at))
+              .slice(0, RUN_LIST_LIMIT)
+              .map((r) => (
+                <li key={r.id}>
+                  <Link
+                    to={`/runs/${r.id}`}
+                    className="flex items-center justify-between gap-3 py-3 transition-colors hover:bg-accent/40 -mx-2 px-2 rounded-md"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{r.strategy_name}</span>
+                        <Badge variant="outline" className="text-[10px] uppercase">
+                          {r.mode}
+                        </Badge>
+                        <Badge variant={STATUS_VARIANT[r.status]} className="text-[10px]">
+                          {r.status}
+                        </Badge>
+                      </div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        <span className="font-mono">{shortId(r.id)}</span>
+                        {" · "}
+                        ticks {r.tick_count}
+                        {" · "}
+                        last {formatTime(r.last_tick_at)}
+                      </div>
                     </div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">
-                      <span className="font-mono">{shortId(r.id)}</span>
-                      {" · "}
-                      ticks {r.tick_count}
-                      {" · "}
-                      last {formatTime(r.last_tick_at)}
-                    </div>
-                  </div>
-                  <ArrowRight className="h-4 w-4 text-muted-foreground" />
-                </Link>
-              </li>
-            ))}
+                    <ArrowRight className="h-4 w-4 text-muted-foreground" />
+                  </Link>
+                </li>
+              ))}
           </ul>
         )}
       </CardContent>

@@ -1,43 +1,29 @@
-# Issue #1 — Mobile-friendly frontend
+# Issue #2 — Limit runs list to last 10, newest first
 
 ## Audit findings
 
-- **Viewport meta tag**: present (good).
-- **Tailwind container**: centered with 1rem padding on all screens (good).
-- **Header.tsx**: brand text + nav + user info + Logout in one row. Wraps awkwardly on phones; needs hidden-on-small text and tighter spacing.
-- **App.tsx main**: `container py-6` — fine, container already pads.
-- **Home.tsx**: `md:grid-cols-2` — already responsive.
-- **StrategyForm.tsx**: stacks naturally; mode buttons use `grid-cols-2` (fine).
-- **RunPage.tsx header**: `flex items-start justify-between gap-4` does not wrap → on phones the title row + Stop button collide. Title row contains 3+ badges that overflow.
-- **MetricsRow.tsx**: `grid-cols-2 md:grid-cols-3 lg:grid-cols-6` — already responsive but the `text-2xl` value font + `p-4` makes 2-up tiles cramped on narrow phones.
-- **PnLChart.tsx**: `ResponsiveContainer` handles widths; fixed `h-64` is fine.
-- **ProposalTable.tsx flat view**: wrapped by `<Table>` which uses `overflow-auto` → already scrolls horizontally. Good.
-- **ProposalTable.tsx pair-grouped view**: `sm:grid-cols-2` already responsive.
-- **MarketProfilePage.tsx**: form `md:grid-cols-4` (stacks on mobile, good); DailyGrid `lg:grid-cols-2` (single col on phone, good).
-- **MarketProfileChart.tsx**: SVG with fixed widths (~600px) wrapped in `overflow-x-auto` — touch-scrollable; acceptable.
-- **EODReportCard.tsx**: `<pre>` wrapped in `overflow-auto` — fine.
-- **LoginCard.tsx**: `max-w-md` centered card — fine.
+- `frontend/src/components/RunsList.tsx:40` is the only consumer of `api.listRuns()`. Currently does `[...runs].reverse()` — implicitly assumes the backend returns chronological order. Fragile.
+- `RunSummary` (frontend/src/lib/types.ts:33) carries `created_at` as an ISO timestamp string. ISO-8601 with timezone sorts lexically, so `localeCompare` on the string is sufficient — no `new Date()` parsing needed.
+- Issue is explicitly frontend-only; backend `/runs` endpoint is unchanged.
 
 ## Plan
 
-- [x] **Header**: tighten spacing, hide brand subtitle + user_id on phones, make nav scroll horizontally if needed, hide "Logout" label on small (keep icon-only).
-- [x] **RunPage header**: allow flex-wrap so the title block + Stop button stack on phones; let the badges row wrap.
-- [x] **MetricsRow**: shrink tile padding + value font on mobile so 2-up tiles read cleanly on a 360-wide phone.
-- [x] **Verify build** still type-checks and bundles.
-- [x] **Commit & push** to `claude/fix-issue-1-6lrbf`.
+- [x] Replace `[...runs].reverse()` with explicit sort on `created_at` desc + `.slice(0, 10)`.
+- [x] Extract the limit as a named constant `RUN_LIST_LIMIT` for clarity.
+- [x] Verify `npm run build` (tsc + vite) passes.
+- [x] Commit & push to `claude/fix-issue-2`, open PR.
 
 ## Review
 
-Changes shipped:
+Single-file change in `frontend/src/components/RunsList.tsx`:
 
-- `frontend/src/components/Header.tsx`: brand text shortens to "Dashboard", "v0.1" badge + user name/id hidden under `sm`, "Logout" collapses to icon-only, nav row gets `overflow-x-auto` to absorb future tabs without breaking the bar.
-- `frontend/src/pages/RunPage.tsx`: outer header is `flex-wrap` so the destructive Stop button drops below the title block when room runs out; badges row also wraps; `text-xl` → `text-lg sm:text-xl` for the strategy name.
-- `frontend/src/components/MetricsRow.tsx`: tile padding `p-3 sm:p-4`, value font `text-xl sm:text-2xl`, label font `text-[10px] sm:text-xs` so the 2-up grid stays readable on a 360-wide phone.
+- Added `const RUN_LIST_LIMIT = 10;` near the top of the module.
+- Render path now does `[...runs].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, RUN_LIST_LIMIT).map(...)`. Explicit ordering guarantee instead of relying on backend response order.
 
-Already responsive (no change needed): Home grid (`md:grid-cols-2`), StrategyForm/ParamForm (stack), MarketProfilePage form (`md:grid-cols-4`), DailyGrid (`lg:grid-cols-2`), MarketProfileChart (already wrapped in `overflow-x-auto`), ProposalTable flat view (Table wraps in `overflow-auto`), ProposalTable pair-grouped view (`sm:grid-cols-2`), EODReportCard `<pre>` (`overflow-auto`), PnLChart (`ResponsiveContainer`), LoginCard (`max-w-md`).
-
-Verified: `npm run build` (tsc + vite) passes cleanly.
+No behavior change for users with <=10 runs except a stable, explicit sort. Users with >10 runs now see only the most recent 10 — matches the issue spec.
 
 ## Out of scope
 
-Native mobile app, mobile-only routes, hamburger nav (only 2 nav items — horizontal still works at 360px).
+- Pagination / "load more" for older runs (issue calls it out as follow-up).
+- Backend changes to how runs are stored (issue calls it out as out of scope).
+- A "showing 10 of N" indicator — the issue doesn't ask for it, and adding one could prompt scope creep.

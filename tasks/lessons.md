@@ -16,3 +16,12 @@
 ## Icon-only buttons need labels
 
 - When collapsing a button to icon-only on small screens (`<LogOut className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">Logout</span>`), add `aria-label` to the button so screen readers and tap-to-read still announce it.
+
+## Sort ISO timestamps with localeCompare, not Date()
+
+- API timestamps in this repo (e.g. `RunSummary.created_at`) come from `datetime.now().isoformat()` on the Python side — **naive** ISO-8601 like `2026-05-04T19:00:00.123456`, no timezone suffix. They sort correctly lexically because every record uses the same shape and the same implicit (server-local) timezone. Use `b.created_at.localeCompare(a.created_at)` for newest-first. Avoid `new Date(a) - new Date(b)` — it allocates two Date objects per compare and is less obvious at a glance.
+- Footnote: the backend really should emit timezone-aware ISO (`datetime.now(timezone.utc).isoformat()`) so cross-machine comparisons stay correct. Out of scope for issue #2.
+
+## Don't rely on backend response order
+
+- The `/runs` endpoint returned chronological order *in practice*, so the original RunsList just did `[...runs].reverse()`. That's fragile — any backend change (added pagination, switched ORM ordering, parallel fetch) silently breaks the UI. When ordering matters, sort explicitly on the field that defines the order.
