@@ -15,6 +15,8 @@ const STATUS_VARIANT: Record<RunStatus, "default" | "secondary" | "destructive" 
   ERRORED: "destructive",
 };
 
+const RUN_LIST_LIMIT = 10;
+
 export function RunsList() {
   const { data: runs, isLoading } = useQuery({
     queryKey: ["runs"],
@@ -37,7 +39,10 @@ export function RunsList() {
           <p className="text-sm text-muted-foreground">No runs yet.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {[...runs].reverse().map((r) => (
+            {[...runs]
+              .sort((a, b) => b.created_at.localeCompare(a.created_at))
+              .slice(0, RUN_LIST_LIMIT)
+              .map((r) => (
               <li key={r.id}>
                 <Link
                   to={`/runs/${r.id}`}
