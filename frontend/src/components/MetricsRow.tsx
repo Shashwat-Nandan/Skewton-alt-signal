@@ -20,10 +20,10 @@ function MetricTile({ label, value, hint, signed }: Tile) {
       : "";
   return (
     <Card>
-      <CardContent className="p-4">
-        <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
-        <div className={cn("mt-1 text-2xl font-semibold tabular-nums", tone)}>{value}</div>
-        {hint && <div className="mt-0.5 text-xs text-muted-foreground">{hint}</div>}
+      <CardContent className="p-3 sm:p-4">
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground sm:text-xs">{label}</div>
+        <div className={cn("mt-1 text-xl font-semibold tabular-nums sm:text-2xl", tone)}>{value}</div>
+        {hint && <div className="mt-0.5 text-[10px] text-muted-foreground sm:text-xs">{hint}</div>}
       </CardContent>
     </Card>
   );
