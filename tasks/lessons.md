@@ -43,6 +43,20 @@
 - Python's `datetime.isoformat()` defaults to **microsecond** precision (`2026-05-04T13:47:03.954864+00:00`). Chrome/Firefox parse that fine, but Safari/JavaScriptCore only honours up to **3** fractional digits per the ECMAScript spec — it returns Invalid Date, and any downstream `toLocaleString({dateStyle, timeStyle})` then throws "the string did not match the expected pattern." Always pass `timespec="milliseconds"` on any ISO string that crosses the API boundary.
 - Pre-existing endpoints in this repo that emit `datetime.now().isoformat()` (e.g. `RunSummary.created_at`) have the same latent bug — they only avoid it because the frontend currently uses `localeCompare` for sort instead of `new Date()`. If a future caller does `new Date(created_at).toLocaleString(...)` on Safari, fix it at the source the same way.
 
+## Kite spot-quote keys for indices are display names, not derivatives tickers
+
+- `kite.quote(["NSE:NIFTY"])` returns `{}` — Kite Connect's quote feed indexes the **spot** price under the index's display name (with spaces), not the derivatives ticker. Confirmed live against ZP6019 on 2026-05-05:
+  - `NSE:NIFTY 50` → `last_price=24119.3` ✓
+  - `NSE:NIFTY BANK` → `last_price=54878.5` ✓
+  - `NSE:NIFTY` / `NSE:NIFTY50` / `NSE:BANKNIFTY` → `{}` (Kite silently omits the key)
+- The map lives at module level in `strategies/taleb_karpathy.py` as `_INDEX_SPOT_SYMBOLS`. `f"NSE:{underlying}"` is correct for stocks (e.g. `NSE:RELIANCE`); for indices, the map must be consulted. Extend it when adding a new index underlying.
+
+## Bare-except + numeric fallback = silent poison for the rest of the session
+
+- The 2026-05-04 incident: `_get_spot_price` had `try ... except: return 0.0`. Wrong symbol → KeyError → caught → spot=0.0 → `math.log(0/K)` exploded on every tick for 5+ hours. systemd reported "Succeeded" because the run-loop caught each downstream exception and continued. **339 stack traces, 0 trades, 0 alerts.**
+- Rules: (1) do not bare-except; catch `Exception` and log it with the input that produced it. (2) never silently substitute a numeric sentinel (`0.0`, `-1`) that downstream code can consume — return `None` and force the caller to handle absence. (3) for hot paths, add a consecutive-failure counter that escalates WARN → ERROR after N=5 so a sustained failure mode lights up in journal greps as something other than the symptom.
+- Test coverage corollary: `mock.kite.quote.return_value = {}` *literally exercises the bug path*. If you mock that return shape, you must also have a positive-path test that asserts the real-shape extraction works. Otherwise the test suite "passes" by exercising the broken fallback exactly the way production hits it.
+
 ## TestClient coverage ≠ proxy coverage — keep an HTTP smoke check in front of nginx
 
 - A new router can pass every `tests/test_backend.py` assertion and still 500-equivalent in production if the nginx prefix whitelist (`location ~ ^/(...)`) wasn't updated to include it. `fastapi.testclient.TestClient` instantiates the ASGI app directly — it never sees nginx — so it is structurally incapable of catching this. Shipped exactly this regression on 2026-05-05 with `/pair-candidates`.

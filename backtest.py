@@ -27,7 +27,8 @@ import pandas as pd
 
 from greeks_engine import GreeksEngine, OptionContract, implied_volatility_bisect
 from strategies.taleb_karpathy import (
-    TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
+    TalebKarpathyStrategy, HedgeState, _INDEX_SPOT_SYMBOLS,
+    estimate_transaction_cost,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,11 +72,19 @@ class MockKite:
         result = {}
         tick_data = self.data[self.data["timestamp"] == self._current_ts]
 
+        # Accept both the legacy "NSE:<UNDERLYING>" form and Kite's real
+        # index display key ("NSE:NIFTY 50", "NSE:NIFTY BANK"). The strategy
+        # now uses the latter for indices; historical CSVs key spot rows
+        # by the bare underlying name.
+        spot_aliases = {self.underlying}
+        mapped = _INDEX_SPOT_SYMBOLS.get(self.underlying)
+        if mapped:
+            spot_aliases.add(mapped.split(":", 1)[1])
         for sym in symbols:
-            # Parse symbol: "NSE:NIFTY" or "NFO:NIFTY26403CE22000"
+            # Parse symbol: "NSE:NIFTY 50" or "NFO:NIFTY26403CE22000"
             exchange, tsym = sym.split(":", 1) if ":" in sym else ("NFO", sym)
 
-            if exchange == "NSE" and tsym == self.underlying:
+            if exchange == "NSE" and tsym in spot_aliases:
                 # Return underlying spot price
                 spot_rows = tick_data[tick_data["symbol"] == self.underlying]
                 if not spot_rows.empty:

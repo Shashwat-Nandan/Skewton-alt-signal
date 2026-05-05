@@ -1299,3 +1299,75 @@ class TestRVIVGate:
         result = mock_hedger.scan_and_propose()
 
         assert len(result) == 1
+
+
+# ───────────────────────────────────────────────────────────────────
+# Spot-fetch regression — incident 2026-05-04
+# ───────────────────────────────────────────────────────────────────
+# Before this fix, _get_spot_price did `kite.quote([f"NSE:{underlying}"])`
+# which returns {} for indices on Kite Connect (the right key is
+# "NSE:NIFTY 50", not "NSE:NIFTY"). A bare-except masked the KeyError
+# and silently returned 0.0, which poisoned every Greek call with
+# math.log(0/K). One full session (339 ticks) ran zero proposals as a
+# result. These tests pin all three corrected behaviours.
+
+class TestSpotFetch:
+    def _bare(self):
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h._consecutive_spot_failures = 0
+        return h
+
+    def test_index_underlying_uses_kite_display_name(self):
+        h = self._bare()
+        h.underlying = "NIFTY"
+        assert h._spot_quote_key() == "NSE:NIFTY 50"
+        h.underlying = "BANKNIFTY"
+        assert h._spot_quote_key() == "NSE:NIFTY BANK"
+
+    def test_stock_underlying_passes_through(self):
+        h = self._bare()
+        h.underlying = "RELIANCE"
+        assert h._spot_quote_key() == "NSE:RELIANCE"
+
+    def test_empty_quote_returns_none_not_zero(self):
+        # The exact failure mode from 2026-05-04: Kite returns {} and
+        # the old code's q[key]["last_price"] raised KeyError into a
+        # bare except that converted it to 0.0. Must now return None.
+        h = self._bare()
+        h.underlying = "NIFTY"
+        h.kite.quote.return_value = {}
+        assert h._get_spot_price() is None
+
+    def test_kite_exception_returns_none(self):
+        h = self._bare()
+        h.underlying = "NIFTY"
+        h.kite.quote.side_effect = RuntimeError("network down")
+        assert h._get_spot_price() is None
+
+    def test_valid_quote_returns_price(self):
+        h = self._bare()
+        h.underlying = "NIFTY"
+        h.kite.quote.return_value = {"NSE:NIFTY 50": {"last_price": 24119.3}}
+        assert h._get_spot_price() == 24119.3
+
+    def test_check_spot_escalates_to_error_after_5_failures(self, caplog):
+        import logging
+        h = self._bare()
+        h.underlying = "NIFTY"
+        with caplog.at_level(logging.WARNING, logger="strategies.taleb_karpathy"):
+            for _ in range(4):
+                assert h._check_spot(None) is False
+            assert all(r.levelno != logging.ERROR for r in caplog.records)
+            caplog.clear()
+            assert h._check_spot(None) is False  # 5th failure
+            assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_check_spot_resets_counter_on_recovery(self):
+        h = self._bare()
+        h.underlying = "NIFTY"
+        for _ in range(3):
+            h._check_spot(None)
+        assert h._consecutive_spot_failures == 3
+        assert h._check_spot(24000.0) is True
+        assert h._consecutive_spot_failures == 0

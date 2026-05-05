@@ -34,6 +34,17 @@ from risk_analyzer import (
 
 from .base import BaseStrategy, ExecutionMode
 
+# Kite Connect's quote feed indexes the *spot* price under the index's
+# display name (with spaces), not the derivatives ticker. f"NSE:{u}"
+# works for stocks (NSE:RELIANCE) but Kite silently returns {} for
+# "NSE:NIFTY" — masked for two weeks by the bare-except in the old
+# _get_spot_price, which made every tick a no-op. Extend this map when
+# adding a new index underlying.
+_INDEX_SPOT_SYMBOLS = {
+    "NIFTY": "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -200,6 +211,10 @@ class TalebKarpathyStrategy(BaseStrategy):
         self._daily_loss_stop_date = None  # Date on which daily loss limit was hit
         self._cached_lot_size = None
         self._cached_futures_symbol = None
+        # Spot-fetch failure counter — escalates the per-tick log to ERROR
+        # after 5 consecutive failures so a wrong symbol or session issue
+        # surfaces clearly instead of being buried in unrelated stack traces.
+        self._consecutive_spot_failures = 0
         self._clock = datetime.now  # Override for backtest replay
         # Persistent ATM IV history survives across runs so IV percentile is
         # computed against a real multi-session distribution. Backtests disable
@@ -223,6 +238,8 @@ class TalebKarpathyStrategy(BaseStrategy):
             return []
 
         spot = self._get_spot_price()
+        if not self._check_spot(spot):
+            return []
         self._record_spot_sample(self._clock(), spot)
         chain = self._get_options_chain()
         if chain.empty:
@@ -355,6 +372,8 @@ class TalebKarpathyStrategy(BaseStrategy):
             return []
 
         spot = self._get_spot_price()
+        if not self._check_spot(spot):
+            return []
         self._record_spot_sample(self._clock(), spot)
         self._update_positions_prices(spot)
         self._update_portfolio_greeks()
@@ -417,6 +436,9 @@ class TalebKarpathyStrategy(BaseStrategy):
             return {"status": "no_positions"}
 
         spot = self._get_spot_price()
+        if not spot or spot <= 0:
+            logger.warning("EOD report: spot unavailable; returning degraded report")
+            return {"status": "spot_unavailable", "n_positions": len(self.state.positions)}
         T = time_to_expiry(self.state.positions[0].expiry, self._clock()) if self.state.positions[0].expiry else 1/365
         self._update_portfolio_greeks()
         pf = self.state.portfolio_greeks
@@ -647,6 +669,9 @@ class TalebKarpathyStrategy(BaseStrategy):
             self.state.portfolio_greeks = PortfolioGreeks()
             return
         spot = self._get_spot_price()
+        if not spot or spot <= 0:
+            logger.warning("Cannot update portfolio greeks: spot unavailable; keeping last value")
+            return
         T = time_to_expiry(self.state.positions[0].expiry, self._clock()) if self.state.positions[0].expiry else 1/365
         self.state.portfolio_greeks = self.greeks.compute_portfolio_greeks(self.state.positions, spot, T)
         # Include futures hedge in net delta (both analytical and discrete)
@@ -927,12 +952,47 @@ class TalebKarpathyStrategy(BaseStrategy):
         logger.warning("Could not look up futures symbol for %s, using placeholder", self.underlying)
         return f"{self.underlying}FUT"
 
-    def _get_spot_price(self):
+    def _spot_quote_key(self) -> str:
+        return _INDEX_SPOT_SYMBOLS.get(self.underlying, f"NSE:{self.underlying}")
+
+    def _get_spot_price(self) -> Optional[float]:
+        """Fetch underlying spot price.
+
+        Returns None on any failure. Callers MUST handle None and skip
+        the tick — never substitute 0.0, that masks symbol/connectivity
+        bugs and poisons every downstream Greek calculation with
+        math.log(0/K) (see incident 2026-05-04).
+        """
+        sym = self._spot_quote_key()
         try:
-            q = self.kite.quote([f"NSE:{self.underlying}"])
-            return q[f"NSE:{self.underlying}"]["last_price"]
-        except:
-            return 0.0
+            q = self.kite.quote([sym])
+        except Exception as e:
+            logger.warning("Spot quote raised for %s: %s: %s",
+                           sym, type(e).__name__, e)
+            return None
+        if not q or sym not in q or not q[sym].get("last_price"):
+            logger.warning(
+                "Spot quote returned no usable price for %s (got keys=%s). "
+                "Check _INDEX_SPOT_SYMBOLS for index underlyings.",
+                sym, list(q.keys()) if q else [],
+            )
+            return None
+        return float(q[sym]["last_price"])
+
+    def _check_spot(self, spot: Optional[float]) -> bool:
+        """Return True if spot is usable; otherwise log + bump counter."""
+        consecutive = getattr(self, "_consecutive_spot_failures", 0)
+        if spot and spot > 0:
+            if consecutive:
+                logger.info("Spot recovered after %d consecutive failure(s).", consecutive)
+            self._consecutive_spot_failures = 0
+            return True
+        consecutive += 1
+        self._consecutive_spot_failures = consecutive
+        log = logger.error if consecutive >= 5 else logger.warning
+        log("No usable spot for %s (consecutive failures=%d) — skipping tick",
+            getattr(self, "underlying", "?"), consecutive)
+        return False
 
     def _get_options_chain(self):
         """
@@ -956,6 +1016,10 @@ class TalebKarpathyStrategy(BaseStrategy):
                 return pd.DataFrame()
 
             spot = self._get_spot_price()
+            if not spot or spot <= 0:
+                # Without spot we can't pick the best ATM expiry. Caller
+                # treats empty chain as "skip this tick."
+                return pd.DataFrame()
             best_chain = pd.DataFrame()
             best_atm_count = -1
 
@@ -1145,7 +1209,7 @@ class TalebKarpathyStrategy(BaseStrategy):
                     tradingsymbol=self._get_futures_symbol(),
                     instrument_token=0, strike=0, expiry="", option_type="FUT",
                     lot_size=lot_size, quantity=fut_lots,
-                    price=self._get_spot_price(),
+                    price=self._get_spot_price() or 0.0,
                     transaction_type="SELL" if self.state.futures_hedge_delta > 0 else "BUY",
                     iv=0, bid_ask_spread_pct=0.0, margin_required=0.0,
                     rationale="Close futures hedge (safety trigger)",
