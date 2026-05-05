@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { api } from "@/lib/api";
@@ -82,6 +82,19 @@ export function PairCandidatesPage() {
   const [sortKey, setSortKey] = useState<SortKey>("latest_z_score");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [minAbsZ, setMinAbsZ] = useState<string>("");
+  const [userHasSorted, setUserHasSorted] = useState(false);
+
+  // First-deploy fallback: a CSV produced before this PR has no z-score
+  // column. Default-sorting on an all-null column would render with no
+  // visible ordering signal, so fall back to rank_score asc.
+  useEffect(() => {
+    if (userHasSorted || !data?.candidates?.length) return;
+    const anyZ = data.candidates.some((c) => c.latest_z_score != null);
+    if (!anyZ) {
+      setSortKey("rank_score");
+      setSortDir("asc");
+    }
+  }, [data, userHasSorted]);
 
   const rows = useMemo(() => {
     if (!data?.candidates) return [];
@@ -98,6 +111,7 @@ export function PairCandidatesPage() {
   }, [data, sortKey, sortDir, minAbsZ]);
 
   function toggleSort(key: SortKey) {
+    setUserHasSorted(true);
     if (key === sortKey) {
       setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     } else {
@@ -135,6 +149,7 @@ export function PairCandidatesPage() {
               id="min-abs-z"
               type="number"
               inputMode="decimal"
+              min="0"
               step="0.1"
               placeholder="any"
               value={minAbsZ}

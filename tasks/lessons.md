@@ -26,9 +26,9 @@
 
 - The `/runs` endpoint returned chronological order *in practice*, so the original RunsList just did `[...runs].reverse()`. That's fragile — any backend change (added pagination, switched ORM ordering, parallel fetch) silently breaks the UI. When ordering matters, sort explicitly on the field that defines the order.
 
-## Stray service on dev port
+## Probe the smoke-test port before assuming it's free
 
-- A persistent Python service squats on `:8765` on this machine and serves HTML 404s with `Content-Type: text/html`. JSON-decoding the body fails confusingly. Smoke-tests should use a less common port (e.g. 8788) and `lsof -i :<port>` is the quick way to identify the squatter.
+- When a curl-then-pipe-to-jq pipeline fails with `JSONDecodeError: Expecting value`, the first thing to check is whether something else is already listening on the port — an ambient service can return HTML 404s with `Content-Type: text/html` and the JSON parser blows up confusingly. `lsof -i :<port>` identifies the squatter; pick a less-common port (e.g. 8788) when starting an ad-hoc backend.
 
 ## Project venv shebangs are absolute and brittle
 
