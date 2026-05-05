@@ -189,20 +189,31 @@ class KiteAuthManager:
         kite_login_url = (
             f"https://kite.trade/connect/login?v=3&api_key={self.api_key}"
         )
-        redirect_resp = session.get(kite_login_url, allow_redirects=True)
-        final_url = redirect_resp.url
 
-        # Extract request_token from redirect URL
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(final_url)
-        params = parse_qs(parsed.query)
-        request_token = params.get("request_token", [None])[0]
+        # Walk the redirect chain manually. If the callback URL is itself an
+        # active endpoint, allow_redirects=True can invalidate request_token
+        # before we redeem it. Stop at the first Location header carrying the
+        # token, before issuing the request to that URL.
+        from urllib.parse import urlparse, parse_qs, urljoin
+
+        resp = session.get(kite_login_url, allow_redirects=False)
+        chain_urls = [kite_login_url]
+        request_token = None
+        for _ in range(10):  # safety cap on redirect depth
+            if not (resp.is_redirect or resp.is_permanent_redirect):
+                break
+            location = urljoin(resp.url, resp.headers["Location"])
+            chain_urls.append(location)
+            token = parse_qs(urlparse(location).query).get("request_token", [None])[0]
+            if token:
+                request_token = token
+                break
+            resp = session.get(location, allow_redirects=False)
 
         if not request_token:
-            # Alternative: try to get from the response if redirect didn't work
             raise AuthenticationError(
-                "Could not extract request_token from redirect. "
-                f"Final URL: {final_url}"
+                "Could not extract request_token from redirect chain. "
+                f"Visited URLs: {chain_urls}"
             )
 
         # ── Step 4: Exchange for access_token ──
