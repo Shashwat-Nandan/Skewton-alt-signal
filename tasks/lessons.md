@@ -36,4 +36,9 @@
 
 ## CSV → API: prefer file-mtime over a separate "generated_at" column
 
-- Pipeline outputs (like `pair_candidates.csv`) don't carry their own timestamp. Surfacing freshness via `Path.stat().st_mtime` keeps the producer simple and means the freshness signal can never drift from the file. Use `datetime.fromtimestamp(..., tz=timezone.utc).isoformat()` to emit a clean timezone-aware ISO string.
+- Pipeline outputs (like `pair_candidates.csv`) don't carry their own timestamp. Surfacing freshness via `Path.stat().st_mtime` keeps the producer simple and means the freshness signal can never drift from the file. Use `datetime.fromtimestamp(..., tz=timezone.utc).isoformat(timespec="milliseconds")` — see the next lesson on why microsecond precision breaks Safari.
+
+## Always clamp ISO timestamps to millisecond precision for the wire
+
+- Python's `datetime.isoformat()` defaults to **microsecond** precision (`2026-05-04T13:47:03.954864+00:00`). Chrome/Firefox parse that fine, but Safari/JavaScriptCore only honours up to **3** fractional digits per the ECMAScript spec — it returns Invalid Date, and any downstream `toLocaleString({dateStyle, timeStyle})` then throws "the string did not match the expected pattern." Always pass `timespec="milliseconds"` on any ISO string that crosses the API boundary.
+- Pre-existing endpoints in this repo that emit `datetime.now().isoformat()` (e.g. `RunSummary.created_at`) have the same latent bug — they only avoid it because the frontend currently uses `localeCompare` for sort instead of `new Date()`. If a future caller does `new Date(created_at).toLocaleString(...)` on Safari, fix it at the source the same way.

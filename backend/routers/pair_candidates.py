@@ -65,9 +65,12 @@ def list_pair_candidates() -> PairCandidatesResponse:
             detail="Pair candidates not yet generated. Run screen_pairs.py.",
         )
 
+    # Millisecond precision: Safari's Date parser rejects 6-digit fractional
+    # seconds (the default of .isoformat()) and the page's toLocaleString call
+    # then throws "the string did not match the expected pattern".
     generated_at = datetime.fromtimestamp(
         CSV_PATH.stat().st_mtime, tz=timezone.utc
-    ).isoformat()
+    ).isoformat(timespec="milliseconds")
 
     candidates: List[PairCandidate] = []
     with CSV_PATH.open(newline="") as f:
