@@ -12,11 +12,20 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
 from . import db
-from .routers import auth, market_profile, pair_candidates, runs, strategies
+from .dashboard_auth import require_session
+from .routers import (
+    auth,
+    dashboard_session,
+    market_profile,
+    pair_candidates,
+    runs,
+    strategies,
+)
 from .run_manager import get_run_manager
 from .settings import get_settings
 
@@ -56,11 +65,29 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.include_router(auth.router)
-    app.include_router(strategies.router)
-    app.include_router(runs.router)
-    app.include_router(market_profile.router)
-    app.include_router(pair_candidates.router)
+    # SameSite=Lax (not Strict) so the Kite OAuth callback — a top-level
+    # cross-site GET from kite.zerodha.com → us — still carries the cookie.
+    # CSRF on state-changing routes is preserved because they're all POSTs,
+    # which Lax blocks cross-site.
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.dashboard_session_secret,
+        session_cookie="dashboard_session",
+        max_age=settings.dashboard_session_max_age_days * 86400,
+        same_site="lax",
+        https_only=settings.dashboard_url.startswith("https://"),
+    )
+
+    # The /session/* router stays public — it's how callers acquire a session
+    # in the first place. Every other router is gated.
+    app.include_router(dashboard_session.router)
+
+    gated = [Depends(require_session)]
+    app.include_router(auth.router, dependencies=gated)
+    app.include_router(strategies.router, dependencies=gated)
+    app.include_router(runs.router, dependencies=gated)
+    app.include_router(market_profile.router, dependencies=gated)
+    app.include_router(pair_candidates.router, dependencies=gated)
 
     @app.get("/", tags=["meta"])
     def root():

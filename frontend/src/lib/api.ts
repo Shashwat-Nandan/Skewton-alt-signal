@@ -5,8 +5,21 @@ import type {
   PairCandidatesResponse,
   RunDetail,
   RunSummary,
+  SessionStatus,
   StrategyInfo,
 } from "./types";
+
+/**
+ * Thrown when an API call returns 401. The dashboard session expired or
+ * was never established; the caller should kick the user back to the
+ * login page. App.tsx's QueryClient onError handler reacts to this.
+ */
+export class UnauthorizedError extends Error {
+  constructor() {
+    super("Unauthorized");
+    this.name = "UnauthorizedError";
+  }
+}
 
 /**
  * Thin typed wrapper around fetch. The backend is same-origin in dev (Vite
@@ -21,6 +34,9 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers ?? {}),
     },
   });
+  if (res.status === 401) {
+    throw new UnauthorizedError();
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -36,6 +52,13 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // Dashboard session (the password gate in front of everything below)
+  sessionStatus: () => http<SessionStatus>("/session/me"),
+  sessionLogin: (password: string) =>
+    http<void>("/session/login", { method: "POST", body: JSON.stringify({ password }) }),
+  sessionLogout: () => http<void>("/session/logout", { method: "POST" }),
+
+  // Kite OAuth (the broker session, gated behind the dashboard session)
   authStatus: () => http<AuthStatus>("/auth/status"),
   loginUrl: () => http<{ login_url: string }>("/auth/login"),
   logout: () => http<void>("/auth/logout", { method: "POST" }),

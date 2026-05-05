@@ -23,24 +23,27 @@ if [[ ${#BASES[@]} -eq 0 ]]; then
     BASES=("http://127.0.0.1:8000")
 fi
 
-# Each entry: "<path>|<allow_503>". 503 is only acceptable for endpoints
-# whose data source may legitimately be absent on a fresh deploy
-# (e.g. pair_candidates.csv before the first screener run).
+# Each entry: "<path>|<expected_status>". Most routes are gated behind the
+# dashboard session and return 401 to an unauthenticated probe — that's a
+# success signal: it proves both that the proxy reached the backend AND
+# that the gate is up. /session/me is the one truly public route; if that
+# can't return 200 something's deeply wrong.
 #
 # NOTE: GET / (the FastAPI meta endpoint) is intentionally NOT in this
 # list. In production nginx's `location /` serves the SPA's index.html
 # for HTML5 router fallback, so the meta endpoint is unreachable through
 # the public host by design. The SPA never calls it.
 ROUTES=(
-    "/auth/status|0"
-    "/strategies|0"
-    "/runs|0"
-    "/market-profile/symbols|0"
-    "/pair-candidates|1"
+    "/session/me|200"
+    "/auth/status|401"
+    "/strategies|401"
+    "/runs|401"
+    "/market-profile/symbols|401"
+    "/pair-candidates|401"
 )
 
 probe() {
-    local url="$1" allow_503="$2"
+    local url="$1" expected="$2"
     local body status ctype meta
     body=$(mktemp)
     # Retry briefly: just-restarted uvicorn may not have bound yet.
@@ -55,16 +58,9 @@ probe() {
     done
     ctype="${meta#* }"
 
-    local ok_status=0
-    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
-        ok_status=1
-    elif [[ "$status" == "503" && "$allow_503" == "1" ]]; then
-        ok_status=1
-    fi
-
-    if [[ $ok_status -ne 1 ]]; then
+    if [[ "$status" != "$expected" ]]; then
         echo "FAIL $url" >&2
-        echo "     status=$status ctype=$ctype" >&2
+        echo "     status=$status (expected $expected) ctype=$ctype" >&2
         echo "     body[:200]=$(head -c 200 "$body" 2>/dev/null)" >&2
         rm -f "$body"
         return 1
@@ -89,9 +85,9 @@ fail=0
 for base in "${BASES[@]}"; do
     for entry in "${ROUTES[@]}"; do
         path="${entry%|*}"
-        allow_503="${entry##*|}"
+        expected="${entry##*|}"
         url="${base%/}${path}"
-        probe "$url" "$allow_503" || fail=1
+        probe "$url" "$expected" || fail=1
     done
 done
 

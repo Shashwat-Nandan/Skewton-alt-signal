@@ -1,14 +1,27 @@
 import { useEffect } from "react";
 import { Routes, Route } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { api, UnauthorizedError } from "@/lib/api";
 import { Header } from "@/components/Header";
 import { Home } from "@/pages/Home";
+import { DashboardLoginPage } from "@/pages/DashboardLoginPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
 import { RunPage } from "@/pages/RunPage";
+import { Skeleton } from "@/components/ui/skeleton";
 
 export default function App() {
   const qc = useQueryClient();
+
+  // Dashboard-session gate. This runs before everything; if the cookie is
+  // missing, expired, or tampered with, the backend returns 401 and we
+  // render the login page instead of the app.
+  const session = useQuery({
+    queryKey: ["session"],
+    queryFn: api.sessionStatus,
+    retry: (count, e) => !(e instanceof UnauthorizedError) && count < 1,
+    staleTime: 30_000,
+  });
 
   // Post-OAuth landing: backend bounces the browser to /?login=success.
   // Force a fresh /auth/status fetch (the cached "not authenticated" answer
@@ -20,6 +33,21 @@ export default function App() {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, [qc]);
+
+  if (session.isLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <Skeleton className="h-32 w-80" />
+      </div>
+    );
+  }
+
+  // session.isError covers UnauthorizedError thrown by api.sessionStatus,
+  // session.data?.authenticated === false covers a successful 200 with the
+  // gate marking us logged out (e.g. after sessionLogout invalidated us).
+  if (session.isError || !session.data?.authenticated) {
+    return <DashboardLoginPage />;
+  }
 
   return (
     <div className="min-h-screen bg-background">

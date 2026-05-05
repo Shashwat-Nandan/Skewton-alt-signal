@@ -1,5 +1,11 @@
 /** Mirrors the FastAPI response shapes — keep in sync with backend/routers/*.py */
 
+/** Dashboard session (the password gate). */
+export type SessionStatus = {
+  authenticated: boolean;
+};
+
+/** Kite/broker session, returned by /auth/status. */
 export type AuthStatus = {
   authenticated: boolean;
   user_id?: string | null;

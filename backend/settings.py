@@ -50,7 +50,28 @@ class Settings(BaseSettings):
     # run-create endpoint regardless of strategy. Set true only with eyes open.
     allow_live_mode: bool = False
 
+    # ── Dashboard session auth ────────────────────────────────────
+    # The dashboard is single-operator. Any caller who reaches the API surface
+    # can drive runs against the operator's cached Kite session — so we gate
+    # every route behind a password-cookie session (Starlette SessionMiddleware,
+    # signed by `dashboard_session_secret`). Both values MUST be set; the
+    # backend refuses to boot with either missing.
+    dashboard_password: str = ""
+    dashboard_session_secret: str = ""
+    # Cookie max-age. 7 days is operator-friendly for a personal dashboard.
+    dashboard_session_max_age_days: int = 7
+
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    if not s.dashboard_password or not s.dashboard_session_secret:
+        # Fail loud at first access — the alternative is shipping without a
+        # gate and silently exposing the API. There is no degraded mode.
+        raise RuntimeError(
+            "DASHBOARD_PASSWORD and DASHBOARD_SESSION_SECRET must be set in "
+            ".env. Generate the secret with:\n"
+            "  python -c 'import secrets; print(secrets.token_urlsafe(64))'\n"
+            "Then choose a password and add both to .env (mode 0600)."
+        )
+    return s

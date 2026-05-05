@@ -275,7 +275,9 @@ class TestApi:
         bdb.insert_bars(12345, 30, rows)
         bdb.mark_backfilled("XYZ")
 
+        from tests._helpers import login_client
         c = TestClient(app)
+        login_client(c)
         # Symbols list
         r = c.get("/market-profile/symbols")
         assert r.status_code == 200
@@ -301,7 +303,9 @@ class TestApi:
     def test_router_404_for_unknown_symbol(self, fresh_db):
         from fastapi.testclient import TestClient
         from backend.main import app
+        from tests._helpers import login_client
         c = TestClient(app)
+        login_client(c)
         r = c.get("/market-profile/GHOST")
         assert r.status_code == 404
         assert "bars_universe" in r.json()["detail"]
@@ -311,7 +315,9 @@ class TestApi:
         from backend.main import app
         from backend import bars as bdb
         bdb.upsert_universe("ABC", 111, "NSE")
+        from tests._helpers import login_client
         c = TestClient(app)
+        login_client(c)
         r = c.get("/market-profile/ABC")
         assert r.status_code == 404
         assert "No 30m bars" in r.json()["detail"]

@@ -42,10 +42,12 @@ MALFORMED_CSV = textwrap.dedent(
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    from tests._helpers import login_client
     rm._manager = None
     db.reset_for_tests(tmp_path / "test.db")
     app = create_app()
     with TestClient(app) as c:
+        login_client(c)
         yield c
     db.reset_for_tests(None)
 

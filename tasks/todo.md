@@ -1,3 +1,111 @@
+# Dashboard auth — gate the API behind a password-cookie session
+
+## Motivation
+
+Per the security review (CRITICAL #1), the backend has no authentication. Any
+internet caller who can reach `dashboard.propelytics.in` can `POST /runs`
+against the operator's cached Kite session. Decision (2026-05-05): cookie-
+session with password login (Option B), 7-day TTL, plaintext password in
+`.env`, migrate Kite OAuth endpoints under the new gate too.
+
+## Plan
+
+- [ ] **Backend** — `backend/settings.py` gains `dashboard_password`,
+  `dashboard_session_secret`, `dashboard_session_max_age_days` (default 7);
+  fail-fast at app start if either secret is empty.
+- [ ] **Backend** — add Starlette `SessionMiddleware` (HttpOnly + Secure +
+  SameSite=Lax + 7d) wired up via `dashboard_url` for `https_only`.
+- [ ] **Backend** — new `backend/dashboard_auth.py` with `require_session`
+  dependency.
+- [ ] **Backend** — new `backend/routers/dashboard_session.py`:
+  `POST /session/login`, `POST /session/logout`, `GET /session/me`. These
+  are the ONLY routes outside the gate.
+- [ ] **Backend** — every other router (`auth`, `strategies`, `runs`,
+  `market-profile`, `pair-candidates`) registered with
+  `dependencies=[Depends(require_session)]`.
+- [ ] **Backend** — pytest coverage in `tests/test_dashboard_auth.py`
+  (login pass/fail, gating, logout, tampered cookie, expired cookie).
+  Install `httpx` so the existing TestClient suites run too.
+- [ ] **Frontend** — `lib/api.ts` adds session endpoints + 401 → typed
+  `UnauthorizedError`; QueryClient global onError invalidates the session
+  query so a stale session kicks the user back to the login page mid-flow.
+- [ ] **Frontend** — new `pages/DashboardLoginPage.tsx`. Single password
+  field, error state, no signup/forgot.
+- [ ] **Frontend** — `App.tsx` gates the entire app on the session query
+  before any other route renders.
+- [ ] **Frontend** — `Header.tsx` "Logout" button now clears the dashboard
+  session (the per-Kite Disconnect can stay implicit — it expires daily).
+- [ ] **Ops** — append `DASHBOARD_SESSION_SECRET` (random token-urlsafe(64))
+  to `.env` without echoing it. Operator sets `DASHBOARD_PASSWORD` in their
+  own shell. Add nginx `limit_req` on `/session/login` (defer if scope creep).
+- [ ] **Ops** — update `backend/README.md` with the two new env vars.
+- [ ] **Verify** — pytest green; backend boots and refuses to boot without
+  the secrets; smoke-test login → API access → logout → access blocked
+  via curl from outside the SPA.
+
+## Review
+
+Shipped (CRITICAL #1 closed):
+
+- `backend/settings.py`: `dashboard_password`, `dashboard_session_secret`,
+  `dashboard_session_max_age_days`. `get_settings()` now refuses to return
+  if either secret is empty — backend won't boot in a half-configured state.
+- `backend/dashboard_auth.py` (new): `password_matches` (constant-time
+  compare), `mark_authenticated`, `clear_session`, `is_authenticated`,
+  `require_session` FastAPI dependency. Bare 401 with no leak about which
+  check failed.
+- `backend/routers/dashboard_session.py` (new): `/session/me`,
+  `/session/login`, `/session/logout` — the only public surface.
+- `backend/main.py`: SessionMiddleware (HttpOnly + SameSite=Lax + Secure
+  on HTTPS, 7d) and `Depends(require_session)` on every other router.
+  Lax (not Strict) so the Kite OAuth callback still carries the cookie.
+- `tests/test_dashboard_auth.py` (new, 20 cases): login pass/fail, gating
+  on every router, logout, tampered cookie, public-route exemption.
+  `tests/conftest.py` stamps test env vars; `tests/_helpers.py::login_client`
+  is the per-test login. 235 tests green (was 190+45 with 8 httpx-blocked).
+- `frontend/src/lib/api.ts`: `UnauthorizedError` thrown on any 401, plus
+  `sessionStatus` / `sessionLogin` / `sessionLogout`.
+- `frontend/src/main.tsx`: QueryCache `onError` invalidates the session
+  query on any cross-component 401, so a mid-session expiry flips the
+  whole app back to the login page without per-component handling.
+- `frontend/src/App.tsx`: `useQuery(["session"])` gates the entire app
+  before any route renders.
+- `frontend/src/pages/DashboardLoginPage.tsx` (new): single password form,
+  autoFocus, error state, no signup/forgot.
+- `frontend/src/components/Header.tsx`: "Sign out" now clears the
+  dashboard session (Kite token expires daily on its own).
+- `/etc/nginx/sites-enabled/dashboard` + `deploy/nginx-dashboard.conf.example`:
+  added `session` to the API prefix whitelist.
+- `deploy/smoke.sh`: every gated route now expected to return 401 (still
+  asserts JSON content-type — same proxy-correctness signal). `/session/me`
+  is the only 200-expected route. 12/12 probes green across both bases.
+- `backend/README.md`: documents the password gate, the secret-generation
+  one-liner, and the rotate-by-changing-secret semantics.
+- `.env`: `DASHBOARD_SESSION_SECRET` appended via `printf …(secrets.token_urlsafe(64))`
+  (value never echoed). `DASHBOARD_PASSWORD` set by the operator with `read -rs`.
+
+Verified end-to-end:
+
+- pytest: 235 passed.
+- Public-host smoke (https://dashboard.propelytics.in): /session/me → 200,
+  every other route → 401, all JSON.
+- Authed cycle via curl: login (204) → /strategies (200) → logout (204)
+  → /strategies (401). Wrong password → 401.
+- Backend refuses to start with either secret missing (verified by reading
+  the code path; `get_settings()` raises before app construction).
+
+Out of scope (deliberate):
+
+- nginx `limit_req` on `/session/login` — easy to add later, but a single
+  attacker hammering one endpoint over HTTPS won't materially change the
+  threat model with a long-enough password.
+- bcrypt-hashing the password at rest. `.env` is the trust boundary; the
+  hash only buys protection against env-file leaks where the running
+  process is uncompromised, which is a narrow scenario for this setup.
+- Rate-limiting / lockout / 2FA — single-operator dashboard, deferred.
+
+---
+
 # Issue #3 — Surface current pair-trading candidates in frontend
 
 ## Audit findings

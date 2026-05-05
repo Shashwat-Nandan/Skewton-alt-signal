@@ -32,6 +32,31 @@ OpenAPI docs at <http://localhost:8000/docs>.
 `signals` and `paper` only. `live` is rejected with HTTP 403; flip
 `ALLOW_LIVE_MODE=true` in `.env` to override (deliberately not enabled).
 
+## Dashboard password
+
+Every API route except `/session/*` is gated behind a single shared
+password. The session lives in a signed HttpOnly cookie issued by
+`POST /session/login`; the cookie is honoured for 7 days and then the
+user has to log in again. Backend refuses to start if either env var
+below is empty.
+
+```bash
+# Generate a session-signing secret (one-time):
+python -c 'import secrets; print(secrets.token_urlsafe(64))'
+```
+
+Add to `.env` (mode 0600):
+```
+DASHBOARD_PASSWORD=<choose a strong password>
+DASHBOARD_SESSION_SECRET=<paste the generated token>
+# DASHBOARD_SESSION_MAX_AGE_DAYS=7   # default
+```
+
+The password is in `.env` plaintext on purpose — `.env` is the trust
+boundary anyway. Rotate by editing `.env` and restarting the backend;
+all live sessions are invalidated when `DASHBOARD_SESSION_SECRET`
+changes (signature mismatch).
+
 ## Kite Connect setup
 
 The dashboard uses the **OAuth redirect flow**, not the headless TOTP path
@@ -64,8 +89,8 @@ The token is valid until ~6 AM IST the next day; re-login refreshes it.
 - **Persistence.** Runs and their state are in-memory; restarting the
   backend clears active runs. SQLite for durable run/trade history is
   Phase 5.
-- **Authentication.** The Kite token is the only auth — there is no
-  per-user login on top of it. Single-user assumption.
+- **Per-user accounts.** The dashboard is single-operator — one shared
+  password gates the entire API (see "Dashboard password" below).
 - **Live trading from the dashboard.** Off by design. Live mode still
   exists in the strategies for the headless daemon path, but the dashboard
   endpoint refuses to create live runs.

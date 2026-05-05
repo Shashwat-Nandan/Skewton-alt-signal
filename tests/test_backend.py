@@ -31,6 +31,23 @@ def client(tmp_path):
     db.reset_for_tests(tmp_path / "test.db")
     app = create_app()
     with TestClient(app) as c:
+        # Acquire a dashboard session for the rest of the test. The cookie
+        # is held by TestClient and replayed on every subsequent request.
+        # Tests that exercise the unauthenticated surface should use a
+        # fresh TestClient (see TestDashboardSession below).
+        r = c.post("/session/login", json={"password": "test-password"})
+        assert r.status_code == 204, r.text
+        yield c
+    db.reset_for_tests(None)
+
+
+@pytest.fixture
+def unauthed_client(tmp_path):
+    """Same setup as `client` but without the login step."""
+    rm._manager = None
+    db.reset_for_tests(tmp_path / "test.db")
+    app = create_app()
+    with TestClient(app) as c:
         yield c
     db.reset_for_tests(None)
 

@@ -9,9 +9,13 @@ import { cn } from "@/lib/utils";
 export function Header() {
   const qc = useQueryClient();
   const { data: auth } = useQuery({ queryKey: ["auth"], queryFn: api.authStatus });
+  // Logout = sign out of the dashboard session (the password gate). The
+  // Kite/broker token expires daily on its own and rarely needs explicit
+  // teardown, so we don't surface it here. Invalidating ["session"] kicks
+  // App.tsx to the login page.
   const logout = useMutation({
-    mutationFn: api.logout,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["auth"] }),
+    mutationFn: api.sessionLogout,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["session"] }),
   });
 
   return (
@@ -69,25 +73,25 @@ export function Header() {
         </div>
         <div className="flex shrink-0 items-center gap-2 sm:gap-3">
           {auth?.authenticated ? (
-            <>
-              <div className="hidden text-right text-sm leading-tight sm:block">
-                <div className="font-medium">{auth.user_name}</div>
-                <div className="text-xs text-muted-foreground">{auth.user_id}</div>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => logout.mutate()}
-                disabled={logout.isPending}
-                aria-label="Logout"
-              >
-                <LogOut className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Logout</span>
-              </Button>
-            </>
+            <div className="hidden text-right text-sm leading-tight sm:block">
+              <div className="font-medium">{auth.user_name}</div>
+              <div className="text-xs text-muted-foreground">{auth.user_id}</div>
+            </div>
           ) : (
-            <Badge variant="secondary">Not signed in</Badge>
+            <Badge variant="secondary" className="hidden sm:inline-flex">
+              Kite not connected
+            </Badge>
           )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => logout.mutate()}
+            disabled={logout.isPending}
+            aria-label="Sign out of dashboard"
+          >
+            <LogOut className="h-4 w-4 sm:mr-2" />
+            <span className="hidden sm:inline">Sign out</span>
+          </Button>
         </div>
       </div>
     </header>
