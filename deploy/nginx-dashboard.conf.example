@@ -13,9 +13,10 @@ server {
     listen 80;
     server_name dashboard.example.com;
 
-    # Backend API — three prefixes only. Anything else falls through
-    # to the SPA.
-    location ~ ^/(auth|strategies|runs)(/|$) {
+    # Backend API — five prefixes only. Anything else falls through
+    # to the SPA. Keep this list in sync with the routers registered in
+    # backend/main.py.
+    location ~ ^/(auth|strategies|runs|market-profile|pair-candidates)(/|$) {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
