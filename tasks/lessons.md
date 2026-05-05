@@ -42,3 +42,9 @@
 
 - Python's `datetime.isoformat()` defaults to **microsecond** precision (`2026-05-04T13:47:03.954864+00:00`). Chrome/Firefox parse that fine, but Safari/JavaScriptCore only honours up to **3** fractional digits per the ECMAScript spec — it returns Invalid Date, and any downstream `toLocaleString({dateStyle, timeStyle})` then throws "the string did not match the expected pattern." Always pass `timespec="milliseconds"` on any ISO string that crosses the API boundary.
 - Pre-existing endpoints in this repo that emit `datetime.now().isoformat()` (e.g. `RunSummary.created_at`) have the same latent bug — they only avoid it because the frontend currently uses `localeCompare` for sort instead of `new Date()`. If a future caller does `new Date(created_at).toLocaleString(...)` on Safari, fix it at the source the same way.
+
+## TestClient coverage ≠ proxy coverage — keep an HTTP smoke check in front of nginx
+
+- A new router can pass every `tests/test_backend.py` assertion and still 500-equivalent in production if the nginx prefix whitelist (`location ~ ^/(...)`) wasn't updated to include it. `fastapi.testclient.TestClient` instantiates the ASGI app directly — it never sees nginx — so it is structurally incapable of catching this. Shipped exactly this regression on 2026-05-05 with `/pair-candidates`.
+- `deploy/smoke.sh` exists for this. The single load-bearing assertion is `Content-Type: application/json` — when nginx falls through to the SPA fallback, the response is `text/html` regardless of HTTP status, and that's the discriminator. `redeploy.sh` runs it against `127.0.0.1:8000` always and `$SMOKE_PUBLIC_URL` if set, gating the deploy.
+- When adding a new public router: add a row to the `ROUTES` array in `deploy/smoke.sh`. Pick `allow_503=1` only if the data source can be legitimately absent on a fresh deploy.

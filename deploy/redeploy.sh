@@ -52,5 +52,19 @@ systemctl is-active --quiet "$BACKEND_UNIT" || {
     exit 2
 }
 
+# 6. End-to-end smoke. Always probes 127.0.0.1:8000 (catches backend
+#    bugs); also probes $SMOKE_PUBLIC_URL if set (catches nginx prefix
+#    drift — TestClient cannot see this layer). A failure here means
+#    something the SPA depends on is broken in production.
+SMOKE_BASES=("http://127.0.0.1:8000")
+if [[ -n "${SMOKE_PUBLIC_URL:-}" ]]; then
+    SMOKE_BASES+=("$SMOKE_PUBLIC_URL")
+fi
+echo "Smoke check against ${SMOKE_BASES[*]} ..."
+"$PROJECT_DIR/deploy/smoke.sh" "${SMOKE_BASES[@]}" || {
+    echo "ERROR: smoke check failed — deploy not green" >&2
+    exit 3
+}
+
 echo
 echo "Deploy OK at $(git rev-parse --short HEAD)."

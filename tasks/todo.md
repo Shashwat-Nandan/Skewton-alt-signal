@@ -48,3 +48,35 @@ Changes shipped:
 
 - The Z-score reported is computed at *screen time* (panel mean/std vs latest bar of the panel). The live pair-trading strategy uses a *rolling* lookback that may differ slightly. For "what is the strategy considering?" this is close enough — both views look at the same candidate set with comparable spread stats.
 - `backend/run_manager.py:38` still uses naive `datetime.now()` (per issue #2 lessons). The new endpoint emits a timezone-aware `generated_at` from `datetime.fromtimestamp(..., tz=timezone.utc)` — small inconsistency but isolated to this surface.
+
+---
+
+# Post-deploy API smoke test
+
+## Motivation
+
+On 2026-05-05 a deploy shipped a new router (`/pair-candidates`) that the existing pytest suite covered, but the live frontend still broke because nginx's API prefix whitelist was not updated. Requests fell through to the SPA, which returned `<!doctype html>`, which the frontend tried to `JSON.parse`. `tests/test_backend.py` cannot catch this — `TestClient` bypasses the reverse proxy entirely. We need an end-to-end probe.
+
+## Plan
+
+- [x] Write `deploy/smoke.sh` — bash + curl, takes one or more base URLs, probes every public no-auth route, asserts `Content-Type: application/json` (the precise discriminator vs. nginx fallthrough). Per-route status check: `2xx` always, with `503` permitted only for `/pair-candidates` (CSV may be absent on first deploy).
+- [x] Routes covered: `/auth/status`, `/strategies`, `/runs`, `/market-profile/symbols`, `/pair-candidates`. Path-param and auth-gated endpoints stay out of scope (already covered by pytest). `GET /` dropped after the first run flagged it: nginx's `location /` *intentionally* serves the SPA's `index.html` for HTML5 router fallback, so the meta endpoint is unreachable through the public host by design.
+- [x] Wire into `deploy/redeploy.sh` — runs after the `is-active` check, against `127.0.0.1:8000` always and `$SMOKE_PUBLIC_URL` if set. A failed smoke fails the deploy with exit 3.
+- [x] Verify end-to-end: passes against both bases when correct; with `pair-candidates` deleted from the live nginx whitelist, smoke reproduces today's failure (`status=200 ctype=text/html ... nginx likely fell through to SPA`) with exit 1. nginx restored.
+- [x] Capture lesson in `tasks/lessons.md`: `TestClient`-level coverage ≠ proxy coverage; `Content-Type: application/json` is the load-bearing assertion.
+
+## Review
+
+Files added/changed:
+
+- `deploy/smoke.sh` — new. Bash + curl, retries connect briefly (uvicorn warmup after restart), 5 routes × N base URLs, fails fast on the first non-JSON or non-2xx (with `/pair-candidates` allowed 503 on a fresh deploy).
+- `deploy/redeploy.sh` — added a step 6 that builds a `SMOKE_BASES` array (always localhost; appends `$SMOKE_PUBLIC_URL` if set) and invokes `smoke.sh`, exiting 3 on failure.
+- `tasks/lessons.md` — new section: TestClient-level coverage cannot see nginx; the content-type discriminator is the bug-catcher; instructions for updating the routes list.
+
+Key design choices:
+
+- **Bash + curl** over pytest: smoke runs from inside `redeploy.sh`, no venv assumption. The whole script is ~80 lines and depends only on `curl`/`mktemp`/`sed`-free.
+- **Content-Type, not just status code**: nginx returns `200 text/html` when it falls through to the SPA, so a status-only check would pass on the exact regression we're trying to catch. The script's load-bearing line is `[[ "$ctype" != application/json* ]]`.
+- **Two base URLs, not one**: `127.0.0.1:8000` catches backend regressions; `$SMOKE_PUBLIC_URL` catches nginx whitelist drift. Same probe code, two layers.
+- **Auth-gated and path-param routes excluded**: `tests/test_backend.py` already exercises them with mocks. Smoke is for "is the route reachable from a real HTTP client at all", not for testing logic.
+- **Allow-503 list, kept tight**: only `/pair-candidates` (CSV may legitimately be missing). Anything else returning 503 from a fresh deploy is genuinely broken.
