@@ -10,6 +10,8 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import math
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +23,38 @@ logger = logging.getLogger(__name__)
 
 ExecutionMode = Literal["signals", "paper", "live"]
 VALID_MODES = ("signals", "paper", "live")
+
+# Pre-submit fat-finger / NaN-Inf guard. Spot-band and per-strategy notional
+# checks live in the risk-gate path; this is the floor of last resort before
+# kite.place_order. Bounds chosen so any real Indian equity-derivatives order
+# passes; obvious-broken values are rejected.
+_TRADINGSYMBOL_RE = re.compile(r"^[A-Z0-9&\-]{3,30}$")
+_ABS_MAX_LOTS_PER_ORDER = 10000
+_MAX_PRICE_INR = 1_000_000
+
+
+class OrderValidationError(ValueError):
+    """A proposal failed pre-submit sanity checks."""
+
+
+def validate_order(proposal: TradeProposal) -> None:
+    """Reject obviously-broken orders before they reach the broker."""
+    sym = proposal.tradingsymbol or ""
+    if not _TRADINGSYMBOL_RE.match(sym):
+        raise OrderValidationError(f"bad tradingsymbol: {sym!r}")
+
+    price, qty = proposal.price, proposal.quantity
+    if not (math.isfinite(price) and math.isfinite(qty)):
+        raise OrderValidationError(
+            f"non-finite price/qty: price={price}, qty={qty}"
+        )
+    if not (0 < price <= _MAX_PRICE_INR):
+        raise OrderValidationError(f"price out of range: {price}")
+    qty_lots = abs(qty)
+    if not (0 < qty_lots <= _ABS_MAX_LOTS_PER_ORDER):
+        raise OrderValidationError(
+            f"qty out of range: {qty} lots (cap={_ABS_MAX_LOTS_PER_ORDER})"
+        )
 
 
 class BaseStrategy(ABC):

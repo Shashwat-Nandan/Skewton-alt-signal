@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -66,7 +67,11 @@ def _save_token(session: dict) -> None:
     }
     path = get_settings().token_cache_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload))
+    # Open with 0600 explicitly — default umask leaves the cache 0644,
+    # which exposes a live access_token to any local UID.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f)
 
 
 def load_cached_session() -> Optional[dict]:

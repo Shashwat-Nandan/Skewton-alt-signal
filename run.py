@@ -44,7 +44,9 @@ def main():
     # ── Step 2: Initialize hedger ──
     from strategies import TalebKarpathyStrategy
     logger.info("[2/3] Initializing Taleb Dynamic Hedger...")
-    hedger = TalebKarpathyStrategy(kite, config_path=CONFIG_PATH)
+    # Pin paper mode here. Live execution requires editing this script
+    # explicitly — config.ini alone must never be sufficient to send orders.
+    hedger = TalebKarpathyStrategy(kite, config_path=CONFIG_PATH, mode="paper")
     logger.info("Mode: %s", hedger.mode.upper())
     logger.info("Underlying: %s", hedger.underlying)
     logger.info("Capital: ₹%s", f"{hedger.immutable_params['total_capital']:,.0f}")

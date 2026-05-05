@@ -138,7 +138,14 @@ class KiteAuthManager:
             "timestamp": self._token_timestamp.isoformat(),
             "user_id": self.user_id,
         }
-        with open(self.TOKEN_CACHE_FILE, "w") as f:
+        # Open with 0600 explicitly — default umask leaves the cache 0644,
+        # which exposes a live access_token to any local UID.
+        fd = os.open(
+            self.TOKEN_CACHE_FILE,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f)
         logger.info("Access token cached to %s", self.TOKEN_CACHE_FILE)
 

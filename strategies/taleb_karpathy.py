@@ -32,7 +32,7 @@ from risk_analyzer import (
     BleedForecast, HedgeDecision,
 )
 
-from .base import BaseStrategy, ExecutionMode
+from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
 
 # Kite Connect's quote feed indexes the *spot* price under the index's
 # display name (with spaces), not the derivatives ticker. f"NSE:{u}"
@@ -1263,6 +1263,11 @@ class TalebKarpathyStrategy(BaseStrategy):
         return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
 
     def _live_execute(self, proposal):
+        try:
+            validate_order(proposal)
+        except OrderValidationError as e:
+            logger.error("Order rejected pre-submit: %s — %s", e, proposal)
+            return {"order_id": None, "status": "REJECTED", "error": str(e), "mode": "live"}
         try:
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR, exchange="NFO",

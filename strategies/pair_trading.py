@@ -38,7 +38,7 @@ import pandas as pd
 
 from trade_proposer import TradeProposal
 
-from .base import BaseStrategy, ExecutionMode
+from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
 
 logger = logging.getLogger(__name__)
 
@@ -589,6 +589,11 @@ class PairTradingStrategy(BaseStrategy):
         return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
 
     def _live_execute(self, prop: TradeProposal) -> Dict:
+        try:
+            validate_order(prop)
+        except OrderValidationError as e:
+            logger.error("Order rejected pre-submit: %s — %s", e, prop)
+            return {"order_id": None, "status": "REJECTED", "error": str(e), "mode": "live"}
         try:
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR, exchange="NFO",
