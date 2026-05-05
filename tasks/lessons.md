@@ -25,3 +25,15 @@
 ## Don't rely on backend response order
 
 - The `/runs` endpoint returned chronological order *in practice*, so the original RunsList just did `[...runs].reverse()`. That's fragile — any backend change (added pagination, switched ORM ordering, parallel fetch) silently breaks the UI. When ordering matters, sort explicitly on the field that defines the order.
+
+## Probe the smoke-test port before assuming it's free
+
+- When a curl-then-pipe-to-jq pipeline fails with `JSONDecodeError: Expecting value`, the first thing to check is whether something else is already listening on the port — an ambient service can return HTML 404s with `Content-Type: text/html` and the JSON parser blows up confusingly. `lsof -i :<port>` identifies the squatter; pick a less-common port (e.g. 8788) when starting an ad-hoc backend.
+
+## Project venv shebangs are absolute and brittle
+
+- `.venv/bin/uvicorn` (and similar entry-point scripts) carry an absolute shebang to `.venv/bin/python3.12`. If the project directory is moved (e.g. Downloads → Desktop), those scripts break with `bad interpreter`. Workaround: invoke as `.venv/bin/python -m uvicorn ...` instead. Recreating the venv in-place would also fix it.
+
+## CSV → API: prefer file-mtime over a separate "generated_at" column
+
+- Pipeline outputs (like `pair_candidates.csv`) don't carry their own timestamp. Surfacing freshness via `Path.stat().st_mtime` keeps the producer simple and means the freshness signal can never drift from the file. Use `datetime.fromtimestamp(..., tz=timezone.utc).isoformat()` to emit a clean timezone-aware ISO string.

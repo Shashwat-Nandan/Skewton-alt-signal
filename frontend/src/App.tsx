@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Header } from "@/components/Header";
 import { Home } from "@/pages/Home";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
+import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
 import { RunPage } from "@/pages/RunPage";
 
 export default function App() {
@@ -28,6 +29,7 @@ export default function App() {
           <Route path="/" element={<Home />} />
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />
+          <Route path="/pair-candidates" element={<PairCandidatesPage />} />
         </Routes>
       </main>
     </div>

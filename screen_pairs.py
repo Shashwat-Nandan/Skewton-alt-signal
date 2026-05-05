@@ -185,6 +185,11 @@ def screen_pairs(
         spread_vol_pct = spread_std / avg_leg_price * 100
         half_life = _half_life(spread)
 
+        latest_spread = float(spread[-1])
+        latest_z_score = (
+            (latest_spread - spread_mean) / spread_std if spread_std > 0 else None
+        )
+
         results.append({
             "symbol_a": a,
             "symbol_b": b,
@@ -195,6 +200,11 @@ def screen_pairs(
             "spread_vol_pct": spread_vol_pct,
             "spread_mean": spread_mean,
             "spread_std": spread_std,
+            "latest_spread": latest_spread,
+            "latest_z_score": latest_z_score,
+            "last_close_a": float(ya[-1]),
+            "last_close_b": float(yb[-1]),
+            "last_data_date": panel.index[-1].strftime("%Y-%m-%d"),
             "n_obs": len(panel),
         })
 
