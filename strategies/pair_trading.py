@@ -109,6 +109,16 @@ class PairTradingStrategy(BaseStrategy):
         if self.hedge_ratio is None:
             raise ValueError("hedge_ratio must be supplied via arg, config, or screener output")
 
+        # Defensive bound on β: anything outside [0.1, 10] either points at a
+        # corrupted screener output or a pair so mismatched it shouldn't be
+        # traded as a hedge in the first place. Refuse to construct the
+        # strategy rather than letting bad β size leg-B unbounded.
+        if not 0.1 <= abs(self.hedge_ratio) <= 10.0:
+            raise ValueError(
+                f"hedge_ratio out of range for {self.symbol_a}/{self.symbol_b}: "
+                f"|β|={abs(self.hedge_ratio):.4f} not in [0.1, 10]"
+            )
+
         # Risk band
         self.entry_z = float(cfg.get("entry_z", 2.0))
         self.exit_z = float(cfg.get("exit_z", 0.5))
@@ -124,6 +134,15 @@ class PairTradingStrategy(BaseStrategy):
         # the cap, the entry is skipped.
         mln = cfg.get("max_leg_notional", "").strip()
         self.max_leg_notional: Optional[float] = float(mln) if mln else None
+
+        # max_leg_notional is the only hard cap on per-entry deployed notional.
+        # In signals-only mode it's informational, but for paper / live it must
+        # be set so a misconfigured hedge_ratio cannot multiply leg-B sizing.
+        if self.mode != "signals" and self.max_leg_notional is None:
+            raise ValueError(
+                "max_leg_notional must be set in [pair_trading] config when "
+                f"mode={self.mode!r}; refusing to run without a notional cap"
+            )
 
         # Shared sizing/risk knobs from [strategy]
         self.total_capital = self.config.getfloat("strategy", "total_capital", fallback=500000)

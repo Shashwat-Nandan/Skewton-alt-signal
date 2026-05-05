@@ -254,7 +254,6 @@ def append_proposal(
     run_id: str, kind: str, source: str, prop, result: Dict[str, Any],
 ) -> None:
     conn = get_conn()
-    counter = "n_signals" if source == "signal" else "n_trades"
     conn.execute("BEGIN")
     try:
         conn.execute(
@@ -271,7 +270,13 @@ def append_proposal(
                 result.get("status"), result.get("order_id"), result.get("mode"),
             ),
         )
-        conn.execute(f"UPDATE runs SET {counter} = {counter} + 1 WHERE id = ?", (run_id,))
+        # Counter column chosen by an explicit branch — never f-string a SQL
+        # identifier, even when the input is currently bounded by a Pydantic
+        # Literal upstream.
+        if source == "signal":
+            conn.execute("UPDATE runs SET n_signals = n_signals + 1 WHERE id = ?", (run_id,))
+        else:
+            conn.execute("UPDATE runs SET n_trades = n_trades + 1 WHERE id = ?", (run_id,))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

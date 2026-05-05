@@ -44,4 +44,10 @@ server {
 
     # Block direct access to the dotfiles that live in the project root.
     location ~ /\. { deny all; return 404; }
+
+    # Defence-in-depth: nothing under /logs/ or /data_cache/ should ever be
+    # reachable through the SPA root. The fallthrough to try_files /index.html
+    # would otherwise quietly serve the SPA on a request like /logs/foo —
+    # but a future try_files change could turn this into real exposure.
+    location ~ ^/(logs|data_cache)(/|$) { return 404; }
 }
