@@ -65,9 +65,12 @@ async def create_run(req: CreateRunRequest):
     manager = get_run_manager()
     try:
         run = manager.create_run(req.strategy, req.mode, req.params, kite=kite)
-    except Exception as e:
+    except Exception:
+        # Don't echo the underlying exception — kiteconnect errors can
+        # carry URL/API-key fragments that don't belong in client bodies.
+        # The full traceback is in the journal via logger.exception.
         logger.exception("create_run failed for strategy=%s mode=%s", req.strategy, req.mode)
-        raise HTTPException(status_code=500, detail=f"Failed to create run: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create run")
     return RunSummary(**run.to_dict())
 
 

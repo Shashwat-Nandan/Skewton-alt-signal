@@ -8,6 +8,7 @@ JSONL emission so every strategy logs proposals to the dashboard the same way.
 from __future__ import annotations
 
 import configparser
+import fcntl
 import json
 import logging
 import math
@@ -139,8 +140,19 @@ class BaseStrategy(ABC):
             "expiry": str(getattr(proposal, "expiry", "") or ""),
             "rationale": getattr(proposal, "rationale", None),
         }
+        # Multiple strategy instances can append to the same file (one per
+        # active run). POSIX O_APPEND is atomic only up to PIPE_BUF (~4KB)
+        # per syscall, and `f.write` may issue several. Wrap in flock so
+        # crashed/concurrent writes can't interleave half-lines that break
+        # the consumer's JSONDecoder.
+        line = json.dumps(record, default=str) + "\n"
         with path.open("a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
         logger.info(
             "[SIGNAL] %s %d lots %s @ %.2f — %s",

@@ -68,7 +68,14 @@ class KiteAuthManager:
         return value
 
     def _validate_no_placeholders(self):
-        """Fail fast if any credential is still a ${...} placeholder."""
+        """Fail fast if any credential is empty or still a placeholder.
+
+        Catches three failure modes: empty strings, the original ${...}
+        env-var format, and the YOUR_* template values shipped in
+        config_template.ini that operators sometimes forget to replace
+        (and which would otherwise be sent to kite.zerodha.com as a
+        password attempt — landing the placeholder in upstream logs).
+        """
         import re
         placeholder_re = re.compile(r"^\$\{.+\}$")
         creds = {
@@ -76,7 +83,15 @@ class KiteAuthManager:
             "user_id": self.user_id, "password": self.password,
             "totp_key": self.totp_key,
         }
-        bad = [name for name, val in creds.items() if placeholder_re.match(val.strip())]
+        bad = []
+        for name, val in creds.items():
+            stripped = val.strip()
+            if (
+                not stripped
+                or placeholder_re.match(stripped)
+                or stripped.startswith("YOUR_")
+            ):
+                bad.append(name)
         if bad:
             raise AuthenticationError(
                 f"Credentials not configured: {', '.join(bad)}. "
@@ -203,24 +218,46 @@ class KiteAuthManager:
         # token, before issuing the request to that URL.
         from urllib.parse import urlparse, parse_qs, urljoin
 
+        # Hosts the OAuth flow legitimately redirects through. Anything
+        # off-list means our session cookies (and any token in the URL
+        # query) would be sent to an attacker-controlled host — refuse.
+        allowed_redirect_hosts = {"kite.zerodha.com", "kite.trade"}
+        callback_host = urlparse(self.redirect_url).hostname
+        if callback_host:
+            allowed_redirect_hosts.add(callback_host)
+
         resp = session.get(kite_login_url, allow_redirects=False)
         chain_urls = [kite_login_url]
         request_token = None
         for _ in range(10):  # safety cap on redirect depth
             if not (resp.is_redirect or resp.is_permanent_redirect):
                 break
-            location = urljoin(resp.url, resp.headers["Location"])
+            location_header = resp.headers.get("Location")
+            if not location_header:
+                break
+            location = urljoin(resp.url, location_header)
+            parsed = urlparse(location)
+            if parsed.scheme not in {"http", "https"} or (
+                parsed.hostname and parsed.hostname not in allowed_redirect_hosts
+            ):
+                raise AuthenticationError(
+                    "Refusing to follow redirect to unexpected host "
+                    f"{parsed.hostname!r} during Kite OAuth flow."
+                )
             chain_urls.append(location)
-            token = parse_qs(urlparse(location).query).get("request_token", [None])[0]
+            token = parse_qs(parsed.query).get("request_token", [None])[0]
             if token:
                 request_token = token
                 break
             resp = session.get(location, allow_redirects=False)
 
         if not request_token:
+            # Strip query strings — the chain may contain auth-bearing tokens
+            # we don't want landing in the system journal.
+            scrubbed = [u.split("?", 1)[0] for u in chain_urls]
             raise AuthenticationError(
                 "Could not extract request_token from redirect chain. "
-                f"Visited URLs: {chain_urls}"
+                f"Visited URLs (query stripped): {scrubbed}"
             )
 
         # ── Step 4: Exchange for access_token ──

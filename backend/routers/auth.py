@@ -74,9 +74,12 @@ def callback(
         raise HTTPException(status_code=400, detail="Kite login was cancelled or failed")
     try:
         session = kite_oauth.exchange_request_token(request_token)
-    except Exception as e:
-        logger.exception("Failed to exchange request_token: %s", e)
-        raise HTTPException(status_code=502, detail=f"Kite token exchange failed: {e}")
+    except Exception:
+        # KiteConnect TokenException messages can contain URL fragments
+        # and API-key prefixes — log full details server-side, return a
+        # generic message to the client.
+        logger.exception("Failed to exchange request_token")
+        raise HTTPException(status_code=502, detail="Kite token exchange failed")
 
     # Bounce the browser back to the SPA root. The ?login=success query
     # tells the SPA to invalidate its cached auth state and re-fetch the

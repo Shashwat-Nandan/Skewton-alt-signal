@@ -162,6 +162,13 @@ class TalebKarpathyStrategy(BaseStrategy):
     ):
         super().__init__(kite, config_path=config_path, mode=mode)
 
+        # Market-hours gate uses naive datetime.now() against 09:15-15:30,
+        # which silently breaks if TZ is not Asia/Kolkata (e.g. a redeploy
+        # that loses the systemd unit's `Environment=TZ=`). Log loud at
+        # boot so the issue is visible in journalctl rather than expressed
+        # as "strategy did nothing today".
+        self._warn_if_not_ist()
+
         self.greeks = GreeksEngine(risk_free_rate=0.065)
         self.risk = RiskAnalyzer(self.greeks)
         self.proposer = TradeProposer(kite, config_path)
@@ -842,6 +849,21 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     # ── Pre-trade checks, price fetching, risk filters (unchanged from v1) ──
 
+    @staticmethod
+    def _warn_if_not_ist() -> None:
+        """The market-hours gate is timezone-naive; log loudly at startup
+        if the system clock isn't on Asia/Kolkata so a TZ misconfig is
+        visible in the journal, not expressed as a no-trade day."""
+        tz_name = time.tzname[0] if time.tzname else "?"
+        if tz_name != "IST":
+            logger.error(
+                "Local timezone is %r, not IST. Market-hours gate "
+                "compares naive datetime.now() against 09:15-15:30 IST "
+                "and will be off. Set Environment=TZ=Asia/Kolkata in the "
+                "systemd unit.",
+                tz_name,
+            )
+
     def _pre_trade_checks(self):
         now = self._clock()
         market_open = now.replace(hour=9, minute=15, second=0)
@@ -1044,7 +1066,14 @@ class TalebKarpathyStrategy(BaseStrategy):
                 return df[df["expiry"] == nearest_expiry]
 
             return best_chain
-        except:
+        except Exception as e:
+            consecutive = getattr(self, "_consecutive_chain_failures", 0) + 1
+            self._consecutive_chain_failures = consecutive
+            log = logger.error if consecutive >= 5 else logger.warning
+            log(
+                "Options-chain fetch failed (consecutive=%d): %s",
+                consecutive, e,
+            )
             return pd.DataFrame()
 
     def _compute_iv_percentile(self, chain, spot):
@@ -1246,8 +1275,19 @@ class TalebKarpathyStrategy(BaseStrategy):
             try:
                 q = self.kite.quote([f"{self.exchange}:{pos.tradingsymbol}"])
                 pos.current_price = q[list(q.keys())[0]]["last_price"]
-            except:
-                pass
+            except Exception as e:
+                # Don't carry stale marks forward — clearing forces the
+                # downstream rehedge math to either get fresh quotes next
+                # tick or skip. Silent fallback to the last good price
+                # (the previous behaviour) was the 2026-05-04 incident class.
+                consecutive = getattr(self, "_consecutive_quote_failures", 0) + 1
+                self._consecutive_quote_failures = consecutive
+                log = logger.error if consecutive >= 5 else logger.warning
+                log(
+                    "Quote failed for %s (consecutive=%d): %s",
+                    pos.tradingsymbol, consecutive, e,
+                )
+                pos.current_price = pos.entry_price
         unrealized = sum((p.current_price - p.entry_price) * p.quantity * p.lot_size for p in self.state.positions)
         # Futures unrealized P/L: (current_spot - entry_vwap) * net_lots * lot_size
         if self.state.futures_lots != 0 and self.state.futures_entry_vwap > 0:

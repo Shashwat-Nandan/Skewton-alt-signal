@@ -8,10 +8,40 @@
 # Replace dashboard.example.com with your real hostname. For HTTPS,
 # add cert paths under listen 443 ssl; certbot's --nginx will edit
 # this file in place.
+#
+# This config expects a rate-limit zone defined at the http level —
+# typically /etc/nginx/conf.d/dashboard-ratelimit.conf:
+#     limit_req_zone $binary_remote_addr zone=dashboard_login:10m rate=10r/m;
 
 server {
     listen 80;
     server_name dashboard.example.com;
+
+    # ── Security headers ─────────────────────────────────────────
+    # HSTS only does anything on HTTPS; certbot's --nginx will keep these
+    # add_header lines in place when it converts listen to 443 ssl.
+    add_header Strict-Transport-Security "max-age=15552000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+
+    # ── Rate-limited login endpoint ──────────────────────────────
+    # `location = /session/login` matches before the regex below so the
+    # rate-limit applies just to this path. burst=5 + nodelay = a real
+    # operator can fast-retry a typo, but a brute-force attempt eats the
+    # budget within seconds and gets 429s.
+    location = /session/login {
+        limit_req zone=dashboard_login burst=5 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_read_timeout 60s;
+    }
 
     # Backend API — six prefixes only. Anything else falls through
     # to the SPA. Keep this list in sync with the routers registered in
