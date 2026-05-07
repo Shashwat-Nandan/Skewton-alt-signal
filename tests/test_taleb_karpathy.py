@@ -7,6 +7,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 from strategies.taleb_karpathy import (
     TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
+    _apply_best_params,
 )
 from trade_proposer import TradeProposal
 from greeks_engine import OptionContract
@@ -882,6 +883,97 @@ class TestPreEntryVegaGate:
 
         assert result  # proposals survived the vega gate
         mock_hedger.risk.stability_test.assert_called_once()
+
+
+class TestApplyBestParams:
+    """_apply_best_params overlays autoresearch output onto runtime tunable params."""
+
+    def test_missing_file_no_overlay(self, tmp_path):
+        params = {"a": 1, "b": 2}
+        applied, ignored = _apply_best_params(params, tmp_path / "absent.json")
+        assert applied == 0
+        assert ignored == []
+        assert params == {"a": 1, "b": 2}
+
+    def test_overlays_known_keys(self, tmp_path):
+        import json
+        path = tmp_path / "best.json"
+        path.write_text(json.dumps({"best_params": {"a": 99, "b": 42}}))
+        params = {"a": 1, "b": 2, "c": 3}
+        applied, ignored = _apply_best_params(params, path)
+        assert applied == 2
+        assert ignored == []
+        assert params == {"a": 99, "b": 42, "c": 3}
+
+    def test_unknown_keys_ignored_not_added(self, tmp_path):
+        import json
+        # Stale autoresearch outputs may contain renamed/removed knobs.
+        # They must not pollute the tunable surface.
+        path = tmp_path / "best.json"
+        path.write_text(json.dumps({"best_params": {"a": 99, "stale_param": 7}}))
+        params = {"a": 1, "b": 2}
+        applied, ignored = _apply_best_params(params, path)
+        assert applied == 1
+        assert ignored == ["stale_param"]
+        assert params == {"a": 99, "b": 2}
+        assert "stale_param" not in params
+
+    def test_malformed_json_no_overlay(self, tmp_path):
+        path = tmp_path / "best.json"
+        path.write_text("{not valid json")
+        params = {"a": 1}
+        applied, ignored = _apply_best_params(params, path)
+        assert applied == 0
+        assert params == {"a": 1}
+
+    def test_missing_best_params_object_no_overlay(self, tmp_path):
+        import json
+        path = tmp_path / "best.json"
+        # File is valid JSON but lacks the expected wrapper.
+        path.write_text(json.dumps({"timestamp": "2026-04-18", "metric": 10815}))
+        params = {"a": 1}
+        applied, ignored = _apply_best_params(params, path)
+        assert applied == 0
+        assert params == {"a": 1}
+
+
+class TestActivePositionGuard:
+    """scan_and_propose must not stack new entries on top of an open book.
+
+    Without this guard, every tick that passes IV/RV/alpha/vega/MC gates
+    re-enters and execute_proposals nets onto the existing legs, silently
+    blowing past position_size_pct (observed live on 2026-05-06: 22 entries
+    accumulated to 44 lots before max_positions tripped).
+    """
+
+    @pytest.fixture
+    def mock_hedger(self):
+        kite = MagicMock()
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.kite = kite
+        hedger.state = HedgeState()
+        hedger.mode = "paper"
+        hedger._pre_trade_checks = MagicMock(return_value=True)
+        hedger._get_spot_price = MagicMock(return_value=22000.0)
+        hedger.proposer = MagicMock()
+        hedger.greeks = MagicMock()
+        hedger.risk = MagicMock()
+        return hedger
+
+    def test_open_book_skips_entry_pipeline(self, mock_hedger):
+        mock_hedger.state.positions.append(OptionContract(
+            tradingsymbol="NIFTY26403CE22000", instrument_token=1,
+            strike=22000, expiry="2026-04-03", option_type="CE",
+            lot_size=25, quantity=2, entry_price=300, current_price=300, iv=0.15,
+        ))
+
+        result = mock_hedger.scan_and_propose()
+
+        assert result == []
+        # Downstream pipeline must not be touched while a position is open.
+        mock_hedger._pre_trade_checks.assert_not_called()
+        mock_hedger._get_spot_price.assert_not_called()
+        mock_hedger.proposer.propose_delta_neutral.assert_not_called()
 
 
 class TestMCSizingSubLotGate:

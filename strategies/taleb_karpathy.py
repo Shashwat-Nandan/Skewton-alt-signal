@@ -110,6 +110,39 @@ def estimate_transaction_cost(
     return brokerage + stt + exchange_charges + sebi + gst + stamp + slippage
 
 
+def _apply_best_params(tunable_params: Dict, path: Path) -> Tuple[int, List[str]]:
+    """Overlay autoresearch output onto an existing tunable_params dict.
+
+    Reads ``{"best_params": {...}}`` from ``path`` and assigns each value to
+    matching keys in ``tunable_params`` in place. Unknown keys are skipped
+    rather than added — the dict's keys define the permitted surface, and
+    a stale autoresearch run with renamed params should not silently inject
+    them. Returns ``(applied_count, ignored_keys)``. Missing or malformed
+    files yield ``(0, [])`` and a warning so a misplaced file does not
+    silently fall back to config defaults.
+    """
+    if not path.exists():
+        return 0, []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("best_params at %s could not be read: %s — using config defaults", path, e)
+        return 0, []
+    best = data.get("best_params") if isinstance(data, dict) else None
+    if not isinstance(best, dict):
+        logger.warning("best_params at %s missing 'best_params' object — using config defaults", path)
+        return 0, []
+    applied = 0
+    ignored: List[str] = []
+    for k, v in best.items():
+        if k in tunable_params:
+            tunable_params[k] = v
+            applied += 1
+        else:
+            ignored.append(k)
+    return applied, ignored
+
+
 @dataclass
 class HedgeState:
     """Current state — enhanced with bleed and risk tracking."""
@@ -197,6 +230,21 @@ class TalebKarpathyStrategy(BaseStrategy):
             "rv_window_days": self.config.getfloat("strategy", "rv_window_days", fallback=5.0),
         }
 
+        # Overlay autoresearch optimum on top of config defaults so the
+        # output of run_autoresearch.py actually reaches live trading.
+        # Disable with [strategy] use_best_params = false in config.ini.
+        if self.config.getboolean("strategy", "use_best_params", fallback=True):
+            bp_path = Path(self.config.get(
+                "strategy", "best_params_path", fallback="best_params.json",
+            ))
+            if not bp_path.is_absolute():
+                bp_path = Path(__file__).resolve().parent.parent / bp_path
+            applied, ignored = _apply_best_params(self.tunable_params, bp_path)
+            if applied:
+                logger.info("Overlaid %d tunable params from %s", applied, bp_path)
+            if ignored:
+                logger.debug("best_params keys not in tunable schema (ignored): %s", ignored)
+
         # ── Immutable safety rails ──
         self.immutable_params = {
             "max_daily_loss_pct": self.config.getfloat("strategy", "max_daily_loss_pct"),
@@ -241,6 +289,13 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         """Full scan → filter → stability test → MC sizing → propose cycle."""
+        # One straddle at a time: rest of the engine (entry_time, max_holding,
+        # attribution, exit gates) is written for a single active trade.
+        # Without this guard, a tick that passes all entry gates while a
+        # position is open stacks fills onto existing legs and silently blows
+        # past position_size_pct.
+        if self.state.positions:
+            return []
         if not self._pre_trade_checks():
             return []
 
