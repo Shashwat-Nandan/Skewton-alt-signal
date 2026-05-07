@@ -1,0 +1,29 @@
+# Top-level runtime dependencies. Edit this file when adding/removing a
+# direct dep, then regenerate `requirements.lock` with:
+#
+#   uv pip compile requirements.in \
+#     --generate-hashes --output-file requirements.lock \
+#     --python-version 3.11
+#
+# Do not pin versions here — the lockfile is the source of pinned truth.
+
+# Web/backend
+fastapi
+itsdangerous            # SessionMiddleware (Starlette) requires this
+pydantic
+pydantic-settings
+python-dotenv
+starlette
+uvicorn                 # ExecStart entrypoint in dashboard-backend.service
+
+# Broker integration
+kiteconnect
+
+# Numerics / analytics
+numpy
+pandas
+scipy
+statsmodels
+
+# Auth
+pyotp

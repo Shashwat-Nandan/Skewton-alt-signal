@@ -35,7 +35,12 @@ else
     git merge --ff-only origin/main
 fi
 
-# 4. Rebuild frontend only if frontend/ changed since last deploy marker
+# 4. Lockfile drift check. Catches "someone edited requirements*.in
+#    without regenerating the .lock" before we touch the running venv.
+echo "Checking dependency lockfiles ..."
+"$PROJECT_DIR/deploy/check_lockfile.sh"
+
+# 5. Rebuild frontend only if frontend/ changed since last deploy marker
 #    (or always — the build is ~30s and idempotent, so we don't bother
 #    with a marker)
 echo "Rebuilding frontend ..."
@@ -43,7 +48,7 @@ cd "$PROJECT_DIR/frontend"
 npm ci --no-audit --no-fund
 npm run build
 
-# 5. Restart backend so it picks up any code or .env changes
+# 6. Restart backend so it picks up any code or .env changes
 echo "Restarting $BACKEND_UNIT ..."
 systemctl restart "$BACKEND_UNIT"
 systemctl is-active --quiet "$BACKEND_UNIT" || {
@@ -52,7 +57,7 @@ systemctl is-active --quiet "$BACKEND_UNIT" || {
     exit 2
 }
 
-# 6. End-to-end smoke. Always probes 127.0.0.1:8000 (catches backend
+# 7. End-to-end smoke. Always probes 127.0.0.1:8000 (catches backend
 #    bugs); also probes $SMOKE_PUBLIC_URL if set (catches nginx prefix
 #    drift — TestClient cannot see this layer). A failure here means
 #    something the SPA depends on is broken in production.

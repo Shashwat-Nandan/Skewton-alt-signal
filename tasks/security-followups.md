@@ -34,25 +34,15 @@ Python-level RCE in any dependency is still root.
 
 **Risk if delayed:** unchanged — RCE on any router/SDK upgrade lands as root.
 
-### 2. Pin Python dependencies with hashes (Medium)
+### 2. Pin Python dependencies with hashes (Medium) — **CLOSED 2026-05-07**
 
-No `requirements.txt`, `pyproject.toml`, or `Pipfile` in the repo. The venv
-content is whatever `pip install` produced over time. Two stale
-`.cpython-38.pyc` files in `__pycache__/` confirm interpreter churn.
-
-**Approach:**
-- `python -m pip freeze > requirements.txt` from the working venv, review
-  for anything obviously wrong, commit it.
-- Re-install with `pip install --require-hashes -r requirements.lock`
-  (use `pip-compile --generate-hashes` from `pip-tools` to produce the
-  hashed lockfile). Two-file split: `requirements.txt` (top-level) and
-  `requirements.lock` (pinned with hashes).
-- Add a CI check that `pip install --require-hashes -r requirements.lock`
-  in a clean container resolves identically.
-- Delete `__pycache__/*.cpython-38.pyc`.
-
-**Risk if delayed:** future supply-chain compromise of any transitive
-dep executes as root (see #1 — these compound).
+Shipped: `requirements.in` + `requirements.lock` (hashed) and the
+matching `-dev` pair, both generated with `uv pip compile`. Drift gated
+two ways: `.github/workflows/lockfile.yml` on PR and
+`deploy/check_lockfile.sh` from `redeploy.sh` for out-of-band deploys.
+Stale 3.8 `.pyc` files removed. Reproducing-the-venv docs in root
+`README.md`. See `tasks/todo.md` "Pin Python deps with hashes" for the
+full review.
 
 ### 3. Per-tick max-lots cap on rehedge proposals (Medium)
 

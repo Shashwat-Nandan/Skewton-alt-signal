@@ -25,12 +25,11 @@ Production is at <https://dashboard.propelytics.in>.
 ## Quick start
 
 ```bash
-# 1. Clone + venv + deps
+# 1. Clone + venv + deps (deps are pinned with sha256 hashes — see "Reproducing the venv" below)
 git clone git@github.com:Shashwat-Nandan/taleb-karpathy-kite.git
 cd taleb-karpathy-kite
 python3.11 -m venv .venv
-.venv/bin/pip install fastapi uvicorn 'pydantic>=2' pydantic-settings \
-                     kiteconnect numpy pandas scipy pyotp python-dotenv
+.venv/bin/pip install --require-hashes -r requirements.lock -r requirements-dev.lock
 
 # 2. Secrets — fill credentials, lock perms
 cp config_template.ini config.ini && chmod 600 config.ini
@@ -158,6 +157,56 @@ host — use `git worktree add` if you need to test something there.
 
 The suite covers each strategy, the Greeks engine, the risk analyser,
 the dashboard API, and the SQLite persistence layer.
+
+---
+
+## Reproducing the venv
+
+Python deps are split into two layers:
+
+- `requirements.in` / `requirements.lock` — runtime (entry points,
+  strategies, backend).
+- `requirements-dev.in` / `requirements-dev.lock` — test-only
+  (`pytest`, `httpx`).
+
+The `.lock` files are the source of truth: every line carries a `==`
+pin and one or more `--hash=sha256:…` artifact hashes. `pip` refuses
+to install anything not in the lock when invoked with
+`--require-hashes`.
+
+Reproduce the venv from scratch:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install --require-hashes -r requirements.lock -r requirements-dev.lock
+```
+
+Bump or add a dep:
+
+```bash
+$EDITOR requirements.in            # or requirements-dev.in
+uv pip compile requirements.in \
+    --generate-hashes --output-file requirements.lock \
+    --python-version 3.11
+uv pip compile requirements-dev.in \
+    --generate-hashes --output-file requirements-dev.lock \
+    --python-version 3.11 --constraint requirements.lock
+.venv/bin/pip install --require-hashes -r requirements.lock -r requirements-dev.lock
+.venv/bin/pytest tests/ -q
+git add requirements*.in requirements*.lock && git commit
+```
+
+Drift between `.in` and `.lock` is enforced two ways:
+
+- `.github/workflows/lockfile.yml` — runs on PR. Regenerates both
+  locks and `git diff --exit-code`s, and re-installs from the lock
+  with `--require-hashes` in a clean container.
+- `deploy/check_lockfile.sh` — runs from `redeploy.sh` before the
+  service restart, so a deploy from a side branch that bypasses CI
+  still can't ship a drifted lock.
+
+Both checks share the same uv-based regeneration, so they fail
+identically.
 
 ---
 

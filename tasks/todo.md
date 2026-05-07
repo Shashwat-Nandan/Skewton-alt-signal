@@ -188,3 +188,162 @@ Key design choices:
 - **Two base URLs, not one**: `127.0.0.1:8000` catches backend regressions; `$SMOKE_PUBLIC_URL` catches nginx whitelist drift. Same probe code, two layers.
 - **Auth-gated and path-param routes excluded**: `tests/test_backend.py` already exercises them with mocks. Smoke is for "is the route reachable from a real HTTP client at all", not for testing logic.
 - **Allow-503 list, kept tight**: only `/pair-candidates` (CSV may legitimately be missing). Anything else returning 503 from a fresh deploy is genuinely broken.
+
+---
+
+# Pin Python deps with hashes (security follow-up #2)
+
+## Motivation
+
+Per `tasks/security-followups.md` #2: no `requirements.txt`, `pyproject.toml`,
+or `Pipfile` in the repo. The project venv at `.venv/` (Python 3.11.15, 53
+packages) is whatever `pip install` produced over time. There is no
+reproducible way to rebuild it, and a future supply-chain compromise of any
+transitive dep — including the ones the operator never explicitly installed
+— executes with the same blast radius as the running process. Hash-pinning
+turns "trust whoever publishes to PyPI tomorrow" into "trust exactly the
+artifact bytes we audited today."
+
+Two stale `.cpython-38.pyc` files in `__pycache__/` (`greeks_engine`,
+`market_profile`, `risk_analyzer`, `trade_proposer`) confirm earlier 3.8 →
+3.11 churn — pinning is also the right time to clear those.
+
+## Approach
+
+Use **`uv pip compile --generate-hashes`** rather than `pip-tools`. `uv` is
+already on the box (`/root/.local/bin/uv`); `pip-tools` is not installed
+anywhere. Output format and `--require-hashes` semantics on the install
+side are identical, so this is a pure plumbing choice. No new dep added
+to the project venv.
+
+Two-file split:
+- `requirements.in` — top-level deps only, hand-written, no pins.
+- `requirements.lock` — full transitive closure with `==` pins and
+  `--hash=sha256:…` per artifact. Generated, not edited.
+
+## Plan
+
+- [x] **Manifest** — `requirements.in` (13 runtime deps) and
+  `requirements-dev.in` (`pytest`, `httpx`).
+- [x] **Lockfile** — `requirements.lock` (49 packages) and
+  `requirements-dev.lock` (10 packages, constrained against the
+  runtime lock). Generated with `uv pip compile --generate-hashes
+  --python-version 3.11`.
+- [x] **Verify install** — throwaway uv venv installed cleanly with
+  `--require-hashes`; 241 pytest tests passed against it.
+- [x] **CI check** — both `.github/workflows/lockfile.yml` (regen +
+  `git diff --exit-code` + clean-venv install) **and**
+  `deploy/check_lockfile.sh` (same regen-and-diff logic, called from
+  `redeploy.sh` step 4 before the service restart). Drift demo:
+  appending `requests` to `requirements.in` made the script exit 11
+  with a precise diff; restoring brought it back to clean.
+- [x] **Stale artifacts** — four `__pycache__/*.cpython-38.pyc` files
+  removed; `.gitignore` already excluded `*.pyc` and `__pycache__/`.
+- [x] **Docs** — root `README.md` Quick start now points at
+  `--require-hashes` and there's a new "Reproducing the venv" section
+  with the install + regen commands and a paragraph on the two-layer
+  drift enforcement.
+- [x] **Verify** — `pytest tests/` 241 passed in the existing project
+  venv. Top-level imports + `starlette.middleware.sessions`,
+  `statsmodels.tsa.stattools`, `scipy.stats` all OK.
+
+## Review
+
+Files added:
+
+- `requirements.in`, `requirements-dev.in` — top-level manifests, no
+  pins. Source of truth for "what does the project actually import?"
+- `requirements.lock` (~63KB, 46 packages, fully hashed),
+  `requirements-dev.lock` (~3KB, 10 packages, constrained against the
+  runtime lock so shared transitives like `anyio` / `idna` /
+  `typing-extensions` can't drift between layers).
+- `.github/workflows/lockfile.yml` — drift gate on PR. Triggers only on
+  changes to `requirements*.{in,lock}` or itself. Two assertions:
+  regen + `git diff --exit-code`, and a clean-venv install with
+  `--require-hashes`.
+- `deploy/check_lockfile.sh` — same drift logic as the CI workflow,
+  invoked from `redeploy.sh` step 4. Exists so an out-of-band deploy
+  from a side branch (which would skip the PR-gated workflow) still
+  can't ship a drifted lock. Exit 10 if `uv` is missing, exit 11 on
+  drift.
+
+Files changed:
+
+- `deploy/redeploy.sh` — new step 4 (lockfile drift check) inserted
+  between the FF and the frontend rebuild. Comment numbers shifted.
+- `README.md` — Quick-start `pip install …` line replaced with
+  `--require-hashes` install. New "Reproducing the venv" section
+  documents the two-file split, the install command, the regen
+  command, and the two-layer drift enforcement.
+
+Files removed:
+
+- `__pycache__/greeks_engine.cpython-38.pyc`,
+  `__pycache__/market_profile.cpython-38.pyc`,
+  `__pycache__/risk_analyzer.cpython-38.pyc`,
+  `__pycache__/trade_proposer.cpython-38.pyc` — stale 3.8 bytecode left
+  over from the 3.8 → 3.11 migration. Already gitignored, so this is a
+  filesystem cleanup, not a tracked change.
+
+## Key design choices
+
+- **`uv` over `pip-tools`.** `uv` was already on `/root/.local/bin/uv`;
+  `pip-tools` was not. `uv pip compile --generate-hashes` produces the
+  same `--require-hashes`-compatible output with the same `==` pins
+  and `--hash=sha256:…` annotations. No new dev dep added to the
+  project.
+- **Two-file split (.in / .lock), not one.** A single `requirements.txt`
+  produced by `pip freeze` mixes intentional deps with transitives,
+  giving no signal about "what does this project actually need?"
+  Splitting makes bumps explicit: edit `.in`, regen `.lock`. The
+  reviewer sees exactly which line you intended to change.
+- **Constrained dev lock (`-c requirements.lock`).** Without this,
+  `pytest`-side deps like `anyio` could resolve to a different version
+  than the runtime side, even though both layers install into the same
+  venv. The constraint pins shared transitives to whatever the runtime
+  lock decided.
+- **Belt-and-braces drift check (workflow + redeploy script).** PR
+  gate alone leaves a hole: an admin can hot-fix on the VPS by
+  cherry-picking onto a non-`main` branch and running `redeploy.sh`,
+  bypassing GitHub Actions. The redeploy-side script closes that.
+  Costs ~2s per deploy; saves a "lock looked fine in PR but the deployed
+  branch had a drifted lock" incident.
+- **`mktemp -d` + cd, not output-to-tmpfile.** First version of
+  `check_lockfile.sh` failed clean runs because uv embeds the
+  `--output-file` path in the autogen header. Using a tmp directory
+  with the canonical filenames inside it produces byte-identical
+  output that diffs cleanly.
+
+## Out of scope (deliberate)
+
+- Migrating to `pyproject.toml` / PEP 621. Pure plumbing benefit; same
+  lockfile semantics and same threat model whether the source-of-truth
+  manifest is `requirements.in` or `[project.dependencies]`. Defer
+  unless we adopt a build backend.
+- Pinning the Python interpreter version. `pyvenv.cfg` records 3.11.15
+  and the lockfile is generated with `--python-version 3.11`. A real
+  Python upgrade is its own decision separate from dep hygiene.
+- Frontend deps. `package-lock.json` is already committed and already
+  hash-locks every npm artifact via `integrity:` fields. Same threat
+  model, different ecosystem, already solved.
+- Bumping the existing project venv to match the lockfile (lock has
+  `cryptography 48.0.0` / `pydantic 2.13.4` / `pyOpenSSL 26.2.0`; live
+  venv is one minor older on each). `pip install --require-hashes
+  -r requirements.lock -r requirements-dev.lock` against the live venv
+  on this dev box would in-place upgrade those three. Tests already
+  pass on the current versions and the lock; the actual upgrade is a
+  one-command operator action and it's safe to defer to the next
+  redeploy. Listed here so it doesn't get lost.
+
+## Out of scope (deliberate)
+
+- Migrating to `pyproject.toml` / `[project.dependencies]`. Pure plumbing
+  benefit; does not change the threat model. `requirements.in` is the
+  same source of truth.
+- Pinning the system Python interpreter. The repo's venv is created from
+  uv-managed Python 3.11.15 (per `pyvenv.cfg`); a Python upgrade is its
+  own decision separate from dep hygiene.
+- Pinning frontend (npm) deps. `package-lock.json` already does this and
+  is committed. Out of this follow-up's scope.
+- Removing `anthropic` import from `claude_example.py`. That file is
+  untracked (a demo) and not part of the deployed surface.

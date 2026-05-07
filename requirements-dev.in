@@ -1,0 +1,12 @@
+# Test-only deps. Constrained against requirements.lock so dev resolution
+# never drifts shared transitives away from runtime versions.
+#
+# Regenerate with:
+#
+#   uv pip compile requirements-dev.in \
+#     --generate-hashes --output-file requirements-dev.lock \
+#     --python-version 3.11 \
+#     --constraint requirements.lock
+
+pytest
+httpx                   # required by fastapi.testclient.TestClient
