@@ -325,41 +325,59 @@ class PairTradingStrategy(BaseStrategy):
         """
         LONG_SPREAD  → buy A, sell hedge-equivalent B (expect spread to rise)
         SHORT_SPREAD → sell A, buy hedge-equivalent B (expect spread to fall)
-        Hedge is sized so leg-B notional ≈ |hedge_ratio| × leg-A notional.
-        If max_leg_notional is set, scale both legs down to fit.
+
+        Sizing follows Varsity Trading Systems Ch. 13/14 (share-count β-weighted):
+        spread = A − β·B is hedged by qty_B_shares = |β|·qty_A_shares. We anchor
+        on `lots_per_leg` lots of A; if that would round B below 1 lot
+        (Varsity Ch. 14: HDFC β=0.79 vs ICICI lot 2750), we anchor on B and
+        scale A up to preserve the share-count ratio.
+
+        If max_leg_notional is set, both legs scale down proportionally so the
+        hedge ratio is preserved.
         """
         fut_a = self._resolve_futures(self.symbol_a)
         fut_b = self._resolve_futures(self.symbol_b)
         if not (fut_a and fut_b):
             return []
 
-        # Refuse the entry if even 1 lot of the larger leg would bust the cap —
-        # we can't go fractional in lots, so silently oversizing is the wrong call.
+        # Refuse if 1 lot of EITHER leg busts the cap — we can't size below
+        # 1 lot, so the cap can't be honoured under any anchoring.
         if self.max_leg_notional:
-            one_lot_a = fut_a["lot_size"] * prices[self.symbol_a]
-            min_max_natural = one_lot_a * max(1.0, abs(self.hedge_ratio))
-            if min_max_natural > self.max_leg_notional:
+            one_lot_a_notional = fut_a["lot_size"] * prices[self.symbol_a]
+            one_lot_b_notional = fut_b["lot_size"] * prices[self.symbol_b]
+            if max(one_lot_a_notional, one_lot_b_notional) > self.max_leg_notional:
                 logger.warning(
-                    "%s/%s: 1-lot pair would deploy ₹%.0f, exceeds cap ₹%.0f — skipping entry",
-                    self.symbol_a, self.symbol_b, min_max_natural, self.max_leg_notional,
+                    "%s/%s: 1 lot of the larger leg deploys ₹%.0f, exceeds cap ₹%.0f — skipping entry",
+                    self.symbol_a, self.symbol_b,
+                    max(one_lot_a_notional, one_lot_b_notional),
+                    self.max_leg_notional,
                 )
                 return []
 
+        # Share-count β-weighted sizing (Varsity Ch. 13/14).
+        beta_abs = abs(self.hedge_ratio)
         qty_a = self.lots_per_leg
-        notional_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
-        target_notional_b = abs(self.hedge_ratio) * notional_a
-        per_lot_b = fut_b["lot_size"] * prices[self.symbol_b]
+        target_b_shares = beta_abs * qty_a * fut_a["lot_size"]
+        qty_b = round(target_b_shares / fut_b["lot_size"])
+        if qty_b < 1:
+            # Anchoring on A would put B below 1 lot — flip the anchor to B
+            # and scale A up so the realized ratio still tracks β. This is
+            # the Varsity HDFC/ICICI case (small β, big lot mismatch).
+            qty_b = self.lots_per_leg
+            target_a_shares = qty_b * fut_b["lot_size"] / beta_abs
+            qty_a = max(round(target_a_shares / fut_a["lot_size"]), 1)
 
-        # Apply the cap by scaling qty_a down (preserves hedge ratio).
+        notional_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
+        notional_b = qty_b * fut_b["lot_size"] * prices[self.symbol_b]
+
+        # Apply per-leg cap by scaling BOTH legs down proportionally.
         if self.max_leg_notional:
-            max_natural = max(notional_a, target_notional_b)
+            max_natural = max(notional_a, notional_b)
             if max_natural > self.max_leg_notional:
                 scale = self.max_leg_notional / max_natural
                 qty_a = max(int(round(qty_a * scale)), 1)
-                notional_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
-                target_notional_b = abs(self.hedge_ratio) * notional_a
+                qty_b = max(int(round(qty_b * scale)), 1)
 
-        qty_b = max(int(round(target_notional_b / per_lot_b)), 1)
         # Sign convention: spread = A - β·B
         # LONG_SPREAD wants spread to rise → +A, sign of -β on B
         # SHORT_SPREAD wants spread to fall → -A, sign of +β on B
