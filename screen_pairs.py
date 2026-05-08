@@ -114,10 +114,27 @@ def load_front_month_panel(
     return panel
 
 
+def _fit(y: np.ndarray, x: np.ndarray):
+    """OLS y on x with intercept. Returns the fitted statsmodels result."""
+    return OLS(y, add_constant(x)).fit()
+
+
 def _hedge_ratio(y: np.ndarray, x: np.ndarray) -> float:
     """OLS slope of y on x with intercept (hedge ratio for the long leg)."""
-    model = OLS(y, add_constant(x)).fit()
-    return float(model.params[1])
+    return float(_fit(y, x).params[1])
+
+
+def _error_ratio(fit) -> float:
+    """Varsity Ch. 10 Error Ratio = SE(intercept) / SE(regression).
+    Lower ER → smaller intercept relative to residual scale → the y/x assignment
+    where the regression is doing more of the explanatory work and the
+    intercept is doing less. Used to pick which side is X vs Y when both
+    directions are statistically plausible."""
+    se_intercept = float(fit.bse[0])      # intercept is at index 0 (add_constant prepends)
+    se_regression = float(np.sqrt(fit.scale))
+    if se_regression == 0:
+        return float("inf")
+    return se_intercept / se_regression
 
 
 def _half_life(spread: np.ndarray) -> float:
@@ -167,9 +184,25 @@ def screen_pairs(
 
     skipped_beta = 0
     results = []
-    for a, b in combinations(symbols, 2):
-        if corr.loc[a, b] < min_correlation:
+    for raw_a, raw_b in combinations(symbols, 2):
+        if corr.loc[raw_a, raw_b] < min_correlation:
             continue
+        # Varsity Ch. 10: regress both directions and keep the one with the
+        # lower Error Ratio = SE(intercept)/SE(regression). Without this step,
+        # iterating combinations() locks in symbol-alphabetical order — which
+        # is statistically arbitrary — and we lose the cleaner residual the
+        # other direction would have produced.
+        series_a = panel[raw_a].values
+        series_b = panel[raw_b].values
+        fit_ab = _fit(series_a, series_b)   # y=raw_a on x=raw_b
+        fit_ba = _fit(series_b, series_a)   # y=raw_b on x=raw_a
+        er_ab = _error_ratio(fit_ab)
+        er_ba = _error_ratio(fit_ba)
+        if er_ab <= er_ba:
+            a, b, fit, error_ratio = raw_a, raw_b, fit_ab, er_ab
+        else:
+            a, b, fit, error_ratio = raw_b, raw_a, fit_ba, er_ba
+
         ya = panel[a].values
         yb = panel[b].values
         try:
@@ -180,7 +213,7 @@ def screen_pairs(
         if p_value > p_threshold:
             continue
 
-        beta = _hedge_ratio(ya, yb)
+        beta = float(fit.params[1])
         if not min_hedge_ratio <= abs(beta) <= max_hedge_ratio:
             skipped_beta += 1
             logger.debug(
@@ -211,6 +244,8 @@ def screen_pairs(
             "symbol_b": b,
             "correlation": float(corr.loc[a, b]),
             "hedge_ratio": beta,
+            "intercept": float(fit.params[0]),
+            "error_ratio": error_ratio,
             "coint_pvalue": float(p_value),
             "half_life_days": half_life,
             "spread_vol_pct": spread_vol_pct,
@@ -299,16 +334,17 @@ def main():
     print(f"Top {min(args.top, len(df))} pair candidates "
           f"(of {len(df)} total passing filters)")
     print("=" * 100)
-    print(f"{'#':<3} {'Symbol A':<14} {'Symbol B':<14} {'corr':>6} "
-          f"{'β':>8} {'p-val':>8} {'half-life':>11} {'vol%':>7} {'score':>7}")
-    print("-" * 100)
+    print(f"{'#':<3} {'Symbol A (Y)':<14} {'Symbol B (X)':<14} {'corr':>6} "
+          f"{'β':>8} {'ER':>6} {'p-val':>8} {'half-life':>11} {'vol%':>7} {'score':>7}")
+    print("-" * 110)
     for i, row in df.head(args.top).iterrows():
         hl = f"{row['half_life_days']:.1f}d" if np.isfinite(row['half_life_days']) else "  inf "
         print(f"{i+1:<3} {row['symbol_a']:<14} {row['symbol_b']:<14} "
               f"{row['correlation']:>6.3f} {row['hedge_ratio']:>8.3f} "
+              f"{row['error_ratio']:>6.3f} "
               f"{row['coint_pvalue']:>8.4f} {hl:>11} "
               f"{row['spread_vol_pct']:>6.2f}% {row['rank_score']:>7.3f}")
-    print("=" * 100)
+    print("=" * 110)
     print(f"Saved to: {args.output}")
     return 0
 
