@@ -347,3 +347,60 @@ Files removed:
   is committed. Out of this follow-up's scope.
 - Removing `anthropic` import from `claude_example.py`. That file is
   untracked (a demo) and not part of the deployed surface.
+
+---
+
+# Hedge silently no-op — fix sizing/threshold mismatch (2026-05-08)
+
+## Motivation
+
+Today's paper session (`logs/paper-2026-05-07.log`) crossed the rehedge gate
+~150 times and executed exactly zero futures hedges. The straddle held flat
+all day, bleeding theta with no gamma capture (net −₹1,358). Root cause: the
+gate is in fractional lots (`rehedge_delta_threshold = 0.15`), and the
+hard-hedge sizer is `lots = round(delta/lot_size)`. NIFTY lot_size is 65
+post-restructuring, so any drift below 0.5 lots (= 32.5 discrete delta) rounds
+to 0 and `_generate_hard_delta_proposals` returns `[]` silently. Today's peak
+drift was 0.33 lots — never close.
+
+## Plan
+
+- [x] **Visibility** — `_generate_hard_delta_proposals` now logs when sizing
+  rounds to 0 lots so the failure mode is grep-able.
+- [x] **Threshold floor** — `best_params.json` and `config.ini` default
+  `rehedge_delta_threshold` raised 0.15 → 0.6. 0.6 is clear of Python's
+  banker's-rounding tie at exactly 0.5.
+- [x] **Search space** — `autoresearch_loop.TUNABLE_RANGES` widened from
+  (0.05, 0.30) to (0.5, 1.5) so the optimizer can no longer pick a value
+  below the executable floor.
+- [x] **Synthetic lot size** — `backtest.generate_synthetic_data` now
+  defaults `lot_size` from a per-underlying dict (NIFTY=65, BANKNIFTY=15,
+  FINNIFTY=25) instead of a hard-coded 25, so the optimizer's synthetic
+  fallback path sees realistic rounding.
+- [x] **Tests** — `pytest tests/test_taleb_karpathy.py tests/test_backtest.py`
+  passes (75 tests).
+- [x] **Re-sweep** — `run_autoresearch.py` running in background against
+  `data_cache/NIFTY_20260407_20260507.csv` (20 intraday days), 30
+  experiments × 3 cycles, metric=net_pnl, seed=42. Pre-resweep
+  `best_params.json` snapshotted to `best_params.pre-resweep-2026-05-07.json`.
+- [x] **Lesson** — captured in `tasks/lessons.md` ("Threshold gates in
+  continuous units, executors in integer lots").
+
+## Review
+
+Code change is small (one log line + one threshold value + one tuple + one
+default-dict). The leverage comes from making the silent failure mode loud:
+any future lot-size change or threshold drift now lights up a log line
+immediately rather than producing a flat day.
+
+## Out of scope (deliberate)
+
+- Switching the optimizer's gamma-scalp metric from estimated `0.5·γ·dS²`
+  to realized hedge P/L. The current metric scored a "hedge nothing" param
+  set as healthy — that's a real blind spot, but it's an autoresearch
+  refactor, not a hotfix.
+- Backfilling a smoke test that asserts a hedge fires when `delta_in_lots
+  > threshold`. Worth doing; queued behind the resweep.
+- Reconsidering whether 0.6 lots is the right *operational* threshold (vs.
+  defending against the rounding edge). The resweep will pick a sweep-
+  optimal value within (0.5, 1.5) and overwrite this baseline.

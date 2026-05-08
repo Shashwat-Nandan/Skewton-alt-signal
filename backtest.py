@@ -157,13 +157,16 @@ class MockKite:
         return {"user_name": "Backtest", "user_id": "BT0000", "exchanges": ["NSE", "NFO"], "products": ["NRML"]}
 
 
+_DEFAULT_LOT_SIZE = {"NIFTY": 65, "BANKNIFTY": 15, "FINNIFTY": 25}
+
+
 def generate_synthetic_data(
     underlying: str = "NIFTY",
     spot_start: float = 22000,
     days: int = 30,
     ticks_per_day: int = 12,
     daily_vol: float = 0.012,
-    lot_size: int = 25,
+    lot_size: int | None = None,
 ) -> pd.DataFrame:
     """
     Generate synthetic historical data for backtesting.
@@ -172,6 +175,8 @@ def generate_synthetic_data(
     engine = GreeksEngine(risk_free_rate=0.065)
     rows = []
     spot = spot_start
+    if lot_size is None:
+        lot_size = _DEFAULT_LOT_SIZE.get(underlying, 25)
     start_date = datetime(2026, 3, 1, 9, 15)
     expiry_date = start_date + timedelta(days=days + 7)
     expiry_str = expiry_date.strftime("%Y-%m-%d")

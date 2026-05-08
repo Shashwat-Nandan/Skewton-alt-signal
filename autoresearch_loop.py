@@ -56,7 +56,7 @@ class HedgeResearchLoop:
 
     # Parameters the loop is allowed to tune and their valid ranges
     TUNABLE_RANGES = {
-        "rehedge_delta_threshold": (0.05, 0.30),
+        "rehedge_delta_threshold": (0.5, 1.5),
         "gamma_scalp_band_pct": (0.5, 3.0),
         "position_size_pct": (5.0, 25.0),
         "vega_limit": (1000.0, 8000.0),  # per-lot; scales with position size

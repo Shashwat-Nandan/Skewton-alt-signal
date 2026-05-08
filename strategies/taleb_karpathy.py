@@ -623,6 +623,13 @@ class TalebKarpathyStrategy(BaseStrategy):
         lot_size = self._get_lot_size()
         lots = round(delta_to_hedge / lot_size)
         if lots == 0:
+            # Drift cleared the threshold gate but rounded to <1 lot.
+            # Without this log the no-hedge looks identical to a successful one.
+            logger.info(
+                "Hard hedge sized to 0 lots: %.1f delta / %d lot_size = %.2f rounds to 0. "
+                "Raise rehedge_delta_threshold so threshold passes only when round() >= 1.",
+                delta_to_hedge, lot_size, delta_to_hedge / lot_size,
+            )
             return []
         fut_symbol = self._get_futures_symbol()
         # Fetch live futures price

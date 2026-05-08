@@ -1,5 +1,12 @@
 # Lessons
 
+## Threshold gates in continuous units, executors in integer lots: silent no-op
+
+- The 2026-05-07 paper session triggered the rehedge gate ~150 times and executed zero hedges. Every threshold-pass was followed by `_generate_hard_delta_proposals` returning `[]` — silently — because `lots = round(delta / lot_size)` rounded to 0 for any drift below 0.5 lots. Threshold was 0.15 lots; lot_size jumped from 25 → 65 (NIFTY restructuring). The gate said "go", the executor said "<1 lot, never mind", and the only log was "Hedge decision: Safe to use futures…", which read like success. Net: a held straddle bled theta with zero gamma scalping (today's −₹1,358).
+- This is the same shape as the 2026-05-04 bare-except / numeric-fallback incident: a permitted-but-meaningless no-op silently masquerades as a working code path, and downstream metrics (`rehedge_count`, `gamma_scalp_pnl`) keep incrementing as if work was done.
+- Rules: (1) any function whose contract is "produce executable side effects" must log when it produces none — silent `return []` is forbidden in execution paths. (2) thresholds expressed in fractional units must be ≥ the minimum unit the executor can actually trade; pick the threshold to make `round(threshold) >= 1`. (3) when a strategy parameter has lot/sizing implications, surface the executable lot size in the optimizer's search space (synthetic data must use the live `lot_size`, not a default of 25).
+- Optimizer-blindness corollary: `rehedge_count` increments at the *bottom* of `check_and_rehedge`, before sizing filters proposals. `gamma_scalp_pnl` accumulates `0.5·γ·dS²` (an estimate, not realized P/L). A param set that produces zero hedges looks fine to the search. Re-tuned param search must score on a metric tied to executions, not intentions.
+
 ## Tailwind breakpoints
 
 - Default breakpoints are `sm` (640), `md` (768), `lg` (1024), `xl` (1280), `2xl` (1536). There is **no `xs:`** unless you add it under `theme.screens` in `tailwind.config.js`. Using `xs:inline` silently does nothing — caught and removed during the issue #1 fix.
