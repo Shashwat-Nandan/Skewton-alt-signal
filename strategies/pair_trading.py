@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 PairPosition = Literal["FLAT", "LONG_SPREAD", "SHORT_SPREAD"]
 PAIR_CANDIDATES_PATH = Path("data_cache/pair_candidates.csv")
 
+# Tradeable hedge-ratio range. |β| < 0.1 means leg B is so small the spread
+# is essentially leg A alone (no hedge); |β| > 10 means leg B notional
+# explodes relative to leg A. Used both as the __init__ guard and as the
+# filter `_top_screener_pair` applies before picking row 0.
+HEDGE_RATIO_MIN = 0.1
+HEDGE_RATIO_MAX = 10.0
+
 
 @dataclass
 class PairLeg:
@@ -109,14 +116,15 @@ class PairTradingStrategy(BaseStrategy):
         if self.hedge_ratio is None:
             raise ValueError("hedge_ratio must be supplied via arg, config, or screener output")
 
-        # Defensive bound on β: anything outside [0.1, 10] either points at a
-        # corrupted screener output or a pair so mismatched it shouldn't be
-        # traded as a hedge in the first place. Refuse to construct the
-        # strategy rather than letting bad β size leg-B unbounded.
-        if not 0.1 <= abs(self.hedge_ratio) <= 10.0:
+        # Defensive bound on β: anything outside [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX]
+        # either points at a corrupted screener output or a pair so mismatched it
+        # shouldn't be traded as a hedge in the first place. Refuse to construct
+        # the strategy rather than letting bad β size leg-B unbounded.
+        if not HEDGE_RATIO_MIN <= abs(self.hedge_ratio) <= HEDGE_RATIO_MAX:
             raise ValueError(
                 f"hedge_ratio out of range for {self.symbol_a}/{self.symbol_b}: "
-                f"|β|={abs(self.hedge_ratio):.4f} not in [0.1, 10]"
+                f"|β|={abs(self.hedge_ratio):.4f} not in "
+                f"[{HEDGE_RATIO_MIN}, {HEDGE_RATIO_MAX}]"
             )
 
         # Risk band
@@ -592,7 +600,18 @@ class PairTradingStrategy(BaseStrategy):
         df = pd.read_csv(PAIR_CANDIDATES_PATH).sort_values("rank_score")
         if df.empty:
             raise RuntimeError(f"{PAIR_CANDIDATES_PATH} has no candidates")
-        row = df.iloc[0]
+        # Filter to pairs the strategy can actually trade. The screener has no
+        # β-range filter, so its row 0 (best rank_score) can be a pair the
+        # __init__ guard would reject — see 2026-05-08 LT/MARUTI β=0.077 incident.
+        beta_abs = df["hedge_ratio"].abs()
+        tradeable = df[(beta_abs >= HEDGE_RATIO_MIN) & (beta_abs <= HEDGE_RATIO_MAX)]
+        if tradeable.empty:
+            raise RuntimeError(
+                f"{PAIR_CANDIDATES_PATH} has {len(df)} candidates but none with "
+                f"|β| in [{HEDGE_RATIO_MIN}, {HEDGE_RATIO_MAX}] — re-run "
+                "`python screen_pairs.py` or set pair_trading.symbol_a/b in config."
+            )
+        row = tradeable.iloc[0]
         return str(row["symbol_a"]), str(row["symbol_b"]), float(row["hedge_ratio"])
 
     # ══════════════════════════════════════════════════════════

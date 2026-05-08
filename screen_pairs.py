@@ -141,6 +141,8 @@ def screen_pairs(
     panel: pd.DataFrame,
     p_threshold: float = 0.05,
     min_correlation: float = 0.5,
+    min_hedge_ratio: float = 0.1,
+    max_hedge_ratio: float = 10.0,
 ) -> pd.DataFrame:
     """
     Run pairwise Engle-Granger cointegration and return one row per
@@ -149,6 +151,12 @@ def screen_pairs(
     Pre-filter: skip pairs whose Pearson correlation is below
     `min_correlation` — uncorrelated series rarely cointegrate, and the
     coint() call dominates runtime.
+
+    Tradeable-β filter: skip pairs whose |β| is outside
+    [min_hedge_ratio, max_hedge_ratio]. Defaults match
+    `strategies.pair_trading.HEDGE_RATIO_MIN`/`HEDGE_RATIO_MAX` so the
+    output CSV is always consumable by that strategy without further
+    filtering on the consumer side.
     """
     symbols = panel.columns.tolist()
     n_pairs = len(symbols) * (len(symbols) - 1) // 2
@@ -157,6 +165,7 @@ def screen_pairs(
 
     corr = panel.corr().abs()
 
+    skipped_beta = 0
     results = []
     for a, b in combinations(symbols, 2):
         if corr.loc[a, b] < min_correlation:
@@ -172,6 +181,13 @@ def screen_pairs(
             continue
 
         beta = _hedge_ratio(ya, yb)
+        if not min_hedge_ratio <= abs(beta) <= max_hedge_ratio:
+            skipped_beta += 1
+            logger.debug(
+                "Skipped %s/%s: |β|=%.4f outside [%.2f, %.2f]",
+                a, b, abs(beta), min_hedge_ratio, max_hedge_ratio,
+            )
+            continue
         spread = ya - beta * yb
         spread_mean = float(np.mean(spread))
         spread_std = float(np.std(spread))
@@ -208,6 +224,10 @@ def screen_pairs(
             "n_obs": len(panel),
         })
 
+    if skipped_beta:
+        logger.info("Skipped %d pair(s) with |β| outside [%.2f, %.2f]",
+                    skipped_beta, min_hedge_ratio, max_hedge_ratio)
+
     if not results:
         logger.warning("No pairs passed p-value %.3f and correlation %.2f filters",
                        p_threshold, min_correlation)
@@ -239,6 +259,10 @@ def main():
                    help="Cointegration p-value cutoff (default: 0.05)")
     p.add_argument("--min-correlation", type=float, default=0.5,
                    help="Pre-filter: skip pairs below this |Pearson| (default: 0.5)")
+    p.add_argument("--min-hedge-ratio", type=float, default=0.1,
+                   help="Skip pairs with |β| below this (default: 0.1, matches strategy floor)")
+    p.add_argument("--max-hedge-ratio", type=float, default=10.0,
+                   help="Skip pairs with |β| above this (default: 10.0, matches strategy ceiling)")
     p.add_argument("--universe", type=str, default=None,
                    help="Path to a newline-separated symbol list (default: NIFTY 50)")
     p.add_argument("--output", type=str, default=str(OUTPUT_PATH),
@@ -260,6 +284,8 @@ def main():
         panel,
         p_threshold=args.p_threshold,
         min_correlation=args.min_correlation,
+        min_hedge_ratio=args.min_hedge_ratio,
+        max_hedge_ratio=args.max_hedge_ratio,
     )
 
     if df.empty:
