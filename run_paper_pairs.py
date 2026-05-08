@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--top", type=int, default=3,
                         help="Number of top pairs from pair_candidates.csv (default 3)")
     parser.add_argument("--entry-z", type=float, default=2.0)
-    parser.add_argument("--exit-z", type=float, default=0.5)
+    parser.add_argument("--exit-z", type=float, default=0.75)
     parser.add_argument("--stop-z", type=float, default=4.0)
     parser.add_argument("--lookback", type=int, default=60, dest="lookback_days")
     parser.add_argument("--max-hold", type=int, default=10, dest="max_holding_days")
