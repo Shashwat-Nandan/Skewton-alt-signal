@@ -251,7 +251,7 @@ def main():
                         help="Days of signal history to summarise (default 10)")
     parser.add_argument("--lookback", type=int, default=60, dest="lookback_days")
     parser.add_argument("--entry-z", type=float, default=2.0)
-    parser.add_argument("--exit-z", type=float, default=0.5)
+    parser.add_argument("--exit-z", type=float, default=0.75)
     parser.add_argument("--stop-z", type=float, default=4.0)
     parser.add_argument("--max-hold", type=int, default=10, dest="max_holding_days")
     parser.add_argument("--lots-per-leg", type=int, default=1)

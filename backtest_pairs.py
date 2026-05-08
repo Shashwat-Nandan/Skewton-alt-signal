@@ -374,7 +374,7 @@ def main():
     p.add_argument("--top", type=int, default=5)
     p.add_argument("--candidates", type=str, default=str(CANDIDATES_PATH))
     p.add_argument("--entry-z", type=float, default=2.0)
-    p.add_argument("--exit-z", type=float, default=0.5)
+    p.add_argument("--exit-z", type=float, default=0.75)
     p.add_argument("--stop-z", type=float, default=4.0)
     p.add_argument("--lookback", type=int, default=30, dest="lookback_days")
     p.add_argument("--max-hold", type=int, default=10, dest="max_holding_days")
