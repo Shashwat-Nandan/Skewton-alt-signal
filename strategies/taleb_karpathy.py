@@ -278,10 +278,16 @@ class TalebKarpathyStrategy(BaseStrategy):
         self._iv_history_max_size = 500
         self._atm_iv_history: List[float] = []
         # Rolling spot history is used to estimate realized vol for the
-        # RV/IV entry gate. In-memory only; backtests rebuild it forward.
+        # RV/IV entry gate. Live ticks are appended in-memory; backtests
+        # rebuild it forward. Cron paper sessions are oneshot, so the
+        # history is also seeded from the daily EOD CSV at startup —
+        # without this seed the gate is permissive every morning until
+        # ~10 minutes of intraday ticks accumulate, by which point an
+        # entry has typically already fired.
         self._spot_history: List[Tuple[datetime, float]] = []
         self._spot_history_max_size = 2000  # ~1.5 days of 1-min ticks or weeks of 5-min
         self._load_iv_history()
+        self._load_spot_history()
 
     # ══════════════════════════════════════════════════════════
     # PUBLIC API
@@ -1208,7 +1214,11 @@ class TalebKarpathyStrategy(BaseStrategy):
             return None
         cutoff = self._clock() - timedelta(days=window_days)
         samples = [(ts, s) for ts, s in self._spot_history if ts >= cutoff]
-        if len(samples) < 10:
+        # 5 in-window samples (≥4 returns) is the floor for the regime call.
+        # The post-loop `n < 5` check below is the final accuracy gate.
+        # Earlier this was 10, which assumed intraday-tick warmup; under
+        # daily seeding the in-window sample count is naturally lower.
+        if len(samples) < 5:
             return None
         sumsq = 0.0
         n = 0
@@ -1255,6 +1265,39 @@ class TalebKarpathyStrategy(BaseStrategy):
             }))
         except OSError as e:
             logger.warning("Could not save IV history to %s: %s", path, e)
+
+    def _load_spot_history(self):
+        # Seed _spot_history with one underlying_price per date from the most
+        # recent EOD CSV produced by fetch_historical_data.py. Daily granularity
+        # is sufficient for the RV/IV regime gate's default 5-day window.
+        cache_dir = Path("data_cache")
+        if not cache_dir.exists():
+            return
+        candidates = sorted(cache_dir.glob(f"{self.underlying}_*_eod.csv"))
+        if not candidates:
+            return
+        path = candidates[-1]  # filenames embed end-date YYYYMMDD; lex sort = recency
+        try:
+            df = pd.read_csv(path, usecols=["timestamp", "underlying_price"])
+        except (OSError, ValueError, pd.errors.ParserError) as e:
+            logger.warning("Could not load spot history from %s: %s", path, e)
+            return
+        # CSV has one row per option per snapshot — dedupe to one row per date.
+        df["date"] = df["timestamp"].str[:10]
+        df = df.drop_duplicates(subset="date", keep="last").sort_values("date")
+        seeded = []
+        for _, row in df.iterrows():
+            try:
+                # Anchor each daily sample at 15:30 IST (close), naive to match
+                # the strategy's _clock() convention. The exact intraday time
+                # doesn't matter for daily-spaced returns.
+                ts = datetime.strptime(row["date"], "%Y-%m-%d").replace(hour=15, minute=30)
+                seeded.append((ts, float(row["underlying_price"])))
+            except (TypeError, ValueError):
+                continue
+        if seeded:
+            self._spot_history = seeded[-self._spot_history_max_size:]
+            logger.info("Seeded %d daily spot samples from %s", len(self._spot_history), path)
 
     def _apply_risk_filters(self, proposals, spot):
         """
