@@ -377,7 +377,7 @@ def main():
     p.add_argument("--exit-z", type=float, default=0.75)
     p.add_argument("--stop-z", type=float, default=4.0)
     p.add_argument("--lookback", type=int, default=30, dest="lookback_days")
-    p.add_argument("--max-hold", type=int, default=10, dest="max_holding_days")
+    p.add_argument("--max-hold", type=int, default=7, dest="max_holding_days")
     p.add_argument("--lots-per-leg", type=int, default=1)
     p.add_argument("--max-leg-notional", type=float, default=None,
                    help="Cap per-leg notional in ₹. Strategy scales BOTH legs "
