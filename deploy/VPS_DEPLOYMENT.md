@@ -15,6 +15,12 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | ----------------------------- | ----------------------------- | ------------------------------------------------------------------------------------ |
 | `taleb-hedger.timer`          | Mon–Fri 09:10 IST + jitter    | Fires `taleb-hedger.service`                                                         |
 | `taleb-hedger.service`        | Oneshot, ~6 hours             | Runs `run_paper.py` — auths, sleeps to 09:15, ticks until 15:25, flattens, exits     |
+| `pair-paper.timer`            | Mon–Fri 09:11 IST + jitter    | Fires `pair-paper.service` (1-min offset from taleb-hedger to stagger TOTP logins)   |
+| `pair-paper.service`          | Oneshot, ~6 hours             | Runs `run_paper_pairs.py` — top-N cointegrated STF pairs, paper mode, EOD JSON sidecar |
+| `pair-verify.timer`           | Mon–Fri 16:00 IST + jitter    | Fires `pair-verify.service`                                                          |
+| `pair-verify.service`         | Oneshot, ~5 min               | Runs `verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
+| `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
+| `screen-pairs.service`        | Oneshot, ~5–15 min            | Runs `deploy/run_weekly_pair_screen.sh` — bhavcopy fetch + Engle-Granger screen      |
 | `taleb-autoresearch.timer`    | Sat 10:00 IST + jitter        | Fires `taleb-autoresearch.service`                                                   |
 | `taleb-autoresearch.service`  | Oneshot, up to 2h             | Runs `deploy/run_weekly_autoresearch.sh` — fetches data, sweeps params, logs result  |
 | `fetch-bars.timer`            | Daily 16:30 IST + jitter      | Fires `fetch-bars.service`                                                           |
@@ -79,11 +85,17 @@ If that prints `Authenticated as <name>` and exits cleanly, you are good.
 
 ## 3. Install the systemd units
 
-Copy all six unit files into `/etc/systemd/system/`:
+Copy all unit files into `/etc/systemd/system/`:
 
 ```bash
 sudo cp deploy/taleb-hedger.service       /etc/systemd/system/
 sudo cp deploy/taleb-hedger.timer         /etc/systemd/system/
+sudo cp deploy/pair-paper.service         /etc/systemd/system/
+sudo cp deploy/pair-paper.timer           /etc/systemd/system/
+sudo cp deploy/pair-verify.service        /etc/systemd/system/
+sudo cp deploy/pair-verify.timer          /etc/systemd/system/
+sudo cp deploy/screen-pairs.service       /etc/systemd/system/
+sudo cp deploy/screen-pairs.timer         /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.service /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.timer   /etc/systemd/system/
 sudo cp deploy/fetch-bars.service         /etc/systemd/system/
@@ -94,13 +106,21 @@ sudo systemctl daemon-reload
 
 Each `.service` file hardcodes `User=taleb` and `WorkingDirectory=/opt/taleb-karpathy-kite`. **Edit them in `/etc/systemd/system/` (or the originals before copying) if your VPS differs.**
 
-Enable all three timers:
+Enable all timers:
 
 ```bash
 sudo systemctl enable --now taleb-hedger.timer
+sudo systemctl enable --now pair-paper.timer
+sudo systemctl enable --now pair-verify.timer
+sudo systemctl enable --now screen-pairs.timer
 sudo systemctl enable --now taleb-autoresearch.timer
 sudo systemctl enable --now fetch-bars.timer
 ```
+
+The pair-trading pipeline runs daily as three coordinated steps:
+- **09:11 IST** — `pair-paper.service` paper-trades the top-3 cointegrated NIFTY-50 STF pairs (logs at `logs/paper-pairs-YYYY-MM-DD.log`, EOD JSON at `data_cache/pair_paper_eod_YYYY-MM-DD.json`).
+- **16:00 IST** — `pair-verify.service` reads today's EOD JSON, runs a trailing-60d backtest on the same pairs, and writes a paper-vs-backtest drift report to `logs/pair-verify-YYYY-MM-DD.{log,json}`.
+- **19:00 IST** — `screen-pairs.service` refreshes `data_cache/pair_candidates.csv` from the day's bhavcopy, ready for the next morning.
 
 Confirm they are scheduled:
 

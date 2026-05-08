@@ -1,0 +1,19 @@
+[Unit]
+Description=Fire pair-verify.service Mon–Fri at 16:00 IST (after market close)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 16:00 IST — pair-paper.service flattens at 15:25 and writes the EOD sidecar.
+# A ~30 min cushion lets the bhavcopy STF closes settle in the panel cache too.
+OnCalendar=Mon..Fri *-*-* 16:00:00 Asia/Kolkata
+
+# Catch up if missed (e.g. VPS rebooted during the window). Verifier is
+# read-only; safe to re-run.
+Persistent=true
+
+RandomizedDelaySec=300
+
+Unit=pair-verify.service
+
+[Install]
+WantedBy=timers.target

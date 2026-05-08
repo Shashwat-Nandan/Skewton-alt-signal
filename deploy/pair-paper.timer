@@ -1,0 +1,23 @@
+[Unit]
+Description=Fire pair-paper.service Mon–Fri at 09:11 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:11 IST — offset 1 minute from taleb-hedger.timer (09:10) so two TOTP
+# logins don't collide on the same .kite_session.json. The shared session
+# is fine; staggering just dodges a worst-case mid-rotation race.
+# run_paper_pairs.py self-gates on 09:15 anyway, so it'll wait the few
+# minutes until the open bell.
+OnCalendar=Mon..Fri *-*-* 09:11:00 Asia/Kolkata
+
+# If the VPS was asleep or systemd missed the window, run once to catch up.
+# run_paper_pairs.py refuses to start after 15:30 — safe to be Persistent.
+Persistent=true
+
+# Jitter to avoid thundering-herd Kite logins on multi-account VPSes.
+RandomizedDelaySec=60
+
+Unit=pair-paper.service
+
+[Install]
+WantedBy=timers.target

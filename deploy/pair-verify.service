@@ -1,0 +1,34 @@
+[Unit]
+Description=Pair-Trading EOD verifier — paper P&L vs trailing backtest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/verify_pair_paper.py
+# -------------------------------
+
+# Trailing-60d replay across N pairs is bounded; 10 min ceiling is generous.
+TimeoutStartSec=10min
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches screen-pairs.service)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
