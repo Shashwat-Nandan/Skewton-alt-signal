@@ -137,7 +137,14 @@ class PairTradingStrategy(BaseStrategy):
         self.stop_z = float(cfg.get("stop_z", 4.0))
         self.lookback_days = int(cfg.get("lookback_days", 60))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
-        self.max_holding_days = int(cfg.get("max_holding_days", 10))
+        # max_holding_days=7 emerged as the win-rate peak (82.6%) in both
+        # in-sample and OOS sweeps — see data_cache/backtest_2026-05-08/
+        # sweep_maxhold_*.csv. Tighter time stop (7d) frees the book to
+        # re-enter on natural winners; the prior 10d default sat in the
+        # worst-spot valley between the 7d "fail-fast" optimum and the 14d
+        # "let-winners-run" optimum. Roughly aligns with Varsity Method 1's
+        # ~5-day time-stop guidance.
+        self.max_holding_days = int(cfg.get("max_holding_days", 7))
 
         # Optional per-leg notional cap (₹). Without it, high-β pairs can
         # silently deploy huge amounts (e.g. β=10 with 1 lot of A → ~10 lots
