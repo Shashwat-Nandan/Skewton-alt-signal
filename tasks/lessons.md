@@ -1,5 +1,24 @@
 # Lessons
 
+## Index calendars: same edge, worse cost ratio than STF
+
+- 2026-05-09: extended the mean-rev calendar to NIFTY/BANKNIFTY/etc. (IDF). The strategy does have a positive gross edge (+₹1.6k–5k across 1–3 trades on the 63-day replay window) but **costs are 5-10× larger per trade than STF** because notional is 5-10× larger (NIFTY ≈ ₹1.6M/lot, BANKNIFTY ≈ ₹1.7M/lot, vs ₹100k–500k for typical STF). At ~0.05 % round-trip percentage costs, every trade burns ₹3-5k that the spread has to recover. NIFTY's mean spread is ~109 points; entries fire at +1·SD ≈ 130; mean reversion of 30 points = ₹2k per leg — *less than the round-trip cost*.
+- Multi-lot doesn't fix it — gross AND costs scale roughly linearly, so the ratio is unchanged. Spread-margin recognition by the exchange (which we don't model) helps margin but not transaction costs.
+- This contradicts the intuition that "indices are more liquid so calendars work better there." Liquidity helps slippage, not the percentage-based STT/exchange/GST stack.
+- Rules: (1) for any new strategy, the per-trade fixed cost vs typical gross-edge ratio should be sanity-checked at design time, not discovered in backtest. The breakeven move size (in price units) should be small relative to one SD of the entry signal. For index calendars: breakeven ≈ 1 SD = strategy can never net out. (2) When a strategy has a "more liquid is better" architectural premise, verify by looking at notional × percentage-cost — not just turnover.
+
+## Volume thresholds in shares vs contracts: silently empties the universe
+
+- 2026-05-09: implementing the Varsity-style mean-reversion calendar I shipped a `min_avg_volume = 100_000` default thinking in **share** terms. STF (single-stock-futures) volumes in `bhavcopy.TtlTradgVol` are in **contracts**. Liquid front-month names trade ~5k–25k contracts/day; next-month is far thinner (~1k–5k until it rolls). Result: zero trades on the entire 125-day backtest, no error, the report cheerfully said "Calendars opened: 0" and I almost shipped the strategy as broken.
+- Same shape as the rehedge-count and zero-trade-fitness lessons: a per-instrument unit mismatch produces a silent no-op, downstream metrics increment as if work was done, no alarm fires.
+- Rules: (1) when adding a unit-bearing threshold, write a comment on the SAME LINE clarifying the unit (`# in contracts, not shares`). (2) Calibrate defaults against one known liquid name before merging — for the calendar strategy, RELIANCE (~22k front, ~2.5k next) is the canary. (3) Any new strategy whose backtest opens zero trades on 100+ days of data should be treated as a bug, not a finding, until proven otherwise.
+
+## Mean-reversion fails systematically around dividend ex-dates
+
+- The Varsity calendar-spread chapter notes "all SBIN long trades lost, only shorts won" — the implementation reproduced this *very* strongly. On the 125-day archive replay with longs allowed, ~95% of LONG_CALENDAR trades (entered when spread crossed below mean − 1·SD) lost. Inspection of the entry contexts: the spread "crashed" because of a dividend ex-date — the future legitimately repriced lower and stayed there. The strategy interpreted a one-time structural shift as a mean-reversion opportunity and held into the loss.
+- The cleanliness gate / per-symbol q overlay help on the basis arm but don't catch this case (the spread *change* is the signal, not the level). The simplest fix is what we shipped: `allow_long = false` by default, with the operator flipping it on per-name only after seeing the per-symbol breakdown.
+- Rules: (1) for any mean-reversion strategy on prices that can step-change (dividends, stock splits, special distributions), default-disable the side that benefits from "spread will rise back up" — that's the side most exposed to one-way structural moves. (2) Backtest reporters must show per-symbol AND per-direction breakdown; the bottom-line P&L hides the asymmetry. (3) When the strategy's underlying source (Varsity in this case) explicitly mentions a per-name asymmetry, encode it as a default, not as a footnote.
+
 ## Flat-fitness landscapes silently lobotomize the optimizer
 
 - The 2026-05-09 weekly autoresearch ran 40 experiments and every single one — including the unmodified baseline — returned `sharpe_ratio = 0.000000`. Diagnosis: all 3 training windows from the April CSV produced 0 trades under the seed params (low-vol regime, RV/IV never crossed `min_rv_iv_ratio = 1.22`). With 0 trades, `daily_pnl_history` stays empty and `get_strategy_metrics()` defaults `sharpe_ratio` to 0. Every mutation tied at 0 → nothing accepted → random walk stuck at the seed → "best params" emitted are byte-identical to last week's. The cron reported success; systemd was happy.

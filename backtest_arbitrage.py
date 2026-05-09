@@ -53,44 +53,72 @@ RAW_DIR = CACHE_DIR / "bhavcopy_raw"
 def load_stf_panel(
     raw_dir: Path = RAW_DIR,
     universe: Optional[List[str]] = None,
+    instrument_types: Tuple[str, ...] = ("STF",),
 ) -> pd.DataFrame:
     """
-    Build a long-form DataFrame of STF rows across the bhavcopy archive:
-        date, symbol, expiry, tradingsymbol, close, spot, lot_size
+    Build a long-form DataFrame of futures rows across the bhavcopy archive:
+        date, symbol, expiry, tradingsymbol, close, spot, lot_size, volume
 
-    One row per (date, symbol, expiry).
+    One row per (date, symbol, expiry). `volume` is `TtlTradgVol` from the
+    bhavcopy and is consumed by the mean-reversion calendar strategy's
+    liquidity filter. If a particular CSV in the archive lacks the column
+    (older NSE schemas), that file's rows still load with `volume = NaN`
+    and downstream filters treat NaN as passing.
+
+    `instrument_types` defaults to single-stock-futures only (back-compat).
+    Pass `("IDF",)` for index futures (NIFTY, BANKNIFTY, FINNIFTY, …) or
+    `("STF", "IDF")` for both. IDF rows have no underlying spot in the bhavcopy
+    sense — `UndrlygPric` carries the spot index level, which is fine for the
+    mean-reversion calendar (which only needs F_curr and F_next). The basis
+    arm in `[arbitrage]` would be meaningless on indices anyway because the
+    cash-and-carry trade isn't replicable on an index.
     """
     files = sorted(raw_dir.glob("bhavcopy_fo_*.csv"))
     if not files:
         raise RuntimeError(f"No bhavcopy CSVs in {raw_dir}")
 
-    cols = ["TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "FinInstrmNm",
-            "ClsPric", "UndrlygPric", "NewBrdLotQty"]
+    base_cols = ["TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "FinInstrmNm",
+                 "ClsPric", "UndrlygPric", "NewBrdLotQty"]
+    optional_cols = ["TtlTradgVol"]
     frames = []
     for f in files:
+        # Probe header so we don't blow up on archives missing TtlTradgVol.
+        try:
+            header = pd.read_csv(f, nrows=0).columns.tolist()
+        except Exception as e:
+            logger.warning("skip %s: %s", f.name, e)
+            continue
+        cols = base_cols + [c for c in optional_cols if c in header]
         try:
             df = pd.read_csv(f, usecols=cols, dtype={"TckrSymb": str, "FinInstrmNm": str})
         except Exception as e:
             logger.warning("skip %s: %s", f.name, e)
             continue
-        df = df[df["FinInstrmTp"] == "STF"]
+        df = df[df["FinInstrmTp"].isin(instrument_types)]
+        if "TtlTradgVol" not in df.columns:
+            df = df.assign(TtlTradgVol=pd.NA)
         if universe:
             df = df[df["TckrSymb"].isin(universe)]
         frames.append(df)
 
     if not frames:
-        raise RuntimeError("No STF rows found in bhavcopy archive")
+        raise RuntimeError(
+            f"No rows of types {instrument_types} found in bhavcopy archive"
+        )
     out = pd.concat(frames, ignore_index=True)
     out = out.rename(columns={
         "TradDt": "date", "TckrSymb": "symbol", "XpryDt": "expiry",
         "FinInstrmNm": "tradingsymbol", "ClsPric": "close",
         "UndrlygPric": "spot", "NewBrdLotQty": "lot_size",
+        "TtlTradgVol": "volume",
     })
     out["date"] = pd.to_datetime(out["date"]).dt.date
     out["expiry"] = pd.to_datetime(out["expiry"]).dt.date
     out["lot_size"] = out["lot_size"].astype(int)
     out["close"] = out["close"].astype(float)
     out["spot"] = out["spot"].astype(float)
+    # `volume` may be NaN for archives lacking the column; coerce numeric.
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
     out = out.sort_values(["date", "symbol", "expiry"]).reset_index(drop=True)
     return out
 
