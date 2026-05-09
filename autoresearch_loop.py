@@ -37,6 +37,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# Sentinel returned from a single backtest cycle that produced zero trades.
+# Distinct from the -999999 used for hard failures (cycle exception, DD blow-up):
+# zero-trades is "no signal", failures are "actively bad". Both are far below
+# any plausible sharpe so the optimizer rejects them. The split exists so logs
+# distinguish a flat-fitness regime from a strategy that's blowing up.
+ZERO_TRADE_PENALTY = -1e6
+
+
 class HedgeResearchLoop:
     """
     Autonomous parameter optimization loop for the Taleb Dynamic Hedger.
@@ -302,6 +310,10 @@ class HedgeResearchLoop:
                     tunable_params=params,
                 )
                 metrics = results["metrics"]
+                if metrics.get("total_trades", 0) == 0:
+                    logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                 cycle + 1, ZERO_TRADE_PENALTY)
+                    metrics = {**metrics, self.primary_metric: ZERO_TRADE_PENALTY}
                 cycle_metrics.append(metrics)
 
             except Exception as e:
