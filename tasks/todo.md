@@ -404,3 +404,62 @@ immediately rather than producing a flat day.
 - Reconsidering whether 0.6 lots is the right *operational* threshold (vs.
   defending against the rounding edge). The resweep will pick a sweep-
   optimal value within (0.5, 1.5) and overwrite this baseline.
+
+---
+
+# Autoresearch optimizer-blindness fix (zero-trade penalty + window pre-screen)
+
+## Motivation
+
+The 2026-05-09 weekly cron ran 40 experiments and every single one — including
+the baseline — returned `sharpe_ratio = 0.000000`. Investigation: all 3 April
+training windows produced **0 trades** under the seed params (the regime never
+cleared `min_rv_iv_ratio = 1.22`). With 0 trades, `daily_pnl_history` stayed
+empty and `get_strategy_metrics()` defaulted `sharpe_ratio` to 0. Every mutation
+tied at 0, nothing was ever accepted, and the "best params" written out were
+identical to the prior week's incumbent — falsely framed as a converged optimum.
+Same shape as `lessons.md` "Optimizer-blindness corollary".
+
+## Plan
+
+- [x] `autoresearch_loop.py`: add module-level `ZERO_TRADE_PENALTY = -1e6`;
+      apply inside `_run_experiment` cycle loop when `total_trades == 0`.
+- [x] `run_autoresearch.py`: import the constant, apply same penalty in both
+      branches of `patched_run`.
+- [x] `run_autoresearch.py`: pre-screen historical training windows after
+      `_split_data_into_windows`. Drop windows where seed params produce 0
+      trades. Raise `RuntimeError` with actionable message if all windows are
+      dead. Warn (don't fail) if holdout produces 0 trades.
+- [x] Verify negative path: cron-style invocation against April CSV exits 1
+      with the actionable error.
+- [x] Verify positive path: with loosened seed (`min_rv_iv_ratio=0.7`,
+      `entry_iv_percentile_min=1.0`) all 3 windows kept; tight seed on a
+      tradable window correctly applies the penalty.
+- [x] Test suite: `tests/test_taleb_karpathy.py` 63/63 pass; full suite has
+      3 failures in `tests/test_pair_trading.py` that are unrelated (notional
+      sizing math) and pre-existing.
+
+## Review
+
+Three small edits, no new files. Net effect: the optimizer now has gradient
+even when most cycles produce no trades, and dead training windows are removed
+up-front instead of consuming 40 cycles producing identical 0.0 scores. The
+error message tells the operator exactly what to do (widen the data window,
+loosen the entry gate, or inspect the CSV).
+
+What this does NOT fix: if a regime is genuinely untradable AND the seed isn't
+tradable anywhere, the run errors out — which is the correct behavior, but
+means the operator needs to act manually. A future improvement (deferred) is
+to make the runner auto-loosen the seed and retry, but that should be a
+separate, opt-in feature, not silent magic.
+
+## Out of scope (deliberate)
+
+- Adaptive `mutation_step_size` or multi-axis mutation (option D from the
+  diagnosis). Independent improvement; not needed to fix the silent failure.
+- Changing the metric formula in `strategies/taleb_karpathy.py` so that 0
+  trades returns something other than 0 sharpe. The strategy code is correct;
+  the right place to interpret "no trades" as "bad candidate" is the optimizer.
+- Auto-promotion of candidate to `best_params.json`. Promotion stays manual.
+- The 3 pre-existing pair-trading test failures (`test_hedge_qty_matches_notional`
+  and notional-cap pair). Out of scope for this hotfix.

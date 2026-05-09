@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from backtest import generate_synthetic_data, MockKite, run_backtest
 from strategies import TalebKarpathyStrategy
-from autoresearch_loop import HedgeResearchLoop
+from autoresearch_loop import HedgeResearchLoop, ZERO_TRADE_PENALTY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,6 +136,54 @@ def main():
     loop.primary_metric = args.metric
     loop.eval_cycles = args.eval_cycles
 
+    # Pre-screen training windows. A window where the seed params produce 0
+    # trades gives the optimizer no gradient — every mutation will tie at the
+    # zero-trade penalty floor, so the random walk can't escape. Drop those
+    # windows up front; if none survive, fail loudly (the alternative is the
+    # silent flat-fitness sweep that hid this bug for a week).
+    if historical_windows:
+        seed_params = hedger.tunable_params
+        kept_windows, dropped_idx = [], []
+        for i, w in enumerate(historical_windows):
+            try:
+                n_trades = run_backtest(
+                    w, underlying=args.underlying, tunable_params=seed_params,
+                )["metrics"].get("total_trades", 0)
+            except Exception as e:
+                logger.warning("Pre-screen window %d failed: %s — dropping", i, e)
+                n_trades = 0
+            if n_trades > 0:
+                kept_windows.append(w)
+            else:
+                dropped_idx.append(i)
+        if not kept_windows:
+            raise RuntimeError(
+                f"All {len(historical_windows)} training windows produced 0 trades "
+                f"with seed params. The data likely contains no regime where the "
+                f"entry gates trigger. Suggested fixes: widen --days (longer history "
+                f"more likely to span a tradable regime), loosen min_rv_iv_ratio in "
+                f"best_params.json, or inspect the data CSV for regime."
+            )
+        logger.info(
+            "Pre-screen: kept %d/%d training windows (dropped indices %s for zero-trade)",
+            len(kept_windows), len(historical_windows), dropped_idx,
+        )
+        historical_windows = kept_windows
+
+        # Holdout: warn but never fail — validation is informational, not gating.
+        if holdout_data is not None and len(holdout_data) > 0:
+            try:
+                holdout_trades = run_backtest(
+                    holdout_data, underlying=args.underlying, tunable_params=seed_params,
+                )["metrics"].get("total_trades", 0)
+                if holdout_trades == 0:
+                    logger.warning(
+                        "Pre-screen: holdout produced 0 trades with seed params — "
+                        "validation report at end will be uninformative."
+                    )
+            except Exception as e:
+                logger.warning("Pre-screen holdout backtest failed: %s — proceeding", e)
+
     # Patch _run_experiment to use historical or synthetic data
     def patched_run(params):
         import copy as cp
@@ -153,7 +201,12 @@ def main():
                     results = run_backtest(
                         window, underlying=args.underlying, tunable_params=params
                     )
-                    cycle_metrics.append(results["metrics"])
+                    m = results["metrics"]
+                    if m.get("total_trades", 0) == 0:
+                        logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                     cycle + 1, ZERO_TRADE_PENALTY)
+                        m = {**m, loop.primary_metric: ZERO_TRADE_PENALTY}
+                    cycle_metrics.append(m)
                 except Exception as e:
                     logger.warning("Cycle %d failed: %s", cycle + 1, e)
                     return -999999.0
@@ -167,7 +220,12 @@ def main():
                     results = run_backtest(
                         data, underlying=args.underlying, tunable_params=params
                     )
-                    cycle_metrics.append(results["metrics"])
+                    m = results["metrics"]
+                    if m.get("total_trades", 0) == 0:
+                        logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                     cycle + 1, ZERO_TRADE_PENALTY)
+                        m = {**m, loop.primary_metric: ZERO_TRADE_PENALTY}
+                    cycle_metrics.append(m)
                 except Exception as e:
                     logger.warning("Cycle %d failed: %s", cycle + 1, e)
                     return -999999.0
