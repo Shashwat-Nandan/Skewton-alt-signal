@@ -74,6 +74,13 @@ class CalendarTrade:
     entry_time: datetime
     entry_carry_diff: float   # implied carry minus fair carry (annualized, fraction)
     legs: List[CalendarLeg] = field(default_factory=list)
+    # Snapshot of state.realized_pnl / state.total_transaction_costs at the
+    # moment the trade opened (before its first fill is applied). Used to
+    # compute *per-trade* realized P&L and costs at archive time — without
+    # these baselines, closed_trades records the running cumulative totals
+    # and every closed trade looks more profitable than the last.
+    _baseline_realized: float = 0.0
+    _baseline_costs: float = 0.0
 
 
 @dataclass
@@ -127,12 +134,18 @@ class ArbitrageStrategy(BaseStrategy):
             from screen_pairs import NIFTY_50
             self.universe = list(NIFTY_50)
 
-        # Carry assumptions — hardcoded per config (no per-stock dividend yield).
-        # Stocks with high dividend yield (q > 0) will appear as "cash rich"
-        # under the q=0 default; we expose `dividend_yield_default` so the
-        # operator can shift the whole curve up if needed.
+        # Carry assumptions. `dividend_yield_default` is the global fallback;
+        # `dividend_yields` is a per-symbol overlay parsed as a comma-separated
+        # `SYM=q` list (e.g. `ITC=0.04,COALINDIA=0.06,HUL=0.025`). Without the
+        # overlay, high-yield stocks appear as "cash rich" under q=0 and the
+        # calendar fires LONG_CALENDAR around every ex-date on a pricing
+        # artifact — the per-symbol map is the principled fix; the
+        # `calendar_max_leg_basis` gate is the band-aid on top of it.
         self.risk_free_rate = float(cfg.get("risk_free_rate", 0.07))
         self.dividend_yield = float(cfg.get("dividend_yield_default", 0.0))
+        self.dividend_yields: Dict[str, float] = self._parse_yield_map(
+            cfg.get("dividend_yields", "")
+        )
 
         # Cash-futures basis — always emitted as a signal (never traded).
         self.basis_entry_annual = float(cfg.get("basis_entry_annual", 0.015))   # 1.5%
@@ -169,6 +182,11 @@ class ArbitrageStrategy(BaseStrategy):
         # State
         self.state = ArbitrageState()
         self._instrument_cache: Optional[List[dict]] = None
+        # Authoritative tradingsymbol → underlying name map. Populated from
+        # the instrument list every time we observe the universe; consulted
+        # in _apply_fill so we never have to guess the underlying from the
+        # tradingsymbol's prefix (LT/LTIM, M&M/M&MFIN, MOTHERSON/MOTHERSUMI…).
+        self._ts_to_name: Dict[str, str] = {}
         self._clock = datetime.now
 
     # ══════════════════════════════════════════════════════════
@@ -185,7 +203,18 @@ class ArbitrageStrategy(BaseStrategy):
             # execution mode — the strategy doubles as a basis-monitoring
             # service. The proposals are routed to _emit_signal in
             # execute_proposals so paper/live state is never touched.
-            if (
+            #
+            # spot_is_fallback gate: when spot was back-discounted from the
+            # near future (cash quote unavailable), basis_annual is
+            # structurally zero by construction, so a missing cash feed
+            # would silently mask all basis dislocations. Skip explicitly
+            # and DEBUG-log so feed outages don't masquerade as quiet markets.
+            if snap.get("spot_is_fallback"):
+                logger.debug(
+                    "%s: spot fallback in use — suppressing basis arm "
+                    "(would be structurally zero)", snap["symbol"],
+                )
+            elif (
                 snap["near"] is not None
                 and snap["dte_near"] >= self.basis_min_dte
                 and abs(snap["basis_annual"]) >= self.basis_entry_annual
@@ -306,15 +335,46 @@ class ArbitrageStrategy(BaseStrategy):
     # CARRY MATH
     # ══════════════════════════════════════════════════════════
 
-    def _fair_future(self, spot: float, dte_days: int) -> float:
-        T = max(dte_days, 0) / 365.0
-        return spot * math.exp((self.risk_free_rate - self.dividend_yield) * T)
+    @staticmethod
+    def _parse_yield_map(raw: str) -> Dict[str, float]:
+        """Parse `SYM=0.04,SYM2=0.06` → {"SYM": 0.04, "SYM2": 0.06}. Bad
+        entries are dropped with a warning rather than failing init —
+        a typo in one config row should not take the strategy down."""
+        out: Dict[str, float] = {}
+        for piece in (raw or "").split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if "=" not in piece:
+                logger.warning("dividend_yields: skipping malformed entry %r", piece)
+                continue
+            sym, q = piece.split("=", 1)
+            sym = sym.strip().upper()
+            if not sym:
+                logger.warning("dividend_yields: skipping entry with empty symbol")
+                continue
+            try:
+                out[sym] = float(q.strip())
+            except ValueError:
+                logger.warning("dividend_yields: non-numeric q for %r", sym)
+        return out
 
-    def _annualized_basis(self, spot: float, fut: float, dte_days: int) -> float:
+    def _get_dividend_yield(self, symbol: str) -> float:
+        """Per-symbol dividend yield, falling back to the global default."""
+        return self.dividend_yields.get(symbol, self.dividend_yield)
+
+    def _fair_future(self, spot: float, dte_days: int, symbol: str = "") -> float:
+        T = max(dte_days, 0) / 365.0
+        q = self._get_dividend_yield(symbol)
+        return spot * math.exp((self.risk_free_rate - q) * T)
+
+    def _annualized_basis(
+        self, spot: float, fut: float, dte_days: int, symbol: str = "",
+    ) -> float:
         """(F - F*)/S · 365 / dte. Positive = futures rich."""
         if spot <= 0 or dte_days <= 0:
             return 0.0
-        fair = self._fair_future(spot, dte_days)
+        fair = self._fair_future(spot, dte_days, symbol)
         return (fut - fair) / spot * (365.0 / dte_days)
 
     def _implied_carry(self, near: float, nxt: float, dte_near: int, dte_next: int) -> Optional[float]:
@@ -373,15 +433,20 @@ class ArbitrageStrategy(BaseStrategy):
             # parallel cash-segment quote, falling back to the near future's
             # implied spot if the cash quote isn't available.
             spot = self._safe_spot(sym)
+            spot_is_fallback = False
             if spot is None and near_q is not None:
-                # Fallback: discount near future back to spot at fair carry. Inexact
-                # but better than skipping the symbol entirely.
+                # Fallback: discount near future back to spot at fair carry.
+                # Inexact, and *circular* for the basis math (basis would
+                # come out identically zero), so we flag it and let the
+                # basis arm in scan_and_propose suppress on the flag.
                 dte = (self._exp_date(near["expiry"]) - today).days
                 if dte > 0:
                     T = dte / 365.0
+                    q = self._get_dividend_yield(sym)
                     spot = float(near_q["last_price"]) * math.exp(
-                        -(self.risk_free_rate - self.dividend_yield) * T
+                        -(self.risk_free_rate - q) * T
                     )
+                    spot_is_fallback = True
 
             if near_q is None or spot is None:
                 continue
@@ -389,7 +454,7 @@ class ArbitrageStrategy(BaseStrategy):
             dte_near = (self._exp_date(near["expiry"]) - today).days
             near_px = float(near_q["last_price"])
 
-            basis_ann = self._annualized_basis(spot, near_px, dte_near)
+            basis_ann = self._annualized_basis(spot, near_px, dte_near, sym)
 
             next_px = None
             dte_next = None
@@ -401,12 +466,15 @@ class ArbitrageStrategy(BaseStrategy):
                 next_px = float(next_q["last_price"])
                 carry_implied = self._implied_carry(near_px, next_px, dte_near, dte_next)
                 if carry_implied is not None:
-                    carry_diff = carry_implied - (self.risk_free_rate - self.dividend_yield)
-                basis_ann_next = self._annualized_basis(spot, next_px, dte_next)
+                    carry_diff = carry_implied - (
+                        self.risk_free_rate - self._get_dividend_yield(sym)
+                    )
+                basis_ann_next = self._annualized_basis(spot, next_px, dte_next, sym)
 
             snapshots.append({
                 "symbol": sym,
                 "spot": spot,
+                "spot_is_fallback": spot_is_fallback,
                 "near": near,
                 "near_price": near_px,
                 "dte_near": dte_near,
@@ -445,6 +513,10 @@ class ArbitrageStrategy(BaseStrategy):
         Backtester replays ~200+ symbols per day, so re-scanning the full NFO
         list inside `_symbol_futures_sorted` is O(symbols × instruments) per
         bar. Indexing once collapses that to a dict lookup.
+
+        Side effect: refreshes ``self._ts_to_name`` so _apply_fill can resolve
+        a tradingsymbol back to the authoritative underlying name without
+        relying on prefix matching (which mis-routes LTIM → LT, etc.).
         """
         idx: Dict[str, List[dict]] = {}
         for r in instruments:
@@ -456,8 +528,11 @@ class ArbitrageStrategy(BaseStrategy):
                 continue
             if exp < today:
                 continue
-            idx.setdefault(r.get("name"), []).append({
-                "tradingsymbol": r["tradingsymbol"],
+            name = r.get("name")
+            ts = r["tradingsymbol"]
+            self._ts_to_name[ts] = name
+            idx.setdefault(name, []).append({
+                "tradingsymbol": ts,
                 "lot_size": int(r.get("lot_size", 0) or 0),
                 "expiry": exp.isoformat(),
                 "instrument_token": int(r.get("instrument_token", 0) or 0),
@@ -514,10 +589,11 @@ class ArbitrageStrategy(BaseStrategy):
         side_fut = "SELL" if basis > 0 else "BUY"
         side_cash = "BUY" if basis > 0 else "SELL"
 
+        q_sym = self._get_dividend_yield(snap["symbol"])
         rationale = (
             f"BASIS {basis*100:.2f}% ann. on {snap['symbol']} "
             f"(F={fut_px:.2f}, S={spot:.2f}, dte={snap['dte_near']}d, "
-            f"r-q={self.risk_free_rate - self.dividend_yield:.3f})"
+            f"r-q={self.risk_free_rate - q_sym:.3f})"
         )
         lot_size = int(near["lot_size"])
         qty = self.lots_per_leg
@@ -587,9 +663,10 @@ class ArbitrageStrategy(BaseStrategy):
             side_near, side_next = "SELL", "BUY"
             position = "LONG_CALENDAR"
 
+        q_sym = self._get_dividend_yield(symbol)
         rationale = (
             f"{position} on {symbol}: implied carry={snap['carry_implied']:.3f} "
-            f"vs fair={self.risk_free_rate - self.dividend_yield:.3f} "
+            f"vs fair={self.risk_free_rate - q_sym:.3f} "
             f"(diff={cd*100:.2f}% ann., near {snap['dte_near']}d / next {snap['dte_next']}d)"
         )
         return [
@@ -607,11 +684,27 @@ class ArbitrageStrategy(BaseStrategy):
         proposals: List[TradeProposal] = []
         for leg in trade.legs:
             # Match the leg back to a future in the snapshot for current price.
-            current_px = leg.current_price
+            current_px: Optional[float] = None
             if snap.get("near") and snap["near"]["tradingsymbol"] == leg.tradingsymbol:
                 current_px = snap["near_price"]
             elif snap.get("next") and snap["next"] and snap["next"]["tradingsymbol"] == leg.tradingsymbol:
                 current_px = snap["next_price"]
+
+            if current_px is None:
+                # The leg's contract is no longer in the snapshot — usually
+                # because it expired and rolled out of the instruments list.
+                # Fall back to the last known mark, then to entry as a final
+                # sentinel; warn so the operator can see that the realized
+                # P&L on this exit is *unverified* (it could be off by the
+                # contract's last-day move).
+                current_px = leg.current_price or leg.entry_price
+                logger.warning(
+                    "exit %s/%s: leg %s not in current snapshot (likely "
+                    "rolled/delisted); pricing at last-known %.2f — "
+                    "realized P&L on this leg is approximate",
+                    trade.symbol, reason, leg.tradingsymbol, current_px,
+                )
+
             side = "SELL" if leg.quantity > 0 else "BUY"
             proposals.append(self._make_fut_proposal(
                 {
@@ -621,7 +714,7 @@ class ArbitrageStrategy(BaseStrategy):
                     "instrument_token": 0,
                 },
                 abs(leg.quantity),
-                current_px or leg.entry_price,
+                current_px,
                 side,
                 rationale,
             ))
@@ -658,8 +751,6 @@ class ArbitrageStrategy(BaseStrategy):
             prop.price, prop.quantity, prop.lot_size, prop.transaction_type,
             instrument_type="FUT",
         )
-        self.state.total_transaction_costs += cost
-        self.state.realized_pnl -= cost
 
         symbol = self._symbol_from_tradingsymbol(prop.tradingsymbol)
         signed_qty = prop.quantity if prop.transaction_type == "BUY" else -prop.quantity
@@ -667,14 +758,21 @@ class ArbitrageStrategy(BaseStrategy):
         trade = self.state.open_calendars.get(symbol)
         if trade is None:
             # Opening leg — create the trade record on the first fill.
+            # Snapshot the running totals BEFORE this fill's cost is booked so
+            # the per-trade delta we record at close excludes pre-existing P&L.
             trade = CalendarTrade(
                 symbol=symbol,
                 position="LONG_CALENDAR",   # finalized after both legs in
                 entry_time=self._clock(),
                 entry_carry_diff=self.state.pending_entry_diff.pop(symbol, 0.0),
                 legs=[],
+                _baseline_realized=self.state.realized_pnl,
+                _baseline_costs=self.state.total_transaction_costs,
             )
             self.state.open_calendars[symbol] = trade
+
+        self.state.total_transaction_costs += cost
+        self.state.realized_pnl -= cost
 
         existing = next((l for l in trade.legs if l.tradingsymbol == prop.tradingsymbol), None)
         if existing is None:
@@ -712,15 +810,20 @@ class ArbitrageStrategy(BaseStrategy):
             near_leg = min(trade.legs, key=lambda l: l.expiry)
             trade.position = "SHORT_CALENDAR" if near_leg.quantity > 0 else "LONG_CALENDAR"
 
-        # If the trade is now empty, archive and remove.
+        # If the trade is now empty, archive and remove. realized_pnl /
+        # transaction_costs are deltas vs the baselines snapshotted at open,
+        # so each closed_trades row is independently meaningful (sweeps and
+        # autoresearch loss functions consume these directly).
         if not trade.legs:
             self.state.closed_trades.append({
                 "symbol": symbol,
                 "exit_time": self._clock(),
                 "entry_time": trade.entry_time,
                 "entry_carry_diff": trade.entry_carry_diff,
-                "realized_pnl": self.state.realized_pnl,
-                "transaction_costs": self.state.total_transaction_costs,
+                "realized_pnl": self.state.realized_pnl - trade._baseline_realized,
+                "transaction_costs": (
+                    self.state.total_transaction_costs - trade._baseline_costs
+                ),
                 "position": trade.position,
             })
             del self.state.open_calendars[symbol]
@@ -730,21 +833,42 @@ class ArbitrageStrategy(BaseStrategy):
         for symbol, trade in self.state.open_calendars.items():
             snap = snapshots.get(symbol)
             for leg in trade.legs:
+                matched = False
                 cur = leg.current_price
                 if snap:
                     if snap.get("near") and snap["near"]["tradingsymbol"] == leg.tradingsymbol:
                         cur = snap["near_price"]
+                        matched = True
                     elif snap.get("next") and snap["next"] and snap["next"]["tradingsymbol"] == leg.tradingsymbol:
                         cur = snap["next_price"]
+                        matched = True
+                if not matched:
+                    # Same shape as _build_calendar_exit: contract has rolled
+                    # off the instruments list. Mark-to-market is now stale;
+                    # log once per refresh so operators can see why MTM stops
+                    # moving on a leg.
+                    logger.debug(
+                        "%s: leg %s not in current snapshot — MTM stale at %.2f",
+                        symbol, leg.tradingsymbol, cur,
+                    )
                 leg.current_price = cur
                 unrealized += (cur - leg.entry_price) * leg.quantity * leg.lot_size
         self.state.unrealized_pnl = unrealized
 
     def _symbol_from_tradingsymbol(self, tradingsymbol: str) -> str:
-        for sym in self.universe:
-            # NFO trading symbols start with the underlying name (RELIANCE26APRFUT etc.)
-            if tradingsymbol.startswith(sym):
-                return sym
+        # Authoritative path: the instrument index has a `name` field that
+        # NSE itself publishes for each contract; we cached it in
+        # _build_fut_index. Use it whenever it's available.
+        name = self._ts_to_name.get(tradingsymbol)
+        if name:
+            return name
+        # Fallback when the ts has not yet been observed (unusual). Pick the
+        # LONGEST matching prefix from the universe so LTIM26APRFUT picks
+        # LTIM, not LT — the original startswith-on-first-match was a real
+        # state-corruption bug in NIFTY-50 universes containing both.
+        candidates = [s for s in self.universe if tradingsymbol.startswith(s)]
+        if candidates:
+            return max(candidates, key=len)
         return tradingsymbol
 
     # ══════════════════════════════════════════════════════════

@@ -1,3 +1,47 @@
+# Arbitrage / calendar review — priority 1–4 fixes (2026-05-09)
+
+## Motivation
+Code-review against Varsity (Trading Systems / Calendar Spreads) surfaced four
+correctness issues on `strategies/arbitrage.py`. User authorized fixes for
+priority items 1–4 in the review's suggested-priority list.
+
+## Plan
+- [x] **#1 — prefix-collision** in `_symbol_from_tradingsymbol`. Authoritative
+  `_ts_to_name` populated by `_build_fut_index`; longest-prefix fallback when
+  the map is unseeded. 3 regression tests in `TestSymbolAttribution`.
+- [x] **#2 — per-trade `closed_trades.realized_pnl`.** `CalendarTrade` now
+  carries `_baseline_realized` / `_baseline_costs` snapshotted at first fill;
+  archive records the delta. Backtest reporter rewritten to sort by per-trade
+  P&L and show top 5 + bottom 5. Regression test in `TestPerTradePnL`.
+- [x] **#3 — per-symbol dividend yield.** `dividend_yields` config CSV parsed
+  by `_parse_yield_map`; `_get_dividend_yield` + plumbed through
+  `_fair_future`, `_annualized_basis`, and `carry_diff`. Backtest CLI gained
+  `--dividend-yields`. Verified live: TCS basis on 2026-04-17 dropped from
+  `-33.10%` to `-3.17%` annualized when `TCS=0.30` was passed.
+  4 tests in `TestPerSymbolDividendYield`.
+- [x] **#4a (2c) — spot-fallback suppresses basis arm.** Snapshot carries
+  `spot_is_fallback`; `scan_and_propose` debug-logs and skips the basis arm
+  when set. 2 tests in `TestSpotFallbackSuppression`.
+- [x] **#4b (2d) — rolled-out leg pricing.** `_build_calendar_exit` and
+  `_update_unrealized` log WARN/DEBUG on missing leg, keep last-known mark.
+  1 test in `TestRolledLegPricing`.
+
+## Out of scope (deferred)
+- 2e placeholder `LONG_CALENDAR` between first and second leg fill (review §2e).
+- §3 and §4 items (review priority 5).
+
+## Review
+- All 38 `tests/test_arbitrage.py` cases pass (was 23 pre-change).
+- 3 pre-existing failures in `tests/test_pair_trading.py` are on `main` and
+  unrelated to this work — confirmed via `git stash` round-trip.
+- `config.ini` is gitignored; the new `dividend_yields` line is documented
+  inline in the local copy only. If the operator wants the config example to
+  live in version control, add an `[arbitrage]` section to `config_template.ini`.
+- Backtester smoke test on RELIANCE/INFY/TCS for 2026-04-01..17 ran clean
+  end-to-end.
+
+---
+
 # Dashboard auth — gate the API behind a password-cookie session
 
 ## Motivation

@@ -28,6 +28,7 @@ def _make_strategy(
     *, mode: str = "paper",
     risk_free_rate: float = 0.07,
     dividend_yield: float = 0.0,
+    dividend_yields=None,
     basis_entry_annual: float = 0.015,
     calendar_entry_annual: float = 0.020,
     calendar_exit_annual: float = 0.005,
@@ -43,6 +44,7 @@ def _make_strategy(
     s.universe = list(universe) if universe is not None else ["AAA", "BBB"]
     s.risk_free_rate = risk_free_rate
     s.dividend_yield = dividend_yield
+    s.dividend_yields = dict(dividend_yields or {})
     s.basis_entry_annual = basis_entry_annual
     s.basis_min_dte = 3
     s.calendar_entry_annual = calendar_entry_annual
@@ -57,6 +59,7 @@ def _make_strategy(
     s.total_capital = 500_000
     s.state = ArbitrageState()
     s._instrument_cache = None
+    s._ts_to_name = {}
     s._clock = lambda: datetime(2026, 4, 17, 10, 30)
     return s
 
@@ -423,3 +426,233 @@ class TestFillHandling:
         # The exact value isn't important — verify book is flat and trade archived.
         assert "AAA" not in s.state.open_calendars
         assert len(s.state.closed_trades) == 1
+
+
+# ──────────────────────────────────────────────────────────
+# Regression: prefix-collision in symbol attribution (LT vs LTIM)
+# ──────────────────────────────────────────────────────────
+
+class TestSymbolAttribution:
+    def _prop(self, ts, side="BUY", qty=1, price=100.0):
+        return TradeProposal(
+            tradingsymbol=ts, instrument_token=1, strike=0.0,
+            expiry="2026-04-28" if "APR" in ts else "2026-05-26",
+            option_type="FUT", lot_size=100, quantity=qty, price=price,
+            transaction_type=side, iv=0.0, bid_ask_spread_pct=0.0,
+            margin_required=0.0, rationale="test",
+        )
+
+    def test_authoritative_map_resolves_ltim_correctly(self):
+        # In a NIFTY-50 universe LT and LTIM both exist; the prior
+        # startswith-on-first-match would route LTIM26APRFUT → LT.
+        s = _make_strategy(universe=["LT", "LTIM"])
+        s._ts_to_name = {"LTIM26APRFUT": "LTIM", "LT26APRFUT": "LT"}
+        assert s._symbol_from_tradingsymbol("LTIM26APRFUT") == "LTIM"
+        assert s._symbol_from_tradingsymbol("LT26APRFUT") == "LT"
+
+    def test_longest_prefix_fallback_when_map_unpopulated(self):
+        # If _build_fut_index hasn't run yet the map is empty; the fallback
+        # must still route to LTIM (longest match), not LT.
+        s = _make_strategy(universe=["LT", "LTIM"])
+        # _ts_to_name intentionally empty
+        assert s._symbol_from_tradingsymbol("LTIM26APRFUT") == "LTIM"
+        assert s._symbol_from_tradingsymbol("LT26APRFUT") == "LT"
+
+    def test_apply_fill_routes_ltim_independent_of_lt(self):
+        # Direct correctness check on _apply_fill: an LTIM leg must NOT
+        # land in an LT trade. This is the load-bearing assertion that
+        # protects the full state machine from prefix collision.
+        s = _make_strategy(universe=["LT", "LTIM"])
+        s._ts_to_name = {
+            "LT26APRFUT": "LT", "LT26MAYFUT": "LT",
+            "LTIM26APRFUT": "LTIM", "LTIM26MAYFUT": "LTIM",
+        }
+        s._apply_fill(self._prop("LT26APRFUT", "BUY"))
+        s._apply_fill(self._prop("LT26MAYFUT", "SELL"))
+        s._apply_fill(self._prop("LTIM26APRFUT", "BUY"))
+        s._apply_fill(self._prop("LTIM26MAYFUT", "SELL"))
+        assert set(s.state.open_calendars) == {"LT", "LTIM"}
+        assert len(s.state.open_calendars["LT"].legs) == 2
+        assert len(s.state.open_calendars["LTIM"].legs) == 2
+
+
+# ──────────────────────────────────────────────────────────
+# Regression: per-trade realized_pnl on closed_trades
+# ──────────────────────────────────────────────────────────
+
+class TestPerTradePnL:
+    def _prop(self, ts, side, qty=1, price=100.0):
+        return TradeProposal(
+            tradingsymbol=ts, instrument_token=1, strike=0.0,
+            expiry="2026-04-28" if "APR" in ts else "2026-05-26",
+            option_type="FUT", lot_size=100, quantity=qty, price=price,
+            transaction_type=side, iv=0.0, bid_ask_spread_pct=0.0,
+            margin_required=0.0, rationale="test",
+        )
+
+    def test_two_round_trips_record_independent_realized_pnl(self):
+        # Open + close AAA at +₹200 gross. Then open + close BBB at +₹400 gross.
+        # The OLD bug: closed_trades[1].realized_pnl ≈ closed_trades[0].realized_pnl
+        # + bbb_delta (running total). The fix: each row contains only its own
+        # contribution.
+        s = _make_strategy(mode="paper", universe=["AAA", "BBB"])
+        s._ts_to_name = {
+            "AAA26APRFUT": "AAA", "AAA26MAYFUT": "AAA",
+            "BBB26APRFUT": "BBB", "BBB26MAYFUT": "BBB",
+        }
+        # Round trip 1 — AAA, +₹200 gross spread move (each leg ₹1×100 lot).
+        s._apply_fill(self._prop("AAA26APRFUT", "BUY", price=100.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "SELL", price=101.0))
+        s._apply_fill(self._prop("AAA26APRFUT", "SELL", price=101.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "BUY", price=100.0))
+        # Round trip 2 — BBB, +₹400 gross (₹2×100 each leg).
+        s._apply_fill(self._prop("BBB26APRFUT", "BUY", price=100.0))
+        s._apply_fill(self._prop("BBB26MAYFUT", "SELL", price=101.0))
+        s._apply_fill(self._prop("BBB26APRFUT", "SELL", price=102.0))
+        s._apply_fill(self._prop("BBB26MAYFUT", "BUY", price=99.0))
+
+        assert len(s.state.closed_trades) == 2
+        aaa, bbb = s.state.closed_trades
+        # Per-trade realized = gross spread move - per-trade transaction costs.
+        # gross AAA = 200; gross BBB = 400.
+        assert aaa["symbol"] == "AAA"
+        assert bbb["symbol"] == "BBB"
+        # AAA cleared 200 gross; net must be roughly 200 - aaa.transaction_costs.
+        assert abs(aaa["realized_pnl"] - (200.0 - aaa["transaction_costs"])) < 1e-6
+        # BBB independently cleared 400 gross; net ≈ 400 - bbb.transaction_costs.
+        assert abs(bbb["realized_pnl"] - (400.0 - bbb["transaction_costs"])) < 1e-6
+        # And the bug-shape we are guarding against: the second row is NOT
+        # the running total of both trades' P&L.
+        assert bbb["realized_pnl"] != aaa["realized_pnl"] + bbb["realized_pnl"]
+        # Cumulative totals on state should still equal the sum of the per-trade rows.
+        assert abs(
+            s.state.realized_pnl - (aaa["realized_pnl"] + bbb["realized_pnl"])
+        ) < 1e-6
+
+
+# ──────────────────────────────────────────────────────────
+# Per-symbol dividend yield
+# ──────────────────────────────────────────────────────────
+
+class TestPerSymbolDividendYield:
+    def test_parse_yield_map_basic(self):
+        m = ArbitrageStrategy._parse_yield_map(
+            "ITC=0.04,COALINDIA=0.06, hindunilvr =0.025"
+        )
+        assert m == {"ITC": 0.04, "COALINDIA": 0.06, "HINDUNILVR": 0.025}
+
+    def test_parse_yield_map_drops_garbage(self):
+        # Malformed entries are warned-and-skipped, not fatal.
+        m = ArbitrageStrategy._parse_yield_map("ITC=0.04,oops,COALINDIA=notanumber,=0.05,")
+        assert m == {"ITC": 0.04}
+
+    def test_get_yield_falls_back_to_default(self):
+        s = _make_strategy(dividend_yield=0.01, dividend_yields={"ITC": 0.04})
+        assert s._get_dividend_yield("ITC") == 0.04
+        assert s._get_dividend_yield("RELIANCE") == 0.01
+
+    def test_fair_future_uses_per_symbol_q(self):
+        # With q=4% the fair future on ITC should be lower than the q=0 default.
+        s = _make_strategy(risk_free_rate=0.07, dividend_yield=0.0,
+                           dividend_yields={"ITC": 0.04})
+        f_default = s._fair_future(100.0, 60, "RELIANCE")
+        f_itc = s._fair_future(100.0, 60, "ITC")
+        assert f_itc < f_default
+        # Sanity: f_itc = 100 · exp((0.07 - 0.04) · 60/365)
+        assert abs(f_itc - 100.0 * math.exp(0.03 * 60 / 365)) < 1e-9
+
+    def test_basis_uses_per_symbol_q(self):
+        # Same fut price; basis on a high-q name should be higher than on a q=0 name.
+        s = _make_strategy(risk_free_rate=0.07, dividend_yield=0.0,
+                           dividend_yields={"ITC": 0.04})
+        spot, fut, dte = 100.0, 102.0, 60
+        b_default = s._annualized_basis(spot, fut, dte, "RELIANCE")
+        b_itc = s._annualized_basis(spot, fut, dte, "ITC")
+        assert b_itc > b_default
+
+
+# ──────────────────────────────────────────────────────────
+# Spot fallback suppresses the basis arm
+# ──────────────────────────────────────────────────────────
+
+class TestSpotFallbackSuppression:
+    def test_basis_skipped_when_spot_is_fallback(self):
+        # When spot is back-discounted from the near future (cash quote
+        # missing), basis_annual is structurally zero by construction.
+        # The arm must skip rather than emit a noise signal.
+        s = _make_strategy(mode="paper", basis_entry_annual=0.001)
+        snap = {
+            "symbol": "AAA", "spot": 100.0, "spot_is_fallback": True,
+            "near": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
+                     "expiry": "2026-04-28", "instrument_token": 1},
+            "near_price": 102.0, "dte_near": 30,
+            "next": None, "next_price": None, "dte_next": None,
+            # If the snapshot ever leaks a non-zero basis through the
+            # fallback path (it shouldn't), the gate must still suppress.
+            "basis_annual": 0.50, "basis_annual_next": None,
+            "carry_implied": None, "carry_diff": None,
+        }
+        s._observe_universe = lambda: [snap]
+        proposals = s.scan_and_propose()
+        assert proposals == []
+
+    def test_basis_fires_with_real_spot(self):
+        # Same snapshot but spot_is_fallback=False — gate passes.
+        s = _make_strategy(mode="paper", basis_entry_annual=0.001)
+        snap = {
+            "symbol": "AAA", "spot": 100.0, "spot_is_fallback": False,
+            "near": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
+                     "expiry": "2026-04-28", "instrument_token": 1},
+            "near_price": 102.0, "dte_near": 30,
+            "next": None, "next_price": None, "dte_next": None,
+            "basis_annual": 0.50, "basis_annual_next": None,
+            "carry_implied": None, "carry_diff": None,
+        }
+        s._observe_universe = lambda: [snap]
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+
+
+# ──────────────────────────────────────────────────────────
+# Rolled-out leg pricing logs WARN (regression for 2d)
+# ──────────────────────────────────────────────────────────
+
+class TestRolledLegPricing:
+    def test_exit_warns_when_leg_not_in_snapshot(self, caplog):
+        # Open a calendar, then build an exit against a snapshot whose `near`
+        # / `next` no longer carry the leg's tradingsymbol — simulating the
+        # case where the contract has rolled off the instrument list.
+        import logging
+        s = _make_strategy(mode="paper")
+        trade = CalendarTrade(
+            symbol="AAA", position="SHORT_CALENDAR",
+            entry_time=datetime(2026, 4, 1, 10, 0),
+            entry_carry_diff=0.04,
+            legs=[
+                CalendarLeg(symbol="AAA", tradingsymbol="AAA26APRFUT",
+                            expiry="2026-04-28", lot_size=100, quantity=1,
+                            entry_price=100.0, current_price=99.5),
+                CalendarLeg(symbol="AAA", tradingsymbol="AAA26MAYFUT",
+                            expiry="2026-05-26", lot_size=100, quantity=-1,
+                            entry_price=101.0, current_price=101.5),
+            ],
+        )
+        # Snapshot's "near" is now the May contract (April rolled off);
+        # the April leg in our trade record won't match.
+        snap = {
+            "symbol": "AAA", "spot": 100.0,
+            "near": {"tradingsymbol": "AAA26MAYFUT", "lot_size": 100,
+                     "expiry": "2026-05-26", "instrument_token": 2},
+            "near_price": 101.5, "dte_near": 26,
+            "next": None, "next_price": None, "dte_next": None,
+            "basis_annual": 0.0,
+            "carry_implied": None, "carry_diff": None,
+        }
+        with caplog.at_level(logging.WARNING, logger="strategies.arbitrage"):
+            exits = s._build_calendar_exit(trade, snap, "MAX_HOLD")
+        assert len(exits) == 2
+        # The April leg should have been priced at last-known current_price (99.5)
+        apr = next(p for p in exits if "APR" in p.tradingsymbol)
+        assert apr.price == 99.5
+        # And we logged about it.
+        assert any("not in current snapshot" in r.message for r in caplog.records)

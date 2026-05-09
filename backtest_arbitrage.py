@@ -224,6 +224,7 @@ def make_strategy(
     lots_per_leg: int,
     max_open_calendars: int,
     max_leg_notional: Optional[float],
+    dividend_yields: Optional[Dict[str, float]] = None,
 ) -> ArbitrageStrategy:
     s = ArbitrageStrategy.__new__(ArbitrageStrategy)
     s.kite = kite
@@ -233,6 +234,7 @@ def make_strategy(
     s.universe = list(universe)
     s.risk_free_rate = risk_free_rate
     s.dividend_yield = dividend_yield
+    s.dividend_yields = dict(dividend_yields or {})
     s.basis_entry_annual = basis_entry_annual
     s.basis_min_dte = basis_min_dte
     s.calendar_entry_annual = calendar_entry_annual
@@ -246,6 +248,7 @@ def make_strategy(
     s.max_leg_notional = max_leg_notional
     s.total_capital = 500_000
     s.state = ArbitrageState()
+    s._ts_to_name = {}
     # Crucial: the instrument cache must NOT persist across days because
     # each bhavcopy day publishes a different set of expiring contracts.
     # We override _load_instruments to bypass the per-instance cache.
@@ -274,6 +277,7 @@ def run_backtest(
     lots_per_leg: int = 1,
     max_open_calendars: int = 5,
     max_leg_notional: Optional[float] = None,
+    dividend_yields: Optional[Dict[str, float]] = None,
 ) -> dict:
     universe = sorted(panel["symbol"].unique().tolist())
     mock = MockKiteArb(panel)
@@ -290,6 +294,7 @@ def run_backtest(
         lots_per_leg=lots_per_leg,
         max_open_calendars=max_open_calendars,
         max_leg_notional=max_leg_notional,
+        dividend_yields=dividend_yields,
     )
 
     pnl_curve: List[dict] = []
@@ -402,11 +407,24 @@ def print_report(result: dict, args) -> None:
     print("=" * 90)
 
     if result["closed_trades"]:
-        print("\nTop 10 closed calendars by realized P&L (cumulative line):")
-        rows = result["closed_trades"][-10:]
-        for t in rows:
+        # closed_trades.realized_pnl is now a per-trade delta (not the running
+        # total). Sort by it directly and report the worst+best so the tail
+        # of the distribution is visible — Varsity flags that calendar P&L
+        # is small per-trade so the spread of outcomes matters.
+        sorted_trades = sorted(
+            result["closed_trades"], key=lambda t: t["realized_pnl"], reverse=True,
+        )
+        head = sorted_trades[:5]
+        tail = sorted_trades[-5:] if len(sorted_trades) > 5 else []
+        print("\nTop 5 closed calendars by per-trade realized P&L:")
+        for t in head:
             print(f"  {t['symbol']:<14} {t['position']:<16} entry_diff={t['entry_carry_diff']:+.3f} "
-                  f"realized_running=₹{t['realized_pnl']:,.0f}")
+                  f"realized=₹{t['realized_pnl']:>+10,.0f} costs=₹{t['transaction_costs']:>7,.0f}")
+        if tail:
+            print("Bottom 5:")
+            for t in tail:
+                print(f"  {t['symbol']:<14} {t['position']:<16} entry_diff={t['entry_carry_diff']:+.3f} "
+                      f"realized=₹{t['realized_pnl']:>+10,.0f} costs=₹{t['transaction_costs']:>7,.0f}")
 
     if result["basis_events"]:
         # Top by absolute annualized basis
@@ -446,6 +464,10 @@ def main() -> int:
     p.add_argument("--lots-per-leg", type=int, default=1, dest="lots_per_leg")
     p.add_argument("--max-open-calendars", type=int, default=5, dest="max_open_calendars")
     p.add_argument("--max-leg-notional", type=float, default=500_000, dest="max_leg_notional")
+    p.add_argument("--dividend-yields", type=str, default="", dest="dividend_yields",
+                   help="Comma-separated per-symbol dividend yields, e.g. "
+                        "'ITC=0.04,COALINDIA=0.06,HUL=0.025'. Symbols not "
+                        "listed fall back to --dividend-yield.")
     p.add_argument("--from", type=str, default=None, dest="date_from",
                    help="Start date YYYY-MM-DD (inclusive)")
     p.add_argument("--to", type=str, default=None, dest="date_to",
@@ -474,6 +496,9 @@ def main() -> int:
     logger.info("Panel: %d rows over %d trading days, %d underlyings",
                 len(panel), panel["date"].nunique(), panel["symbol"].nunique())
 
+    # Reuse the strategy's parser so live + replay never disagree on the format.
+    div_yields = ArbitrageStrategy._parse_yield_map(args.dividend_yields)
+
     result = run_backtest(
         panel,
         risk_free_rate=args.risk_free_rate, dividend_yield=args.dividend_yield,
@@ -486,6 +511,7 @@ def main() -> int:
         lots_per_leg=args.lots_per_leg,
         max_open_calendars=args.max_open_calendars,
         max_leg_notional=args.max_leg_notional,
+        dividend_yields=div_yields,
     )
 
     print_report(result, args)
