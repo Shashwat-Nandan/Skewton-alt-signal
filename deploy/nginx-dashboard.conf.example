@@ -43,11 +43,11 @@ server {
         proxy_read_timeout 60s;
     }
 
-    # Backend API — six prefixes only. Anything else falls through
+    # Backend API — seven prefixes only. Anything else falls through
     # to the SPA. Keep this list in sync with the routers registered in
     # backend/main.py. /session is the dashboard-password gate; everything
     # else is gated behind it server-side.
-    location ~ ^/(session|auth|strategies|runs|market-profile|pair-candidates)(/|$) {
+    location ~ ^/(session|auth|strategies|runs|market-profile|pair-candidates|equity)(/|$) {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

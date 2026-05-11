@@ -58,12 +58,30 @@ systemctl is-active --quiet "$BACKEND_UNIT" || {
 }
 
 # 7. End-to-end smoke. Always probes 127.0.0.1:8000 (catches backend
-#    bugs); also probes $SMOKE_PUBLIC_URL if set (catches nginx prefix
-#    drift — TestClient cannot see this layer). A failure here means
-#    something the SPA depends on is broken in production.
+#    bugs); also probes the public URL (catches nginx prefix drift —
+#    TestClient cannot see this layer; loopback can't either). A failure
+#    here means something the SPA depends on is broken in production.
+#
+#    Resolution order for the public URL:
+#      a. $SMOKE_PUBLIC_URL env override (explicit; for staging hosts)
+#      b. server_name from /etc/nginx/sites-enabled/dashboard (the live
+#         config — guarantees we probe the same host visitors hit)
+#      c. skip with a warning (dev box without nginx)
 SMOKE_BASES=("http://127.0.0.1:8000")
-if [[ -n "${SMOKE_PUBLIC_URL:-}" ]]; then
-    SMOKE_BASES+=("$SMOKE_PUBLIC_URL")
+public_url="${SMOKE_PUBLIC_URL:-}"
+if [[ -z "$public_url" && -r /etc/nginx/sites-enabled/dashboard ]]; then
+    detected=$(awk '/^[[:space:]]*server_name[[:space:]]/ {
+        for (i=2; i<=NF; i++) { gsub(";","",$i); if ($i!="" && $i!="_") { print $i; exit } }
+    }' /etc/nginx/sites-enabled/dashboard)
+    if [[ -n "$detected" ]]; then
+        public_url="https://$detected"
+        echo "Auto-detected public URL: $public_url (override with SMOKE_PUBLIC_URL=)"
+    fi
+fi
+if [[ -n "$public_url" ]]; then
+    SMOKE_BASES+=("$public_url")
+else
+    echo "WARN: no public URL to smoke — set SMOKE_PUBLIC_URL or check nginx config" >&2
 fi
 echo "Smoke check against ${SMOKE_BASES[*]} ..."
 "$PROJECT_DIR/deploy/smoke.sh" "${SMOKE_BASES[@]}" || {
