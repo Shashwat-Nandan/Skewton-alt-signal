@@ -23,6 +23,10 @@ if [[ ${#BASES[@]} -eq 0 ]]; then
     BASES=("http://127.0.0.1:8000")
 fi
 
+# Cap on how long we'll wait for each base URL to become reachable on a
+# fresh deploy. Override via env if your stack is slower.
+READY_TIMEOUT_S="${READY_TIMEOUT_S:-60}"
+
 # Each entry: "<path>|<expected_status>". Most routes are gated behind the
 # dashboard session and return 401 to an unauthenticated probe — that's a
 # success signal: it proves both that the proxy reached the backend AND
@@ -46,20 +50,34 @@ ROUTES=(
     "/equity/fii-dii|401"
 )
 
+wait_ready() {
+    # Block until the backend at $1 responds to /session/me, or give up
+    # after READY_TIMEOUT_S seconds. curl returns instantly on TCP-refused
+    # (the just-restarted-uvicorn case), so we can't rely on curl's own
+    # --max-time to budget the wait — we need our own outer loop with a
+    # sleep between attempts. dashboard-backend's lifespan (db.init_schema
+    # + RunManager.hydrate_from_db) routinely takes ~12 s on first start.
+    local url="$1"
+    local deadline=$(( $(date +%s) + READY_TIMEOUT_S ))
+    while (( $(date +%s) < deadline )); do
+        if curl -sSf -o /dev/null --max-time 5 "$url" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "ERROR: $url did not become reachable within ${READY_TIMEOUT_S}s" >&2
+    return 1
+}
+
 probe() {
     local url="$1" expected="$2"
     local body status ctype meta
     body=$(mktemp)
-    # Retry briefly: just-restarted uvicorn may not have bound yet.
-    for attempt in 1 2 3 4 5; do
-        meta=$(curl -sS -o "$body" -w "%{http_code} %{content_type}" \
-                    --max-time 10 "$url" 2>/dev/null || echo "000 connect-error")
-        status="${meta%% *}"
-        if [[ "$status" != "000" ]]; then
-            break
-        fi
-        sleep 1
-    done
+    # By the time we get here wait_ready has confirmed the backend is up,
+    # so a single curl is enough; keep --max-time as a hard cap.
+    meta=$(curl -sS -o "$body" -w "%{http_code} %{content_type}" \
+                --max-time 10 "$url" 2>/dev/null || echo "000 connect-error")
+    status="${meta%% *}"
     ctype="${meta#* }"
 
     if [[ "$status" != "$expected" ]]; then
@@ -87,6 +105,13 @@ probe() {
 
 fail=0
 for base in "${BASES[@]}"; do
+    # Gate on /session/me reachability first. Skips this base's per-route
+    # probes if the backend never came up — avoids 10× redundant failure
+    # rows that obscure the root cause in deploy logs.
+    if ! wait_ready "${base%/}/session/me"; then
+        fail=1
+        continue
+    fi
     for entry in "${ROUTES[@]}"; do
         path="${entry%|*}"
         expected="${entry##*|}"
