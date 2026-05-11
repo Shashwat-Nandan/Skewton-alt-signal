@@ -161,9 +161,16 @@ class VarsityEquitySwingStrategy(BaseStrategy):
         "mp_veto_below_val":      1,            # 0/1 veto entries with close < VAL
         "mp_boost_above_vah":     1,            # 0/1 score+1 if close > VAH
         # Phase 2 — OI confluence gate (front-month price, total-expiry OI).
-        # Default ON: backtest 2026-05-10 showed clear improvement —
-        # win rate 24 % → 35 %, Sharpe −2.47 → −1.72, drawdown −5 pp.
-        "oi_enabled":             1,            # 0/1 master toggle
+        # Default OFF: the 2026-05-10 STF-proxy backtest that motivated
+        # default-ON was a 125-day window with corp-action artifacts.
+        # Re-evaluated 2026-05-11 on 535 trading days of real EQ bhavcopy
+        # (2024-03 → 2026-05, 209 symbols): trend-only Sharpe 0.48,
+        # +OI gate Sharpe 0.18 — gate strips ~₹52K of edge per ₹10L
+        # over the window. The classifier likely vetoes too many honest
+        # breakouts because Indian SSF OI churn is dominated by hedging
+        # / rollover noise rather than directional positioning. Operators
+        # who want the gate on can flip oi_enabled=1 in config.ini.
+        "oi_enabled":             0,            # 0/1 master toggle
         "oi_lookback":            5,            # bars
         "oi_min_price_chg_pct":   1.0,          # min |Δprice|% to register a class
         "oi_min_oi_chg_pct":      2.0,          # min |ΔOI|% to register a class

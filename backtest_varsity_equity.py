@@ -319,8 +319,8 @@ def main():
     p.add_argument("--cost-pct", type=float, default=ROUND_TRIP_COST_PCT)
     p.add_argument("--mp", choices=["off", "on"], default="on",
                    help="Phase-2 Market Profile gate (default: on)")
-    p.add_argument("--oi", choices=["off", "on"], default="on",
-                   help="Phase-2 OI confluence gate (default: on)")
+    p.add_argument("--oi", choices=["off", "on"], default="off",
+                   help="Phase-2 OI confluence gate (default: off — see DEFAULTS rationale)")
     p.add_argument("--ledger-out", default="data_cache/equity_swing_trades.tsv")
     p.add_argument("--report-json", default=None)
     p.add_argument("--quiet", action="store_true")
