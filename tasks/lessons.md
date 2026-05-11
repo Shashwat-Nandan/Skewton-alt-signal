@@ -141,9 +141,13 @@
 
 ## TestClient coverage ≠ proxy coverage — keep an HTTP smoke check in front of nginx
 
-- A new router can pass every `tests/test_backend.py` assertion and still 500-equivalent in production if the nginx prefix whitelist (`location ~ ^/(...)`) wasn't updated to include it. `fastapi.testclient.TestClient` instantiates the ASGI app directly — it never sees nginx — so it is structurally incapable of catching this. Shipped exactly this regression on 2026-05-05 with `/pair-candidates`.
-- `deploy/smoke.sh` exists for this. The single load-bearing assertion is `Content-Type: application/json` — when nginx falls through to the SPA fallback, the response is `text/html` regardless of HTTP status, and that's the discriminator. `redeploy.sh` runs it against `127.0.0.1:8000` always and `$SMOKE_PUBLIC_URL` if set, gating the deploy.
-- When adding a new public router: add a row to the `ROUTES` array in `deploy/smoke.sh`. Pick `allow_503=1` only if the data source can be legitimately absent on a fresh deploy.
+- A new router can pass every `tests/test_backend.py` assertion and still 500-equivalent in production if the nginx prefix whitelist (`location ~ ^/(...)`) wasn't updated to include it. `fastapi.testclient.TestClient` instantiates the ASGI app directly — it never sees nginx — so it is structurally incapable of catching this. Shipped this regression twice: 2026-05-05 with `/pair-candidates`, then again 2026-05-11 with `/equity/*` (page broke with "Unexpected token '<', '<!doctype '... is not valid JSON" because `SMOKE_PUBLIC_URL` wasn't set so the public smoke silently no-op'd).
+- `deploy/smoke.sh` exists for this. The single load-bearing assertion is `Content-Type: application/json` — when nginx falls through to the SPA fallback, the response is `text/html` regardless of HTTP status, and that's the discriminator. As of 2026-05-11, `redeploy.sh` auto-detects the public URL from `/etc/nginx/sites-enabled/dashboard`'s `server_name` so the public-host smoke runs by default — `SMOKE_PUBLIC_URL` is now an override, not an opt-in.
+- **When adding a new public router, update all three places**:
+  1. `backend/main.py` — `app.include_router(...)`
+  2. `deploy/nginx-dashboard.conf.example` AND the live `/etc/nginx/sites-enabled/dashboard` — add the prefix to the API `location ~ ^/(...)` regex
+  3. `deploy/smoke.sh` ROUTES array — one row per public path
+- The auto-smoke-against-public-URL will now fail the deploy if step 2 is missed. Don't bypass it.
 
 ## `uv pip compile` embeds the output path in the autogen header
 
