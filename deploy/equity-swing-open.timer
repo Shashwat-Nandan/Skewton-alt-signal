@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire equity-swing-open.service Mon–Fri at 09:30 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:30 IST — 15 min after open. Gives the bell a chance to settle and
+# Kite's spot quotes to stabilise. Same pattern as pair-paper.timer's
+# offset from the open. The runner self-gates on holidays.csv.
+OnCalendar=Mon..Fri *-*-* 09:30:00 Asia/Kolkata
+
+# If the VPS was asleep / systemd missed the window, run once to catch up.
+# run_equity_swing.py refuses to take new entries at the open scan and
+# only checks exits, so a late catch-up won't open marginal positions.
+Persistent=true
+
+# Jitter to avoid thundering-herd Kite logins on multi-account VPSes.
+RandomizedDelaySec=60
+
+Unit=equity-swing-open.service
+
+[Install]
+WantedBy=timers.target

@@ -151,6 +151,80 @@ export type PairCandidatesResponse = {
   candidates: PairCandidate[];
 };
 
+// ── Equity Swing ──
+
+export type EquityPosition = {
+  id: number;
+  symbol: string;
+  side: string;
+  entry_dt: string;
+  entry_px: number;
+  qty: number;
+  initial_sl: number;
+  current_sl: number;
+  target: number;
+  atr_at_entry: number;
+  rationale?: string | null;
+  last_mtm_dt?: string | null;
+  last_mtm_px?: number | null;
+  high_watermark?: number | null;
+  status: "OPEN" | "CLOSED";
+  exit_dt?: string | null;
+  exit_px?: number | null;
+  exit_reason?: string | null;
+  pnl?: number | null;
+  opened_by_scan?: string | null;
+};
+
+export type EquityPositionsResponse = {
+  positions: EquityPosition[];
+};
+
+export type EquitySignal = {
+  timestamp: string;
+  tradingsymbol: string;
+  transaction_type: "BUY" | "SELL";
+  quantity: number;
+  price: number;
+  rationale?: string | null;
+};
+
+export type EquitySignalsResponse = {
+  date: string;
+  generated_at: string | null;
+  signals: EquitySignal[];
+};
+
+export type EquityScan = {
+  id: number;
+  scan_dt: string;
+  scan_kind: "open" | "close";
+  mode: "signals" | "paper";
+  n_signals: number;
+  n_trades: number;
+  n_open_positions: number;
+  n_closed_today: number;
+  notes?: string | null;
+};
+
+export type EquityScansResponse = {
+  scans: EquityScan[];
+};
+
+export type FiiDiiRow = {
+  date: string;
+  fii_net: number | null;
+  dii_net: number | null;
+  fii_net_5d: number | null;
+  dii_net_5d: number | null;
+  fii_boost: number | null;
+};
+
+export type FiiDiiResponse = {
+  generated_at: string | null;
+  rows: FiiDiiRow[];
+};
+
 export type MarketProfileResponse = {
   symbol: string;
   name?: string | null;

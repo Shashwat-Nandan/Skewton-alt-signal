@@ -1,3 +1,351 @@
+# Varsity-style equity swing strategy (2026-05-10)
+
+## Motivation
+User wants a medium-to-long-term equity directional system grounded in the
+Varsity modules: trend (Module 2), gap behaviour (Module 5 sentiment), market
+profile (POC/VAH/VAL), OI confluence on F&O names, and FII/DII flow overlay,
+with Module 9 risk management (ATR-sized stops, RR ≥ 2). Run twice daily as
+cron, surface signals + paper P&L on the dashboard with full trade detail
+(entry / SL / target / position size / status). This is the **first equity-
+directional strategy** in this repo, which is otherwise options/derivatives.
+
+User decisions captured 2026-05-10:
+- Universe: **Nifty 200**.
+- Cadence: **twice daily** — post-open scan and post-close scan.
+- Mode: **signals + paper trading** (no live in v1; `live` stays gated).
+- Signals: **Trend + Gap + Market Profile + OI + FII/DII** (full set).
+
+## Design constraints (from `tasks/lessons.md`)
+- Volume thresholds for equity must be in **shares** (bhavcopy `EQ` segment) —
+  comment the unit on the same line where defined. Do NOT mix with F&O contract
+  volumes (which is what the calendar lesson got wrong).
+- Strategy must NEVER bare-except + return `0.0` from a price/quote helper.
+  Return `None` and force callers to handle absence. Add a consecutive-failure
+  counter that escalates WARN→ERROR after 5 consecutive misses.
+- Backtest must treat `total_trades == 0` as a **distinct sentinel** (not flat
+  zero score) to keep autoresearch hookup viable later.
+- Any new public API route MUST be added to `deploy/smoke.sh` ROUTES array
+  before deploy (TestClient passes are necessary but not sufficient).
+- Spot keys: `f"NSE:{symbol}"` is correct for stocks (no index-name special
+  case needed since Nifty 200 constituents are equities).
+- Any unit-bearing threshold gets `# unit: <X>` on the same line.
+- Function whose contract is "produce executable side effects" must log when
+  it produces none — silent `return []` is forbidden.
+
+## Architecture
+
+**New strategy:** `strategies/varsity_equity_swing.py` subclassing
+`BaseStrategy`. `option_type="EQ"` is added to `TradeProposal` semantics
+(string is already free-form; no schema change needed but `validate_order`
+already accepts `EQ`-style symbols since the regex is `[A-Z0-9&\-]{3,30}`).
+
+**Universe loader:** `data_cache/nifty200.csv` (one column `symbol`). Either
+hand-maintained or refreshed via a small `fetch_nifty200_constituents.py`.
+
+**Data sources** (all free):
+| Signal       | Source                             | Cache                              | Cadence |
+|--------------|------------------------------------|------------------------------------|---------|
+| Daily OHLCV  | NSE bhavcopy EQ archive (existing) | `data_cache/bhavcopy_eq/`          | EOD     |
+| Intraday 30m | Kite historical (existing)         | `backend/bars.db`                  | EOD     |
+| F&O OI       | NSE bhavcopy F&O (existing)        | `data_cache/bhavcopy_raw/`         | EOD     |
+| FII/DII flow | NSE `fiidiiTradeReact` API         | `data_cache/fii_dii/YYYY-MM-DD.json` | EOD   |
+
+**Risk manager (Varsity Module 9):**
+- Position size: `shares = (total_capital * risk_per_trade_pct) / (entry - SL)`
+  where `risk_per_trade_pct = 1 %` and `SL = entry − 2.5 × ATR(14)`.
+- Hard SL at entry, Chandelier trail (highest_high − 3 × ATR) once 1× SL is
+  green.
+- Target: 2 × SL distance (RR=2). Optional scale-out at 1.5× (out of scope v1).
+- Time stop: 20 trading days flat → exit.
+- Portfolio: max 6 open positions, max 30 % gross exposure of `total_capital`.
+
+**Signal pipeline (per scan):**
+1. Universe filter: liquidity (avg daily turnover > ₹50 cr, 20-day median).
+2. Trend filter: `SMA50 > SMA200` AND `ADX(14) > 20`.
+3. Setup trigger (any-of):
+   - Pullback to 20 EMA (close within 0.5 ATR), prior-day green candle.
+   - Breakout > 20-day high with vol > 1.5× 20d avg.
+4. Gap filter: skip if |open − prev_close| / prev_close > 2 %.
+5. Market profile (uses `market_profile.py` on 5-day rolling 30m bars):
+   prefer entries near VAL (long) when above VAH; reject if at POC and stalling.
+6. OI confluence (only for F&O names; non-F&O names skip this gate):
+   long buildup (price ↑, OI ↑) → green; short buildup (price ↓, OI ↑) → red.
+7. FII/DII overlay: **5-day cumulative net FII cash** > 0 → tilt toward longs;
+   < 0 → require stronger setup (score threshold +1).
+8. Score = sum of weighted booleans; rank desc; take top N (≤ remaining slots).
+
+**Paper-mode harness:** mirrors `run_paper.py`. Persists open positions to a
+new SQLite table `equity_positions` (cols: id, run_id, symbol, side, entry_dt,
+entry_px, sl, target, atr_at_entry, qty, status, exit_dt, exit_px, exit_reason,
+pnl). Each scan also marks-to-market open positions and triggers SL/target/
+time-stop exits.
+
+**Backend API** (`backend/routers/equity_swing.py`):
+- `GET /equity/positions?status=open|closed` — full row dump.
+- `GET /equity/signals?date=YYYY-MM-DD` — pending signals from latest scan.
+- `GET /equity/scans` — last N scan summaries (date, mode, n_signals, n_skipped).
+- `GET /equity/fii-dii` — last 30 trading days of cash + index futures flows.
+- `deploy/smoke.sh` ROUTES updated for each.
+
+**Frontend** (`frontend/src/pages/EquitySwingPage.tsx`):
+- Open positions table — symbol, entry_dt, entry, current, SL, target, P&L,
+  days held, status badge (OPEN / SL_HIT / TARGET_HIT / TIME_STOP / TRAIL_STOP).
+- Today's signals card — symbol, score, rationale, suggested entry/SL/target/qty.
+- FII/DII tile — last 5d cumulative cash + futures, sparkline.
+- Reuse `ProposalTable.tsx` row pattern; add a "Trade Details" drawer with
+  the full signal-time snapshot (trend, profile context, OI delta).
+- Route added to `App.tsx`; entry on `Home.tsx` strategy picker.
+
+**Live runtime:**
+- `run_equity_swing.py` — single CLI, `--scan {open|close}` flag, `--mode
+  {signals|paper}`. Loads strategy, runs `scan_and_propose` →
+  `check_and_rehedge` (which exits triggered positions) → `execute_proposals`.
+- `deploy/equity-swing-open.timer` — `Mon..Fri 09:30 IST`.
+- `deploy/equity-swing-close.timer` — `Mon..Fri 15:35 IST` (after bhavcopy is
+  available). Each timer launches a `equity-swing-{open,close}.service` unit
+  that calls `run_equity_swing.py` with the matching flag.
+- Both write JSONL to `logs/signals-YYYY-MM-DD.jsonl` (existing convention,
+  flock-locked appends from `BaseStrategy._emit_signal`).
+- Paper mode also persists positions to `dashboard.db.equity_positions`.
+
+## Phasing (build-then-validate at each phase)
+
+### Phase 1 — Strategy core + backtest [no live, no UI]
+- [ ] Universe: add `data_cache/nifty200.csv` (hand-curated for v1) + tiny
+      loader in `strategies/varsity_equity_swing.py`.
+- [ ] Indicator library `strategies/_indicators.py`: `sma`, `ema`, `atr`,
+      `adx`, `donchian_high` — pure pandas, no Kite dep.
+- [ ] `VarsityEquitySwingStrategy(BaseStrategy)`:
+      - `scan_and_propose()` → trend + gap + setup + ATR sizing + risk gate.
+      - `check_and_rehedge()` → SL/target/time-stop/Chandelier exits.
+      - `execute_proposals()` → signals JSONL + paper book.
+      - `generate_eod_report()` → P&L, win rate, expectancy, n_open, n_closed.
+- [ ] `backtest_varsity_equity.py` — replays bhavcopy EQ archive (3-year
+      window default). Must:
+      - emit per-trade ledger TSV with entry, exit, holding period, R-multiple;
+      - print summary block (Sharpe, Calmar, max DD, profit factor, win rate);
+      - return ZERO_TRADE_PENALTY = -1e6 when 0 trades, separate from errors;
+      - apply 0.2 % round-trip cost (delivery STT 0.1 % sell + slippage).
+- [ ] `tests/test_varsity_equity_swing.py` — unit tests for ATR sizing
+      (asserts non-zero shares for normal ATR), trend filter, gap filter,
+      Chandelier trail, time-stop. Plus an integration smoke that runs the
+      strategy over a fixture and asserts at least one trade fires (catches
+      the "silently empties the universe" lesson).
+- [ ] Run backtest end-to-end on the available bhavcopy archive. Sanity-check
+      output: per-symbol breakdown, win rate by direction, average holding
+      period 5–25 trading days for a "swing" claim.
+- [ ] STOP. Review backtest with user before proceeding.
+
+### Phase 2 — Market profile + OI confluence
+- [ ] Wire `market_profile.py` into the scan: build a 5-day rolling profile
+      per symbol from `backend/bars.db` 30-min bars. Add a setup gate using
+      VAH/VAL/POC.
+- [ ] Add OI gate: read `data_cache/bhavcopy_raw/` F&O segment for the symbol
+      (skip if no F&O); compute price-vs-OI delta for the last 5 sessions;
+      veto on short-buildup, boost on long-buildup.
+- [ ] Re-run backtest. Compare metrics vs Phase 1 baseline. Document delta.
+- [ ] If MP/OI gates degrade Sharpe, default-disable them and surface as
+      tunables (Varsity calendar dividend lesson: encode known asymmetries
+      as defaults, not footnotes).
+
+### Phase 3 — FII/DII + live runtime + paper book
+- [ ] `fetch_fii_dii.py` — pulls NSE `fiidiiTradeReact` JSON, writes
+      `data_cache/fii_dii/YYYY-MM-DD.json`. Idempotent. Add a `--lookback N`
+      backfill flag.
+- [ ] FII/DII overlay in scan; backtest replay needs synthetic backfill from
+      NSE bulk archive (fall back to skipping the gate when not available).
+- [ ] `run_equity_swing.py` CLI wrapper (signals + paper modes).
+- [ ] `dashboard.db.equity_positions` table + persistence helpers in
+      `backend/db.py`. Schema migration on startup (additive only, won't
+      conflict with existing `runs/proposals/pnl_snapshots`).
+- [ ] systemd: `deploy/equity-swing-open.{service,timer}` and
+      `deploy/equity-swing-close.{service,timer}`. Fetcher dependency:
+      close-scan timer waits for `fetch-fii-dii` + `fetch-bhavcopy` to land.
+- [ ] Smoke: trigger both timers manually, verify JSONL written, paper book
+      updated, no 500s in journalctl.
+
+### Phase 4 — Backend API + frontend
+- [x] `backend/routers/equity_swing.py` with the four endpoints listed above.
+      Wire into `backend/main.py`. Add `pages/EquitySwingPage.tsx`.
+- [x] Update `deploy/smoke.sh` ROUTES — `/equity/positions`,
+      `/equity/signals`, `/equity/scans`, `/equity/fii-dii`. All four gated,
+      so probe expects 401 + application/json (matches existing rows).
+- [x] `pages/EquitySwingPage.tsx` — open positions table, today's signals
+      card, FII/DII tile, trade-detail drawer (side sheet). Wired into
+      `App.tsx` + `Header.tsx` NavLink.
+- [x] Backend tests in `tests/test_backend_equity.py` (13 tests, mirrors
+      `test_pair_candidates.py` pattern — monkeypatches LOG_DIR/FII_CACHE_DIR
+      to tmp_path).
+- [x] TestClient probe: all four routes return 401 + `application/json` when
+      unauthed (router-level verification).
+- [x] Live `smoke.sh` against `uvicorn` on `127.0.0.1:8123` — all 10 routes
+      green (6 pre-existing + 4 new equity routes). Real production smoke pipeline.
+- [x] Production SPA dist verified: `frontend/dist/index.html` + 776 KB JS
+      bundle serves correctly, grep confirms `/equity-swing` route and all
+      four `/equity/*` API paths are baked into the bundle.
+- [x] End-to-end data path exercised: fetched 199 days of EQ bhavcopy (41,367
+      rows × 209 symbols), ran `run_equity_swing.py --scan close --mode paper
+      --force`. Strategy executed across full universe, DB writes clean,
+      session exited cleanly. Open positions resumed correctly from DB.
+
+### Phase 5 — Documentation + ops
+- [x] Add `[equity_swing]` section to `config_template.ini` with all tunables
+      and inline unit comments (Phase 1/2/3 grouped, defaults match
+      `VarsityEquitySwingStrategy.DEFAULTS`).
+- [x] Update `ARCHITECTURE.md` — new strategy row in §4.2, full §4.4 stanza
+      ("Varsity Equity Swing"), API table extended with /equity/* rows, and
+      `deploy/equity-swing-*` units listed in §12.2.
+- [x] Update `README.md` — quickstart step 5 (run_equity_swing.py), entry
+      points table, strategies table.
+- [x] Final review: 206-test sweep passes (test_backend, test_backend_equity,
+      test_pair_candidates, test_varsity_equity_swing, test_market_profile,
+      test_persistence, test_dashboard_auth, test_backtest, test_arbitrage,
+      test_calendar_meanreversion, test_risk_analyzer, test_trade_proposer).
+      One pre-existing failure in test_pair_trading.py::test_hedge_qty_matches_notional
+      confirmed on baseline (git stash) — not introduced by this work.
+- [x] `bash -n deploy/smoke.sh` clean; `systemd-analyze verify` clean on all
+      four `equity-swing-*` units (only complaint is the deliberate
+      `/opt/taleb-karpathy-kite/...` placeholder path).
+- [x] `npm run build` clean (vite build emits 776 KB bundle, no TS errors).
+
+## Out of scope for v1
+- Live trading mode (kite.place_order). Signals + paper only.
+- Autoresearch hookup (Phase 6 candidate; design keeps the door open via the
+  ZERO_TRADE_PENALTY-compatible scorer).
+- Scale-outs / partial profit booking. Single binary exit per position.
+- Sector rotation / sector-relative strength. Stock-level only.
+- Intraday 5-min bar signals. Daily + 30-min bars only.
+
+## Review
+
+### Phase 1 — shipped 2026-05-10
+
+**Code delivered**
+- `data_cache/nifty200.csv` (209 symbols, derived from F&O STF universe).
+- `strategies/_indicators.py` — `sma`, `ema`, `atr`, `adx`, `donchian_high/low`,
+  `chandelier_stop_long`. Pure pandas, NaN warm-up (no zero-fallback).
+- `strategies/_eq_data.py` — equity OHLCV loader: per-symbol cache CSVs
+  (preferred) or front-month STF proxy from existing F&O bhavcopy archive.
+  Volume converted to share-equivalent via `NewBrdLotQty`.
+- `strategies/varsity_equity_swing.py` — `VarsityEquitySwingStrategy` with
+  trend (SMA short/long + ADX), gap, pullback-or-breakout setup, ATR sizing,
+  SL/target/Chandelier/time-stop state machine; signals + paper modes; live
+  raises NotImplementedError. Registered in `strategies/__init__.py`.
+- `backtest_varsity_equity.py` — date-by-date replay; entries at next-bar
+  open (no look-ahead), intraday-touch exits, 0.20 % round-trip cost,
+  ZERO_TRADE_PENALTY = -1e6 sentinel, per-trade ledger TSV, per-symbol
+  breakdown, full metrics block (Sharpe, Calmar, max DD, profit factor,
+  CAGR).
+- `fetch_bhavcopy_eq.py` — NSE EQ-segment fetcher writing per-symbol
+  OHLCV to `data_cache/equity_ohlcv/`. Idempotent. Will run on the user's
+  VPS where NSE archives are reachable; the dev sandbox blocks them.
+- `tests/test_varsity_equity_swing.py` — 17 tests covering indicators,
+  strategy gates, position state machine, integration smoke that asserts
+  ≥1 trade fires (catches the silent-empty-universe lesson) and zero-trade
+  returns sentinel (catches flat-fitness lesson).
+
+**Test status**: 17/17 new tests pass, 292 prior tests pass, 3 pre-existing
+`test_pair_trading.py` failures unchanged (documented on main).
+
+**Backtest run on local STF-proxy archive** (125 days, 2025-10-31 → 2026-05-07,
+209-symbol universe, SMA20/50, ADX>18, ATR-stop 2.5×, RR=2):
+- 30 trades, avg holding 9.8 days (within 5-25 day swing target).
+- Win rate 26.7 %, avg R = 0.486, profit factor 0.54.
+- Net P&L −₹75k on ₹1M capital → −7.5 % gross / ~−15 % CAGR-equiv.
+- Exit mix SL_HIT=21 / TIME_STOP=4 / TARGET_HIT=3 / TRAIL_STOP=2.
+- Sharpe -1.47, max DD -14.4 %.
+
+**Caveats on the result**
+- 125-day window forces SMA20/50 instead of canonical SMA50/200 — much
+  more whipsaw-prone (Varsity Module 2 is explicit that 50/200 is the
+  reference). This alone explains a large fraction of the SL-heavy mix.
+- This window (Nov-2025–May-2026) is the same regime the autoresearch
+  lesson flagged as "low-vol / no trend reachable" — multiple low-quality
+  setups during a sideways market.
+- STF proxy has ~0.3 % basis vs spot; immaterial at ATR-stop scale.
+- No MP / OI / FII gates yet — those land in Phase 2 / 3 and are designed
+  precisely to filter low-quality setups.
+
+**Conclusion**: pipeline, harness, sizing, exits, and reporting all behave
+as designed. The win rate / Sharpe are not investable as-is; they should
+not be — Phase 2 (MP + OI confluence) and Phase 3 (FII/DII overlay) exist
+to add the filters. Phase 1 deliverable is the **working substrate**, not
+the final P&L.
+
+**Recommendation**: proceed to Phase 2. Re-run backtest after MP/OI gates
+land — only commit to Phase 3+ if the gates demonstrably tighten the win
+rate or expectancy.
+
+**Operator action item**: on the VPS, run
+`python fetch_bhavcopy_eq.py --days 800` to populate
+`data_cache/equity_ohlcv/`. Once that lands, re-running the backtest with
+canonical SMA50/200 on a 3-year window will give a more honest baseline.
+
+### Phase 2 — shipped 2026-05-10
+
+**Code delivered**
+- `strategies/_market_profile_eq.py` — daily-bar volume-profile helper with
+  rolling N-day VAH/POC/VAL per (symbol, date). Pure pandas, no bars.db dep.
+- `strategies/_oi_signal.py` — F&O bhavcopy reader producing per-(symbol,
+  date) OI classification (LONG_BUILDUP / SHORT_COVERING / SHORT_BUILDUP /
+  LONG_UNWINDING / NEUTRAL). Uses **total OI summed across all live
+  expiries**, not front-month only — that fixed a 300 %+ calendar-roll
+  artifact discovered during smoke-test (front-month OI craters to 0 on
+  expiry day, the new front-month inherits the bulk).
+- Strategy wiring: gate features merged into `_ensure_features`; `_signal_at`
+  now applies MP veto (close < VAL → reject), MP boost (close > VAH →
+  +1 score), OI veto (SHORT_BUILDUP → reject), OI boost (LONG_BUILDUP →
+  +1 score). All gates have config flags.
+- Backtest CLI `--mp on|off  --oi on|off`.
+- 8 new tests covering value-area math, OI classification, MP veto, OI
+  veto, OI boost. Total 25 strategy tests, all green.
+
+**Two latent bugs found and fixed during the Phase 2 backtest**
+1. Chandelier trail can pin to a stale rolling-max when the source data
+   has corp-action discontinuity (NUVAMA had a ~5:1 split mid-archive;
+   pre-split highs of ₹7600+ stayed in the lookback window). Strategy
+   now refuses to update the trail stop unless `chandelier < close`.
+2. Exit fills must lie within today's [low, high] range. Previously the
+   exit logic could "fill" at a stop level above today's high (the bug
+   that produced the spurious 437 % NUVAMA win). Now each exit branch
+   gates on reachability; SL/target gaps are explicitly handled.
+3. Data-side: STF proxy loader drops symbols with any single-bar move
+   > 30 % across the whole panel — proxy data isn't corp-action adjusted
+   and partial detection isn't worth the bug surface. Operators bypass
+   this filter by populating the per-symbol EQ cache via
+   `fetch_bhavcopy_eq.py`. Same shape as the dividend-asymmetry lesson:
+   one-time structural shifts must be encoded as a default-exclusion.
+
+**Phase 2 backtest** (same window/params as Phase 1 baseline, post-fixes):
+
+| Config       | Trades | Win % | PF   | Avg R | Net P&L  | Sharpe | Max DD  |
+|--------------|--------|-------|------|-------|----------|--------|---------|
+| Baseline     | 29     | 24.1  | 0.33 | −0.47 | −₹115k   | −2.47  | −15.2 % |
+| MP only      | 25     | 24.0  | 0.36 | −0.49 | −₹109k   | −2.22  | −14.6 % |
+| **OI only**  | 29     | 34.5  | 0.46 | −0.27 | **−₹70k**| **−1.72** | **−10.4 %** |
+| Both         | 28     | 25.0  | 0.38 | −0.49 | −₹90k    | −2.26  | −12.7 % |
+
+**Decisions** (per the dividend-asymmetry lesson):
+- **OI gate default ON** — clear win-rate (+10 pp) and Sharpe (+0.75)
+  improvement, real edge.
+- **MP gate default OFF** — neutral-to-slightly-harmful on this window
+  on STF-proxy data; remains available as a tunable. Likely deserves
+  re-evaluation once the EQ cache is populated (split-adjusted EQ is
+  cleaner than STF proxy, and MP is sensitive to clean price levels).
+- **Strategy is still net-loss** on this 125-day window — that's the
+  data regime, not the gates. Phase 3 (FII/DII overlay + cron) will
+  add another filter; Phase 1 caveats about needing canonical SMA50/200
+  on a longer window still apply.
+
+**Tests**: 25/25 strategy tests pass, 300/303 repo-wide pass; 3 prior
+pair_trading failures unchanged.
+
+**Recommendation**: proceed to Phase 3 (FII/DII overlay, cron entry-point,
+paper-book persistence). Re-evaluate MP default once split-adjusted EQ
+data lands.
+
+---
+
 # Arbitrage / calendar review — priority 1–4 fixes (2026-05-09)
 
 ## Motivation

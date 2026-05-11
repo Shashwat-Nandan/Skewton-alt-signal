@@ -113,6 +113,60 @@ CREATE TABLE IF NOT EXISTS bars (
 
 CREATE INDEX IF NOT EXISTS idx_bars_token_ts
     ON bars (instrument_token, interval_minutes, ts);
+
+-- ──────────────────────────────────────────────────────────
+-- Equity-swing paper book (Phase 3)
+-- ──────────────────────────────────────────────────────────
+-- One row per *position* (open or closed). A "scan" is identified by
+-- (scan_id, scan_kind) — scan_kind is "open" or "close". No FK to runs:
+-- the equity strategy runs as a cron job, not a backend-managed run, so
+-- it has its own audit trail rather than borrowing the runs/proposals
+-- pair. Reads from /equity/positions hit only this table.
+CREATE TABLE IF NOT EXISTS equity_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,                 -- always 'LONG' in v1
+    entry_dt TEXT NOT NULL,
+    entry_px REAL NOT NULL,
+    qty INTEGER NOT NULL,
+    initial_sl REAL NOT NULL,
+    current_sl REAL NOT NULL,
+    target REAL NOT NULL,
+    atr_at_entry REAL NOT NULL,
+    rationale TEXT,
+    last_mtm_dt TEXT,
+    last_mtm_px REAL,
+    high_watermark REAL,
+    status TEXT NOT NULL,               -- OPEN | CLOSED
+    exit_dt TEXT,
+    exit_px REAL,
+    exit_reason TEXT,                   -- SL_HIT | TARGET_HIT | TIME_STOP | TRAIL_STOP | MANUAL
+    pnl REAL,
+    opened_by_scan TEXT                 -- "open" | "close" (which scan kind opened it)
+);
+
+CREATE INDEX IF NOT EXISTS idx_eq_pos_status_dt
+    ON equity_positions (status, entry_dt DESC);
+
+CREATE INDEX IF NOT EXISTS idx_eq_pos_symbol
+    ON equity_positions (symbol, entry_dt DESC);
+
+-- One row per scan invocation. Captures n_signals, n_trades, mode for the
+-- /equity/scans dashboard tile. Lightweight — we never read the rationale.
+CREATE TABLE IF NOT EXISTS equity_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_dt TEXT NOT NULL,              -- ISO timestamp
+    scan_kind TEXT NOT NULL,            -- 'open' | 'close'
+    mode TEXT NOT NULL,                 -- 'signals' | 'paper'
+    n_signals INTEGER NOT NULL DEFAULT 0,
+    n_trades INTEGER NOT NULL DEFAULT 0,
+    n_open_positions INTEGER NOT NULL DEFAULT 0,
+    n_closed_today INTEGER NOT NULL DEFAULT 0,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_eq_scans_dt
+    ON equity_scans (scan_dt DESC);
 """
 
 
@@ -368,3 +422,137 @@ def _row_to_proposal_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "order_id": row["order_id"],
         "mode": row["mode"],
     }
+
+
+# ──────────────────────────────────────────────────────────
+# Equity-swing paper book + scans (Phase 3)
+# ──────────────────────────────────────────────────────────
+
+def insert_equity_position(pos_dict: Dict[str, Any], opened_by_scan: str) -> int:
+    """Insert a fresh OPEN position. Returns the row id."""
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO equity_positions
+            (symbol, side, entry_dt, entry_px, qty, initial_sl, current_sl, target,
+             atr_at_entry, rationale, last_mtm_dt, last_mtm_px, high_watermark,
+             status, opened_by_scan)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+        """,
+        (
+            pos_dict["symbol"], pos_dict.get("side", "LONG"),
+            pos_dict["entry_dt"], pos_dict["entry_px"], pos_dict["qty"],
+            pos_dict["initial_sl"], pos_dict.get("current_sl", pos_dict["initial_sl"]),
+            pos_dict["target"], pos_dict.get("atr_at_entry", 0.0),
+            pos_dict.get("rationale"),
+            pos_dict.get("last_mtm_dt"), pos_dict.get("last_mtm_px"),
+            pos_dict.get("high_watermark", pos_dict["entry_px"]),
+            opened_by_scan,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def update_equity_position_mtm(
+    position_id: int,
+    last_mtm_dt: str,
+    last_mtm_px: float,
+    current_sl: float,
+    high_watermark: float,
+) -> None:
+    """Mark-to-market update on an open position (no exit)."""
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE equity_positions
+           SET last_mtm_dt    = ?,
+               last_mtm_px    = ?,
+               current_sl     = ?,
+               high_watermark = ?
+         WHERE id = ?
+        """,
+        (last_mtm_dt, last_mtm_px, current_sl, high_watermark, position_id),
+    )
+
+
+def close_equity_position(
+    position_id: int,
+    exit_dt: str,
+    exit_px: float,
+    exit_reason: str,
+    pnl: float,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE equity_positions
+           SET status      = 'CLOSED',
+               exit_dt     = ?,
+               exit_px     = ?,
+               exit_reason = ?,
+               pnl         = ?
+         WHERE id = ?
+        """,
+        (exit_dt, exit_px, exit_reason, pnl, position_id),
+    )
+
+
+def list_equity_positions(status: Optional[str] = None,
+                          limit: int = 500) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    if status is None:
+        rows = conn.execute(
+            """
+            SELECT * FROM equity_positions
+             ORDER BY (status='OPEN') DESC, entry_dt DESC, id DESC
+             LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM equity_positions WHERE status = ? "
+            " ORDER BY entry_dt DESC, id DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_open_equity_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """Resolve an open paper position by symbol (v1 has at most one per symbol)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM equity_positions WHERE symbol = ? AND status = 'OPEN' "
+        " ORDER BY id DESC LIMIT 1",
+        (symbol,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def insert_equity_scan(
+    scan_dt: str, scan_kind: str, mode: str,
+    n_signals: int, n_trades: int,
+    n_open_positions: int, n_closed_today: int,
+    notes: Optional[str] = None,
+) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO equity_scans
+            (scan_dt, scan_kind, mode, n_signals, n_trades,
+             n_open_positions, n_closed_today, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (scan_dt, scan_kind, mode, n_signals, n_trades,
+         n_open_positions, n_closed_today, notes),
+    )
+    return int(cur.lastrowid)
+
+
+def list_equity_scans(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM equity_scans ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]

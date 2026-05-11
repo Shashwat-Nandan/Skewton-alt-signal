@@ -5,6 +5,7 @@ import { api, UnauthorizedError } from "@/lib/api";
 import { Header } from "@/components/Header";
 import { Home } from "@/pages/Home";
 import { DashboardLoginPage } from "@/pages/DashboardLoginPage";
+import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
 import { RunPage } from "@/pages/RunPage";
@@ -58,6 +59,7 @@ export default function App() {
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />
           <Route path="/pair-candidates" element={<PairCandidatesPage />} />
+          <Route path="/equity-swing" element={<EquitySwingPage />} />
         </Routes>
       </main>
     </div>

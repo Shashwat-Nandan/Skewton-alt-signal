@@ -43,6 +43,9 @@ cd frontend && npm ci && npm run dev                            # SPA on :5173
 
 # 4. Or run paper-trading once (refuses outside 09:15–15:30 IST unless --force)
 .venv/bin/python run_paper.py --force
+
+# 5. Or run the Varsity-style equity-swing scan once (Nifty 200, cron-driven)
+.venv/bin/python run_equity_swing.py --scan close --mode paper --force
 ```
 
 For the full VPS install (systemd + nginx + Let's Encrypt) see
@@ -67,11 +70,12 @@ Top-level Python entry points (most are CLI scripts):
 | File | Role |
 | --- | --- |
 | `run_paper.py` | Daily unattended paper-trader; fires from `taleb-hedger.timer` |
+| `run_equity_swing.py` | Twice-daily Varsity equity scan (fires from `equity-swing-{open,close}.timer`) |
 | `run.py` | Headless mode + autoresearch loop |
 | `run_autoresearch.py` | Standalone parameter sweep with hold-out validation |
-| `backtest.py` / `backtest_pairs.py` / `backtest_arbitrage.py` | Strategy-specific backtest harnesses |
+| `backtest.py` / `backtest_pairs.py` / `backtest_arbitrage.py` / `backtest_varsity_equity.py` | Strategy-specific backtest harnesses |
 | `screen_pairs.py` | Engle-Granger cointegration screen on NIFTY-50 stock futures |
-| `fetch_historical_data.py` / `fetch_bars.py` / `fetch_bhavcopy.py` | Data ingestion (option chains, 30-min bars, NSE bhavcopy) |
+| `fetch_historical_data.py` / `fetch_bars.py` / `fetch_bhavcopy.py` / `fetch_bhavcopy_eq.py` / `fetch_fii_dii.py` | Data ingestion (option chains, 30-min bars, F&O bhavcopy, EQ bhavcopy, FII/DII cash flows) |
 | `market_profile.py` | TPO / value-area computation (pure, no I/O) |
 | `kite_auth.py` | Headless TOTP login (the dashboard uses OAuth instead — see below) |
 | `greeks_engine.py` / `risk_analyzer.py` / `trade_proposer.py` | Greeks, Taleb-style risk tooling, proposal generation |
@@ -91,6 +95,7 @@ one of `signals` (log only) / `paper` (in-memory simulation) / `live`
 | `taleb_karpathy` | `strategies/taleb_karpathy.py` | Long-gamma straddle hedger: rehedges delta on a threshold, harvests gamma vs theta bleed. The flagship strategy and the one the autoresearch loop tunes. |
 | `pair_trading` | `strategies/pair_trading.py` | Long-short on cointegrated stock-futures pairs (screened by `screen_pairs.py`). Z-score entry/exit on the spread. |
 | `arbitrage` | `strategies/arbitrage.py` | Cash–futures basis (signals only — no SLB) plus calendar-spread term-structure trades (executable). |
+| `varsity_equity_swing` | `strategies/varsity_equity_swing.py` | Medium-term equity swing on Nifty 200 — trend + ATR risk (Varsity Module 9), plus optional Market Profile, OI confluence, and FII/DII flow overlays. Cron-driven, not tick-driven. |
 
 The registry that maps name → class is `strategies/__init__.py` —
 that's the canonical list both the headless runner and the dashboard

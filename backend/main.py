@@ -21,6 +21,7 @@ from .dashboard_auth import require_session
 from .routers import (
     auth,
     dashboard_session,
+    equity_swing,
     market_profile,
     pair_candidates,
     runs,
@@ -88,6 +89,7 @@ def create_app() -> FastAPI:
     app.include_router(runs.router, dependencies=gated)
     app.include_router(market_profile.router, dependencies=gated)
     app.include_router(pair_candidates.router, dependencies=gated)
+    app.include_router(equity_swing.router, dependencies=gated)
 
     @app.get("/", tags=["meta"])
     def root():

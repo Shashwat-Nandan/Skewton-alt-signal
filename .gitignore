@@ -17,6 +17,7 @@ logs/
 results.tsv
 results_old*.tsv
 results_april.tsv
+candidate_params_*.json
 
 # Historical market data cache (regenerable via fetch_historical_data.py)
 data_cache/

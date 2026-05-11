@@ -1,5 +1,9 @@
 import type {
   AuthStatus,
+  EquityPositionsResponse,
+  EquityScansResponse,
+  EquitySignalsResponse,
+  FiiDiiResponse,
   MarketProfileResponse,
   MarketProfileSymbol,
   PairCandidatesResponse,
@@ -72,6 +76,23 @@ export const api = {
   stopRun: (id: string) => http<RunSummary>(`/runs/${id}/stop`, { method: "POST" }),
 
   pairCandidates: () => http<PairCandidatesResponse>("/pair-candidates"),
+
+  equityPositions: (status?: "open" | "closed") => {
+    const qs = status ? `?status=${status}` : "";
+    return http<EquityPositionsResponse>(`/equity/positions${qs}`);
+  },
+  equitySignals: (date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : "";
+    return http<EquitySignalsResponse>(`/equity/signals${qs}`);
+  },
+  equityScans: (limit?: number) => {
+    const qs = limit != null ? `?limit=${limit}` : "";
+    return http<EquityScansResponse>(`/equity/scans${qs}`);
+  },
+  equityFiiDii: (days?: number) => {
+    const qs = days != null ? `?days=${days}` : "";
+    return http<FiiDiiResponse>(`/equity/fii-dii${qs}`);
+  },
 
   marketProfileSymbols: () =>
     http<MarketProfileSymbol[]>("/market-profile/symbols"),

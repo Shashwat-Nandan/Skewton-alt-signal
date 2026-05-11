@@ -1,5 +1,54 @@
 # Lessons
 
+## Backtest exit fills must lie inside today's [low, high]
+
+- 2026-05-10: Phase-2 equity-swing backtest showed a +437 % single-trade win
+  on NUVAMA (R-multiple = 48.8). Two bugs in series: (1) `chandelier_stop_long`
+  uses `cummax` over the rolling indicator, so once a stale pre-split high
+  (₹7600+) entered the lookback window the trail stop pinned at ~₹7000 forever;
+  (2) the exit branch `if low <= pos.current_sl: exit_px = pos.current_sl`
+  blindly used the recorded stop as the fill price — even when that price was
+  above today's high (i.e. unfillable). The combination produced a "trail
+  stop" exit at ₹7074 on a bar whose high was ₹1465. The whole strategy's
+  Phase-2 P&L came from this single fictional trade.
+- The right fix has two parts: (a) refuse to ratchet a long-side trail stop
+  above the current close — that's a clear sign the indicator is stale or
+  the data has a structural break — and (b) every exit branch must gate on
+  `low <= exit_px <= high` for fillability; gap-throughs are handled
+  explicitly with `min(stop, open)` / `max(target, open)` so the fill is
+  conservative.
+- Same shape as the bare-except-numeric-fallback lesson and the
+  threshold-gates-vs-integer-lots lesson: a downstream sentinel value (here
+  `pos.current_sl = 7000`) makes a degenerate input look like a healthy
+  data point. The optimizer / reporter can't distinguish "winner" from
+  "data-anomaly fill". 
+- Rules: (1) any cumulative-max indicator (Chandelier, watermark trails) must
+  be sanity-bounded by the relevant current-bar value before being
+  persisted into position state. (2) every backtest exit must verify
+  `low <= exit_px <= high`; an exit "fill" outside that range is a bug.
+  (3) when a strategy's Phase-N P&L is dominated by a single trade with R > 5,
+  treat it as a bug-shape, not a finding, until proven otherwise.
+
+## STF proxy is not corp-action adjusted — drop the symbol, don't try to fix the bar
+
+- 2026-05-10: NUVAMA's bhavcopy STF prices fell from ₹7614 (Dec) to ₹1110
+  (March) — about a 5-6× move. That's a stock split, but each STF contract
+  is a fresh series; the proxy panel concatenates them without applying any
+  adjustment. Pre-split highs in the rolling indicator window then pollute
+  ATR, ADX, donchian-high, AND chandelier-trail. There is no clean way to
+  "fix" a single bar — the discontinuity propagates through every downstream
+  feature.
+- The fix shipped is to drop any symbol with a > 30 % single-bar `pct_change`
+  from the entire panel. Operators on a host with NSE archive access run
+  `fetch_bhavcopy_eq.py` to populate `data_cache/equity_ohlcv/`, which uses
+  the EQ-segment bhavcopy that IS corp-action adjusted, and the loader's
+  cache-priority path bypasses the STF proxy entirely.
+- Same shape as the dividend-asymmetry lesson (`mean-reversion fails
+  systematically around dividend ex-dates`): an underlying-source-level
+  structural shift, encoded in the data, that the strategy interprets as
+  signal. The simplest defensible fix is exclusion-by-default, with the
+  per-symbol whitelist living outside the strategy.
+
 ## Index calendars: same edge, worse cost ratio than STF
 
 - 2026-05-09: extended the mean-rev calendar to NIFTY/BANKNIFTY/etc. (IDF). The strategy does have a positive gross edge (+₹1.6k–5k across 1–3 trades on the 63-day replay window) but **costs are 5-10× larger per trade than STF** because notional is 5-10× larger (NIFTY ≈ ₹1.6M/lot, BANKNIFTY ≈ ₹1.7M/lot, vs ₹100k–500k for typical STF). At ~0.05 % round-trip percentage costs, every trade burns ₹3-5k that the spread has to recover. NIFTY's mean spread is ~109 points; entries fire at +1·SD ≈ 130; mean reversion of 30 points = ₹2k per leg — *less than the round-trip cost*.

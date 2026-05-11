@@ -40,6 +40,10 @@ ROUTES=(
     "/runs|401"
     "/market-profile/symbols|401"
     "/pair-candidates|401"
+    "/equity/positions|401"
+    "/equity/signals|401"
+    "/equity/scans|401"
+    "/equity/fii-dii|401"
 )
 
 probe() {

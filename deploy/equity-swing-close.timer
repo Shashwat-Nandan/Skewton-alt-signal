@@ -1,0 +1,25 @@
+[Unit]
+Description=Fire equity-swing-close.service Mon–Fri at 15:35 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 15:35 IST — 5 min after the bell. Bhavcopy F&O / FII-DII tend to
+# land at NSE within a few minutes of close. Operator should have
+# fetch-bars.timer / fetch_fii_dii cron-equivalents firing earlier
+# in the same window so the strategy has fresh OHLCV + flow data.
+OnCalendar=Mon..Fri *-*-* 15:35:00 Asia/Kolkata
+
+# Persistent catch-up: the close scan IS the entries scan, so a late
+# fire might open positions stale by a day. That's still preferable to
+# missing the day entirely; the next day's open scan will run exits
+# against intraday levels and the next close scan will refresh
+# everything. If that's undesirable on your deployment, set this to
+# false.
+Persistent=true
+
+RandomizedDelaySec=60
+
+Unit=equity-swing-close.service
+
+[Install]
+WantedBy=timers.target

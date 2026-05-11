@@ -187,6 +187,7 @@ Registered in `strategies/__init__.py`:
 |---|---|---|---|
 | `taleb_karpathy` | `TalebKarpathyStrategy` | NIFTY index options + futures hedge | Long ATM straddle, delta-neutral via futures, gamma-scalp band |
 | `pair_trading` | `PairTradingStrategy` | Two NIFTY 50 stock futures (cointegrated pair) | Z-score mean-reversion on the spread, configurable entry/exit/stop |
+| `varsity_equity_swing` | `VarsityEquitySwingStrategy` | F&O-listed equities (Nifty 200 v1) | Trend + ATR risk, optional Market Profile / OI / FII overlays; cron-driven, twice-daily scan |
 
 Add a third strategy by:
 
@@ -225,6 +226,25 @@ the operator copies from `run_paper.py` after deleting the paper guard. See
 - Spread = `price_a − hedge_ratio × price_b`. Z-score against rolling window seeded from cached bhav copy.
 - Entry on `|z| ≥ entry_z`; exit on `|z| ≤ exit_z` (mean revert), `|z| ≥ stop_z` (stop), or `max_holding_days`.
 - Hedge sizing matches notional via `|β| × (price_a/price_b) × (lot_a/lot_b)`. Negative-β pairs handled.
+
+**Varsity Equity Swing** (`strategies/varsity_equity_swing.py`, ~800 lines)
+- Universe: F&O-listed equities (Nifty 200 v1 — `data_cache/nifty200.csv`).
+- **Not** driven by the dashboard's tick loop. Run via the cron path
+  `run_equity_swing.py --scan {open|close} --mode {signals|paper}`, persisted
+  to `equity_positions` + `equity_scans` tables; dashboard is read-only.
+- Entry gates: SMA50 > SMA200 trend + Wilder ADX ≥ threshold, then one of
+  three triggers — Donchian breakout, EMA20 pullback in uptrend, or momentum
+  reclaim. Position size = `risk_per_trade_pct · capital / (ATR × stop_mult)`.
+- Exits: hard SL at entry − k·ATR, target at entry + R·(entry − SL), Chandelier
+  trail activates once unrealised ≥ R·risk, plus time-stop after N flat days.
+- Optional overlays (off/on per `[equity_swing]` config, all default-neutral
+  on missing data): Market Profile VAH/POC/VAL (Module 7), OI confluence
+  classifier reading `data_cache/bhavcopy_raw/` (sum across all expiries to
+  dodge calendar-roll artifacts), FII/DII rolling 5-day net flow read from
+  `data_cache/fii_dii/`.
+- Backtest engine: `backtest_varsity_equity.py` (no look-ahead — entries fill at
+  next-bar open, exits gated on `low ≤ price ≤ high`). 0.20% round-trip
+  costs. Per-trade ledger written to `data_cache/equity_swing_trades.tsv`.
 
 ---
 
@@ -280,6 +300,10 @@ SPA — the run is just terminal.
 | `GET` | `/runs` | — | `[RunSummary]` (live + DB historical, merged) |
 | `GET` | `/runs/{id}` | — | `RunDetail` (summary + signals + trades + pnl_history from DB) |
 | `POST` | `/runs/{id}/stop` | — | `RunSummary`, status flips to STOPPING then STOPPED |
+| `GET` | `/equity/positions` | `status=open\|closed` (opt) | `{positions: [EquityPosition]}` from cron path's paper book |
+| `GET` | `/equity/signals` | `date=YYYY-MM-DD` (opt, default today) | Tail of `logs/signals-{date}.jsonl` filtered to varsity_equity_swing |
+| `GET` | `/equity/scans` | `limit=N` (opt) | `{scans: [EquityScan]}` — recent cron invocations |
+| `GET` | `/equity/fii-dii` | `days=N` (opt) | Per-day FII/DII net flow + rolling 5-day sums. 503 if cache empty |
 
 CORS: `dashboard_url` only (default `http://localhost:5173`).
 
@@ -721,6 +745,8 @@ Two independent stacks under `systemd`:
 - `taleb-autoresearch.{service,timer}` — weekly param sweep
 - `run_weekly_autoresearch.sh` — fetch → sweep → stage candidate
 - `dashboard-backend.service` — long-running uvicorn, restart=always
+- `equity-swing-open.{service,timer}` — Mon-Fri 09:30 IST, exits-only
+- `equity-swing-close.{service,timer}` — Mon-Fri 15:35 IST, full scan (entries + exits)
 - `nginx-dashboard.conf.example` — SPA + API proxy
 - `build-frontend.sh` — `npm ci && npm run build` wrapper
 - `VPS_DEPLOYMENT.md` — full operator guide (10 sections incl. live cutover)

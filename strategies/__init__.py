@@ -3,12 +3,14 @@ from .arbitrage import ArbitrageStrategy
 from .base import BaseStrategy, ExecutionMode, VALID_MODES
 from .pair_trading import PairTradingStrategy
 from .taleb_karpathy import TalebKarpathyStrategy
+from .varsity_equity_swing import VarsityEquitySwingStrategy
 
 # Registry: strategy name → class. Dashboard and CLI look up strategies here.
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     TalebKarpathyStrategy.name: TalebKarpathyStrategy,
     PairTradingStrategy.name: PairTradingStrategy,
     ArbitrageStrategy.name: ArbitrageStrategy,
+    VarsityEquitySwingStrategy.name: VarsityEquitySwingStrategy,
 }
 
 
@@ -27,6 +29,7 @@ __all__ = [
     "TalebKarpathyStrategy",
     "PairTradingStrategy",
     "ArbitrageStrategy",
+    "VarsityEquitySwingStrategy",
     "STRATEGIES",
     "get_strategy",
 ]

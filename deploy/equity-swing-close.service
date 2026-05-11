@@ -1,0 +1,40 @@
+[Unit]
+Description=Equity Swing — post-close scan (full feature compute, entries + exits)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+# Sequence after fetch-bars (Kite 30-min) and after the operator's
+# bhavcopy + FII/DII fetchers if present. Soft dependency: we don't
+# require these units to exist, but if they're enabled and running,
+# we'd rather wait. The strategy gates default-neutral on missing data
+# anyway, so worst-case is a slightly less-informed scan.
+After=fetch-bars.service
+
+[Service]
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_equity_swing.py --scan close --mode paper
+# -------------------------------
+
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

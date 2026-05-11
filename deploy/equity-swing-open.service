@@ -1,0 +1,37 @@
+[Unit]
+Description=Equity Swing — post-open scan (exits only, no new entries)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# --scan=open runs SL/target/time-stop checks against intraday levels we
+# can observe via Kite live quote; v1 does NOT propose new entries at open.
+# Mode=paper persists everything to dashboard.db.equity_positions.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_equity_swing.py --scan open --mode paper
+# -------------------------------
+
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — matches pair-paper.service / taleb-hedger.service
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
