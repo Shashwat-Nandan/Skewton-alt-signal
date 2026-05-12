@@ -25,7 +25,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
-ProtectHome=true
+# NOTE: do NOT set ProtectHome=true here. If WorkingDirectory is under
+# /root or /home (as on the dev VPS), ProtectHome=true hides it from the
+# unit's mount namespace and the unit fails at status=200/CHDIR before
+# ExecStart runs — silently, since the timer just reschedules. See
+# tasks/lessons.md for the 2026-05-12 incident.
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
