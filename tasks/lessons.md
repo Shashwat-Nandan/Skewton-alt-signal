@@ -161,3 +161,48 @@
 - Fix shipped: drop-ins at `/etc/systemd/system/pair-paper.service.d/override.conf` and `/etc/systemd/system/pair-verify.service.d/override.conf`, each containing `[Service]\nProtectHome=false`. `systemctl daemon-reload`, then a manual fire of `pair-paper.service` confirmed the unit now reaches Python, authenticates, screens, and hits its own `Started after 15:30 — nothing to do today.` self-gate as designed.
 - Same shape as the bare-except-numeric-fallback lesson: systemd's "Succeeded"/"Failed" only marks the surface state; a unit that fails *before* `ExecStart` runs leaves no application-level evidence at all. The application logs are the ground truth for whether the cron is doing useful work — their absence is the signal.
 - Rules: (1) any new hardened service must be smoke-tested with `systemctl start <unit>` once before being left to the timer — relying on "the timer will catch the next window" hides CHDIR/namespace failures forever. (2) when copy-pasting a hardening block (`ProtectSystem=strict`, `ProtectHome=...`, `PrivateTmp=...`) between units, audit it against the unit's actual `WorkingDirectory` and `ReadWritePaths` — they are not freely composable. (3) for any cron whose output is a file (an EOD JSON, a log, a report), add an "expected freshness" check somewhere that flags if today's file is missing past the expected write time. The cron silently not firing is structurally indistinguishable from the cron firing and writing nothing unless that check exists.
+
+## Paper-z windows must not be diluted by intraday observations
+
+- 2026-05-13: `pair-paper.service` closed all 3 monitored pairs FLAT but
+  realized ₹−39,251 across 28 round-trips against transaction costs of
+  ₹39,285 — friction was the entire bleed. The backtest baseline expected
+  ~₹1,020/day gross edge; paper ran ~225× the backtest's signal cadence
+  (9 round-trips per pair per session vs ~5 round-trips per pair per
+  127-day backtest).
+- Cause A — seed dilution: `_observe_spread` appended every minute-tick
+  whose spread moved >1 paisa to the same `_spread_history` that
+  `_z_score` reads as its rolling distribution. The seed was 60 days of
+  daily bhavcopy closes; after ~60 ticks the rolling-60 window was
+  mostly intraday observations. Std collapsed to intraday wiggle, so
+  `|z|=2` started triggering on intraday-noise excursions instead of
+  true 2σ daily-spread moves. The strategy was tuned (sweep on
+  daily-bar bhavcopy) for the daily-bar distribution; the production
+  z-denominator silently switched distributions during the session.
+- Cause B — no cost-hurdle: entries fired on any `|z| ≥ entry_z`
+  regardless of expected ₹ move. Each round-trip costs ~0.21% of leg
+  notional + ~₹80 fixed (≈ ₹2.1k at the ₹10L per-leg cap). At the
+  diluted z-scale, expected ₹ move per round-trip was below friction —
+  guaranteed-negative-EV trades fired anyway.
+- Fix shipped (2026-05-13): (1) `_observe_spread` no longer mutates
+  `_spread_history` — the rolling z-window is seed-only, daily, set
+  once at __init__ from bhavcopy, untouched intraday. (2) New
+  `min_edge_multiplier` config knob (default 1.5) gates entries on
+  `expected_gain ≥ multiplier × round_trip_cost` computed at entry
+  quotes. `0` disables for emergency rollback.
+- Same shape as the bare-except-numeric-fallback lesson: a downstream
+  sentinel (the rolling-window std) silently changed meaning
+  intraday, and the strategy kept producing nominally-valid signals
+  against the new meaning. No exception, no alert, just a friction
+  bleed visible only after EOD reconciliation.
+- Rules: (1) when a strategy is tuned against a specific bar cadence
+  (daily / intraday / tick), the production code path must enforce the
+  same cadence end-to-end — never let a higher-resolution stream
+  silently dilute a lower-resolution baseline. (2) any
+  mean-reversion strategy with realistic friction needs an explicit
+  cost-hurdle gate; "the band is wide enough" is not a substitute when
+  std collapses or notional caps shrink the per-trade move. (3) if
+  paper realized P&L ≈ −1 × transaction_costs over a session, treat it
+  as a signal-cadence-vs-cost-model bug, not unlucky alpha — verify
+  trade count against the backtest's expected cadence before assuming
+  the strategy "just had a bad day".

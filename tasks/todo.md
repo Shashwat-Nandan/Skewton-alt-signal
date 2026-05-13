@@ -855,3 +855,178 @@ separate, opt-in feature, not silent magic.
 - Auto-promotion of candidate to `best_params.json`. Promotion stays manual.
 - The 3 pre-existing pair-trading test failures (`test_hedge_qty_matches_notional`
   and notional-cap pair). Out of scope for this hotfix.
+
+---
+
+# Pair-paper cost hurdle + seed-only z (2026-05-13)
+
+## Motivation
+
+2026-05-13 paper session ended at ₹−39,251 across 3 pairs / 28 round-trips.
+Realized losses (~₹39.3k) ≈ transaction costs (~₹39.3k) — virtually all
+the bleed was friction. Diagnosis (see `tasks/lessons.md` entry to be
+added):
+
+1. No cost hurdle / minimum-edge filter. `scan_and_propose` enters on any
+   `|z| ≥ entry_z` regardless of expected ₹ move vs cost.
+2. Rolling z-window dilution. `_observe_spread` (pair_trading.py:283-313)
+   appends every minute-tick whose spread moves > 1 paisa. The seed is
+   daily bhavcopy closes; after ~60 ticks the rolling window is mostly
+   intraday observations, std collapses, `|z|=2` becomes an intraday-noise
+   trigger. Backtest baseline expected ~5 round-trips per pair over 127
+   days; paper today ran ~9 round-trips per pair in one session — ~225×
+   the backtest cadence.
+
+## Plan
+
+### Change 1 — Seed-only spread history (no intraday append)
+
+- `strategies/pair_trading.py:_observe_spread`: remove the append-on-move
+  block. Function still returns `(spread, prices)` for decision-making,
+  but `_spread_history` becomes immutable after `_seed_spread_history`.
+- Daily roll-forward is handled by the existing cron model: a new process
+  starts every morning, `_seed_spread_history` re-reads bhavcopy which
+  contains yesterday's close. Confirms backtest cadence: 1 daily
+  observation appended per trading day, via the seed, not intraday.
+- Fail-loud at `__init__`: if seeded history < `max(20, lookback_days // 4)`,
+  log a WARNING explicitly stating "z unavailable this session — no
+  entries will fire". Currently this only surfaces per-tick as a debug
+  log inside `_z_score`.
+
+### Change 2 — Cost-hurdle entry filter
+
+- Add config knob `min_edge_multiplier` in `[pair_trading]`. Default
+  `1.5`. `0.0` disables the hurdle (parity with current behaviour for
+  emergency rollback).
+- Helper `_expected_edge_passes_cost_hurdle(z_now, prices, qty_a, qty_b,
+  fut_a, fut_b) -> bool`:
+  - Expected ₹ move per unit spread = `qty_a × fut_a.lot_size`
+    (Varsity Ch. 13 share-count β-weighted P&L — net of β·B hedge,
+    one unit of spread change = qty_A_shares of ₹ P&L).
+  - Expected Δspread = `(|z_now| - exit_z) × std`.
+  - Round-trip cost = sum of `estimate_transaction_cost` for the 4 fills
+    (entry A buy/sell + entry B + symmetric exit). Reuses the existing
+    `strategies.taleb_karpathy.estimate_transaction_cost` import already
+    present at line 463.
+  - Pass iff `expected_gain_inr ≥ min_edge_multiplier × round_trip_cost`.
+- Wire into `_build_entry_proposals` after qty sizing, before returning.
+  On reject, log INFO at the same verbosity as the existing skip-on-
+  cap log (line 360) and return `[]`.
+- Refactor: extract `_rolling_window_stats() -> Optional[Tuple[mean, std]]`
+  out of `_z_score` so both the z-score and the hurdle helper share one
+  source of truth for the window stats.
+
+### Tests (`tests/test_pair_trading.py`)
+
+- `TestObserveSpreadDedup` becomes stale (the bug it covered no longer
+  has a code path). Replace with one positive test
+  `test_observe_spread_does_not_mutate_history` that verifies repeated
+  calls leave `_spread_history` length unchanged. Encodes the new
+  invariant.
+- New class `TestCostHurdle`:
+  - `test_hurdle_blocks_low_edge_entry` — small std, `|z|` just past
+    `entry_z`, expected gain ≈ cost → 0 proposals + INFO log.
+  - `test_hurdle_allows_high_edge_entry` — wide std, large `|z|` →
+    proposals returned.
+  - `test_hurdle_disabled_with_zero_multiplier` — `min_edge_multiplier=0`
+    behaves like today: any `|z| ≥ entry_z` produces proposals.
+
+### Config
+
+- `config.ini` `[pair_trading]`: add `min_edge_multiplier = 1.5` with a
+  short WHY comment citing today's incident.
+- `config_template.ini`: same.
+
+### Lessons
+
+- Append a `tasks/lessons.md` entry: "Paper z-windows must not be
+  diluted by intraday observations when the strategy was tuned on
+  daily-bar spread distributions. Cost-hurdle gating is non-optional
+  for high-frequency mean-reversion. Verify in paper before assuming
+  backtest edge survives."
+
+## Tradeoffs / assumptions surfaced
+
+1. **`min_edge_multiplier = 1.5` is a chosen-not-swept default.** Tighter
+   value reduces frequency more aggressively; looser approaches today's
+   over-trading. A proper backtest sweep is a follow-up (out of scope
+   for this fix).
+2. **Seed-only z means a fast intraday dislocation is judged against
+   yesterday's std baseline.** That is intentional — it matches the
+   daily-bar cadence the parameters were tuned on. If we later want
+   intraday adaptation, the right shape is a separate "intraday spread
+   regime" detector, not appending to the daily window.
+3. **Hurdle uses approximate exit cost at entry prices.** Real exit
+   prices will differ; the approximation is conservative on average
+   (treats exit cost as if we exit immediately at entry price). Good
+   enough as a filter; not load-bearing on P&L computation.
+4. **Not touching `entry_z`, `exit_z`, `lookback_days`, `max_holding_days`**
+   — all came from cited sweeps. The fix is filter-quality, not band
+   geometry.
+
+## Checklist
+
+- [x] Refactor `_z_score` to use new `_rolling_window_stats()` helper
+- [x] Remove intraday append from `_observe_spread`; keep observation
+      logic
+- [x] Loud-startup warning when seed history is too thin to z-score
+- [x] Add `min_edge_multiplier` config knob (config.ini). Skipped
+      `config_template.ini` — it has no `[pair_trading]` block at all,
+      so nothing to update; live config is the source of truth.
+- [x] Implement `_expected_edge_passes_cost_hurdle` and wire into
+      `_build_entry_proposals`
+- [x] Replace `TestObserveSpreadDedup` with `TestObserveSpreadSeedOnly`
+      (2 tests encoding the new invariant)
+- [x] Add `TestCostHurdle` (3 tests)
+- [x] `pytest tests/test_pair_trading.py`: 27 pass, 3 fail —
+      same 3 pre-existing sizing-math failures noted in the prior
+      autoresearch-fix section (`test_hedge_qty_matches_notional`,
+      `test_no_cap_means_no_change`, `test_cap_scales_lots_per_leg_down`);
+      no new regressions. Full suite outside pair_trading: 287 pass.
+- [x] Append `tasks/lessons.md` entry
+- [x] Review section at end of this todo block
+
+## Review
+
+Three code-level changes in `strategies/pair_trading.py` plus a config
+knob, a 10-test refresh, and a lessons entry.
+
+1. **Seed-only z** — `_observe_spread` returns `(spread, prices)` and
+   nothing else; `_spread_history` is now pinned to the daily bhavcopy
+   seed loaded at `__init__`. The rolling window `_z_score` uses
+   matches the daily-bar distribution the parameters were swept on.
+2. **Cost-hurdle gate** — `_expected_edge_passes_cost_hurdle` runs
+   inside `_build_entry_proposals` after sizing. Expected ₹ gain =
+   `(|z| − exit_z) × rolling_std × qty_a_shares`; round-trip cost is
+   summed from `estimate_transaction_cost` for all four legs at entry
+   prices. Refuses when expected gain < `min_edge_multiplier × cost`.
+3. **Loud startup warning** — `__init__` logs a WARNING if the seed
+   produced fewer than `max(20, lookback_days // 4)` observations,
+   making the silent-no-entries failure mode operator-visible.
+
+Net effect on tomorrow's `pair-paper.service` session: signals fire on
+the daily-bar z distribution (not intraday-noise dilution) and only
+when the expected ₹ move clears 1.5× friction. Today's behaviour
+(28 round-trips at ~₹1.4k friction each) is statistically blocked.
+
+What this does NOT do:
+- It doesn't sweep `min_edge_multiplier`. 1.5 is the working default
+  that matches the diagnosis; a proper backtest sweep with realistic
+  cost modelling is a follow-up.
+- It doesn't change the z-band geometry (`entry_z=2.0`, `exit_z=0.75`,
+  `lookback_days=60`, `max_holding_days=7`) — all came from cited
+  sweeps and remain in scope. The fix is filter-quality.
+- It doesn't touch the 3 pre-existing sizing-math test failures — out
+  of scope, as documented in the prior autoresearch fix's Review.
+
+## Out of scope (deliberate)
+
+- Backtest sweep for `min_edge_multiplier` value. Should be done with
+  the live cost model and the daily-bar spread distribution, then
+  committed alongside any tightening of the default.
+- A post-exit time cooldown ("don't re-enter same pair within N
+  minutes"). The seed-only z change already removes the main driver
+  of rapid re-entry (intraday dilution). If trade frequency is still
+  too high after this change ships, a cooldown is the next lever.
+- Refresh `_spread_history` mid-session from a new bhavcopy. Bhavcopy
+  is EOD-only; this isn't a real lever within a single session.

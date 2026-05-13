@@ -137,6 +137,14 @@ class PairTradingStrategy(BaseStrategy):
         self.stop_z = float(cfg.get("stop_z", 4.0))
         self.lookback_days = int(cfg.get("lookback_days", 60))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
+        # Cost-hurdle: refuse entries whose expected ₹ move from current z back
+        # to the exit band is below `min_edge_multiplier × round_trip_cost`.
+        # 2026-05-13 paper session ate ~₹39k in friction across 28 round-trips
+        # while the backtest baseline expected only ~₹1k/day gross edge — i.e.
+        # the strategy was firing on z-crossings whose expected ₹ move was
+        # smaller than the round-trip cost. Default 1.5× chosen to cut
+        # marginal entries; set to 0.0 to disable the hurdle entirely.
+        self.min_edge_multiplier = float(cfg.get("min_edge_multiplier", 1.5))
         # max_holding_days=7 emerged as the win-rate peak (82.6%) in both
         # in-sample and OOS sweeps — see data_cache/backtest_2026-05-08/
         # sweep_maxhold_*.csv. Tighter time stop (7d) frees the book to
@@ -173,6 +181,22 @@ class PairTradingStrategy(BaseStrategy):
         self._clock = datetime.now
 
         self._seed_spread_history()
+
+        # Fail loud at startup if the seed is too thin for a z-score.
+        # Without this warning the strategy silently produces no entries all
+        # session — the only signal was a per-tick debug log inside _z_score.
+        # Since the 2026-05-13 switch to seed-only z (intraday observations
+        # no longer dilute the daily window), a thin seed means the pair is
+        # disabled for the session. Surface that loudly at __init__.
+        min_obs = max(20, self.lookback_days // 4)
+        if len(self._spread_history) < min_obs:
+            logger.warning(
+                "%s/%s: seeded only %d spread observations (need >= %d for "
+                "z-score) — this pair will REFUSE all entries this session. "
+                "Verify data_cache/bhavcopy_raw/ has the most recent EOD files.",
+                self.symbol_a, self.symbol_b,
+                len(self._spread_history), min_obs,
+            )
 
     # ══════════════════════════════════════════════════════════
     # PUBLIC API (BaseStrategy interface)
@@ -274,21 +298,17 @@ class PairTradingStrategy(BaseStrategy):
     # SPREAD / Z-SCORE
     # ══════════════════════════════════════════════════════════
 
-    # Spreads quoted in ₹; treat values within 1 paisa as the same observation
-    # so intraday tick noise around an unchanged closing print doesn't queue
-    # a new bar. Conservative: real intraday spread moves are typically
-    # several paisa even on quiet names.
-    _SPREAD_EPSILON = 0.01
-
     def _observe_spread(self) -> Tuple[Optional[float], Dict[str, float]]:
         """Fetch live front-month quotes for both legs and return (spread, prices).
 
-        Only appends to `_spread_history` when the spread has actually moved
-        from the previous observation. Without this guard, an off-hours tick
-        loop keeps re-appending the same closing spread; the rolling window
-        fills with repeats, std collapses toward 0, and z drifts on every
-        tick despite no real price change. Operator-visible symptom:
-        z-score changing on every dashboard refresh while NSE is closed.
+        Does NOT mutate `_spread_history`. The rolling z-window is daily-only,
+        seeded once at __init__ from bhavcopy and untouched intraday — see
+        2026-05-13 incident in tasks/todo.md where appending minute-tick
+        observations collapsed the rolling std (60-day daily seed got
+        overwritten by ~6 hours of intraday wiggle), making `|z|=2` trigger
+        on intraday-noise excursions and producing 28 round-trips of pure
+        cost bleed. The strategy is tuned on daily-bar spread distributions;
+        the z denominator must come from the same distribution.
         """
         prices = {}
         for sym in (self.symbol_a, self.symbol_b):
@@ -300,29 +320,29 @@ class PairTradingStrategy(BaseStrategy):
                 return None, {}
             prices[sym] = quote
         spread = prices[self.symbol_a] - self.hedge_ratio * prices[self.symbol_b]
-
-        if (
-            not self._spread_history
-            or abs(spread - self._spread_history[-1]) > self._SPREAD_EPSILON
-        ):
-            self._spread_history.append(spread)
-            # cap memory — only the most recent lookback*2 observations matter
-            max_keep = max(self.lookback_days * 2, 500)
-            if len(self._spread_history) > max_keep:
-                self._spread_history = self._spread_history[-max_keep:]
         return spread, prices
 
-    def _z_score(self, spread_now: float) -> Optional[float]:
-        # Use the *prior* observations as the rolling distribution so the current
-        # bar doesn't bias its own z-score downward.
-        history = self._spread_history[:-1] if len(self._spread_history) > self.lookback_days else self._spread_history
-        recent = history[-self.lookback_days:]
+    def _rolling_window_stats(self) -> Optional[Tuple[float, float]]:
+        """Return (mean, std) of the last `lookback_days` of seeded spread
+        observations, or None if the window is too thin or std is zero.
+
+        Single source of truth for `_z_score` and the cost-hurdle filter so
+        both compute against the same baseline.
+        """
+        recent = self._spread_history[-self.lookback_days:]
         if len(recent) < max(20, self.lookback_days // 4):
             return None
         mean = float(np.mean(recent))
         std = float(np.std(recent))
         if std == 0:
             return None
+        return mean, std
+
+    def _z_score(self, spread_now: float) -> Optional[float]:
+        stats = self._rolling_window_stats()
+        if stats is None:
+            return None
+        mean, std = stats
         return (spread_now - mean) / std
 
     # ══════════════════════════════════════════════════════════
@@ -389,6 +409,13 @@ class PairTradingStrategy(BaseStrategy):
                 qty_a = max(int(round(qty_a * scale)), 1)
                 qty_b = max(int(round(qty_b * scale)), 1)
 
+        # Cost-hurdle gate: refuse entries whose expected ₹ move from current z
+        # back to the exit band is below the cost-hurdle threshold.
+        if not self._expected_edge_passes_cost_hurdle(
+            z, prices, qty_a, qty_b, fut_a, fut_b,
+        ):
+            return []
+
         # Sign convention: spread = A - β·B
         # LONG_SPREAD wants spread to rise → +A, sign of -β on B
         # SHORT_SPREAD wants spread to fall → -A, sign of +β on B
@@ -428,6 +455,79 @@ class PairTradingStrategy(BaseStrategy):
                 )
             )
         return proposals
+
+    def _expected_edge_passes_cost_hurdle(
+        self,
+        z_now: float,
+        prices: Dict[str, float],
+        qty_a: int,
+        qty_b: int,
+        fut_a: dict,
+        fut_b: dict,
+    ) -> bool:
+        """True if expected ₹ gain at mean-reversion ≥ multiplier × round-trip cost.
+
+        Expected ₹ gain uses Varsity Ch. 13 share-count β-weighted P&L: when
+        the spread changes by 1 in the favourable direction, P&L ≈
+        qty_a_shares (the B leg is sized to cancel β·ΔB, so net P&L per unit
+        spread move equals the A-leg share count). Expected Δspread =
+        (|z_now| − exit_z) × rolling_std. Cost is the full round-trip
+        (entry + exit on both legs) at the current quotes, summed via the
+        existing FUT branch of `estimate_transaction_cost`.
+
+        Approximation: exit prices are unknown at entry, so cost is computed
+        at entry prices. This is conservative on average — actual exit
+        notional drifts with the trade — and good enough as a yes/no filter.
+        """
+        if self.min_edge_multiplier <= 0:
+            return True
+
+        stats = self._rolling_window_stats()
+        if stats is None:
+            # No baseline → no edge estimate → refuse. (Reaching here means
+            # the seeded window is too thin; the __init__ WARN already fired.)
+            return False
+        _mean, std = stats
+
+        # Expected Δspread magnitude when mean-reverting from z_now to ±exit_z.
+        expected_dspread = (abs(z_now) - self.exit_z) * std
+        if expected_dspread <= 0:
+            return False
+
+        qty_a_shares = qty_a * fut_a["lot_size"]
+        expected_gain_inr = expected_dspread * qty_a_shares
+
+        from strategies.taleb_karpathy import estimate_transaction_cost
+        rt_cost = (
+            estimate_transaction_cost(
+                prices[self.symbol_a], qty_a, fut_a["lot_size"], "BUY",
+                instrument_type="FUT",
+            )
+            + estimate_transaction_cost(
+                prices[self.symbol_b], qty_b, fut_b["lot_size"], "SELL",
+                instrument_type="FUT",
+            )
+            + estimate_transaction_cost(
+                prices[self.symbol_a], qty_a, fut_a["lot_size"], "SELL",
+                instrument_type="FUT",
+            )
+            + estimate_transaction_cost(
+                prices[self.symbol_b], qty_b, fut_b["lot_size"], "BUY",
+                instrument_type="FUT",
+            )
+        )
+
+        threshold = self.min_edge_multiplier * rt_cost
+        if expected_gain_inr < threshold:
+            logger.info(
+                "%s/%s: skipping entry — expected ₹%.0f gain < %.2f× round-trip "
+                "cost ₹%.0f (threshold ₹%.0f) at z=%.2f, std=%.2f",
+                self.symbol_a, self.symbol_b,
+                expected_gain_inr, self.min_edge_multiplier,
+                rt_cost, threshold, z_now, std,
+            )
+            return False
+        return True
 
     def _make_fut_proposal(
         self, fut: dict, quantity: int, price: float,

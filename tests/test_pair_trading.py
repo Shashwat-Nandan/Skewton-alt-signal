@@ -33,8 +33,14 @@ def _make_strategy(
     spread_history=None,
     max_leg_notional=None,
     lots_per_leg: int = 1,
+    min_edge_multiplier: float = 0.0,
 ) -> PairTradingStrategy:
-    """Build a PairTradingStrategy with __init__ bypassed — fully controllable for unit tests."""
+    """Build a PairTradingStrategy with __init__ bypassed — fully controllable for unit tests.
+
+    min_edge_multiplier defaults to 0.0 (hurdle disabled) so entry/exit/sizing
+    tests aren't accidentally blocked by friction-vs-edge accounting. Tests
+    that exercise the hurdle set it explicitly.
+    """
     s = PairTradingStrategy.__new__(PairTradingStrategy)
     s.kite = MagicMock()
     s.config = MagicMock()
@@ -50,6 +56,7 @@ def _make_strategy(
     s.lots_per_leg = lots_per_leg
     s.max_holding_days = 10
     s.max_leg_notional = max_leg_notional
+    s.min_edge_multiplier = min_edge_multiplier
     s.total_capital = 500_000
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
@@ -82,10 +89,11 @@ class TestZScore:
         assert s._z_score(5.0) is None
 
     def test_known_z_value(self):
-        # Build a history with mean=0, std=1 → spread of 2 should give z≈2
-        # (excluding the current bar from the rolling window)
+        # Build a history with mean=0, std=1 → spread of 2 should give z≈2.
+        # Under seed-only z (2026-05-13), `spread_now` is never in history
+        # so no exclusion is needed.
         history = [-1.0, 1.0] * 25  # mean 0, std 1
-        s = _make_strategy(spread_history=history + [2.0])
+        s = _make_strategy(spread_history=history)
         z = s._z_score(2.0)
         assert z is not None
         assert abs(z - 2.0) < 0.05
@@ -103,16 +111,17 @@ class TestZScore:
 
 
 # ──────────────────────────────────────────────────────────
-# _observe_spread: dedup against stale closed-market repeats
+# _observe_spread: seed-only z (no intraday mutation)
 # ──────────────────────────────────────────────────────────
 
-class TestObserveSpreadDedup:
+class TestObserveSpreadSeedOnly:
     """
-    When the market is closed, Kite returns a fixed last-traded price every
-    tick. Without a dedup guard, the rolling spread history fills with
-    duplicates → std collapses → z drifts on every tick despite no real
-    move. Operator-visible bug. The dedup keeps history as a true
-    distribution of distinct observations.
+    The rolling z-window is daily-only — seeded once at __init__ from
+    bhavcopy and untouched intraday. 2026-05-13 incident: appending every
+    minute-tick that moved the spread by >1 paisa collapsed the rolling
+    std and made `|z|=2` fire on intraday noise. Whatever happens during
+    the session, `_spread_history` and the z it produces must stay
+    pinned to the daily baseline.
     """
 
     def _stub_quotes(self, s, price_a, price_b):
@@ -121,56 +130,92 @@ class TestObserveSpreadDedup:
             return {sym: {"last_price": price_a if "AAA" in sym else price_b}}
         s.kite.quote = fake_quote
 
-    def test_repeated_identical_observations_are_not_appended(self):
-        s = _make_strategy(hedge_ratio=0.5, spread_history=[])
-        self._stub_quotes(s, 1000.0, 2000.0)  # spread = 0
-        s._observe_spread()
-        s._observe_spread()
-        s._observe_spread()
-        s._observe_spread()
-        # Only the first call should have appended.
-        assert len(s._spread_history) == 1
-
-    def test_real_move_is_appended(self):
-        s = _make_strategy(hedge_ratio=0.5, spread_history=[])
+    def test_observe_spread_does_not_mutate_history(self):
+        seed = [float(x) for x in range(-30, 30)]
+        s = _make_strategy(hedge_ratio=0.5, spread_history=list(seed))
         self._stub_quotes(s, 1000.0, 2000.0)
-        s._observe_spread()
-        # Move price_a by ₹5 → spread changes by 5 → above the 1-paisa epsilon
-        self._stub_quotes(s, 1005.0, 2000.0)
-        s._observe_spread()
-        assert len(s._spread_history) == 2
+        for _ in range(50):
+            s._observe_spread()
+        assert s._spread_history == seed
 
-    def test_subpaisa_jitter_is_filtered(self):
-        # Quote engines sometimes flicker by sub-paisa noise even on closed
-        # markets. The 1-paisa epsilon should swallow that.
-        s = _make_strategy(hedge_ratio=0.5, spread_history=[])
-        self._stub_quotes(s, 1000.0, 2000.0)
-        s._observe_spread()
-        self._stub_quotes(s, 1000.0001, 2000.0)
-        s._observe_spread()
-        assert len(s._spread_history) == 1
-
-    def test_closed_market_does_not_destabilize_z(self):
-        """End-to-end: 200 stale ticks at the same price → z stays put."""
+    def test_session_z_is_pinned_to_seed(self):
+        """200 intraday ticks at the same price → z is identical to first call."""
         s = _make_strategy(
             hedge_ratio=0.5,
-            # Seed with realistic variation so std > 0.
             spread_history=[float(x) for x in range(-30, 30)],
         )
-        self._stub_quotes(s, 1000.0, 2010.0)  # spread = 1000 - 0.5*2010 = -5
-        # First call appends -5 (different from last seed value 29)
-        s._observe_spread()
-        z_first = s._z_score(s._spread_history[-1])
-        # Now tick 200 more times with no price move
+        self._stub_quotes(s, 1000.0, 2010.0)  # spread = -5 throughout
+        spread_first, _ = s._observe_spread()
+        z_first = s._z_score(spread_first)
         for _ in range(200):
             s._observe_spread()
-        # History should not have grown beyond the one new observation.
-        assert len(s._spread_history) == 60 + 1
-        z_after = s._z_score(s._spread_history[-1])
-        # And z should be identical to the first observation.
-        assert z_first is not None
-        assert z_after is not None
+        spread_after, _ = s._observe_spread()
+        z_after = s._z_score(spread_after)
+        assert z_first is not None and z_after is not None
         assert abs(z_first - z_after) < 1e-12
+
+
+# ──────────────────────────────────────────────────────────
+# Cost hurdle — refuse entries with insufficient expected edge
+# ──────────────────────────────────────────────────────────
+
+class TestCostHurdle:
+    """
+    2026-05-13 paper session: 28 round-trips across 3 pairs, ~₹39k realized
+    losses, ~₹39k transaction costs — strategy was firing on z-crossings
+    whose expected ₹ move was smaller than friction. The hurdle refuses
+    entries where expected_gain < multiplier × round_trip_cost.
+    """
+
+    def _stub_quotes(self, s, price_a, price_b):
+        def fake_quote(syms):
+            sym = syms[0]
+            return {sym: {"last_price": price_a if "AAA" in sym else price_b}}
+        s.kite.quote = fake_quote
+
+    def test_hurdle_blocks_low_edge_entry(self):
+        # Tiny rolling std → small expected ₹ move → fails the 1.5× cost hurdle.
+        # Spread history with std ≈ 0.02 → at |z|≈2.5 → expected Δspread ≈ 0.035
+        # × qty_a_shares (100) = ₹3.5 expected gain vs ~₹100+ round-trip cost.
+        s = _make_strategy(
+            hedge_ratio=0.5,
+            exit_z=0.75,
+            min_edge_multiplier=1.5,
+            spread_history=[0.0, 0.04] * 30,  # mean ≈0.02, std ≈0.02
+        )
+        # spread = 1000 - 0.5*2000.1 = -0.05 → ~3σ below mean → would enter
+        self._stub_quotes(s, 1000.0, 2000.1)
+        proposals = s.scan_and_propose()
+        assert proposals == []
+        assert s.state.position == "FLAT"
+
+    def test_hurdle_allows_high_edge_entry(self):
+        # Wide rolling std → large expected ₹ move → easily clears 1.5× cost.
+        # std≈30 → expected Δspread at z=-2.5, exit_z=0.75 = 1.75*30 = 52.5
+        # × qty_a_shares 100 = ₹5,250 expected vs ~₹450 round-trip cost.
+        s = _make_strategy(
+            hedge_ratio=0.5,
+            exit_z=0.75,
+            min_edge_multiplier=1.5,
+            spread_history=[float(x) for x in range(-30, 30)],  # std ≈ 17
+        )
+        # spread = 1000 - 0.5*2100 = -50 → well below mean 0 with std~17 → z<-2.5
+        self._stub_quotes(s, 1000.0, 2100.0)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+
+    def test_hurdle_disabled_with_zero_multiplier(self):
+        # Same low-edge setup as test_hurdle_blocks_low_edge_entry, but
+        # multiplier=0 → no hurdle → entry fires regardless of friction.
+        s = _make_strategy(
+            hedge_ratio=0.5,
+            exit_z=0.75,
+            min_edge_multiplier=0.0,
+            spread_history=[0.0, 0.04] * 30,
+        )
+        self._stub_quotes(s, 1000.0, 2000.1)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
 
 
 # ──────────────────────────────────────────────────────────
