@@ -298,16 +298,23 @@ class TestEntry:
         assert b_leg.transaction_type == "BUY"
 
     def test_hedge_qty_matches_notional(self):
+        # Share-count β-weighted sizing (Varsity Ch. 13/14): qty_b_shares should
+        # ≈ |β| × qty_a_shares. With β=0.5 and 1 lot of A = 100 shares, the
+        # target B is 50 shares — below B's 200-share lot — so the strategy
+        # flips the anchor onto B (qty_b=1 → 200 shares) and scales A up to
+        # 4 lots (400 shares). Realized ratio 200/400 = 0.5 = β.
         s = _make_strategy(hedge_ratio=0.5)
         s._spread_history = [-1.0, 1.0] * 30
         self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
         proposals = s.scan_and_propose()
         a_leg = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
         b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
-        # Notional A = 1 * 100 * 1000 = 100,000
-        # Target |β| * A_notional / per_lot_b = 0.5 * 100000 / (200*2010) ≈ 0.124 → max(round, 1) = 1
-        assert a_leg.quantity == 1
+        assert a_leg.quantity == 4
         assert b_leg.quantity == 1
+        # Invariant: realized share-count ratio equals β.
+        b_shares = b_leg.quantity * b_leg.lot_size
+        a_shares = a_leg.quantity * a_leg.lot_size
+        assert b_shares / a_shares == 0.5
 
 
 # ──────────────────────────────────────────────────────────
@@ -502,16 +509,17 @@ class TestNotionalCap:
         s._spread_history = [-1.0, 1.0] * 30
 
     def test_no_cap_means_no_change(self):
-        # β=0.5, prices 1000/2000, lot 100/200, lots_per_leg=1
-        # natural notional A=1*100*1000=100k, B=1*200*2000=400k → max 400k
-        # max ≤ |β| means qty_b derived from |β|*100k/400k = 0.125 → 1 lot
+        # max_leg_notional=None disables the cap entirely. Share-count sizing
+        # decides: β=0.5, 1 lot of A (100 shares) wants 50 shares of B but
+        # B's lot is 200, so the anchor flips to B (qty_b=1, 200 shares)
+        # and qty_a scales up to 4 (400 shares) to preserve ratio = β = 0.5.
         s = _make_strategy(hedge_ratio=0.5, max_leg_notional=None)
         self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
         proposals = s.scan_and_propose()
         assert len(proposals) == 2
         a = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
         b = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
-        assert a.quantity == 1
+        assert a.quantity == 4
         assert b.quantity == 1
 
     def test_cap_scales_high_beta_down(self):
@@ -552,19 +560,26 @@ class TestNotionalCap:
         assert s.state.position == "FLAT"
 
     def test_cap_scales_lots_per_leg_down(self):
-        # lots_per_leg=5, price 1000/2000, lot 100/200, β=0.5
-        # notional_a = 5*100*1000 = 500k, target_b = 0.5*500k = 250k → max 500k
-        # Cap 200k → scale = 200k/500k = 0.4 → qty_a = round(5*0.4) = 2
-        # New notional_a = 2*100*1000 = 200k → fits cap exactly
-        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=200_000.0, lots_per_leg=5)
+        # lots_per_leg=10, β=0.5, prices 1000/2010, lots 100/200.
+        # Share-count sizing: qty_a=10, target_b_shares = 0.5*10*100 = 500,
+        # qty_b = round(500/200) = round(2.5) = 2 (Python banker's rounding).
+        # Natural notionals: A=10*100*1000=1,000k, B=2*200*2010=804k → max=1,000k.
+        # 1-lot gate needs cap ≥ max(one_lot_a=100k, one_lot_b=402k) = 402k.
+        # Cap 500k → scale=0.5 (exact) → qty_a=5, qty_b=1. The proportional
+        # scale-down preserves the share-count ratio (200/500=0.4 ≠ β here
+        # only because the post-scale qty_b is floor'd at 1 lot — see
+        # `max(..., 1)` in the cap branch); this is the documented behaviour.
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=500_000.0, lots_per_leg=10)
         self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
         proposals = s.scan_and_propose()
         assert len(proposals) == 2
         a = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
         b = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
-        assert a.quantity == 2
-        # target_b after scaling = 0.5 * 200k = 100k; per_lot_b = 200*2010 = 402k → qty_b = max(round(0.249), 1) = 1
+        assert a.quantity == 5
         assert b.quantity == 1
+        # Invariant: post-cap, neither leg's deployed notional exceeds the cap.
+        assert a.quantity * a.lot_size * a.price <= 500_000
+        assert b.quantity * b.lot_size * b.price <= 500_000
 
 
 class TestEODReport:
