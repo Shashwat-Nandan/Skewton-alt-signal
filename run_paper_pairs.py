@@ -77,6 +77,20 @@ FLATTEN_AT = (15, 25)   # close positions before the 15:30 bell
 HARD_STOP = (15, 30)    # never tick past this
 TICK_SECONDS = 60
 
+# Quality floor — pairs below any of these may be statistically cointegrated
+# but are economically untradeable: half-life longer than max_holding_days
+# rules out reversion in window; correlation below 0.65 means the relationship
+# is too weak to anchor the spread; p above 0.025 (tighter than the screener's
+# default 0.05) cuts the false-positive rate across a multi-pair book.
+QUALITY_MIN_CORR = 0.65
+QUALITY_MAX_HALFLIFE = 5.0   # days
+QUALITY_MAX_PVALUE = 0.025
+
+# Leg-concentration cap — no single symbol may participate in more than this
+# many pairs in the book. Prevents one stock's idiosyncratic move from
+# driving multiple positions' P&L in the same direction.
+LEG_CONCENTRATION_CAP = 2
+
 
 def load_holidays(path: Path) -> set[date]:
     if not path.exists():
@@ -124,24 +138,85 @@ def sleep_until(target: datetime, log: logging.Logger):
 
 
 def select_pairs(top: int, log: logging.Logger) -> pd.DataFrame:
-    """Top-N rows from pair_candidates.csv, filtered to a tradeable hedge_ratio."""
+    """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
+
+      1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
+      2) Quality floor: corr ≥ QUALITY_MIN_CORR AND half_life ≤
+         QUALITY_MAX_HALFLIFE AND p ≤ QUALITY_MAX_PVALUE. Drops candidates
+         that are statistically cointegrated but economically untradeable.
+      3) Composite select_score = mean of percentile ranks over (p, half-life,
+         spread_vol, correlation). The screener's `rank_score` weights only
+         p/half-life/vol — adding correlation here rewards spreads whose legs
+         actually co-move, breaking ties in favour of mean-reversion confidence
+         instead of pure bps-per-reversion.
+      4) Walk in select_score order and admit pairs until `top` is reached,
+         skipping any that would push a symbol past LEG_CONCENTRATION_CAP
+         appearances across the book.
+    """
     from strategies.pair_trading import HEDGE_RATIO_MIN, HEDGE_RATIO_MAX
 
     if not CANDIDATES_PATH.exists():
         raise FileNotFoundError(
             f"{CANDIDATES_PATH} not found — run screen_pairs.py first."
         )
-    df = pd.read_csv(CANDIDATES_PATH).sort_values("rank_score").reset_index(drop=True)
+
+    df = pd.read_csv(CANDIDATES_PATH)
+    n_in = len(df)
+
     abs_beta = df["hedge_ratio"].abs()
-    tradeable = df[(abs_beta >= HEDGE_RATIO_MIN) & (abs_beta <= HEDGE_RATIO_MAX)]
-    skipped = len(df) - len(tradeable)
-    if skipped:
+    df = df[(abs_beta >= HEDGE_RATIO_MIN) & (abs_beta <= HEDGE_RATIO_MAX)]
+    if len(df) < n_in:
         log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
-                 skipped, HEDGE_RATIO_MIN, HEDGE_RATIO_MAX)
-    chosen = tradeable.head(top).reset_index(drop=True)
-    if chosen.empty:
-        raise RuntimeError("No tradeable pairs after hedge-ratio filter; aborting")
-    return chosen
+                 n_in - len(df), HEDGE_RATIO_MIN, HEDGE_RATIO_MAX)
+    n_post_beta = len(df)
+
+    df = df[(df["correlation"] >= QUALITY_MIN_CORR)
+            & (df["half_life_days"] <= QUALITY_MAX_HALFLIFE)
+            & (df["coint_pvalue"] <= QUALITY_MAX_PVALUE)]
+    if len(df) < n_post_beta:
+        log.info("Quality floor (corr≥%.2f, HL≤%.1fd, p≤%.3f) dropped %d more",
+                 QUALITY_MIN_CORR, QUALITY_MAX_HALFLIFE, QUALITY_MAX_PVALUE,
+                 n_post_beta - len(df))
+
+    # Recompute percentile ranks within the quality-passing subset so the
+    # added corr_rank component is calibrated to the candidates that are
+    # actually selectable, not the whole 46-row screen.
+    df = df.copy()
+    p_rank = df["coint_pvalue"].rank(pct=True)
+    hl_rank = df["half_life_days"].rank(pct=True)
+    vol_rank = (-df["spread_vol_pct"]).rank(pct=True)
+    corr_rank = (-df["correlation"]).rank(pct=True)
+    df["select_score"] = (p_rank + hl_rank + vol_rank + corr_rank) / 4.0
+    # Percentile ranks over an 18-row quality-passing set produce many ties.
+    # Break them by correlation desc — consistent with this whole composite's
+    # bias toward mean-reversion confidence over bps-per-reversion.
+    df = df.sort_values(["select_score", "correlation"],
+                        ascending=[True, False]).reset_index(drop=True)
+
+    picks: List[pd.Series] = []
+    leg_count: dict[str, int] = {}
+    for _, row in df.iterrows():
+        if len(picks) >= top:
+            break
+        a, b = row["symbol_a"], row["symbol_b"]
+        if (leg_count.get(a, 0) >= LEG_CONCENTRATION_CAP
+                or leg_count.get(b, 0) >= LEG_CONCENTRATION_CAP):
+            log.info("  skipped %s/%s — leg-concentration cap (%dx) reached",
+                     a, b, LEG_CONCENTRATION_CAP)
+            continue
+        picks.append(row)
+        leg_count[a] = leg_count.get(a, 0) + 1
+        leg_count[b] = leg_count.get(b, 0) + 1
+
+    if not picks:
+        raise RuntimeError(
+            "No tradeable pairs after β + quality + concentration filters")
+    if len(picks) < top:
+        log.warning("Selected only %d of %d requested pairs "
+                    "(quality/concentration filters exhausted)",
+                    len(picks), top)
+
+    return pd.DataFrame(picks).reset_index(drop=True)
 
 
 def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: logging.Logger):

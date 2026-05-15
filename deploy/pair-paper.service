@@ -14,7 +14,7 @@ Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # --top, --max-leg-notional and tunables live here so config changes don't
 # require a rebuild. Override on the VPS by `systemctl edit pair-paper.service`.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 3 --max-leg-notional 1000000
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 12 --max-leg-notional 1000000
 # ------------------------------------
 
 # Oneshot session — exits cleanly at 15:25 IST. Timer fires again tomorrow.
