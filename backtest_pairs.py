@@ -157,6 +157,9 @@ def make_strategy(
     *, entry_z: float, exit_z: float, stop_z: float,
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
+    min_edge_multiplier: float = 1.5,
+    max_entry_z: float = 5.0,
+    safety_buffer: float = 0.75,
     seed_spreads: Optional[List[float]] = None,
 ) -> PairTradingStrategy:
     s = PairTradingStrategy.__new__(PairTradingStrategy)
@@ -170,6 +173,9 @@ def make_strategy(
     s.entry_z = entry_z
     s.exit_z = exit_z
     s.stop_z = stop_z
+    s.max_entry_z = max_entry_z
+    s.safety_buffer = safety_buffer
+    s.min_edge_multiplier = min_edge_multiplier
     s.lookback_days = lookback_days
     s.lots_per_leg = lots_per_leg
     s.max_holding_days = max_holding_days
@@ -197,6 +203,9 @@ def backtest_one(
     *, entry_z: float, exit_z: float, stop_z: float,
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
+    min_edge_multiplier: float = 1.5,
+    max_entry_z: float = 5.0,
+    safety_buffer: float = 0.75,
     seed_panel: Optional[pd.DataFrame] = None,
 ) -> Optional[dict]:
     a, b = pair_row["symbol_a"], pair_row["symbol_b"]
@@ -229,6 +238,9 @@ def backtest_one(
         entry_z=entry_z, exit_z=exit_z, stop_z=stop_z,
         lookback_days=lookback_days, max_holding_days=max_holding_days,
         lots_per_leg=lots_per_leg, max_leg_notional=max_leg_notional,
+        min_edge_multiplier=min_edge_multiplier,
+        max_entry_z=max_entry_z,
+        safety_buffer=safety_buffer,
         seed_spreads=seed_spreads,
     )
 
@@ -335,7 +347,9 @@ def print_report(results: List[dict], args):
     cap_label = f"max-leg-notional=₹{args.max_leg_notional:,.0f}" if args.max_leg_notional else "no cap"
     print(f"Pair-trading backtest — {mode_label}")
     print(f"  top={args.top}, lookback={args.lookback_days}d, "
-          f"entry={args.entry_z} exit={args.exit_z} stop={args.stop_z}, "
+          f"entry={args.entry_z} exit={args.exit_z} stop={args.stop_z} "
+          f"max_entry={args.max_entry_z} buf={args.safety_buffer} "
+          f"min_edge={args.min_edge_multiplier}×, "
           f"max-hold={args.max_holding_days}d, lots-per-leg={args.lots_per_leg}, {cap_label}")
     print("=" * 110)
     print(f"{'#':<3} {'Pair':<22} {'β':>9} {'Days':>5} {'Trips':>6} {'Net P&L':>13} "
@@ -376,6 +390,18 @@ def main():
     p.add_argument("--entry-z", type=float, default=2.0)
     p.add_argument("--exit-z", type=float, default=0.75)
     p.add_argument("--stop-z", type=float, default=4.0)
+    p.add_argument("--max-entry-z", type=float, default=5.0, dest="max_entry_z",
+                   help="Hard ceiling for entries; past |z|>=max_entry_z the "
+                        "spread is treated as a regime break and refused.")
+    p.add_argument("--safety-buffer", type=float, default=0.75, dest="safety_buffer",
+                   help="Per-trade widening of stop_z: effective_stop = "
+                        "max(stop_z, |entry_z| + safety_buffer). Keeps deep "
+                        "entries from being insta-stopped by sub-σ jitter.")
+    p.add_argument("--min-edge-multiplier", type=float, default=1.5,
+                   dest="min_edge_multiplier",
+                   help="Refuse entries whose expected ₹ move from current z "
+                        "back to exit band is below this multiple of round-trip "
+                        "cost. 0 disables the hurdle.")
     p.add_argument("--lookback", type=int, default=30, dest="lookback_days")
     p.add_argument("--max-hold", type=int, default=7, dest="max_holding_days")
     p.add_argument("--lots-per-leg", type=int, default=1)
@@ -462,6 +488,9 @@ def main():
             lookback_days=args.lookback_days, max_holding_days=args.max_holding_days,
             lots_per_leg=args.lots_per_leg,
             max_leg_notional=args.max_leg_notional,
+            min_edge_multiplier=args.min_edge_multiplier,
+            max_entry_z=args.max_entry_z,
+            safety_buffer=args.safety_buffer,
             seed_panel=seed_panel,
         )
         if r is not None:
