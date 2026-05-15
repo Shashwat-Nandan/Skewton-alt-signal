@@ -70,6 +70,9 @@ class PairState:
     entry_z: float = 0.0
     entry_time: Optional[datetime] = None
     entry_spread: float = 0.0
+    # Per-trade stop band: max(stop_z, |entry_z| + safety_buffer). 0.0 while
+    # flat. Set in _set_position_from_legs, used by check_and_rehedge.
+    effective_stop_z: float = 0.0
     legs: List[PairLeg] = field(default_factory=list)
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
@@ -135,6 +138,18 @@ class PairTradingStrategy(BaseStrategy):
         self.entry_z = float(cfg.get("entry_z", 2.0))
         self.exit_z = float(cfg.get("exit_z", 0.75))
         self.stop_z = float(cfg.get("stop_z", 4.0))
+        # 2026-05-15 RELIANCE/CIPLA: a deep entry at z=-4.22 (past stop_z=4.0)
+        # produced 346 same-tick entry+stop-out round-trips because the fixed
+        # global stop fired on the very first rehedge. Two knobs fix this:
+        #   - max_entry_z is a hard ceiling for entries — past this is a
+        #     regime break, refuse.
+        #   - safety_buffer guarantees every accepted trade has breathing
+        #     room before its stop: effective_stop_z = max(stop_z,
+        #     |entry_z| + safety_buffer). A z=-3.8 entry therefore stops at
+        #     4.55, not 4.0, so it isn't insta-stopped by sub-σ jitter.
+        # Both are per-pair config-overridable.
+        self.max_entry_z = float(cfg.get("max_entry_z", 5.0))
+        self.safety_buffer = float(cfg.get("safety_buffer", 0.75))
         self.lookback_days = int(cfg.get("lookback_days", 60))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
         # Cost-hurdle: refuse entries whose expected ₹ move from current z back
@@ -213,6 +228,13 @@ class PairTradingStrategy(BaseStrategy):
             logger.debug("Spread history too thin (%d obs) for z-score", len(self._spread_history))
             return []
 
+        # Hard ceiling: past max_entry_z is a regime break, not a deep
+        # mean-reversion signal. Refuse rather than enter with an ever-wider
+        # stop. Below the ceiling, _set_position_from_legs widens the per-
+        # trade stop by safety_buffer to avoid same-tick stop-out.
+        if abs(z) >= self.max_entry_z:
+            return []
+
         if z <= -self.entry_z:
             return self._build_entry_proposals(direction="LONG_SPREAD", z=z, spread=spread, prices=prices)
         if z >= self.entry_z:
@@ -242,7 +264,10 @@ class PairTradingStrategy(BaseStrategy):
 
         if abs(z) <= self.exit_z:
             return self._build_exit_proposals(reason="MEAN_REVERT", z=z, prices=prices)
-        if abs(z) >= self.stop_z:
+        # Per-trade effective stop (widened by safety_buffer for deep entries)
+        # falls back to the global stop_z if state somehow missed initialisation.
+        stop = self.state.effective_stop_z or self.stop_z
+        if abs(z) >= stop:
             return self._build_exit_proposals(reason="STOP", z=z, prices=prices)
         return []
 
@@ -273,6 +298,7 @@ class PairTradingStrategy(BaseStrategy):
             self.state.entry_time = None
             self.state.entry_z = 0.0
             self.state.entry_spread = 0.0
+            self.state.effective_stop_z = 0.0
             self.state.unrealized_pnl = 0.0
 
         return results
@@ -598,13 +624,23 @@ class PairTradingStrategy(BaseStrategy):
 
     def _set_position_from_legs(self) -> None:
         leg_a = next((l for l in self.state.legs if l.symbol == self.symbol_a), None)
-        if leg_a is None:
+        leg_b = next((l for l in self.state.legs if l.symbol == self.symbol_b), None)
+        if leg_a is None or leg_b is None:
             return
         self.state.position = "LONG_SPREAD" if leg_a.quantity > 0 else "SHORT_SPREAD"
         self.state.entry_time = self._clock()
-        if self._spread_history:
-            self.state.entry_spread = self._spread_history[-1]
-            self.state.entry_z = self._z_score(self._spread_history[-1]) or 0.0
+        # entry_spread/entry_z from the actual fill prices, not from
+        # _spread_history[-1] (which is yesterday's daily close under the
+        # seed-only-z regime — stale by hours).
+        entry_spread = leg_a.entry_price - self.hedge_ratio * leg_b.entry_price
+        self.state.entry_spread = entry_spread
+        self.state.entry_z = self._z_score(entry_spread) or 0.0
+        # Widen the stop band by safety_buffer past |entry_z|, but never below
+        # the global stop_z floor — shallow entries still respect the original
+        # band.
+        self.state.effective_stop_z = max(
+            self.stop_z, abs(self.state.entry_z) + self.safety_buffer,
+        )
 
     def _update_unrealized(self, prices: Dict[str, float]) -> None:
         unrealized = 0.0

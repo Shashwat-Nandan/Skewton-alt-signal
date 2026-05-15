@@ -30,6 +30,8 @@ def _make_strategy(
     entry_z: float = 2.0,
     exit_z: float = 0.5,
     stop_z: float = 4.0,
+    max_entry_z: float = 5.0,
+    safety_buffer: float = 0.75,
     spread_history=None,
     max_leg_notional=None,
     lots_per_leg: int = 1,
@@ -52,6 +54,8 @@ def _make_strategy(
     s.entry_z = entry_z
     s.exit_z = exit_z
     s.stop_z = stop_z
+    s.max_entry_z = max_entry_z
+    s.safety_buffer = safety_buffer
     s.lookback_days = 30
     s.lots_per_leg = lots_per_leg
     s.max_holding_days = 10
@@ -191,16 +195,16 @@ class TestCostHurdle:
 
     def test_hurdle_allows_high_edge_entry(self):
         # Wide rolling std → large expected ₹ move → easily clears 1.5× cost.
-        # std≈30 → expected Δspread at z=-2.5, exit_z=0.75 = 1.75*30 = 52.5
-        # × qty_a_shares 100 = ₹5,250 expected vs ~₹450 round-trip cost.
+        # Rolling window is the last lookback_days=30 of history → values 0..29:
+        # mean=14.5, std≈8.66. z must land in the entry band and below
+        # max_entry_z=5.0; price_b=2025 gives spread=-12.5 → z≈-3.12.
         s = _make_strategy(
             hedge_ratio=0.5,
             exit_z=0.75,
             min_edge_multiplier=1.5,
-            spread_history=[float(x) for x in range(-30, 30)],  # std ≈ 17
+            spread_history=[float(x) for x in range(-30, 30)],
         )
-        # spread = 1000 - 0.5*2100 = -50 → well below mean 0 with std~17 → z<-2.5
-        self._stub_quotes(s, 1000.0, 2100.0)
+        self._stub_quotes(s, 1000.0, 2025.0)
         proposals = s.scan_and_propose()
         assert len(proposals) == 2
 
@@ -224,7 +228,13 @@ class TestCostHurdle:
 
 class TestEntry:
     def _seed_priced_quotes(self, s, price_a=1000.0, price_b=2000.0):
-        """Mock the kite quote calls so _observe_spread returns deterministic prices."""
+        """Mock the kite quote calls so _observe_spread returns deterministic prices.
+
+        Seeds a rolling window with mean=0, std=2 so the canonical test prices
+        (price_b ≈ 2010 → spread ≈ -5) land at z ≈ -2.5 — inside the entry band
+        and well below max_entry_z=5.0. Narrower seeds would push |z| past the
+        2026-05-15 regime-break ceiling.
+        """
         def fake_quote(syms):
             assert len(syms) == 1
             sym = syms[0]
@@ -232,8 +242,7 @@ class TestEntry:
                 return {sym: {"last_price": price_a}}
             return {sym: {"last_price": price_b}}
         s.kite.quote = fake_quote
-        # Prepend a stable history so the z-score is computable
-        s._spread_history = [0.0, 1.0] * 30
+        s._spread_history = [-2.0, 2.0] * 30
 
     def test_no_entry_when_already_in_position(self):
         s = _make_strategy()
@@ -242,13 +251,9 @@ class TestEntry:
         assert proposals == []
 
     def test_long_spread_when_z_below_minus_entry(self):
-        # Spread well below the rolling mean → z negative → LONG_SPREAD
+        # Spread below the rolling mean → z negative → LONG_SPREAD.
+        # Helper seeds mean=0, std=2; price_b=2010 → spread=-5 → z=-2.5.
         s = _make_strategy(hedge_ratio=0.5)
-        # Establish mean ~= 0, std ~= 1 over recent history
-        s._spread_history = [-1.0, 1.0] * 30
-        # current price puts spread at -5 (way below mean)
-        # spread = price_a - β*price_b; pick price_a, price_b so spread = -5
-        # 1000 - 0.5*2010 = -5 → price_b = 2010
         self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
         proposals = s.scan_and_propose()
         assert len(proposals) == 2
@@ -263,9 +268,8 @@ class TestEntry:
         assert b_leg.option_type == "FUT"
 
     def test_short_spread_when_z_above_plus_entry(self):
+        # Symmetric to the LONG case: price_b=1990 → spread=+5 → z=+2.5.
         s = _make_strategy(hedge_ratio=0.5)
-        s._spread_history = [-1.0, 1.0] * 30
-        # spread = 1000 - 0.5*1990 = +5 (well above mean)
         self._seed_priced_quotes(s, price_a=1000.0, price_b=1990.0)
         proposals = s.scan_and_propose()
         assert len(proposals) == 2
@@ -297,6 +301,49 @@ class TestEntry:
         # Negative β → both BUY for LONG_SPREAD
         assert b_leg.transaction_type == "BUY"
 
+    def test_no_entry_past_max_entry_z(self):
+        # 2026-05-15 RELIANCE/CIPLA: opened at z=-4.22 and stayed pinned past
+        # the configured stop band. max_entry_z is the regime-break ceiling —
+        # entries past it are refused. (Inside the band, a deep entry gets a
+        # widened per-trade stop; that's covered in TestExit.)
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, max_entry_z=5.0)
+        # std=2, price_b=2022 → spread=-11 → z=-5.5 (past -max_entry_z).
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2022.0)
+        assert s.scan_and_propose() == []
+        # Symmetric upside: price_b=1978 → spread=+11 → z=+5.5.
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=1978.0)
+        assert s.scan_and_propose() == []
+
+    def test_entry_just_inside_max_entry_z_fires_with_widened_stop(self):
+        # Counterpart: an entry at |z|=4.5 (inside max_entry_z=5.0) must fire,
+        # and the per-trade effective stop must be widened by safety_buffer so
+        # the trade isn't insta-stopped at the next tick — the actual
+        # RELIANCE/CIPLA failure mode.
+        s = _make_strategy(
+            hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+            max_entry_z=5.0, safety_buffer=0.75,
+        )
+        # std=2, price_b=2018 → spread=-9 → z=-4.5.
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2018.0)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+        s.execute_proposals(proposals)
+        # effective_stop_z = max(4.0, 4.5 + 0.75) = 5.25 — gives 0.75σ of room
+        # past entry before the per-trade stop fires.
+        assert s.state.effective_stop_z == pytest.approx(5.25)
+
+    def test_shallow_entry_keeps_global_stop_z(self):
+        # Shallow entry at |z|=2.5 → |entry_z|+buffer = 3.25 < stop_z=4.0, so
+        # the per-trade stop stays at the global floor. Guards against an
+        # over-eager widening that would loosen risk for normal trades.
+        s = _make_strategy(
+            hedge_ratio=0.5, entry_z=2.0, stop_z=4.0, safety_buffer=0.75,
+        )
+        # std=2, price_b=2010 → spread=-5 → z=-2.5.
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        s.execute_proposals(s.scan_and_propose())
+        assert s.state.effective_stop_z == pytest.approx(4.0)
+
     def test_hedge_qty_matches_notional(self):
         # Share-count β-weighted sizing (Varsity Ch. 13/14): qty_b_shares should
         # ≈ |β| × qty_a_shares. With β=0.5 and 1 lot of A = 100 shares, the
@@ -322,11 +369,14 @@ class TestEntry:
 # ──────────────────────────────────────────────────────────
 
 class TestExit:
-    def _open_long_spread(self, s, price_a=1000.0, price_b=2000.0):
+    def _open_long_spread(self, s, price_a=1000.0, price_b=2000.0, entry_z=-2.5):
         s.state.position = "LONG_SPREAD"
         s.state.entry_time = s._clock()
-        s.state.entry_z = -2.5
-        s.state.entry_spread = -5.0
+        s.state.entry_z = entry_z
+        s.state.entry_spread = entry_z * 1.0  # std=1 for the standard helper
+        # Mirror _set_position_from_legs so check_and_rehedge sees the same
+        # per-trade stop band a real entry would have produced.
+        s.state.effective_stop_z = max(s.stop_z, abs(entry_z) + s.safety_buffer)
         s.state.legs = [
             PairLeg(symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
                     quantity=1, entry_price=price_a, current_price=price_a),
@@ -382,6 +432,31 @@ class TestExit:
         proposals = s.check_and_rehedge()
         assert len(proposals) == 2
         assert any("MAX_HOLD" in p.rationale for p in proposals)
+
+    def test_deep_entry_not_stopped_inside_widened_band(self):
+        # 2026-05-15 RELIANCE/CIPLA regression: a position opened at z=-3.8
+        # (just inside max_entry_z=5.0) used to fire EXIT_STOP on the next
+        # tick because the global stop_z=4.0 was right next to the entry.
+        # With per-trade effective_stop_z = max(stop_z, |entry_z| + 0.75) =
+        # 4.55, a z=-4.3 reading is inside the band → no exit.
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0, safety_buffer=0.75)
+        s._spread_history = [-1.0, 1.0] * 30  # mean 0, std 1
+        self._open_long_spread(s, entry_z=-3.8)
+        # spread = 1000 - 0.5*2008.6 = -4.3 → z = -4.3 (inside widened band)
+        self._set_quote(s, price_a=1000.0, price_b=2008.6)
+        assert s.check_and_rehedge() == []
+
+    def test_deep_entry_stops_when_past_effective_stop(self):
+        # Counterpart: drift past the widened stop must still fire EXIT_STOP.
+        # Guards against a regression that drops the stop entirely.
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0, safety_buffer=0.75)
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s, entry_z=-3.8)
+        # effective_stop_z = 4.55; spread = -4.7 → z = -4.7 (past stop)
+        self._set_quote(s, price_a=1000.0, price_b=2009.4)
+        proposals = s.check_and_rehedge()
+        assert len(proposals) == 2
+        assert any("STOP" in p.rationale for p in proposals)
 
     def test_no_exit_inside_band(self):
         s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
@@ -502,11 +577,13 @@ class TestNotionalCap:
     scales both legs down (preserving the hedge ratio) or skips the entry."""
 
     def _seed_priced_quotes(self, s, price_a=1000.0, price_b=2000.0):
+        # mean=0, std=2 so price_b=2010 → spread=-5 → z=-2.5, inside the
+        # entry band and below max_entry_z=5.0.
         s.kite.quote = lambda syms: (
             {syms[0]: {"last_price": price_a}} if "AAA" in syms[0]
             else {syms[0]: {"last_price": price_b}}
         )
-        s._spread_history = [-1.0, 1.0] * 30
+        s._spread_history = [-2.0, 2.0] * 30
 
     def test_no_cap_means_no_change(self):
         # max_leg_notional=None disables the cap entirely. Share-count sizing
@@ -531,12 +608,11 @@ class TestNotionalCap:
         # What we want: the cap forces a refusal because 1 lot of A implies 100k of B.
         # Use price_a = 50 so 1 lot of A = 5k notional, β=10 → target B = 50k = cap exactly.
         s = _make_strategy(hedge_ratio=10.0, max_leg_notional=50_000.0, lots_per_leg=1)
-        s.kite.quote = lambda syms: (
-            {syms[0]: {"last_price": 50.0}} if "AAA" in syms[0]
-            else {syms[0]: {"last_price": 100.0}}
-        )
-        s._spread_history = [-1.0, 1.0] * 30
-        # spread = 50 - 10*101 = -960 (way below mean) → LONG_SPREAD entry
+        # Seed mean=0, std=400 so spread=-960 → z=-2.4 (inside entry band, below
+        # max_entry_z=5.0). A tighter std would put |z| past the regime-break
+        # ceiling and the gate would refuse before the cap logic runs.
+        s._spread_history = [-400.0, 400.0] * 30
+        # spread = 50 - 10*101 = -960 → LONG_SPREAD entry
         s.kite.quote = lambda syms: (
             {syms[0]: {"last_price": 50.0}} if "AAA" in syms[0]
             else {syms[0]: {"last_price": 101.0}}
