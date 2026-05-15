@@ -215,6 +215,14 @@ def main():
 
     # Watchdog: if no ticks arrive after cutoff, on_ticks never fires and the
     # ws sits idle. Force-close from a daemon thread so the unit exits.
+    #
+    # ticker.close() shuts the WebSocket but does not stop Twisted's reactor.
+    # ticker.connect(threaded=False) below runs reactor.run() on the main
+    # thread, which blocks in epoll_wait independently of the socket state —
+    # leaving the process alive (and the systemd unit perpetually in
+    # `activating` under Type=oneshot) after the WS closes. We schedule
+    # reactor.stop() onto the reactor thread so the main thread unblocks
+    # and main() can complete its cleanup and return.
     def _watchdog():
         while time.time() < _STOP_EPOCH:
             time.sleep(10)
@@ -223,6 +231,11 @@ def main():
             ticker.close()
         except Exception as e:
             _LOG.warning("Watchdog ticker.close() failed: %s", e)
+        try:
+            from twisted.internet import reactor
+            reactor.callFromThread(reactor.stop)
+        except Exception as e:
+            _LOG.warning("Watchdog reactor.stop() failed: %s", e)
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
