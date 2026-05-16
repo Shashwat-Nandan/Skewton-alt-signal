@@ -141,16 +141,27 @@ def classify_pair_candidates(
     df: pd.DataFrame,
     top: int,
     log: logging.Logger | None = None,
+    *,
+    exclude_symbols: set[str] | None = None,
+    max_hedge_ratio: float | None = None,
 ) -> pd.DataFrame:
     """Annotate every candidate row with its disposition under the four-pass
     runner logic (see `select_pairs` docstring for the passes themselves).
 
     Adds three columns to a copy of `df`:
-      - `select_score`: composite percentile-rank score (NaN if dropped by β
-         or quality before scoring).
+      - `select_score`: composite percentile-rank score (NaN if dropped by
+         excluded/β/quality before scoring).
       - `processing_rank`: 1..N admit order (NaN if not admitted).
-      - `skip_reason`: '' for admitted, otherwise one of {'beta', 'quality',
-         'leg_cap', 'cutoff'}.
+      - `skip_reason`: '' for admitted, otherwise one of {'excluded', 'beta',
+         'quality', 'leg_cap', 'cutoff'}.
+
+    Optional rule overrides (defaults preserve live runner behavior):
+      - `exclude_symbols`: skip any pair where either leg is in this set
+         (skip_reason='excluded'). Used to blacklist e.g. Adani group when
+         the OOS backtest flags them as a persistent drag.
+      - `max_hedge_ratio`: override `HEDGE_RATIO_MAX` for the |β| upper
+         bound. Used to tighten the tradeable hedge-ratio band beyond the
+         strategy's defensive defaults.
 
     Row order is preserved so callers can render the original candidate
     sequence with annotations layered on. Used by both `select_pairs` (which
@@ -159,17 +170,39 @@ def classify_pair_candidates(
     """
     from strategies.pair_trading import HEDGE_RATIO_MIN, HEDGE_RATIO_MAX
 
+    beta_upper = max_hedge_ratio if max_hedge_ratio is not None else HEDGE_RATIO_MAX
+
     out = df.copy()
     out["select_score"] = float("nan")
     out["processing_rank"] = pd.NA
     out["skip_reason"] = ""
 
+    # Excluded-symbol blacklist runs before the β filter so a banned symbol
+    # never costs a rank slot even when its hedge ratio is benign.
+    if exclude_symbols:
+        excluded_mask = (
+            out["symbol_a"].isin(exclude_symbols)
+            | out["symbol_b"].isin(exclude_symbols)
+        )
+        out.loc[excluded_mask, "skip_reason"] = "excluded"
+        if log is not None and excluded_mask.any():
+            log.info("Excluded %d candidate(s) via blacklist: %s",
+                     int(excluded_mask.sum()),
+                     ", ".join(sorted(exclude_symbols)))
+    else:
+        excluded_mask = pd.Series(False, index=out.index)
+
     abs_beta = out["hedge_ratio"].abs()
-    beta_mask = (abs_beta >= HEDGE_RATIO_MIN) & (abs_beta <= HEDGE_RATIO_MAX)
-    out.loc[~beta_mask, "skip_reason"] = "beta"
-    if log is not None and (~beta_mask).any():
+    beta_mask = (
+        ~excluded_mask
+        & (abs_beta >= HEDGE_RATIO_MIN)
+        & (abs_beta <= beta_upper)
+    )
+    beta_dropped = ~excluded_mask & ~beta_mask
+    out.loc[beta_dropped, "skip_reason"] = "beta"
+    if log is not None and beta_dropped.any():
         log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
-                 int((~beta_mask).sum()), HEDGE_RATIO_MIN, HEDGE_RATIO_MAX)
+                 int(beta_dropped.sum()), HEDGE_RATIO_MIN, beta_upper)
 
     quality_mask = (
         beta_mask
