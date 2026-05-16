@@ -75,7 +75,10 @@ export const api = {
     http<RunSummary>("/runs", { method: "POST", body: JSON.stringify(body) }),
   stopRun: (id: string) => http<RunSummary>(`/runs/${id}/stop`, { method: "POST" }),
 
-  pairCandidates: () => http<PairCandidatesResponse>("/pair-candidates"),
+  pairCandidates: (top?: number) => {
+    const qs = top != null ? `?top=${top}` : "";
+    return http<PairCandidatesResponse>(`/pair-candidates${qs}`);
+  },
 
   equityPositions: (status?: "open" | "closed") => {
     const qs = status ? `?status=${status}` : "";

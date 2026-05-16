@@ -137,6 +137,98 @@ def sleep_until(target: datetime, log: logging.Logger):
         time.sleep(min(delta, 60))
 
 
+def classify_pair_candidates(
+    df: pd.DataFrame,
+    top: int,
+    log: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Annotate every candidate row with its disposition under the four-pass
+    runner logic (see `select_pairs` docstring for the passes themselves).
+
+    Adds three columns to a copy of `df`:
+      - `select_score`: composite percentile-rank score (NaN if dropped by β
+         or quality before scoring).
+      - `processing_rank`: 1..N admit order (NaN if not admitted).
+      - `skip_reason`: '' for admitted, otherwise one of {'beta', 'quality',
+         'leg_cap', 'cutoff'}.
+
+    Row order is preserved so callers can render the original candidate
+    sequence with annotations layered on. Used by both `select_pairs` (which
+    filters down to admitted rows) and the dashboard API (which surfaces the
+    full annotated list).
+    """
+    from strategies.pair_trading import HEDGE_RATIO_MIN, HEDGE_RATIO_MAX
+
+    out = df.copy()
+    out["select_score"] = float("nan")
+    out["processing_rank"] = pd.NA
+    out["skip_reason"] = ""
+
+    abs_beta = out["hedge_ratio"].abs()
+    beta_mask = (abs_beta >= HEDGE_RATIO_MIN) & (abs_beta <= HEDGE_RATIO_MAX)
+    out.loc[~beta_mask, "skip_reason"] = "beta"
+    if log is not None and (~beta_mask).any():
+        log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
+                 int((~beta_mask).sum()), HEDGE_RATIO_MIN, HEDGE_RATIO_MAX)
+
+    quality_mask = (
+        beta_mask
+        & (out["correlation"] >= QUALITY_MIN_CORR)
+        & (out["half_life_days"] <= QUALITY_MAX_HALFLIFE)
+        & (out["coint_pvalue"] <= QUALITY_MAX_PVALUE)
+    )
+    quality_dropped = beta_mask & ~quality_mask
+    out.loc[quality_dropped, "skip_reason"] = "quality"
+    if log is not None and quality_dropped.any():
+        log.info("Quality floor (corr≥%.2f, HL≤%.1fd, p≤%.3f) dropped %d more",
+                 QUALITY_MIN_CORR, QUALITY_MAX_HALFLIFE, QUALITY_MAX_PVALUE,
+                 int(quality_dropped.sum()))
+
+    if not quality_mask.any():
+        return out
+
+    # Recompute percentile ranks within the quality-passing subset so the
+    # added corr_rank component is calibrated to the candidates that are
+    # actually selectable, not the whole 46-row screen.
+    sub = out.loc[quality_mask]
+    p_rank = sub["coint_pvalue"].rank(pct=True)
+    hl_rank = sub["half_life_days"].rank(pct=True)
+    vol_rank = (-sub["spread_vol_pct"]).rank(pct=True)
+    corr_rank = (-sub["correlation"]).rank(pct=True)
+    out.loc[quality_mask, "select_score"] = (p_rank + hl_rank + vol_rank + corr_rank) / 4.0
+
+    # Percentile ranks over an 18-row quality-passing set produce many ties.
+    # Break them by correlation desc — consistent with this whole composite's
+    # bias toward mean-reversion confidence over bps-per-reversion.
+    walk_order = (
+        out.loc[quality_mask]
+        .sort_values(["select_score", "correlation"], ascending=[True, False])
+        .index.tolist()
+    )
+
+    admitted_count = 0
+    leg_count: dict[str, int] = {}
+    for idx in walk_order:
+        if admitted_count >= top:
+            out.loc[idx, "skip_reason"] = "cutoff"
+            continue
+        a = out.at[idx, "symbol_a"]
+        b = out.at[idx, "symbol_b"]
+        if (leg_count.get(a, 0) >= LEG_CONCENTRATION_CAP
+                or leg_count.get(b, 0) >= LEG_CONCENTRATION_CAP):
+            out.loc[idx, "skip_reason"] = "leg_cap"
+            if log is not None:
+                log.info("  skipped %s/%s — leg-concentration cap (%dx) reached",
+                         a, b, LEG_CONCENTRATION_CAP)
+            continue
+        admitted_count += 1
+        out.loc[idx, "processing_rank"] = admitted_count
+        leg_count[a] = leg_count.get(a, 0) + 1
+        leg_count[b] = leg_count.get(b, 0) + 1
+
+    return out
+
+
 def select_pairs(top: int, log: logging.Logger) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
@@ -153,62 +245,20 @@ def select_pairs(top: int, log: logging.Logger) -> pd.DataFrame:
          skipping any that would push a symbol past LEG_CONCENTRATION_CAP
          appearances across the book.
     """
-    from strategies.pair_trading import HEDGE_RATIO_MIN, HEDGE_RATIO_MAX
-
     if not CANDIDATES_PATH.exists():
         raise FileNotFoundError(
             f"{CANDIDATES_PATH} not found — run screen_pairs.py first."
         )
 
-    df = pd.read_csv(CANDIDATES_PATH)
-    n_in = len(df)
+    annotated = classify_pair_candidates(pd.read_csv(CANDIDATES_PATH), top, log)
+    picks = (
+        annotated[annotated["processing_rank"].notna()]
+        .sort_values("processing_rank")
+        .drop(columns=["processing_rank", "skip_reason", "select_score"])
+        .reset_index(drop=True)
+    )
 
-    abs_beta = df["hedge_ratio"].abs()
-    df = df[(abs_beta >= HEDGE_RATIO_MIN) & (abs_beta <= HEDGE_RATIO_MAX)]
-    if len(df) < n_in:
-        log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
-                 n_in - len(df), HEDGE_RATIO_MIN, HEDGE_RATIO_MAX)
-    n_post_beta = len(df)
-
-    df = df[(df["correlation"] >= QUALITY_MIN_CORR)
-            & (df["half_life_days"] <= QUALITY_MAX_HALFLIFE)
-            & (df["coint_pvalue"] <= QUALITY_MAX_PVALUE)]
-    if len(df) < n_post_beta:
-        log.info("Quality floor (corr≥%.2f, HL≤%.1fd, p≤%.3f) dropped %d more",
-                 QUALITY_MIN_CORR, QUALITY_MAX_HALFLIFE, QUALITY_MAX_PVALUE,
-                 n_post_beta - len(df))
-
-    # Recompute percentile ranks within the quality-passing subset so the
-    # added corr_rank component is calibrated to the candidates that are
-    # actually selectable, not the whole 46-row screen.
-    df = df.copy()
-    p_rank = df["coint_pvalue"].rank(pct=True)
-    hl_rank = df["half_life_days"].rank(pct=True)
-    vol_rank = (-df["spread_vol_pct"]).rank(pct=True)
-    corr_rank = (-df["correlation"]).rank(pct=True)
-    df["select_score"] = (p_rank + hl_rank + vol_rank + corr_rank) / 4.0
-    # Percentile ranks over an 18-row quality-passing set produce many ties.
-    # Break them by correlation desc — consistent with this whole composite's
-    # bias toward mean-reversion confidence over bps-per-reversion.
-    df = df.sort_values(["select_score", "correlation"],
-                        ascending=[True, False]).reset_index(drop=True)
-
-    picks: List[pd.Series] = []
-    leg_count: dict[str, int] = {}
-    for _, row in df.iterrows():
-        if len(picks) >= top:
-            break
-        a, b = row["symbol_a"], row["symbol_b"]
-        if (leg_count.get(a, 0) >= LEG_CONCENTRATION_CAP
-                or leg_count.get(b, 0) >= LEG_CONCENTRATION_CAP):
-            log.info("  skipped %s/%s — leg-concentration cap (%dx) reached",
-                     a, b, LEG_CONCENTRATION_CAP)
-            continue
-        picks.append(row)
-        leg_count[a] = leg_count.get(a, 0) + 1
-        leg_count[b] = leg_count.get(b, 0) + 1
-
-    if not picks:
+    if picks.empty:
         raise RuntimeError(
             "No tradeable pairs after β + quality + concentration filters")
     if len(picks) < top:
@@ -216,7 +266,7 @@ def select_pairs(top: int, log: logging.Logger) -> pd.DataFrame:
                     "(quality/concentration filters exhausted)",
                     len(picks), top)
 
-    return pd.DataFrame(picks).reset_index(drop=True)
+    return picks
 
 
 def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: logging.Logger):

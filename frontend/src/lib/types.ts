@@ -127,6 +127,8 @@ export type DayProfile = {
 
 // ── Pair Candidates ──
 
+export type PairSkipReason = "beta" | "quality" | "leg_cap" | "cutoff";
+
 export type PairCandidate = {
   symbol_a: string;
   symbol_b: string;
@@ -144,10 +146,15 @@ export type PairCandidate = {
   last_data_date: string | null;
   n_obs: number;
   rank_score: number;
+  /** 1..N admit order under the requested `top` cutoff; null if the runner skips. */
+  processing_rank: number | null;
+  /** Why the runner skipped this candidate ("beta"|"quality"|"leg_cap"|"cutoff"). */
+  skip_reason: PairSkipReason | null;
 };
 
 export type PairCandidatesResponse = {
   generated_at: string | null;
+  top: number;
   candidates: PairCandidate[];
 };
 

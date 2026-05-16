@@ -16,10 +16,11 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { cn, formatNum } from "@/lib/utils";
-import type { PairCandidate } from "@/lib/types";
+import type { PairCandidate, PairSkipReason } from "@/lib/types";
 
 type SortKey =
   | "symbol_a"
+  | "processing_rank"
   | "latest_z_score"
   | "rank_score"
   | "coint_pvalue"
@@ -30,7 +31,8 @@ type SortKey =
 
 type SortDir = "asc" | "desc";
 
-const COLUMNS: { key: SortKey; label: string; align?: "right"; help?: string }[] = [
+const COLUMNS: { key: SortKey; label: string; align?: "right" | "center"; help?: string }[] = [
+  { key: "processing_rank", label: "Order", align: "center", help: "Admit order for the runner under the requested --top cutoff. Blank = skipped (hover for reason)." },
   { key: "symbol_a", label: "Pair" },
   { key: "latest_z_score", label: "Z-score", align: "right", help: "Latest spread vs panel mean/std" },
   { key: "rank_score", label: "Rank", align: "right", help: "Lower is better — composite of p, half-life, vol" },
@@ -40,6 +42,13 @@ const COLUMNS: { key: SortKey; label: string; align?: "right"; help?: string }[]
   { key: "spread_vol_pct", label: "Vol %", align: "right", help: "Spread σ / avg leg price" },
   { key: "hedge_ratio", label: "β", align: "right", help: "OLS hedge ratio (long-leg β · short-leg)" },
 ];
+
+const SKIP_REASON_LABEL: Record<PairSkipReason, string> = {
+  beta: "|β| outside [0.1, 10] — untradeable hedge ratio",
+  quality: "below quality floor (corr < 0.65 OR half-life > 5d OR p > 0.025)",
+  leg_cap: "a leg is already at the concentration cap (2× in book)",
+  cutoff: "survived filters but ranked below the --top cutoff",
+};
 
 function formatScreenedAt(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -68,13 +77,14 @@ function sortKeyValue(c: PairCandidate, key: SortKey): number | string | null {
   if (key === "latest_z_score") {
     return c.latest_z_score == null ? null : Math.abs(c.latest_z_score);
   }
+  if (key === "processing_rank") return c.processing_rank;
   return c[key] as number | null;
 }
 
 export function PairCandidatesPage() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["pair-candidates"],
-    queryFn: api.pairCandidates,
+    queryFn: () => api.pairCandidates(),
     refetchInterval: 5 * 60 * 1000, // CSV updates daily; re-poll every 5 min is generous.
   });
 
@@ -116,8 +126,9 @@ export function PairCandidatesPage() {
       setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     } else {
       setSortKey(key);
-      // Symbol sorts asc by default; numeric columns desc (most-extreme first).
-      setSortDir(key === "symbol_a" ? "asc" : "desc");
+      // Symbol & admit-order sort asc (lower is better/earlier); numeric
+      // analytic columns sort desc (most-extreme first).
+      setSortDir(key === "symbol_a" || key === "processing_rank" ? "asc" : "desc");
     }
   }
 
@@ -139,6 +150,7 @@ export function PairCandidatesPage() {
               {data?.candidates?.[0]?.last_data_date
                 ? ` · last bar ${data.candidates[0].last_data_date}`
                 : ""}
+              {data?.top != null ? ` · runner --top ${data.top}` : ""}
             </p>
           </div>
           <div className="flex flex-col gap-1">
@@ -188,6 +200,7 @@ export function PairCandidatesPage() {
                         className={cn(
                           "cursor-pointer select-none",
                           col.align === "right" && "text-right",
+                          col.align === "center" && "text-center",
                         )}
                         onClick={() => toggleSort(col.key)}
                         title={col.help}
@@ -208,7 +221,31 @@ export function PairCandidatesPage() {
               </TableHeader>
               <TableBody>
                 {rows.map((c) => (
-                  <TableRow key={`${c.symbol_a}-${c.symbol_b}`}>
+                  <TableRow
+                    key={`${c.symbol_a}-${c.symbol_b}`}
+                    className={cn(c.processing_rank == null && "opacity-60")}
+                  >
+                    <TableCell className="text-center tabular-nums">
+                      {c.processing_rank != null ? (
+                        <Badge
+                          variant="outline"
+                          className="border-primary text-primary tabular-nums"
+                        >
+                          {c.processing_rank}
+                        </Badge>
+                      ) : (
+                        <span
+                          className="text-muted-foreground"
+                          title={
+                            c.skip_reason
+                              ? SKIP_REASON_LABEL[c.skip_reason]
+                              : "not admitted"
+                          }
+                        >
+                          —
+                        </span>
+                      )}
+                    </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">
                         <span className="font-medium">{c.symbol_a}</span>
