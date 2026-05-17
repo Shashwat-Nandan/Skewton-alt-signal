@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { cn, formatNum } from "@/lib/utils";
+import { PaperSystemCompare } from "@/components/PaperSystemCompare";
 import type { PairCandidate, PairSkipReason } from "@/lib/types";
 
 type SortKey =
@@ -140,6 +141,8 @@ export function PairCandidatesPage() {
           Cointegrated single-stock-futures pairs from the daily Engle-Granger screen.
         </p>
       </div>
+
+      <PaperSystemCompare />
 
       <Card>
         <CardHeader className="flex flex-row flex-wrap items-end justify-between gap-3 pb-3">

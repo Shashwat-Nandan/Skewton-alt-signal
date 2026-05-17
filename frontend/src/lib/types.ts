@@ -158,6 +158,47 @@ export type PairCandidatesResponse = {
   candidates: PairCandidate[];
 };
 
+// ── Paper-system comparison (baseline vs persistent) ──
+
+export type PaperSystemDay = {
+  net_pnl: number;
+  n_pairs: number;
+  n_trades: number;
+  costs: number;
+} | null;
+
+export type PaperCompareDailyRow = {
+  date: string;
+  systems: Record<string, PaperSystemDay>;
+};
+
+export type PaperCompareAggregate = {
+  system: string;
+  net_pnl: number;
+  n_days_with_data: number;
+  avg_per_day: number;
+  n_unique_pairs: number;
+  n_closed_trades: number;
+  transaction_costs: number;
+};
+
+export type PaperComparePerPair = {
+  pair: string;
+  /** Map of system name → cumulative net P&L over the window, or null if not traded. */
+  by_system: Record<string, number | null>;
+  /** 'BOTH' or 'only <sys>,<sys>'. */
+  traded_by: string;
+};
+
+export type PaperCompareResponse = {
+  start_date: string;
+  end_date: string;
+  systems: string[];
+  daily: PaperCompareDailyRow[];
+  aggregate: PaperCompareAggregate[];
+  per_pair: PaperComparePerPair[];
+};
+
 // ── Equity Swing ──
 
 export type EquityPosition = {

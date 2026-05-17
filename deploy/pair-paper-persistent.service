@@ -1,0 +1,43 @@
+[Unit]
+Description=Pair-Trading Paper Runner — persistence-screened pairs (parallel to pair-paper.service)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --- EDIT THESE THREE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# Mirror of pair-paper.service ExecStart with --candidates and --system flags.
+# Reads data_cache/pair_candidates_persistent.csv (written by the [3/3] step
+# of run_weekly_pair_screen.sh) and writes data_cache/pair_paper_persistent_eod_<date>.json
+# plus logs/paper-pairs-persistent-<date>.log so it never collides with the
+# baseline runner's output. Tunables (entry/exit/stop/lookback/max-hold) are
+# held identical to baseline for fair A/B; if you change one here, mirror it
+# in pair-paper.service to keep the comparison honest.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py \
+    --top 12 --max-leg-notional 1000000 \
+    --candidates data_cache/pair_candidates_persistent.csv \
+    --system persistent
+# ------------------------------------
+
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+# Same ProtectHome caveat as pair-paper.service (see 2026-05-12 incident in tasks/lessons.md).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

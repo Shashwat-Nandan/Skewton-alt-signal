@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire pair-paper-persistent.service Mon–Fri at 09:12 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:12 IST — 1 min offset from pair-paper.timer (09:11) so the two paper
+# runners don't TOTP-login simultaneously and race the .kite_session.json
+# write. run_paper_pairs.py self-gates on 09:15 anyway, so the offset is
+# only about staggering the auth handshake.
+OnCalendar=Mon..Fri *-*-* 09:12:00 Asia/Kolkata
+
+# If the VPS was asleep or systemd missed the window, run once to catch up.
+# run_paper_pairs.py refuses to start after 15:30 — safe to be Persistent.
+Persistent=true
+
+# Jitter to avoid thundering-herd Kite logins on multi-account VPSes.
+RandomizedDelaySec=60
+
+Unit=pair-paper-persistent.service
+
+[Install]
+WantedBy=timers.target

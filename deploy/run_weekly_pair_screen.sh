@@ -29,12 +29,23 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo "Bhavcopy days: $BHAVCOPY_DAYS"
   echo
 
-  echo "[1/2] Refreshing F&O bhavcopy ($BHAVCOPY_DAYS days)..."
+  echo "[1/3] Refreshing F&O bhavcopy ($BHAVCOPY_DAYS days)..."
   "$PY" fetch_bhavcopy.py --days "$BHAVCOPY_DAYS"
 
   echo
-  echo "[2/2] Screening cointegrated pairs..."
+  echo "[2/3] Screening cointegrated pairs (baseline single-window)..."
   "$PY" screen_pairs.py
+
+  echo
+  # Persistence screen: only admits pairs that pass p<0.05 in ≥2 rolling
+  # 130d windows AND in the most recent one. Falls back to empty CSV when
+  # the bhavcopy archive is too shallow for the rolling windows (the
+  # screener logs an error and exits 0; the persistent runner then
+  # gracefully reports an empty book). See tasks/todo.md (2026-05-17).
+  echo "[3/3] Screening cointegrated pairs (persistent: ≥2 of N windows)..."
+  "$PY" screen_pairs.py \
+      --persistence-min 2 \
+      --output data_cache/pair_candidates_persistent.csv
 
   echo
   echo "Done."

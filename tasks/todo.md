@@ -1,3 +1,190 @@
+# Persistence-screened pair trading — parallel paper system (2026-05-17)
+
+## Motivation
+Investigation 2026-05-17 showed the current pair-trading screener admits pairs
+on a single 6-month cointegration window. Across 6 rolling windows of NIFTY 50
+STF data:
+- 287 unique pairs ever passed `p<0.05`. 258 of them (90%) passed in only ONE
+  window — they're statistical noise, not durable economic linkages.
+- Zero pairs passed in all 6 windows. Three pairs in 3, one in 4.
+
+Backtest comparison across three OOS test windows (W4, W5, W7 spanning Feb 2025
+→ Feb 2026) of pairs admitted under "≥2 of 6 windows passed `p<0.05`":
+- W4: 8 persistent pairs, 8/8 profitable, ₹549k net
+- W5: 5 persistent pairs, 5/5 profitable, ₹568k net
+- W7: 10 persistent pairs, 9/10 profitable, ₹617k net
+- Aggregate: 22/23 pair-level win rate, ₹1.73M net across three OOS windows.
+
+The same NIFTY 50 universe under the current single-window screener produced
+−₹450k on the 70/30 OOS split (May–Oct 2025) — collapse driven by junk pairs
+that won't carry. Persistence-based admission survives where the baseline
+breaks; baseline's good windows are slice luck.
+
+Decisions captured 2026-05-17:
+- Build a parallel paper-trading system using V0 admission (≥2 of 6 windows).
+  Both run side-by-side. No backfill — persistent system trades only persistent
+  pairs even if that means a smaller book.
+- Surface comparison in dashboard tile + CLI compare script.
+- Run both for 5 trading days minimum before any live/decision-making step.
+
+## Design (architecture)
+Two paper-trading systems sharing Kite session and execution path; differ only
+in which candidates CSV they read:
+
+```
+NIFTY 49 bhavcopy cache (TATAMOTORS dropped post 2025-10-23)
+    │
+    ├──→ screen_pairs.py (baseline, single 6-mo window)
+    │       → data_cache/pair_candidates.csv
+    │       → run_paper_pairs.py --system baseline
+    │           → data_cache/pair_paper_eod_<date>.json
+    │           → logs/paper-pairs-<date>.log
+    │
+    └──→ screen_pairs.py --persistence-windows 6 --persistence-min 2
+            → data_cache/pair_candidates_persistent.csv
+            → run_paper_pairs.py --system persistent
+                --candidates data_cache/pair_candidates_persistent.csv
+                → data_cache/pair_paper_persistent_eod_<date>.json
+                → logs/paper-pairs-persistent-<date>.log
+```
+
+## Tunables (held identical across both systems for fair A/B)
+- entry_z=2.0, exit_z=0.75, stop_z=4.0
+- lookback_days=60, max_holding_days=7
+- lots_per_leg=1, max_leg_notional=₹1,000,000
+- Same 4-pass runner filter (β + quality floor + composite score +
+  leg-concentration cap). Only the candidates CSV differs.
+- Persistent system: persistence_windows=6, persistence_min=2,
+  window_days=130, step_days=45 (matches OOS validation defaults).
+
+## Implementation tasks
+1. **screen_pairs.py — persistence mode**
+   - Add CLI: `--persistence-windows N --persistence-min M --out PATH`
+   - When `--persistence-windows` is set, run N rolling-window screens
+     (window=130d, step=45d) instead of the single-window screen, output
+     only pairs with ≥M passes. Hedge ratio sourced from the LATEST window
+     where the pair passed.
+   - Defaults preserve current behaviour (single-window screen).
+   - Write output to `--out` if provided, else `pair_candidates.csv`.
+
+2. **run_paper_pairs.py — parameterize candidates path and system tag**
+   - Add CLI: `--candidates PATH --system NAME`
+   - Default `--candidates` → existing `CANDIDATES_PATH`.
+   - Default `--system baseline` preserves existing log/EOD filenames.
+   - Non-default system suffixes the EOD JSON
+     (`pair_paper_persistent_eod_<date>.json`) and log file
+     (`paper-pairs-persistent-<date>.log`).
+   - EOD payload gains a top-level `"system": "<NAME>"` field for the
+     dashboard ingest to discriminate.
+
+3. **Deploy units (systemd)**
+   - `deploy/pair-paper-persistent.service` — mirrors pair-paper.service
+     ExecStart but adds `--candidates ...persistent.csv --system persistent`.
+   - `deploy/pair-paper-persistent.timer` — same OnCalendar as
+     pair-paper.timer + 1 min offset (09:12 IST) to avoid TOTP race.
+   - Wrap the screener in `deploy/run_weekly_pair_screen_persistent.sh`
+     or extend the existing screener wrapper to produce both CSVs in
+     one run. Preferred: extend the existing wrapper (saves a second
+     bhavcopy fetch, two systemd units instead of three).
+
+4. **compare_paper_systems.py — CLI head-to-head**
+   - Reads `data_cache/pair_paper_eod_*.json` and
+     `data_cache/pair_paper_persistent_eod_*.json` for a date range.
+   - Prints per-day per-pair P&L and aggregate by system.
+   - Highlights pairs traded in both systems vs unique-to-system.
+
+5. **Dashboard tile**
+   - Backend: new router `backend/routers/pair_paper_compare.py` exposing
+     `/api/pair-paper-compare?days=N`. Reads both EOD JSON families, returns
+     daily + aggregate rows.
+   - Frontend: new card in the pair-trading dashboard that shows
+     baseline vs persistent system: per-day net P&L, cumulative net,
+     pair counts, win rate.
+   - Add route to `deploy/smoke.sh` ROUTES array (per lessons.md).
+
+6. **Smoke + sign-off**
+   - Run screen_pairs.py with persistence flags locally; confirm
+     `pair_candidates_persistent.csv` has 2–10 pairs.
+   - Run `run_paper_pairs.py --force --system persistent` in dry-run
+     mode (out of market hours OK with `--force`) to confirm pair
+     selection + auth + logging are wired.
+   - Both systemd units enable cleanly on the VPS.
+   - First trading day produces both EOD JSONs.
+   - 5-day comparison after first full trading week.
+
+## Acceptance
+- screen_pairs.py without flags is byte-identical to today's output (no
+  behavioural change to the baseline pipeline).
+- run_paper_pairs.py without flags writes to today's filename
+  (`pair_paper_eod_<date>.json` — no `_baseline` suffix), preserves logs.
+- The persistent system's EOD JSON is consumable by an existing-tooling
+  Python reader (same schema, plus `system` field).
+- Dashboard tile reads both, shows aggregate over the last 5 trading days.
+- compare_paper_systems.py works for any date range, including dates
+  where only one system produced output.
+
+## Risk surface
+- **Both systems share Kite session**: paper mode only — no real orders.
+  Two simultaneous quote() calls per tick are well under rate limits.
+- **Pair overlap**: if both systems pick the same pair, they each maintain
+  independent paper state. Capital comparison is per-system, not per-pair.
+- **Persistent screener may produce 0 pairs**: runner will fail gracefully
+  ("No tradeable pairs after β + quality + concentration filters"). EOD
+  JSON will be empty `{pairs: []}` but still written.
+- **First-time persistent screen takes longer** (~6× the cointegration
+  passes). screen-pairs.timer ceiling is 15min; persistent variant should
+  stay within budget. Bench locally before deploying.
+
+## Review (2026-05-17 implementation)
+Implemented as planned, in one session, with no surprises. Local end-to-end
+smoke shows:
+
+- `screen_pairs.py --persistence-min 2` against the current bhavcopy archive
+  (453d, NIFTY 49 — TATAMOTORS dropped post 2025-10-23 STF restructure)
+  produces 10 persistent pairs over 8 rolling windows. After the runner's
+  4-pass quality floor, 2 pairs admit: **CIPLA/ITC** (pers=2, p=0.013, HL=4.6d)
+  and **BAJAJFINSV/BAJFINANCE** (pers=2, p=0.003, HL=2.4d). HDFCLIFE/NTPC —
+  the W7 false-positive from the fresh-persistence verification — is
+  naturally dropped by the quality floor (corr 0.615 < 0.65 floor), so V0
+  + the existing quality filter is self-correcting.
+
+- `run_paper_pairs.py` with no flags is byte-identical in behaviour to the
+  previous version: same default candidates path, same log/EOD filenames.
+  With `--system persistent --candidates …persistent.csv` it suffixes
+  filenames and labels the EOD payload.
+
+- The dashboard backend registers `/pair-paper-compare`, returns 401 for
+  unauthenticated callers, and the frontend typechecks clean.
+
+- `compare_paper_systems.py` reads both EOD families and merges them
+  correctly (verified with a synthetic persistent EOD, since the real
+  runner has not produced one yet).
+
+### VPS deploy steps (when ready)
+1. `git pull` on the VPS.
+2. `sudo cp deploy/pair-paper-persistent.{service,timer} /etc/systemd/system/`
+3. `sudo systemctl daemon-reload`
+4. Trigger the screener once to generate the new CSV:
+   `sudo systemctl start screen-pairs.service`
+   (Confirm `data_cache/pair_candidates_persistent.csv` exists.)
+5. `sudo systemctl enable --now pair-paper-persistent.timer`
+6. Verify `systemctl list-timers | grep pair-paper`.
+7. Monday 09:12 IST: both runners fire in parallel.
+
+### Watch points during the 5-day window
+- Day-1 EOD: check `data_cache/pair_paper_persistent_eod_*.json` exists
+  AND the dashboard tile loads (re-check `/api/pair-paper-compare` route).
+- After day-5: run `compare_paper_systems.py --days 5` and review the
+  per-pair contribution. If persistent < baseline, drill into WHY (was
+  it the pair selection or the quality filter being too tight on persistent
+  pairs?).
+- If persistent pairs admit 0 most days (book too small), consider
+  loosening QUALITY_MAX_PVALUE for persistent only — but that requires
+  another code change, not a config toggle (the constant is module-level
+  in run_paper_pairs.py).
+
+---
+
 # Varsity-style equity swing strategy (2026-05-10)
 
 ## Motivation

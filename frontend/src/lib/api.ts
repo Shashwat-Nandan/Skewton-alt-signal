@@ -7,6 +7,7 @@ import type {
   MarketProfileResponse,
   MarketProfileSymbol,
   PairCandidatesResponse,
+  PaperCompareResponse,
   RunDetail,
   RunSummary,
   SessionStatus,
@@ -78,6 +79,11 @@ export const api = {
   pairCandidates: (top?: number) => {
     const qs = top != null ? `?top=${top}` : "";
     return http<PairCandidatesResponse>(`/pair-candidates${qs}`);
+  },
+
+  pairPaperCompare: (days?: number) => {
+    const qs = days != null ? `?days=${days}` : "";
+    return http<PaperCompareResponse>(`/pair-paper-compare${qs}`);
   },
 
   equityPositions: (status?: "open" | "closed") => {

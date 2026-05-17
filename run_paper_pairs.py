@@ -113,9 +113,12 @@ def is_trading_day(d: date, holidays: set[date]) -> tuple[bool, str]:
     return True, ""
 
 
-def setup_logging(today: date) -> logging.Logger:
+def setup_logging(today: date, system: str = "baseline") -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logfile = LOG_DIR / f"paper-pairs-{today.isoformat()}.log"
+    # Baseline preserves the original filename; non-baseline systems suffix
+    # the log so two parallel runners don't clobber each other.
+    suffix = "" if system == "baseline" else f"-{system}"
+    logfile = LOG_DIR / f"paper-pairs{suffix}-{today.isoformat()}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
@@ -262,7 +265,8 @@ def classify_pair_candidates(
     return out
 
 
-def select_pairs(top: int, log: logging.Logger) -> pd.DataFrame:
+def select_pairs(top: int, log: logging.Logger,
+                 candidates_path: Path = CANDIDATES_PATH) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
       1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
@@ -278,12 +282,12 @@ def select_pairs(top: int, log: logging.Logger) -> pd.DataFrame:
          skipping any that would push a symbol past LEG_CONCENTRATION_CAP
          appearances across the book.
     """
-    if not CANDIDATES_PATH.exists():
+    if not candidates_path.exists():
         raise FileNotFoundError(
-            f"{CANDIDATES_PATH} not found — run screen_pairs.py first."
+            f"{candidates_path} not found — run screen_pairs.py first."
         )
 
-    annotated = classify_pair_candidates(pd.read_csv(CANDIDATES_PATH), top, log)
+    annotated = classify_pair_candidates(pd.read_csv(candidates_path), top, log)
     picks = (
         annotated[annotated["processing_rank"].notna()]
         .sort_values("processing_rank")
@@ -385,13 +389,24 @@ def flatten_one(strategy, log: logging.Logger):
         log.exception("[%s] flatten failed: %s", pair_label, e)
 
 
-def write_eod_sidecar(strategies, today: date, log: logging.Logger):
-    """Per-pair EOD reports for verify_pair_paper.py to consume."""
+def write_eod_sidecar(strategies, today: date, log: logging.Logger,
+                       system: str = "baseline"):
+    """Per-pair EOD reports for verify_pair_paper.py to consume.
+
+    Baseline keeps the original filename (pair_paper_eod_<date>.json) so the
+    existing verifier and dashboard ingest are untouched. Non-baseline systems
+    suffix the filename and label the payload — the comparison tooling reads
+    both families."""
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
-    path = DATA_CACHE / f"pair_paper_eod_{today.isoformat()}.json"
+    if system == "baseline":
+        filename = f"pair_paper_eod_{today.isoformat()}.json"
+    else:
+        filename = f"pair_paper_{system}_eod_{today.isoformat()}.json"
+    path = DATA_CACHE / filename
     payload = {
         "date": today.isoformat(),
         "generated_at": datetime.now().isoformat(),
+        "system": system,
         "pairs": [],
     }
     for s in strategies:
@@ -421,13 +436,22 @@ def main():
                         help="Per-leg ₹ cap (required for paper mode)")
     parser.add_argument("--force", action="store_true",
                         help="Run even on weekends/holidays (testing only)")
+    parser.add_argument("--candidates", type=str, default=str(CANDIDATES_PATH),
+                        help="Path to pair_candidates CSV (default: "
+                             "data_cache/pair_candidates.csv)")
+    parser.add_argument("--system", type=str, default="baseline",
+                        help="System tag — used to suffix log/EOD filenames "
+                             "and label the EOD payload so the comparison "
+                             "tool can split P&L by system. Defaults to "
+                             "'baseline' which preserves the original "
+                             "filenames.")
     args = parser.parse_args()
 
     load_dotenv(HERE / ".env")
     os.chdir(HERE)
 
     today = datetime.now().date()
-    log = setup_logging(today)
+    log = setup_logging(today, args.system)
 
     holidays = load_holidays(HOLIDAYS_PATH)
     ok, reason = is_trading_day(today, holidays)
@@ -436,10 +460,11 @@ def main():
         return 0
 
     log.info("=" * 60)
-    log.info("PAIR-TRADING PAPER SESSION — %s", today)
+    log.info("PAIR-TRADING PAPER SESSION — %s [system=%s]", today, args.system)
+    log.info("Candidates: %s", args.candidates)
     log.info("=" * 60)
 
-    pairs = select_pairs(args.top, log)
+    pairs = select_pairs(args.top, log, candidates_path=Path(args.candidates))
     log.info("Selected %d pair(s):", len(pairs))
     for _, row in pairs.iterrows():
         log.info("  %s/%s  β=%.4f  z=%.2f  half-life=%.1fd  p=%.4f",
@@ -482,13 +507,13 @@ def main():
         log.info("Flatten window reached.")
         for s in strategies:
             flatten_one(s, log)
-        write_eod_sidecar(strategies, today, log)
+        write_eod_sidecar(strategies, today, log, args.system)
 
     except KeyboardInterrupt:
         log.info("Interrupted — attempting graceful flatten.")
         for s in strategies:
             flatten_one(s, log)
-        write_eod_sidecar(strategies, today, log)
+        write_eod_sidecar(strategies, today, log, args.system)
         return 130
 
     log.info("Session complete. Exiting cleanly.")
