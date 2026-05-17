@@ -102,7 +102,12 @@ class TestPairCandidates:
         assert c["rank_score"] == pytest.approx(0.220)
 
     def test_malformed_row_skipped(self, client, tmp_path, monkeypatch):
-        # The bad row has "not-a-float" in correlation — must be skipped, not 500.
+        # The bad row has "not-a-float" in correlation. Must not 500. After
+        # the pandas 2.x StringArray fix in classify_pair_candidates(), the
+        # bad value is coerced to NaN and the row falls through to
+        # skip_reason='quality' (NaN can't satisfy the QUALITY_MIN_CORR
+        # floor). The row stays in the response so the dashboard can
+        # surface "filtered out" rather than silently dropping it.
         csv = tmp_path / "pair_candidates.csv"
         csv.write_text(MALFORMED_CSV)
         _point_at(monkeypatch, csv)
@@ -110,8 +115,13 @@ class TestPairCandidates:
         r = client.get("/pair-candidates")
         assert r.status_code == 200
         body = r.json()
-        assert len(body["candidates"]) == 1
-        assert body["candidates"][0]["symbol_a"] == "COALINDIA"
+        assert len(body["candidates"]) == 2
+        ok = next(c for c in body["candidates"] if c["symbol_a"] == "COALINDIA")
+        bad = next(c for c in body["candidates"] if c["symbol_a"] == "BAD")
+        assert ok["correlation"] == pytest.approx(0.92)
+        assert ok["skip_reason"] is None  # admitted
+        assert bad["correlation"] is None  # NaN serialized as null
+        assert bad["skip_reason"] == "quality"  # caught by the corr floor
 
     def test_empty_csv_returns_no_candidates(self, client, tmp_path, monkeypatch):
         # Header-only file — no rows.

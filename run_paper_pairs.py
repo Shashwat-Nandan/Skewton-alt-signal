@@ -176,6 +176,17 @@ def classify_pair_candidates(
     beta_upper = max_hedge_ratio if max_hedge_ratio is not None else HEDGE_RATIO_MAX
 
     out = df.copy()
+    # Coerce numeric columns to float, mapping non-coercible values (e.g. a
+    # manually-edited CSV with a typo, or the test_malformed_row_skipped
+    # fixture) to NaN. Without this, pandas ≥2 reads a mixed-type column as
+    # object dtype and any comparison like `correlation >= 0.65` raises a
+    # TypeError on the underlying StringArray. NaN naturally fails all the
+    # downstream quality_mask comparisons → the row gets skip_reason='quality'.
+    for col in ("correlation", "hedge_ratio", "coint_pvalue", "half_life_days",
+                "spread_vol_pct"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
     out["select_score"] = float("nan")
     out["processing_rank"] = pd.NA
     out["skip_reason"] = ""
@@ -266,7 +277,8 @@ def classify_pair_candidates(
 
 
 def select_pairs(top: int, log: logging.Logger,
-                 candidates_path: Path = CANDIDATES_PATH) -> pd.DataFrame:
+                 candidates_path: Path = CANDIDATES_PATH,
+                 max_age_days: float = 7.0) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
       1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
@@ -281,11 +293,29 @@ def select_pairs(top: int, log: logging.Logger,
       4) Walk in select_score order and admit pairs until `top` is reached,
          skipping any that would push a symbol past LEG_CONCENTRATION_CAP
          appearances across the book.
+
+    `max_age_days` is a safety check: if the CSV's mtime is older than this
+    many days, refuse to load it. Protects against a failed weekly screen
+    leaving the runner trading on stale hedge ratios. Set to 0 to disable.
     """
     if not candidates_path.exists():
         raise FileNotFoundError(
             f"{candidates_path} not found — run screen_pairs.py first."
         )
+
+    if max_age_days > 0:
+        mtime = datetime.fromtimestamp(candidates_path.stat().st_mtime)
+        age_days = (datetime.now() - mtime).total_seconds() / 86400.0
+        if age_days > max_age_days:
+            raise RuntimeError(
+                f"{candidates_path} is {age_days:.1f}d old (mtime "
+                f"{mtime:%Y-%m-%d %H:%M}), exceeds max_age_days={max_age_days}. "
+                "The weekly screen has not run recently — refusing to trade on "
+                "stale hedge ratios. Run screen_pairs.py to refresh, or pass "
+                "--max-csv-age-days 0 to bypass (not recommended in paper/live)."
+            )
+        log.info("Candidates CSV age: %.1fd (mtime %s)",
+                 age_days, mtime.strftime("%Y-%m-%d %H:%M"))
 
     annotated = classify_pair_candidates(pd.read_csv(candidates_path), top, log)
     picks = (
@@ -445,6 +475,11 @@ def main():
                              "tool can split P&L by system. Defaults to "
                              "'baseline' which preserves the original "
                              "filenames.")
+    parser.add_argument("--max-csv-age-days", type=float, default=7.0,
+                        help="Refuse to load candidates CSV older than this "
+                             "many days. Safety net for a failed weekly screen "
+                             "leaving stale hedge ratios in production. 0 to "
+                             "disable (default: 7).")
     args = parser.parse_args()
 
     load_dotenv(HERE / ".env")
@@ -464,7 +499,9 @@ def main():
     log.info("Candidates: %s", args.candidates)
     log.info("=" * 60)
 
-    pairs = select_pairs(args.top, log, candidates_path=Path(args.candidates))
+    pairs = select_pairs(args.top, log,
+                          candidates_path=Path(args.candidates),
+                          max_age_days=args.max_csv_age_days)
     log.info("Selected %d pair(s):", len(pairs))
     for _, row in pairs.iterrows():
         log.info("  %s/%s  β=%.4f  z=%.2f  half-life=%.1fd  p=%.4f",

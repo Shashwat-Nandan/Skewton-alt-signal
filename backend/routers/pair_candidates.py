@@ -119,6 +119,11 @@ def list_pair_candidates(
 
     candidates: List[PairCandidate] = []
     for row in annotated.itertuples():
+        # Optional columns: a legacy CSV produced before the latest_* / last_*
+        # fields existed won't have these attrs on the namedtuple. Use getattr
+        # so a missing column resolves to None instead of crashing the whole
+        # row (the test_legacy_csv_without_new_columns_degrades case).
+        last_data_date_raw = getattr(row, "last_data_date", None)
         try:
             candidates.append(
                 PairCandidate(
@@ -131,14 +136,15 @@ def list_pair_candidates(
                     spread_vol_pct=float(row.spread_vol_pct),
                     spread_mean=float(row.spread_mean),
                     spread_std=float(row.spread_std),
-                    latest_spread=_opt_float(row.latest_spread),
-                    latest_z_score=_opt_float(row.latest_z_score),
-                    last_close_a=_opt_float(row.last_close_a),
-                    last_close_b=_opt_float(row.last_close_b),
+                    latest_spread=_opt_float(getattr(row, "latest_spread", None)),
+                    latest_z_score=_opt_float(getattr(row, "latest_z_score", None)),
+                    last_close_a=_opt_float(getattr(row, "last_close_a", None)),
+                    last_close_b=_opt_float(getattr(row, "last_close_b", None)),
                     last_data_date=(
-                        str(row.last_data_date)
-                        if not (isinstance(row.last_data_date, float)
-                                and math.isnan(row.last_data_date))
+                        str(last_data_date_raw)
+                        if last_data_date_raw is not None
+                        and not (isinstance(last_data_date_raw, float)
+                                  and math.isnan(last_data_date_raw))
                         else None
                     ),
                     n_obs=int(row.n_obs),

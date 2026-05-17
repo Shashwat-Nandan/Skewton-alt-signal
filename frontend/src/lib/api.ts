@@ -81,9 +81,13 @@ export const api = {
     return http<PairCandidatesResponse>(`/pair-candidates${qs}`);
   },
 
-  pairPaperCompare: (days?: number) => {
-    const qs = days != null ? `?days=${days}` : "";
-    return http<PaperCompareResponse>(`/pair-paper-compare${qs}`);
+  pairPaperCompare: (params: { days?: number; end?: string; systems?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    if (params.end) q.set("end", params.end);
+    if (params.systems) q.set("systems", params.systems);
+    const qs = q.toString();
+    return http<PaperCompareResponse>(`/pair-paper-compare${qs ? `?${qs}` : ""}`);
   },
 
   equityPositions: (status?: "open" | "closed") => {

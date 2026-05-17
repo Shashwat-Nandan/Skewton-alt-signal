@@ -1,0 +1,36 @@
+[Unit]
+Description=Pair-Trading EOD verifier — persistent system (parallel to pair-verify.service)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# Same verifier as baseline, --system flag selects pair_paper_persistent_eod_*.json
+# input and pair-verify-persistent-*.log / .json output. Tunables (entry/exit/
+# stop/lookback/max-hold) are identical to baseline pair-verify.service so the
+# trailing-backtest comparison is apples-to-apples.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/verify_pair_paper.py --system persistent
+# -------------------------------
+
+TimeoutStartSec=10min
+StandardOutput=journal
+StandardError=journal
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+# Same ProtectHome caveat as pair-verify.service (see 2026-05-12 incident in tasks/lessons.md).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

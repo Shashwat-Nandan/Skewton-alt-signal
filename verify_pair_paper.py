@@ -40,9 +40,10 @@ DATA_CACHE = HERE / "data_cache"
 CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
 
 
-def setup_logging(today: date) -> logging.Logger:
+def setup_logging(today: date, system: str = "baseline") -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logfile = LOG_DIR / f"pair-verify-{today.isoformat()}.log"
+    suffix = "" if system == "baseline" else f"-{system}"
+    logfile = LOG_DIR / f"pair-verify{suffix}-{today.isoformat()}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
@@ -55,8 +56,13 @@ def setup_logging(today: date) -> logging.Logger:
     return logging.getLogger("verify_pair_paper")
 
 
-def load_eod_sidecar(today: date) -> Optional[dict]:
-    path = DATA_CACHE / f"pair_paper_eod_{today.isoformat()}.json"
+def load_eod_sidecar(today: date, system: str = "baseline") -> Optional[dict]:
+    """Match run_paper_pairs.write_eod_sidecar() filename convention."""
+    if system == "baseline":
+        filename = f"pair_paper_eod_{today.isoformat()}.json"
+    else:
+        filename = f"pair_paper_{system}_eod_{today.isoformat()}.json"
+    path = DATA_CACHE / filename
     if not path.exists():
         return None
     return json.loads(path.read_text())
@@ -256,18 +262,27 @@ def main():
     parser.add_argument("--max-hold", type=int, default=7, dest="max_holding_days")
     parser.add_argument("--lots-per-leg", type=int, default=1)
     parser.add_argument("--max-leg-notional", type=float, default=1_000_000)
+    parser.add_argument("--system", type=str, default="baseline",
+                        help="System tag — selects which EOD sidecar to verify "
+                             "and suffixes the output filenames. Defaults to "
+                             "'baseline' so the baseline pair-verify.service "
+                             "wiring is byte-identical to today's.")
     args = parser.parse_args()
 
     today = date.fromisoformat(args.date) if args.date else datetime.now().date()
-    log = setup_logging(today)
+    log = setup_logging(today, args.system)
 
-    sidecar = load_eod_sidecar(today)
+    sidecar = load_eod_sidecar(today, args.system)
     if sidecar is None:
-        log.error("No EOD sidecar at data_cache/pair_paper_eod_%s.json — has "
-                  "run_paper_pairs.py run today?", today.isoformat())
+        sidecar_label = ("pair_paper_eod_" if args.system == "baseline"
+                          else f"pair_paper_{args.system}_eod_")
+        log.error("No EOD sidecar at data_cache/%s%s.json — has "
+                  "run_paper_pairs.py (system=%s) run today?",
+                  sidecar_label, today.isoformat(), args.system)
         return 1
     paper_pairs = sidecar.get("pairs", [])
-    log.info("Loaded EOD sidecar: %d pair(s) traded today", len(paper_pairs))
+    log.info("Loaded EOD sidecar [system=%s]: %d pair(s) traded today",
+             args.system, len(paper_pairs))
 
     bt_results: Dict[str, Optional[dict]] = {}
     for paper in paper_pairs:
@@ -291,8 +306,10 @@ def main():
 
     sig_hist = signal_counts(args.signal_window, today)
     report = render_report(today, paper_pairs, bt_results, sig_hist, log)
+    report["system"] = args.system  # label for downstream tooling
 
-    json_path = LOG_DIR / f"pair-verify-{today.isoformat()}.json"
+    suffix = "" if args.system == "baseline" else f"-{args.system}"
+    json_path = LOG_DIR / f"pair-verify{suffix}-{today.isoformat()}.json"
     json_path.write_text(json.dumps(report, default=str, indent=2))
     log.info("Wrote machine-readable report: %s", json_path)
     return 0

@@ -1,0 +1,20 @@
+[Unit]
+Description=Fire pair-verify-persistent.service Mon–Fri at 16:01 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 16:01 IST — 1 min offset from pair-verify.timer (16:00) so two verifiers
+# don't simultaneously read bhavcopy CSVs / instantiate strategy backtests.
+# Both are read-only so simultaneous runs would be safe; the offset just
+# evens out CPU.
+OnCalendar=Mon..Fri *-*-* 16:01:00 Asia/Kolkata
+
+# Read-only verifier; safe to re-run.
+Persistent=true
+
+RandomizedDelaySec=300
+
+Unit=pair-verify-persistent.service
+
+[Install]
+WantedBy=timers.target
