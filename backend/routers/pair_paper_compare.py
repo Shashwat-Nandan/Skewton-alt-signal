@@ -105,7 +105,13 @@ def compare_systems(
     end: Optional[str] = Query(None, description="End date YYYY-MM-DD (default today)"),
     systems: str = Query("baseline,persistent", description="Comma-separated system names"),
 ) -> ComparisonResponse:
-    end_date = date.fromisoformat(end) if end else date.today()
+    if end:
+        try:
+            end_date = date.fromisoformat(end)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid `end` date: {end!r}. Expected YYYY-MM-DD.")
+    else:
+        end_date = date.today()
     sys_list = [s.strip() for s in systems.split(",") if s.strip()]
     if len(sys_list) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 systems to compare")
