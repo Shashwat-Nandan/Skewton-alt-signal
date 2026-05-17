@@ -1,5 +1,27 @@
 # Lessons
 
+## A new backend router needs THREE wiring updates, not two
+
+- 2026-05-17: Deployed the `/pair-paper-compare` router. Backend was
+  wired (router registered in `backend/main.py`, route added to
+  `deploy/smoke.sh` ROUTES). Loopback smoke passed (`curl 127.0.0.1:8000/...`
+  → 401, as expected for a gated route). Public-URL smoke returned
+  200 with the SPA's `index.html` — nginx's regex allowlist in
+  `deploy/nginx-dashboard.conf.example` (and in the live
+  `/etc/nginx/sites-enabled/dashboard`) had not been updated, so the
+  request fell through `try_files $uri /index.html`.
+- The takeaway: a new public API prefix requires **three** edits in
+  lockstep — (1) register the router in `backend/main.py`, (2) add to
+  `deploy/smoke.sh` ROUTES, (3) add to the regex allowlist in
+  `deploy/nginx-dashboard.conf.example` AND patch the live
+  `/etc/nginx/sites-enabled/dashboard` on the VPS (the live file is
+  hand-edited, not symlinked to the template). Skipping step (3) means
+  the route works for TestClient and loopback `curl` but never for
+  real browsers. The user-memory `feedback_verify_with_public_url`
+  is the same class of bug from the other side — both say "always
+  run `deploy/smoke.sh https://<public-host>` after a deploy that
+  adds a router; loopback alone is necessary but not sufficient."
+
 ## Backtest exit fills must lie inside today's [low, high]
 
 - 2026-05-10: Phase-2 equity-swing backtest showed a +437 % single-trade win
