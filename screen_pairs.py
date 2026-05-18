@@ -110,8 +110,51 @@ def load_front_month_panel(
     if dropped:
         logger.info("Dropped %d symbols below %.0f%% coverage: %s",
                     len(dropped), min_coverage * 100, ", ".join(dropped))
+
+    # Recent-tail coverage filter: a symbol can pass the full-window 80%
+    # threshold while having dropped off the tape in the last few months
+    # (e.g. LTIM had no STF rows from 2026-02-27 onward but still passed
+    # the full-window filter on its prior ~450 days of data). With
+    # dropna(how="any") below, a single such symbol truncates the panel
+    # back to the day it disappeared. Apply the same coverage threshold
+    # to the trailing TAIL_DAYS sessions to drop symbols that have fallen
+    # off the tape, regardless of their long-window history.
+    TAIL_DAYS = 30
+    if n_days >= TAIL_DAYS and keep:
+        tail = panel[keep].iloc[-TAIL_DAYS:]
+        tail_coverage = tail.notna().sum() / TAIL_DAYS
+        tail_keep = tail_coverage[tail_coverage >= min_coverage].index.tolist()
+        tail_dropped = sorted(set(keep) - set(tail_keep))
+        if tail_dropped:
+            logger.info("Dropped %d symbols below %.0f%% coverage in last %d sessions: %s",
+                        len(tail_dropped), min_coverage * 100, TAIL_DAYS,
+                        ", ".join(tail_dropped))
+        keep = tail_keep
+
     panel = panel[keep].dropna(how="any")
     logger.info("Final panel: %d trading days × %d symbols", len(panel), panel.shape[1])
+
+    # Rule 12: surface a stale panel loudly. The screener silently used
+    # data ending 2026-02-26 on 2026-05-17 because a per-symbol NaN
+    # cliff truncated dropna(how="any") — the only signal downstream was
+    # the last_data_date column. A trailing gap of >5 trading days from
+    # the file system's latest bhavcopy almost certainly indicates a
+    # data-pipeline problem worth investigating before trading.
+    if len(panel) > 0:
+        latest_bhav_date = max(
+            pd.to_datetime(f.name.removeprefix("bhavcopy_fo_").removesuffix(".csv"),
+                           format="%Y%m%d")
+            for f in files
+        )
+        gap_days = (latest_bhav_date - panel.index[-1]).days
+        if gap_days > 5:
+            logger.warning(
+                "Panel ends %s but latest bhavcopy is %s (gap=%dd) — "
+                "one or more symbols may have fallen off the tape after "
+                "the panel's last clean date. Investigate before trading.",
+                panel.index[-1].date(), latest_bhav_date.date(), gap_days,
+            )
+
     return panel
 
 
@@ -411,6 +454,12 @@ def main():
                    help="Path to a newline-separated symbol list (default: NIFTY 50)")
     p.add_argument("--output", type=str, default=str(OUTPUT_PATH),
                    help=f"Output CSV path (default: {OUTPUT_PATH})")
+    p.add_argument("--window-days", type=int, default=130,
+                   help="Baseline (single-window) mode: take the trailing N "
+                        "trading days of the panel for the cointegration fit "
+                        "(default: 130, matches --persistence-window-days). "
+                        "Pass 0 to disable and fit over the full panel. "
+                        "Ignored in persistence mode.")
     p.add_argument("--persistence-min", type=int, default=None,
                    help="If set, switch to persistence mode: only emit pairs "
                         "that pass p<p_threshold in ≥M rolling windows. The "
@@ -446,8 +495,22 @@ def main():
             max_hedge_ratio=args.max_hedge_ratio,
         )
     else:
+        # Trailing-window slice for the baseline fit. Without this, the
+        # screener fits one cointegration over every bhavcopy file ever
+        # cached (~503 days at time of writing), which absorbs years of
+        # drift into the regression and inflates half-lives well past
+        # the runtime quality floor (HL ≤ 5d). 130 matches
+        # --persistence-window-days so baseline and persistence are
+        # using comparable lookbacks.
+        baseline_panel = panel
+        if args.window_days > 0 and len(panel) > args.window_days:
+            baseline_panel = panel.iloc[-args.window_days:]
+            logger.info("Baseline window: trailing %d of %d trading days (%s → %s)",
+                        args.window_days, len(panel),
+                        baseline_panel.index[0].date(),
+                        baseline_panel.index[-1].date())
         df = screen_pairs(
-            panel,
+            baseline_panel,
             p_threshold=args.p_threshold,
             min_correlation=args.min_correlation,
             min_hedge_ratio=args.min_hedge_ratio,

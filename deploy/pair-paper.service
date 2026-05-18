@@ -7,7 +7,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 # --- EDIT THESE THREE FOR YOUR VPS ---
-User=taleb
+User=root
 WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
