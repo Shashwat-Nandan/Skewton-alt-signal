@@ -89,15 +89,117 @@ def trading_days(from_date: datetime, to_date: datetime, holidays: set) -> List[
     return days
 
 
+def _build_today_stfs_via_kite(target_date: datetime) -> Optional[bytes]:
+    """When NSE bhavcopy hasn't been published yet for `target_date` AND
+    `target_date` is today, fall back to Kite historical_data to fetch
+    today's front-month STF closes for the NIFTY-50 universe.
+
+    Returns a UDiFF-shaped CSV containing only STF rows (no IDO rows —
+    so the IV-history side of the bhavcopy pipeline still treats today
+    as "no options data", same as a genuinely missing bhavcopy). The
+    pair screener (screen_pairs.load_front_month_panel) gets the STF
+    rows it needs to include today in tonight's cointegration screen.
+
+    Returns None on any failure (auth, instrument lookup, no rows) so
+    the caller falls through to the pre-Kite-fallback "today missing"
+    behaviour.
+
+    Rate-limit budget: ~50 NIFTY-50 STF contracts × 1 historical_data
+    call each ≈ 17s at Kite's 3 req/sec.
+    """
+    try:
+        from kite_auth import KiteAuthManager
+        from screen_pairs import NIFTY_50
+    except Exception as e:
+        logger.warning("Kite fallback unavailable (import failed): %s", e)
+        return None
+
+    try:
+        auth = KiteAuthManager("config.ini")
+        kite = auth.get_kite()
+    except Exception as e:
+        logger.warning("Kite auth failed for today-fallback: %s — "
+                       "leaving today as missing", e)
+        return None
+
+    try:
+        instruments = kite.instruments("NFO")
+    except Exception as e:
+        logger.warning("instruments('NFO') failed for today-fallback: %s", e)
+        return None
+
+    if not instruments:
+        logger.warning("NFO instruments dump is empty")
+        return None
+
+    target = target_date.date()
+    df = pd.DataFrame(instruments)
+    df = df[(df["instrument_type"] == "FUT") & (df["name"].isin(NIFTY_50))].copy()
+    if df.empty:
+        logger.warning("No NIFTY-50 FUT contracts in NFO instruments dump")
+        return None
+
+    df["expiry_date"] = pd.to_datetime(df["expiry"]).dt.date
+    df = df[df["expiry_date"] >= target]
+    if df.empty:
+        return None
+    front = df.loc[df.groupby("name")["expiry_date"].idxmin()]
+    logger.info("Kite fallback: fetching today's close for %d front-month STF(s)...",
+                len(front))
+
+    rows = []
+    for _, r in front.iterrows():
+        try:
+            candles = kite.historical_data(
+                int(r["instrument_token"]), target, target, "day",
+            )
+        except Exception as e:
+            logger.warning("historical_data failed for %s: %s — skipping",
+                           r["tradingsymbol"], e)
+            time.sleep(0.34)
+            continue
+        if not candles:
+            time.sleep(0.34)
+            continue
+        rows.append({
+            "TradDt": target.isoformat(),
+            "TckrSymb": r["name"],
+            "FinInstrmTp": "STF",
+            "XpryDt": r["expiry_date"].isoformat(),
+            "StrkPric": 0,
+            "OptnTp": "",
+            "ClsPric": float(candles[0]["close"]),
+            "UndrlygPric": float(candles[0]["close"]),
+            "NewBrdLotQty": int(r.get("lot_size", 0) or 0),
+        })
+        time.sleep(0.34)
+
+    if not rows:
+        logger.warning("Kite fallback produced no STF rows — leaving today missing")
+        return None
+
+    logger.info("Kite fallback synthesised %d STF rows for %s",
+                len(rows), target.isoformat())
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
 def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[bytes]:
     """
     Download the UDiFF F&O bhav copy zip for a single date.
-    Caches the raw zip to RAW_DIR. Returns the CSV bytes inside the zip, or None
-    if the archive is missing (holiday, weekend, or not yet published).
+
+    Caches the raw zip to RAW_DIR. A successful NSE download is authoritative
+    and short-circuits all subsequent runs. If NSE 404s for *today* (common
+    when run before NSE publishes around 18:00-20:00 IST), falls back to
+    kite.historical_data for STF closes only and marks the cache with a
+    `.kite-fallback` sentinel — subsequent runs will retry NSE first so the
+    cache upgrades to authoritative once NSE publishes.
     """
     yyyymmdd = date.strftime("%Y%m%d")
     cache_file = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.csv"
-    if cache_file.exists():
+    sentinel = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
+
+    # Authoritative cache hit: real NSE bhavcopy already on disk.
+    if cache_file.exists() and not sentinel.exists():
         return cache_file.read_bytes()
 
     url = UDIFF_URL.format(yyyymmdd=yyyymmdd)
@@ -105,29 +207,50 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[by
         resp = session.get(url, headers=REQUEST_HEADERS, timeout=30)
     except requests.RequestException as e:
         logger.warning("Download failed for %s: %s", yyyymmdd, e)
-        return None
+        resp = None
 
-    if resp.status_code == 404:
-        logger.info("No bhav copy for %s (404 — likely holiday/weekend)", yyyymmdd)
-        return None
-    if resp.status_code != 200:
+    if resp is not None and resp.status_code == 200:
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not names:
+                    logger.warning("No CSV inside zip for %s", yyyymmdd)
+                else:
+                    csv_bytes = zf.read(names[0])
+                    RAW_DIR.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_bytes(csv_bytes)
+                    if sentinel.exists():
+                        sentinel.unlink()
+                        logger.info("Upgraded %s cache from Kite-fallback to "
+                                    "authoritative NSE bhavcopy", yyyymmdd)
+                    return csv_bytes
+        except zipfile.BadZipFile:
+            logger.warning("Bad zip returned for %s", yyyymmdd)
+
+    if resp is not None and resp.status_code == 404:
+        logger.info("No bhav copy for %s (404 — likely holiday/weekend or "
+                    "not yet published)", yyyymmdd)
+    elif resp is not None and resp.status_code not in (200, 404):
         logger.warning("Unexpected status %d for %s", resp.status_code, yyyymmdd)
-        return None
 
-    try:
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-            if not names:
-                logger.warning("No CSV inside zip for %s", yyyymmdd)
-                return None
-            csv_bytes = zf.read(names[0])
-    except zipfile.BadZipFile:
-        logger.warning("Bad zip returned for %s", yyyymmdd)
-        return None
+    # NSE didn't deliver. If a Kite-fallback cache from an earlier run
+    # exists, use it (avoids re-spending the Kite quota on a re-run for
+    # the same day).
+    if cache_file.exists():
+        return cache_file.read_bytes()
 
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file.write_bytes(csv_bytes)
-    return csv_bytes
+    # First-time miss on today: try the Kite fallback. Older days that
+    # are genuinely missing get None as before (no point asking Kite for
+    # last week's STF closes — bhavcopy will eventually backfill).
+    if date.date() == datetime.now().date():
+        logger.info("Trying Kite-historical fallback for today's STF closes...")
+        csv_bytes = _build_today_stfs_via_kite(date)
+        if csv_bytes is not None:
+            RAW_DIR.mkdir(parents=True, exist_ok=True)
+            cache_file.write_bytes(csv_bytes)
+            sentinel.write_text("synthesised_via_kite_historical_data\n")
+            return csv_bytes
+    return None
 
 
 def _parse_udiff_day(
