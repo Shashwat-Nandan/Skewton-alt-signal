@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -194,6 +194,11 @@ class PairTradingStrategy(BaseStrategy):
         self._spread_history: List[float] = []
         self._cached_futures: Dict[str, dict] = {}  # symbol → {tradingsymbol, lot_size, expiry}
         self._clock = datetime.now
+        # Session-start P&L snapshot — re-captured if/when restore_state runs.
+        # Lets generate_eod_report() emit per-session delta fields even when
+        # state is carried across sessions by the runner.
+        self._session_start_realized: float = 0.0
+        self._session_start_unrealized: float = 0.0
 
         self._seed_spread_history()
 
@@ -318,7 +323,163 @@ class PairTradingStrategy(BaseStrategy):
             "transaction_costs": self.state.total_transaction_costs,
             "n_closed_trades": len(self.state.closed_trades),
             "spread_history_size": len(self._spread_history),
+            # Session-delta fields (added 2026-05-19 when run_paper_pairs
+            # stopped flattening at EOD). realized_pnl above is cumulative
+            # across sessions; these two are this-session-only so the
+            # verifier and dashboard can still compute per-day P&L.
+            "session_realized_delta": (
+                self.state.realized_pnl - self._session_start_realized
+            ),
+            "session_unrealized_delta": (
+                self.state.unrealized_pnl - self._session_start_unrealized
+            ),
         }
+
+    # ══════════════════════════════════════════════════════════
+    # CROSS-SESSION PERSISTENCE
+    # ══════════════════════════════════════════════════════════
+
+    def serialize_state(self) -> Dict:
+        """Snapshot strategy state so the paper runner can persist it across
+        sessions. Counterpart of restore_state(). hedge_ratio is included so
+        the runner can detect a screener β-drift on a still-held position.
+
+        Note: `_spread_history` is intentionally NOT serialised. It's
+        deterministic from bhavcopy at session start (see _seed_spread_history)
+        and today's bhavcopy view is always one day fresher than yesterday's
+        saved view. The runner re-seeds it after restore.
+        """
+        return {
+            "pair": [self.symbol_a, self.symbol_b],
+            "hedge_ratio": self.hedge_ratio,
+            "state": {
+                "position": self.state.position,
+                "entry_z": self.state.entry_z,
+                "entry_time": (
+                    self.state.entry_time.isoformat()
+                    if self.state.entry_time else None
+                ),
+                "entry_spread": self.state.entry_spread,
+                "effective_stop_z": self.state.effective_stop_z,
+                "legs": [
+                    {
+                        "symbol": leg.symbol,
+                        "tradingsymbol": leg.tradingsymbol,
+                        "lot_size": leg.lot_size,
+                        "quantity": leg.quantity,
+                        "entry_price": leg.entry_price,
+                        "current_price": leg.current_price,
+                    }
+                    for leg in self.state.legs
+                ],
+                "realized_pnl": self.state.realized_pnl,
+                "unrealized_pnl": self.state.unrealized_pnl,
+                "total_transaction_costs": self.state.total_transaction_costs,
+                "closed_trades": [
+                    self._serialise_closed_trade(t)
+                    for t in self.state.closed_trades
+                ],
+            },
+        }
+
+    def restore_state(self, blob: Dict) -> None:
+        """Inverse of serialize_state(). Fails loudly on shape mismatch — a
+        corrupted or partial state file must not silently degrade into a
+        fresh-start strategy (Rule 12).
+
+        Does NOT mutate self.hedge_ratio or self._spread_history — those are
+        the runner's responsibility (it decides whether to honour the saved β
+        for held positions, and re-seeds spread history from today's bhavcopy).
+        """
+        saved_pair = blob.get("pair")
+        if list(saved_pair or []) != [self.symbol_a, self.symbol_b]:
+            raise ValueError(
+                f"State pair {saved_pair!r} does not match strategy "
+                f"({self.symbol_a}/{self.symbol_b})"
+            )
+        state_blob = blob["state"]
+        self.state.position = state_blob["position"]
+        self.state.entry_z = float(state_blob["entry_z"])
+        et = state_blob.get("entry_time")
+        self.state.entry_time = datetime.fromisoformat(et) if et else None
+        self.state.entry_spread = float(state_blob["entry_spread"])
+        self.state.effective_stop_z = float(state_blob["effective_stop_z"])
+        self.state.legs = [
+            PairLeg(
+                symbol=l["symbol"],
+                tradingsymbol=l["tradingsymbol"],
+                lot_size=int(l["lot_size"]),
+                quantity=int(l["quantity"]),
+                entry_price=float(l["entry_price"]),
+                current_price=float(l.get("current_price", l["entry_price"])),
+            )
+            for l in state_blob["legs"]
+        ]
+        self.state.realized_pnl = float(state_blob["realized_pnl"])
+        self.state.unrealized_pnl = float(state_blob["unrealized_pnl"])
+        self.state.total_transaction_costs = float(state_blob["total_transaction_costs"])
+        self.state.closed_trades = [
+            self._deserialise_closed_trade(t)
+            for t in state_blob.get("closed_trades", [])
+        ]
+        # Re-baseline session deltas against the restored cumulative figures.
+        self._capture_session_baseline()
+
+    def _capture_session_baseline(self) -> None:
+        self._session_start_realized = self.state.realized_pnl
+        self._session_start_unrealized = self.state.unrealized_pnl
+
+    @staticmethod
+    def _serialise_closed_trade(trade: Dict) -> Dict:
+        out = dict(trade)
+        for k in ("exit_time", "entry_time"):
+            v = out.get(k)
+            if isinstance(v, datetime):
+                out[k] = v.isoformat()
+        return out
+
+    @staticmethod
+    def _deserialise_closed_trade(blob: Dict) -> Dict:
+        out = dict(blob)
+        for k in ("exit_time", "entry_time"):
+            v = out.get(k)
+            if isinstance(v, str):
+                try:
+                    out[k] = datetime.fromisoformat(v)
+                except ValueError:
+                    pass
+        return out
+
+    def legs_expire_on(self, today: date) -> bool:
+        """True if any open leg's futures contract has its last trading day
+        on `today`. The paper runner uses this to force-flatten before
+        contract expiry rather than holding a contract into settlement."""
+        if not self.state.legs:
+            return False
+        try:
+            instruments = self.kite.instruments("NFO")
+        except Exception as e:
+            logger.warning("instruments('NFO') for expiry check failed: %s", e)
+            return False
+        expiry_by_ts: Dict[str, date] = {}
+        for row in instruments:
+            ts = row.get("tradingsymbol")
+            if not ts:
+                continue
+            exp = row.get("expiry")
+            if isinstance(exp, str):
+                try:
+                    exp = datetime.strptime(exp[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+            elif hasattr(exp, date):
+                exp = exp.date()
+            if exp is not None:
+                expiry_by_ts[ts] = exp
+        return any(
+            expiry_by_ts.get(leg.tradingsymbol) == today
+            for leg in self.state.legs
+        )
 
     # ══════════════════════════════════════════════════════════
     # SPREAD / Z-SCORE
@@ -690,7 +851,7 @@ class PairTradingStrategy(BaseStrategy):
             exp = row.get("expiry")
             if isinstance(exp, str):
                 return datetime.strptime(exp[:10], "%Y-%m-%d").date()
-            if hasattr(exp, "date"):
+            if hasattr(exp, date):
                 return exp.date()
             return exp
 

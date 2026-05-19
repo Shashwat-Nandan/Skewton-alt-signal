@@ -1217,3 +1217,213 @@ What this does NOT do:
   too high after this change ships, a cooldown is the next lever.
 - Refresh `_spread_history` mid-session from a new bhavcopy. Bhavcopy
   is EOD-only; this isn't a real lever within a single session.
+
+# Remove EOD flatten — hold to strategy exit only (2026-05-19)
+
+## Motivation
+Today's 2026-05-19 session entered RELIANCE/ITC at 15:02:19 (z=-2.01) and
+the EOD flatten at 15:25:00 force-closed it 23 minutes later for a -₹3,850
+loss. The strategy's exit triggers (mean-revert at |z|<=0.75, stop at
+effective_stop_z, MAX_HOLD at 7d) never had a chance to fire. The paper
+runner's `FLATTEN_AT = (15, 25)` is an operational artefact (oneshot
+systemd unit dies overnight), not a strategic exit condition.
+
+User decision 2026-05-19: positions should be held to a strategy-driven
+exit. Apply to both `--system=baseline` and `--system=persistent`. On
+futures expiry, force-flatten on the contract's last trading day (no
+overnight roll, no entries near expiry needed beyond that — `MAX_HOLD`=7d
+keeps positions away from deep-expiry territory naturally).
+
+## Design
+
+### Position lifecycle change
+- Replace unconditional `flatten_one` loop at session end (line 545-546)
+  with a `persist_state_one` loop that serialises each strategy's
+  in-memory state to disk.
+- At session start (after `build_strategies`), restore state from disk
+  for any pair whose saved state exists.
+- For pairs whose saved state has an OPEN position but is NOT in today's
+  refreshed candidate list: instantiate a strategy for them anyway, so
+  we can manage them to their strategy exit. No new entries possible
+  (position is already open).
+- Hedge ratio: if saved state has `position != FLAT`, use saved β
+  (the trade is on the books with that ratio); else accept today's
+  screener β.
+
+### State file
+- `data_cache/pair_paper_state_<system>.json` (per system).
+- Atomic write: write to `.tmp` then `os.rename`.
+- Schema:
+  ```
+  {
+    "system": "baseline",
+    "updated_at": "2026-05-19T15:30:00",
+    "pairs": [
+      {
+        "pair": ["RELIANCE", "ITC"],
+        "hedge_ratio": 1.5463,
+        "state": {
+          "position": "LONG_SPREAD",
+          "entry_z": -2.01,
+          "entry_time": "2026-05-19T15:02:19",
+          "entry_spread": 845.70,
+          "effective_stop_z": 4.0,
+          "legs": [
+            {"symbol": "RELIANCE", "tradingsymbol": "RELIANCE26MAYFUT",
+             "lot_size": 250, "quantity": 2, "entry_price": 1327.00,
+             "current_price": 1323.20},
+            ...
+          ],
+          "realized_pnl": -3849.95,
+          "unrealized_pnl": 0.0,
+          "total_transaction_costs": 1969.95,
+          "closed_trades": [...],
+          "spread_history": [...]
+        }
+      }
+    ]
+  }
+  ```
+
+### Strategy serialise/deserialise
+- New on `PairTradingStrategy`:
+  - `serialize_state() -> dict`: dataclass `asdict` on state, plus
+    `_spread_history`, `hedge_ratio`, `symbol_a`, `symbol_b`.
+  - `restore_state(blob: dict) -> None`: reconstructs `PairState`,
+    `PairLeg` list, and `_spread_history`. Fails loudly on missing keys
+    rather than silently defaulting (Rule 12).
+- `datetime` round-trip via ISO strings.
+
+### EOD sidecar semantics
+- The verifier (`verify_pair_paper.py:158`) computes
+  `paper_today_pnl = realized_pnl + unrealized_pnl`. Carrying state
+  across sessions breaks this unless we tell it the per-session delta.
+- Add two new fields to `generate_eod_report()`:
+  - `session_realized_delta`: `realized_pnl − session_start_realized`
+  - `session_unrealized_delta`: `unrealized_pnl − session_start_unrealized`
+- The strategy snapshots `session_start_realized` /
+  `session_start_unrealized` immediately after `restore_state` (or at
+  `__init__` if no prior state).
+- Verifier updated to prefer `session_*_delta` when present, fall back
+  to `realized_pnl + unrealized_pnl` for backwards compatibility on
+  pre-rebuild sidecars.
+
+### Expiry-day force flatten
+- Add `_legs_expire_on(today: date) -> bool` on the strategy.
+  Reads each open leg's `tradingsymbol`, matches to instruments CSV
+  (cached) for the expiry date, returns True if any leg expires today.
+- In `run_paper_pairs.py`, before persist_state at session end:
+  if `strategy._legs_expire_on(today)` and `position != FLAT`,
+  call `flatten_one(strategy)` first (reason = `EXIT_EXPIRY`).
+
+### CLI safety hatch
+- Add `--force-flatten-on-exit` (default False) for ops use:
+  fall back to the old "flatten everything" path when set.
+
+### Files touched
+- `run_paper_pairs.py` — main behavioural change
+- `strategies/pair_trading.py` — serialise/deserialise + expiry helper
+  + session-delta fields
+- `verify_pair_paper.py` — prefer session_*_delta fields
+- `tests/test_pair_trading.py` (existing) — add roundtrip test +
+  dropped-pair-management test
+
+### NOT changing (deliberate, per Rule 3 surgical-changes)
+- `MAX_HOLD = 7d` uses calendar days, not trading days. This existed
+  before. Weekends and holidays count against hold-time. Surface in the
+  Review section; not part of this change.
+- The `persistent` system's candidate-selection logic (V0 admission)
+  is untouched.
+- `compare_paper_systems.py` and dashboard backend — same EOD filenames,
+  same shape with added optional fields. Should be transparent. If
+  they break, fix as a follow-up.
+
+## Implementation checklist
+
+- [ ] Add `serialize_state` / `restore_state` to `PairTradingStrategy`
+- [ ] Add `session_realized_delta` / `session_unrealized_delta` to
+      `generate_eod_report`
+- [ ] Add `_legs_expire_on(today)` helper
+- [ ] Modify `run_paper_pairs.py`:
+  - [ ] Load state file at startup, restore matching strategies
+  - [ ] Include open-position pairs missing from today's candidates
+  - [ ] Replace EOD flatten loop with persist-state loop
+  - [ ] Add expiry-day flatten before persist
+  - [ ] Add `--force-flatten-on-exit` CLI flag
+  - [ ] Persist on KeyboardInterrupt too
+- [ ] Update `verify_pair_paper.py` to prefer session_*_delta
+- [ ] Tests: roundtrip + dropped-pair management
+- [ ] Run existing pair_trading tests to confirm no regression
+- [ ] Manual paper-runner smoke (mock kite, short tick window)
+
+## Review (2026-05-19)
+
+### What shipped
+- **`strategies/pair_trading.py`**: `serialize_state()` / `restore_state()`
+  for cross-session persistence. `_capture_session_baseline()` snapshots
+  realized/unrealized at session start so `generate_eod_report()` emits new
+  `session_realized_delta` / `session_unrealized_delta` fields even when
+  cumulative P&L survives across sessions. `legs_expire_on(today: date)`
+  inspects open legs' tradingsymbols against the instruments dump.
+  `hedge_ratio` and `_spread_history` are intentionally **not** serialised
+  (runner decides; daily bhavcopy seed is always fresher).
+- **`run_paper_pairs.py`**:
+  - `FLATTEN_AT` renamed `SESSION_END_AT` to reflect the new semantics.
+  - `load_prior_state()` (missing-file-safe, corrupt-JSON-safe) +
+    `write_state_file()` (atomic via `.tmp` → `os.replace`).
+  - `restore_matching_strategies()` honours saved β for OPEN positions
+    (locks the entry ratio) and re-seeds spread history at that β; FLAT
+    saved pairs accept today's screener β.
+  - `build_orphan_strategies()` instantiates strategies for pairs with
+    OPEN positions that have dropped out of today's candidate list, so
+    they're still managed to exit.
+  - `end_of_session()` consolidates: (1) expiry-day flatten,
+    (2) `--force-flatten-on-exit` operator hatch, (3) persist state,
+    (4) write EOD sidecar. Same path on `KeyboardInterrupt`.
+- **`verify_pair_paper.py`**: prefers session-delta fields when present,
+  falls back to `realized + unrealized` for pre-rebuild sidecars.
+- **Tests**: 14 new tests in `test_pair_trading.py` (serialise/restore
+  roundtrip, expiry helper, session-delta arithmetic), 14 new in new
+  file `test_run_paper_pairs_state.py` (load/write/restore/orphan). Full
+  suite: 321 tests pass.
+- **Smoke**: 4-session manual lifecycle (enter → persist → restore →
+  force-flatten → expiry-flatten) all green.
+
+### Surprise during smoke
+Initial fixture had `_cached_futures = {}` which made
+`_symbol_from_tradingsymbol` return the futures tradingsymbol instead of
+the equity symbol, so `_apply_fill` failed to find existing legs and
+*added new ones* on exit. The bug was in the test scaffolding, not in
+production code (real runner populates the cache via `_resolve_futures`).
+Worth knowing: `_symbol_from_tradingsymbol` silently degrades to identity
+when the cache misses, rather than raising. That's by design (it's used
+when fills come back from kite mid-flight and the cache might be cold),
+but it's a quiet failure mode.
+
+### What this does NOT do (deliberate, per Rule 3)
+- `max_holding_days = 7d` still measures **calendar days**, not trading
+  days. Weekends and holidays count against hold-time. With overnight
+  holds now real, this matters more — a Tuesday entry that holds through
+  a long weekend burns 4 days before Friday's close. Out of scope for
+  this change; flag for a follow-up sweep if the time-stop turns out to
+  be too tight after a few weeks of live data.
+- `compare_paper_systems.py` and dashboard backend (`backend/main.py`,
+  `pair_paper_compare`) read the same EOD sidecar files with the same
+  shape — just with two new optional fields. Smoke didn't exercise
+  these. If a dashboard tile breaks reporting cumulative P&L instead of
+  per-day, the fix is to switch it to `session_realized_delta` the same
+  way the verifier was switched.
+- The `--persistent` system's V0 admission logic is untouched. Same
+  rebuild applies — now both systems hold to strategy-defined exits.
+
+### Open follow-ups (not blockers)
+- **Calendar vs. trading days** for `max_holding_days` — see above.
+- **Late-entry behaviour** — historically, EOD flatten penalised
+  late-day entries (RELIANCE/ITC 2026-05-19 took the costs without time
+  to revert). With overnight holds, late entries are now fine — but
+  worth a backtest to confirm the late-entry distribution isn't skewed
+  toward poorer subsequent days.
+- **Futures roll** — current expiry-day flatten avoids settlement risk
+  but means the strategy can't take a position spanning the
+  contract switch. If `max_holding_days` and contract-month line up
+  unluckily, valid trades get killed by expiry. Watch for this.

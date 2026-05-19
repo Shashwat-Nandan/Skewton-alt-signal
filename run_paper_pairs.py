@@ -9,10 +9,20 @@ Taleb-Karpathy paper runner (run_paper.py) on its own systemd timer.
   - Authenticates via TOTP (kite_auth.KiteAuthManager)
   - Loads top-N rows from data_cache/pair_candidates.csv and instantiates one
     PairTradingStrategy per pair
+  - Restores any prior-session open positions from
+    data_cache/pair_paper_state_<system>.json (orphans — pairs no longer in
+    today's candidates but with an open position — are loaded too)
   - Blocks until 09:15 IST, ticks every 60s until 15:25 IST
-  - Flattens any open positions and writes data_cache/pair_paper_eod_<date>.json
-    with per-pair generate_eod_report() output for the verifier
+  - Persists strategy state to the state file (no EOD flatten by default;
+    open positions exit only on strategy triggers — mean-revert, stop-z,
+    max-hold — or on the contract's last trading day)
+  - Writes data_cache/pair_paper_eod_<date>.json with per-pair
+    generate_eod_report() for the verifier and dashboard
   - Per-day logfile under logs/paper-pairs-YYYY-MM-DD.log
+
+Operations:
+  --force-flatten-on-exit: emergency hatch to revert to old behaviour for
+    a single session (e.g. before a maintenance window or system change).
 
 Assumes the process sees wall-clock IST (systemd sets TZ=Asia/Kolkata).
 """
@@ -27,7 +37,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -73,7 +83,11 @@ def ensure_pair_config(orig_path: str, cli_max_leg_notional: float, log: logging
     return str(derived)
 
 MARKET_OPEN = (9, 15)
-FLATTEN_AT = (15, 25)   # close positions before the 15:30 bell
+# Wall-clock when the tick loop ends and state is persisted. Open positions
+# are NOT flattened here — they survive to the next session via the state
+# file. The only EOD exits are (a) --force-flatten-on-exit (ops hatch) and
+# (b) a leg's contract expiring today (no holding into settlement).
+SESSION_END_AT = (15, 25)
 HARD_STOP = (15, 30)    # never tick past this
 TICK_SECONDS = 60
 
@@ -398,9 +412,11 @@ def tick_one(strategy, log: logging.Logger):
         log.exception("[%s] check_and_rehedge failed: %s", pair_label, e)
 
 
-def flatten_one(strategy, log: logging.Logger):
+def flatten_one(strategy, log: logging.Logger, reason: str = "EOD_CLOSE"):
     """Force-close any open position using the strategy's own exit-builder.
-    Mirrors backtest_pairs.py's force-close path so behaviour is consistent."""
+    Mirrors backtest_pairs.py's force-close path so behaviour is consistent.
+    Used only by the operator-forced flatten or by the expiry-day flatten;
+    the default session end persists state instead."""
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if strategy.state.position == "FLAT" or not strategy.state.legs:
         return
@@ -411,12 +427,171 @@ def flatten_one(strategy, log: logging.Logger):
                         "leaving position open", pair_label)
             return
         strategy._update_unrealized(prices)
-        close_props = strategy._build_exit_proposals("EOD_CLOSE", 0.0, prices)
+        close_props = strategy._build_exit_proposals(reason, 0.0, prices)
         if close_props:
-            log.info("[%s] flattening %d leg(s)", pair_label, len(close_props))
+            log.info("[%s] flattening %d leg(s) (%s)", pair_label, len(close_props), reason)
             strategy.execute_proposals(close_props)
     except Exception as e:
         log.exception("[%s] flatten failed: %s", pair_label, e)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# CROSS-SESSION STATE PERSISTENCE
+# ════════════════════════════════════════════════════════════════════════
+# The paper runner no longer flattens at session end (2026-05-19). Open
+# positions are serialised to data_cache/pair_paper_state_<system>.json and
+# restored at the start of the next session. Strategy-defined exit triggers
+# (mean-revert, stop-z, max-hold) are the only path to flat — plus the
+# expiry-day force-flatten below.
+
+STATE_FILE_TEMPLATE = "pair_paper_state_{system}.json"
+
+
+def state_file_path(system: str) -> Path:
+    return DATA_CACHE / STATE_FILE_TEMPLATE.format(system=system)
+
+
+def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
+    """Return {pair_key → blob} from the prior session's state file, or {}
+    if no file exists. pair_key is 'A/B' (matches strategy serialise format)."""
+    path = state_file_path(system)
+    if not path.exists():
+        log.info("No prior state file at %s — starting fresh.", path)
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as e:
+        log.exception("Failed to parse state file %s: %s — starting fresh.",
+                      path, e)
+        return {}
+    out: Dict[str, Dict] = {}
+    for blob in payload.get("pairs", []):
+        pair = blob.get("pair")
+        if isinstance(pair, list) and len(pair) == 2:
+            out[f"{pair[0]}/{pair[1]}"] = blob
+    log.info("Loaded prior state for %d pair(s) from %s (updated_at %s)",
+             len(out), path.name, payload.get("updated_at", "?"))
+    return out
+
+
+def write_state_file(strategies, system: str, log: logging.Logger):
+    """Atomically persist current strategy state. Each strategy emits its own
+    serialize_state() blob; runner adds a system/timestamp header.
+
+    Atomic write: write to '.tmp' then os.replace, so a crash mid-write
+    can't leave a half-truncated file that fails to parse next session.
+    """
+    path = state_file_path(system)
+    DATA_CACHE.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "system": system,
+        "updated_at": datetime.now().isoformat(),
+        "pairs": [],
+    }
+    for s in strategies:
+        try:
+            payload["pairs"].append(s.serialize_state())
+        except Exception as e:
+            log.exception("serialize_state failed for %s/%s: %s",
+                          s.symbol_a, s.symbol_b, e)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, default=str, indent=2))
+    os.replace(tmp, path)
+    log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
+
+
+def restore_matching_strategies(
+    strategies, prior_state: Dict[str, Dict], log: logging.Logger,
+) -> set:
+    """For each built strategy: if prior_state has a blob for its pair,
+    restore it. For an OPEN saved position, lock hedge_ratio to the saved β
+    (the trade was entered at that ratio) and re-seed spread history at that
+    β. Returns the set of pair keys that were restored.
+    """
+    matched: set = set()
+    for s in strategies:
+        key = f"{s.symbol_a}/{s.symbol_b}"
+        blob = prior_state.get(key)
+        if not blob:
+            continue
+        saved_position = blob.get("state", {}).get("position", "FLAT")
+        try:
+            if saved_position != "FLAT":
+                saved_beta = float(blob["hedge_ratio"])
+                if abs(saved_beta - s.hedge_ratio) > 1e-9:
+                    log.info(
+                        "[%s] screener β=%.4f differs from saved entry "
+                        "β=%.4f; honouring saved β for held position",
+                        key, s.hedge_ratio, saved_beta,
+                    )
+                    s.hedge_ratio = saved_beta
+                    s._spread_history = []
+                    s._seed_spread_history()
+            s.restore_state(blob)
+            matched.add(key)
+            log.info(
+                "[%s] restored: position=%s entry_z=%.2f legs=%d "
+                "cum_realized=₹%.0f closed_trades=%d",
+                key, s.state.position, s.state.entry_z,
+                len(s.state.legs), s.state.realized_pnl,
+                len(s.state.closed_trades),
+            )
+        except Exception as e:
+            log.exception(
+                "[%s] restore_state failed: %s — keeping fresh strategy "
+                "(saved position will be ABANDONED; manual review)", key, e,
+            )
+    return matched
+
+
+def build_orphan_strategies(
+    prior_state: Dict[str, Dict], matched_keys: set,
+    args, kite, config_path: str, log: logging.Logger,
+):
+    """Build strategies for prior-state pairs with an OPEN position that are
+    NOT in today's candidate list. Without this, a held position would simply
+    be orphaned when the screener drops the pair — no one would manage it to
+    exit.
+
+    Orphans use the saved hedge_ratio and the saved state; they don't get
+    new entries because their position is already open."""
+    from strategies.pair_trading import PairTradingStrategy
+    orphans = []
+    for key, blob in prior_state.items():
+        if key in matched_keys:
+            continue
+        state_blob = blob.get("state", {})
+        if state_blob.get("position", "FLAT") == "FLAT":
+            # Closed before this session — nothing to manage.
+            continue
+        try:
+            pair = blob["pair"]
+            sa, sb = pair[0], pair[1]
+            saved_beta = float(blob["hedge_ratio"])
+            s = PairTradingStrategy(
+                kite=kite, config_path=config_path, mode="paper",
+                symbol_a=sa, symbol_b=sb, hedge_ratio=saved_beta,
+            )
+            s.entry_z = args.entry_z
+            s.exit_z = args.exit_z
+            s.stop_z = args.stop_z
+            s.lookback_days = args.lookback_days
+            s.max_holding_days = args.max_holding_days
+            s.lots_per_leg = args.lots_per_leg
+            s.max_leg_notional = args.max_leg_notional
+            s.restore_state(blob)
+            orphans.append(s)
+            log.info(
+                "[%s] ORPHAN — held position is not in today's candidates; "
+                "loaded for management-to-exit (position=%s legs=%d β=%.4f)",
+                key, s.state.position, len(s.state.legs), saved_beta,
+            )
+        except Exception as e:
+            log.exception(
+                "Orphan strategy for %s could not be built: %s — "
+                "position ABANDONED (manual review)", key, e,
+            )
+    return orphans
 
 
 def write_eod_sidecar(strategies, today: date, log: logging.Logger,
@@ -480,6 +655,13 @@ def main():
                              "many days. Safety net for a failed weekly screen "
                              "leaving stale hedge ratios in production. 0 to "
                              "disable (default: 7).")
+    parser.add_argument("--force-flatten-on-exit", action="store_true",
+                        help="Flatten every open position at session end "
+                             "before persisting state. Operations safety "
+                             "hatch — the default is to hold open positions "
+                             "across sessions and exit only on strategy "
+                             "triggers (mean-revert, stop, max-hold) or "
+                             "contract expiry.")
     args = parser.parse_args()
 
     load_dotenv(HERE / ".env")
@@ -519,9 +701,18 @@ def main():
 
     strategies = build_strategies(pairs, args, kite, config_path, log)
 
+    # Restore prior-session state (no-op if no state file exists yet).
+    prior_state = load_prior_state(args.system, log)
+    matched_keys = restore_matching_strategies(strategies, prior_state, log)
+    orphans = build_orphan_strategies(
+        prior_state, matched_keys, args, kite, config_path, log,
+    )
+    strategies = strategies + orphans
+
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
-    flatten_ts = now.replace(hour=FLATTEN_AT[0], minute=FLATTEN_AT[1], second=0, microsecond=0)
+    session_end_ts = now.replace(hour=SESSION_END_AT[0], minute=SESSION_END_AT[1],
+                                  second=0, microsecond=0)
     hard_stop_ts = now.replace(hour=HARD_STOP[0], minute=HARD_STOP[1], second=0, microsecond=0)
 
     if now >= hard_stop_ts:
@@ -532,29 +723,53 @@ def main():
         sleep_until(open_ts, log)
 
     log.info("Entering tick loop (every %ds until %s) over %d pair(s)",
-             TICK_SECONDS, flatten_ts.strftime("%H:%M"), len(strategies))
+             TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
 
     try:
-        while datetime.now() < flatten_ts:
+        while datetime.now() < session_end_ts:
             for s in strategies:
                 tick_one(s, log)
-            remaining = (flatten_ts - datetime.now()).total_seconds()
+            remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
 
-        log.info("Flatten window reached.")
-        for s in strategies:
-            flatten_one(s, log)
-        write_eod_sidecar(strategies, today, log, args.system)
+        log.info("Session-end window reached.")
+        end_of_session(strategies, today, args, log)
 
     except KeyboardInterrupt:
-        log.info("Interrupted — attempting graceful flatten.")
-        for s in strategies:
-            flatten_one(s, log)
-        write_eod_sidecar(strategies, today, log, args.system)
+        log.info("Interrupted — persisting state and exiting.")
+        end_of_session(strategies, today, args, log)
         return 130
 
     log.info("Session complete. Exiting cleanly.")
     return 0
+
+
+def end_of_session(strategies, today: date, args, log: logging.Logger):
+    """At session end: (1) force-flatten any leg whose contract expires today;
+    (2) honour --force-flatten-on-exit if set; (3) persist state for the
+    next session; (4) write the EOD sidecar for the verifier/dashboard.
+
+    Order matters — flatten must run before persist so the state file reflects
+    the post-flatten reality, and persist must run before sidecar so the
+    sidecar's session_realized_delta is a snapshot of the same moment."""
+    for s in strategies:
+        pair_label = f"{s.symbol_a}/{s.symbol_b}"
+        if s.state.position == "FLAT":
+            continue
+        if args.force_flatten_on_exit:
+            log.info("[%s] forced flatten (--force-flatten-on-exit)", pair_label)
+            flatten_one(s, log, reason="OPS_FORCE")
+            continue
+        try:
+            if s.legs_expire_on(today):
+                log.info("[%s] expiry-day flatten — leg contract expires today",
+                         pair_label)
+                flatten_one(s, log, reason="EXPIRY")
+        except Exception as e:
+            log.exception("[%s] expiry check failed: %s — leaving position",
+                          pair_label, e)
+    write_state_file(strategies, args.system, log)
+    write_eod_sidecar(strategies, today, log, args.system)
 
 
 if __name__ == "__main__":

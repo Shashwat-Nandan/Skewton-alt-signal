@@ -71,6 +71,9 @@ def _make_strategy(
                 "expiry": "2026-04-28", "instrument_token": 222},
     }
     s._clock = lambda: datetime(2026, 4, 21, 10, 30)
+    # session-start P&L baseline — normally set in __init__; tests bypass it.
+    s._session_start_realized = 0.0
+    s._session_start_unrealized = 0.0
     return s
 
 
@@ -673,6 +676,186 @@ class TestEODReport:
         assert "current_z" in report
         assert "realized_pnl" in report
         assert "spread_history_size" in report
+
+    def test_session_deltas_start_at_zero_when_baseline_matches_state(self):
+        s = _make_strategy()
+        s.kite.quote = lambda syms: {syms[0]: {"last_price": 1000.0}}
+        s._spread_history = [-1.0, 1.0] * 30
+        # Simulate restored state: counters are non-zero, but session
+        # baseline matches them (re-baselined in restore_state).
+        s.state.realized_pnl = 5000.0
+        s.state.unrealized_pnl = 300.0
+        s._session_start_realized = 5000.0
+        s._session_start_unrealized = 300.0
+        report = s.generate_eod_report()
+        assert report["realized_pnl"] == 5000.0
+        assert report["session_realized_delta"] == 0.0
+        assert report["session_unrealized_delta"] == 0.0
+
+    def test_session_deltas_capture_this_session_change(self):
+        s = _make_strategy()
+        s.kite.quote = lambda syms: {syms[0]: {"last_price": 1000.0}}
+        s._spread_history = [-1.0, 1.0] * 30
+        # Baseline = yesterday's close. Today added another 2000 realised
+        # and 100 unrealised — those are the per-session deltas.
+        s._session_start_realized = 5000.0
+        s._session_start_unrealized = 300.0
+        s.state.realized_pnl = 7000.0
+        s.state.unrealized_pnl = 400.0
+        report = s.generate_eod_report()
+        assert report["session_realized_delta"] == pytest.approx(2000.0)
+        assert report["session_unrealized_delta"] == pytest.approx(100.0)
+
+
+# ──────────────────────────────────────────────────────────
+# Cross-session persistence (serialize_state / restore_state)
+# ──────────────────────────────────────────────────────────
+
+class TestSerializeRestore:
+    """The 2026-05-19 rebuild removed the EOD flatten. Open positions now
+    survive across sessions via serialize_state/restore_state. Roundtrip
+    correctness is load-bearing — a partial restore would silently start
+    a strategy fresh and abandon a real position."""
+
+    def _build_held_position(self) -> PairTradingStrategy:
+        """A strategy with an OPEN LONG_SPREAD position, two legs, some
+        realized P&L and a couple of closed trades."""
+        s = _make_strategy(hedge_ratio=0.5)
+        s.state.position = "LONG_SPREAD"
+        s.state.entry_z = -2.10
+        s.state.entry_time = datetime(2026, 5, 19, 15, 2, 19)
+        s.state.entry_spread = 845.70
+        s.state.effective_stop_z = 4.0
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol="AAA26MAYFUT",
+                    lot_size=100, quantity=2,
+                    entry_price=1327.00, current_price=1323.20),
+            PairLeg(symbol="BBB", tradingsymbol="BBB26MAYFUT",
+                    lot_size=200, quantity=-1,
+                    entry_price=311.25, current_price=310.05),
+        ]
+        s.state.realized_pnl = -800.0
+        s.state.unrealized_pnl = -50.0
+        s.state.total_transaction_costs = 800.0
+        s.state.closed_trades = [
+            {"exit_time": datetime(2026, 5, 18, 12, 0, 0),
+             "entry_time": datetime(2026, 5, 17, 10, 0, 0),
+             "entry_z": 2.5, "entry_spread": 100.0,
+             "realized_pnl": 1000.0, "transaction_costs": 400.0,
+             "position": "SHORT_SPREAD"},
+        ]
+        return s
+
+    def test_roundtrip_open_position(self):
+        s1 = self._build_held_position()
+        blob = s1.serialize_state()
+
+        s2 = _make_strategy(hedge_ratio=0.5)
+        s2.restore_state(blob)
+
+        assert s2.state.position == "LONG_SPREAD"
+        assert s2.state.entry_z == pytest.approx(-2.10)
+        assert s2.state.entry_time == datetime(2026, 5, 19, 15, 2, 19)
+        assert s2.state.entry_spread == pytest.approx(845.70)
+        assert s2.state.effective_stop_z == pytest.approx(4.0)
+        assert len(s2.state.legs) == 2
+        leg_a = next(l for l in s2.state.legs if l.symbol == "AAA")
+        assert leg_a.tradingsymbol == "AAA26MAYFUT"
+        assert leg_a.quantity == 2
+        assert leg_a.entry_price == pytest.approx(1327.00)
+        assert s2.state.realized_pnl == pytest.approx(-800.0)
+        assert s2.state.total_transaction_costs == pytest.approx(800.0)
+        assert len(s2.state.closed_trades) == 1
+        # closed_trades datetimes roundtrip back to datetime
+        assert isinstance(s2.state.closed_trades[0]["entry_time"], datetime)
+
+    def test_restore_rebaselines_session_deltas(self):
+        s1 = self._build_held_position()
+        blob = s1.serialize_state()
+        s2 = _make_strategy(hedge_ratio=0.5)
+        s2.restore_state(blob)
+        # After restore, session baseline = restored cumulative figures, so
+        # generate_eod_report's session_realized_delta starts at 0.
+        assert s2._session_start_realized == pytest.approx(-800.0)
+        assert s2._session_start_unrealized == pytest.approx(-50.0)
+
+    def test_restore_rejects_pair_mismatch(self):
+        s1 = self._build_held_position()
+        blob = s1.serialize_state()
+
+        s_wrong = _make_strategy(hedge_ratio=0.5)
+        s_wrong.symbol_a = "XXX"
+        s_wrong.symbol_b = "YYY"
+        with pytest.raises(ValueError, match="does not match"):
+            s_wrong.restore_state(blob)
+
+    def test_restore_does_not_overwrite_hedge_ratio(self):
+        # The runner — not the strategy — decides whether to honour the
+        # saved β. Strategy-level restore must leave hedge_ratio alone.
+        s1 = self._build_held_position()  # hedge_ratio = 0.5
+        blob = s1.serialize_state()
+
+        s2 = _make_strategy(hedge_ratio=0.6)   # today's screener β differs
+        s2.restore_state(blob)
+        assert s2.hedge_ratio == 0.6  # unchanged
+
+    def test_flat_state_roundtrip(self):
+        s1 = _make_strategy()
+        # FLAT, no legs, no realized
+        blob = s1.serialize_state()
+        s2 = _make_strategy()
+        s2.restore_state(blob)
+        assert s2.state.position == "FLAT"
+        assert s2.state.legs == []
+        assert s2.state.realized_pnl == 0.0
+
+
+# ──────────────────────────────────────────────────────────
+# legs_expire_on (expiry-day force-flatten helper)
+# ──────────────────────────────────────────────────────────
+
+class TestLegsExpireOn:
+    def _strategy_with_legs(self, leg_tradingsymbol: str = "AAA26MAYFUT"):
+        s = _make_strategy()
+        s.state.position = "LONG_SPREAD"
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol=leg_tradingsymbol,
+                    lot_size=100, quantity=1,
+                    entry_price=1000.0, current_price=1000.0),
+        ]
+        return s
+
+    def test_returns_false_when_flat(self):
+        from datetime import date as d
+        s = _make_strategy()  # FLAT, no legs
+        assert s.legs_expire_on(d(2026, 5, 28)) is False
+
+    def test_true_when_leg_expiry_matches_today(self):
+        from datetime import date as d
+        s = self._strategy_with_legs("AAA26MAYFUT")
+        s.kite.instruments = lambda seg: [
+            {"tradingsymbol": "AAA26MAYFUT", "expiry": "2026-05-28"},
+            {"tradingsymbol": "BBB26MAYFUT", "expiry": "2026-05-28"},
+        ]
+        assert s.legs_expire_on(d(2026, 5, 28)) is True
+
+    def test_false_when_leg_expiry_is_not_today(self):
+        from datetime import date as d
+        s = self._strategy_with_legs("AAA26MAYFUT")
+        s.kite.instruments = lambda seg: [
+            {"tradingsymbol": "AAA26MAYFUT", "expiry": "2026-05-28"},
+        ]
+        assert s.legs_expire_on(d(2026, 5, 20)) is False
+
+    def test_false_on_instruments_lookup_failure(self):
+        """If the instruments call fails, return False rather than raise —
+        a flaky API hiccup must not force-flatten a position."""
+        from datetime import date as d
+        s = self._strategy_with_legs("AAA26MAYFUT")
+        def _raise(*a, **k):
+            raise RuntimeError("network down")
+        s.kite.instruments = _raise
+        assert s.legs_expire_on(d(2026, 5, 28)) is False
 
 
 # ──────────────────────────────────────────────────────────

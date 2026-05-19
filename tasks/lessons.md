@@ -228,3 +228,42 @@
   as a signal-cadence-vs-cost-model bug, not unlucky alpha — verify
   trade count against the backtest's expected cadence before assuming
   the strategy "just had a bad day".
+
+## EOD flatten was an artefact, not a strategy decision (2026-05-19)
+- Incident: RELIANCE/ITC entered 15:02:19 at z=-2.01, force-flattened
+  at 15:25:00 by `run_paper_pairs`'s `FLATTEN_AT` hard-coded constant
+  — −₹3,850 on 23 minutes of hold time, with the strategy's own exit
+  triggers (mean-revert, stop-z, max-hold) never given a chance to
+  fire. The flatten was structural, not strategic.
+- Root cause: the paper runner was a `oneshot` systemd unit. Without
+  cross-session state, "process exits at 15:30" implicitly meant
+  "positions can't survive overnight," so the EOD flatten was the
+  only safe way to close the loop.
+- Fix: replaced the unconditional flatten with disk-persisted state
+  (`data_cache/pair_paper_state_<system>.json`) restored at next
+  session start. Open positions now exit only on strategy triggers,
+  plus an expiry-day force-flatten so contracts don't go to
+  settlement.
+- Rule: when an operational constraint (process lifecycle, file
+  rotation, deploy cadence) is silently shaping strategy behaviour,
+  separate the two. Operational artefacts should not become
+  pseudo-strategy decisions. Check periodically: for each hard-coded
+  EOD/session-boundary action, ask "would the strategy do this if it
+  could speak?" If no, the constraint is leaking and needs an explicit
+  bridge.
+
+## A silent-identity fallback hides leg-lookup bugs in tests
+- Incident: a smoke test of the new cross-session persistence kept
+  re-appending exit legs to `state.legs` instead of removing them, so
+  flatten left the position OPEN. State was correct in production;
+  the smoke's `_cached_futures = {}` was the only thing different.
+- Root cause: `_symbol_from_tradingsymbol` falls back to *identity*
+  when the cache misses — returns the futures tradingsymbol where the
+  caller expects an equity symbol. `_apply_fill` then searches
+  `state.legs` for a leg whose `symbol == "RELIANCE26MAYFUT"`, finds
+  none, treats the exit as a fresh entry, and appends a new leg.
+- Rule: silent identity-fallbacks in symbol-resolution helpers are a
+  trap. They're tolerable in production where the cache is warm; in
+  tests they turn a missing fixture into a plausible-but-wrong run.
+  When writing a strategy-level test, populate `_cached_futures` for
+  every leg the strategy will touch, not just the entry legs.

@@ -155,7 +155,20 @@ def render_report(
         sa, sb = paper["pair"][0], paper["pair"][1]
         key = f"{sa}/{sb}"
         bt = bt_results.get(key)
-        paper_today = float(paper.get("realized_pnl", 0.0)) + float(paper.get("unrealized_pnl", 0.0))
+        # Prefer session-delta fields (added 2026-05-19 when the runner
+        # stopped flattening at EOD — realized_pnl became cumulative). Fall
+        # back to the old realized+unrealized sum for pre-rebuild sidecars
+        # so backfilled historical verifies still work.
+        if "session_realized_delta" in paper or "session_unrealized_delta" in paper:
+            paper_today = (
+                float(paper.get("session_realized_delta", 0.0))
+                + float(paper.get("session_unrealized_delta", 0.0))
+            )
+        else:
+            paper_today = (
+                float(paper.get("realized_pnl", 0.0))
+                + float(paper.get("unrealized_pnl", 0.0))
+            )
 
         if bt is None:
             row = {
