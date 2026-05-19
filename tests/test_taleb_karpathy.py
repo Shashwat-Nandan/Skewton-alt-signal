@@ -1463,3 +1463,191 @@ class TestSpotFetch:
         assert h._consecutive_spot_failures == 3
         assert h._check_spot(24000.0) is True
         assert h._consecutive_spot_failures == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Cross-session persistence (serialize_state / restore_state)
+# ──────────────────────────────────────────────────────────────────
+# The 2026-05-19 rebuild removed run_paper.py's unconditional EOD flatten.
+# Open straddle + futures hedge positions now survive across sessions via
+# serialize/restore. Roundtrip correctness is load-bearing — a partial
+# restore would abandon a real position.
+
+class TestSerializeRestore:
+
+    def _mock_hedger(self):
+        from datetime import datetime
+        kite = MagicMock()
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = kite
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.underlying = "NIFTY"
+        h._cached_lot_size = 75
+        h._cached_futures_symbol = "NIFTY26MAYFUT"
+        h._clock = lambda: datetime(2026, 5, 19, 10, 0)
+        h.immutable_params = {"total_capital": 500000}
+        h.tunable_params = {}
+        h.greeks = MagicMock()
+        return h
+
+    def _seeded_open_position(self):
+        """An open long ATM straddle + a short futures hedge, with some
+        gamma-scalp P/L and one prior closed trade — the realistic shape
+        of a held overnight position."""
+        from datetime import datetime, date
+        h = self._mock_hedger()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY2651923700CE", instrument_token=111,
+                strike=23700, expiry="2026-05-19", option_type="CE",
+                lot_size=75, quantity=1, entry_price=79.65,
+                current_price=85.00, iv=0.20,
+            ),
+            OptionContract(
+                tradingsymbol="NIFTY2651923700PE", instrument_token=222,
+                strike=23700, expiry="2026-05-19", option_type="PE",
+                lot_size=75, quantity=1, entry_price=65.25,
+                current_price=60.00, iv=0.20,
+            ),
+        ]
+        h.state.entry_time = datetime(2026, 5, 19, 9, 16, 9)
+        h.state.realized_pnl = -1500.0
+        h.state.unrealized_pnl = 50.0
+        h.state.total_pnl = -1450.0
+        h.state.rehedge_count = 4
+        h.state.gamma_scalp_pnl = 5058.0
+        h.state.theta_decay_paid = 1200.0
+        h.state.max_drawdown = 800.0
+        h.state.peak_pnl = 200.0
+        h.state.total_transaction_costs = 1500.0
+        h.state.futures_hedge_delta = -75.0
+        h.state.futures_entry_vwap = 23759.90
+        h.state.futures_lots = -1
+        h.state._current_day_pnl = -1450.0
+        h.state._current_trading_date = date(2026, 5, 19)
+        h.state.daily_pnl_history = [+2500.0, -800.0]
+        h.state.closed_trades = [
+            {"exit_time": "2026-05-18T15:25:00", "realized_pnl": -800.0,
+             "transaction_costs": 600.0},
+        ]
+        return h
+
+    def test_roundtrip_open_position(self):
+        from datetime import datetime, date
+        h1 = self._seeded_open_position()
+        blob = h1.serialize_state()
+
+        h2 = self._mock_hedger()
+        h2.restore_state(blob)
+
+        assert len(h2.state.positions) == 2
+        ce = next(p for p in h2.state.positions if p.option_type == "CE")
+        assert ce.strike == 23700
+        assert ce.expiry == "2026-05-19"
+        assert ce.entry_price == pytest.approx(79.65)
+        assert ce.quantity == 1
+        assert h2.state.entry_time == datetime(2026, 5, 19, 9, 16, 9)
+        assert h2.state.realized_pnl == pytest.approx(-1500.0)
+        assert h2.state.gamma_scalp_pnl == pytest.approx(5058.0)
+        assert h2.state.futures_hedge_delta == pytest.approx(-75.0)
+        assert h2.state.futures_entry_vwap == pytest.approx(23759.90)
+        assert h2.state.futures_lots == -1
+        assert h2.state._current_trading_date == date(2026, 5, 19)
+        assert h2.state.daily_pnl_history == [+2500.0, -800.0]
+        assert len(h2.state.closed_trades) == 1
+
+    def test_flat_state_roundtrip(self):
+        """No open position — restore should leave a clean HedgeState."""
+        h1 = self._mock_hedger()
+        blob = h1.serialize_state()
+        h2 = self._mock_hedger()
+        h2.restore_state(blob)
+        assert h2.state.positions == []
+        assert h2.state.futures_lots == 0
+        assert h2.state.realized_pnl == 0.0
+
+    def test_serialised_blob_is_json_clean(self):
+        """The blob must round-trip through json.dumps/loads without losing
+        information — that's what the runner does when it writes the state
+        file."""
+        import json
+        h1 = self._seeded_open_position()
+        blob = h1.serialize_state()
+        wire = json.dumps(blob, default=str)
+        decoded = json.loads(wire)
+        h2 = self._mock_hedger()
+        h2.restore_state(decoded)
+        assert len(h2.state.positions) == 2
+        assert h2.state.gamma_scalp_pnl == pytest.approx(5058.0)
+
+
+class TestLegsExpireOn:
+
+    def _mock_hedger(self):
+        from datetime import datetime
+        kite = MagicMock()
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = kite
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.underlying = "NIFTY"
+        h._cached_lot_size = 75
+        h._cached_futures_symbol = "NIFTY26MAYFUT"
+        h._clock = lambda: datetime(2026, 5, 19, 10, 0)
+        h.immutable_params = {"total_capital": 500000}
+        h.tunable_params = {}
+        return h
+
+    def test_returns_false_when_no_positions(self):
+        from datetime import date
+        h = self._mock_hedger()
+        assert h.legs_expire_on(date(2026, 5, 19)) is False
+
+    def test_true_when_option_expiry_is_today(self):
+        from datetime import date
+        h = self._mock_hedger()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY2651923700CE", instrument_token=1,
+                strike=23700, expiry="2026-05-19", option_type="CE",
+                lot_size=75, quantity=1, entry_price=80, current_price=80, iv=0.2,
+            ),
+        ]
+        assert h.legs_expire_on(date(2026, 5, 19)) is True
+
+    def test_false_when_option_expiry_is_future(self):
+        from datetime import date
+        h = self._mock_hedger()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY2652623700CE", instrument_token=1,
+                strike=23700, expiry="2026-05-26", option_type="CE",
+                lot_size=75, quantity=1, entry_price=80, current_price=80, iv=0.2,
+            ),
+        ]
+        assert h.legs_expire_on(date(2026, 5, 19)) is False
+
+    def test_true_when_futures_hedge_expires_today(self):
+        """Even with no option positions, an open futures hedge that
+        expires today must trip the guard."""
+        from datetime import date
+        h = self._mock_hedger()
+        h.state.futures_hedge_delta = -75.0
+        h.state.futures_lots = -1
+        h.kite.instruments = lambda seg: [
+            {"tradingsymbol": "NIFTY26MAYFUT", "expiry": "2026-05-28"},
+        ]
+        assert h.legs_expire_on(date(2026, 5, 28)) is True
+        assert h.legs_expire_on(date(2026, 5, 19)) is False
+
+    def test_false_on_instruments_lookup_failure(self):
+        """Flaky API hiccup must not force an unintended flatten."""
+        from datetime import date
+        h = self._mock_hedger()
+        h.state.futures_hedge_delta = -75.0
+        h.state.futures_lots = -1
+        def _raise(*a, **k):
+            raise RuntimeError("network down")
+        h.kite.instruments = _raise
+        assert h.legs_expire_on(date(2026, 5, 19)) is False

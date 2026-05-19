@@ -1427,3 +1427,153 @@ but it's a quiet failure mode.
   but means the strategy can't take a position spanning the
   contract switch. If `max_holding_days` and contract-month line up
   unluckily, valid trades get killed by expiry. Watch for this.
+
+# Extend rebuild to Taleb hedger — `run_paper.py` (2026-05-19)
+
+## Motivation
+Today's 2026-05-19 Taleb session entered a long ATM straddle at 09:16 IST
+and got force-flattened at 15:25 by `run_paper.py`'s `FLATTEN_AT`. Same
+structural issue as pair-trading: an operational artefact (oneshot
+systemd unit, no overnight process) leaking into strategy behaviour.
+
+`max_holding_period_hours=22.0` is set in `best_params.json` — the
+strategy is *parameterised* for ~1 calendar day holds, but the runner's
+15:25 cut effectively caps it at ~6 hours. Tuning and execution disagree.
+
+User decision 2026-05-19 (post-pair-trading-rebuild): apply the same
+pattern. Hold to strategy-defined exits only, force-flatten only on
+contract expiry or operator hatch.
+
+## Design (mirrors pair-trading rebuild)
+
+### State persistence
+- `serialize_state()` / `restore_state(blob)` on `TalebKarpathyStrategy`.
+- Serialises full `HedgeState`: `positions` (list of `OptionContract`),
+  `futures_hedge_delta`/`futures_lots`/`futures_entry_vwap`, all P&L
+  counters (`realized_pnl`, `unrealized_pnl`, `total_pnl`,
+  `gamma_scalp_pnl`, `theta_decay_paid`, `total_transaction_costs`),
+  history arrays (`closed_trades`, `daily_pnl_history`,
+  `_current_day_pnl`, `_current_trading_date`).
+- Skips computable derivatives: `portfolio_greeks` (recomputed each tick),
+  `bleed_history` / `stability_history` / `last_hedge_decision` /
+  `monte_carlo_report` (rolling diagnostics — rebuild from positions
+  is cheap), `_attribution_baseline` (re-anchored on next entry).
+- File: `data_cache/taleb_paper_state.json` (single strategy, no
+  per-system suffix needed — only one Taleb hedger runs).
+
+### Runner changes
+- `FLATTEN_AT` → `SESSION_END_AT` rename.
+- Add `load_prior_state` / `write_state_file` (atomic).
+- Replace `flatten_and_report` with `end_of_session(hedger, today, args)`:
+  1. If `--force-flatten-on-exit`: call `_generate_close_all_proposals`
+     and execute (old behaviour).
+  2. Else if any open position's contract (option leg OR futures leg)
+     expires today: same forced flatten path.
+  3. Always: `generate_eod_report`, `_save_iv_history`, then persist state.
+- `--force-flatten-on-exit` CLI flag (default False).
+- Same path on `KeyboardInterrupt`.
+
+### Expiry helper
+- `legs_expire_on(today: date) -> bool` on the strategy. Walks
+  `self.state.positions` (OptionContract.expiry, ISO string) AND the
+  futures hedge's contract expiry. Returns True if anything expires today.
+
+### What this DOESN'T change
+- The option-expiry selection in `_get_options_chain()` still picks
+  nearest expiry. On Tuesdays the nearest weekly NIFTY is often
+  same-day expiry, in which case the new state-persist has no effect —
+  positions go to settlement and get flushed before persisting. The
+  rebuild's benefit only materialises on days when the strategy enters
+  an option whose expiry is later than today. Worth flagging but NOT
+  changing here (Rule 3 surgical).
+- Autoresearch loop (`autoresearch_loop.py`), IV history persistence,
+  parameter tuning. None of these depend on the EOD flatten.
+
+### P&L attribution
+HedgeState ALREADY tracks `_current_day_pnl` + `daily_pnl_history` via
+`_record_pnl_snapshot` (line 1353), with day-boundary detection at
+line 1361. No new "session_delta" fields needed — restoring state and
+ticking again naturally archives yesterday's `_current_day_pnl` to
+history on the first tick after midnight.
+
+### Files touched
+- `strategies/taleb_karpathy.py` — serialise/restore + expiry helper.
+- `run_paper.py` — main behavioural change.
+- `tests/test_taleb_karpathy.py` — roundtrip test, expiry helper test.
+- `tasks/todo.md` — Review section after.
+- `tasks/lessons.md` — short note if any new failure mode surfaces.
+
+## Implementation checklist
+- [ ] `serialize_state` / `restore_state` + dataclass conversion helpers
+      for `OptionContract` and nested structures.
+- [ ] `legs_expire_on(today)` helper (options + futures).
+- [ ] `run_paper.py`: load prior state, rename constants, add CLI flag,
+      replace `flatten_and_report` with `end_of_session`.
+- [ ] Tests: serialise/restore roundtrip (with open straddle + futures
+      hedge), expiry helper, session-end branching.
+- [ ] Smoke: 4-session lifecycle.
+- [ ] Run full test suite; confirm no regressions.
+
+## Review (2026-05-19)
+
+### What shipped
+- **`strategies/taleb_karpathy.py`**: `serialize_state()` / `restore_state()`
+  covering HedgeState's persistent fields (positions, futures hedge, P&L
+  counters, daily-bucket fields, closed_trades). Skips computable
+  derivatives (`portfolio_greeks`, bleed/stability/MC histories,
+  `_attribution_baseline`) which rebuild next tick. `legs_expire_on(today)`
+  checks **both** option legs (each carrying its own ISO `expiry` string)
+  AND the futures hedge (looked up against `instruments("NFO")`).
+- **`run_paper.py`**:
+  - `FLATTEN_AT` → `SESSION_END_AT` rename.
+  - `load_prior_state` (missing-/corrupt-file safe) + `write_state_file`
+    (atomic via `.tmp` → `os.replace`) + `restore_state_if_any`.
+  - `end_of_session(hedger, today, args)` replaces `flatten_and_report`:
+    flatten only on `--force-flatten-on-exit` or `legs_expire_on(today)`,
+    always write EOD report + IV history, always persist state.
+  - `--force-flatten-on-exit` CLI flag.
+  - Same path on `KeyboardInterrupt`.
+- **Tests**: 8 new in `tests/test_taleb_karpathy.py` (roundtrip with open
+  straddle + futures hedge, flat-state roundtrip, JSON-cleanliness,
+  expiry helper across option-leg and futures-leg paths). Full suite:
+  **329 tests pass** (up from 321).
+- **Smoke**: 5-session lifecycle (enter → persist → restore → force-flatten
+  → option-expiry-flatten → futures-expiry-flatten) all green.
+
+### Observation worth surfacing (not a code change)
+The strategy's `_get_options_chain()` picks the **nearest** expiry. On
+Tuesdays that's often same-day weekly NIFTY (today's 2026-05-19 straddle
+on `NIFTY2651923700CE` expired today). For those sessions the new
+state-persist has no effect — the expiry-day flatten fires identically
+to the old EOD flatten. The rebuild's real benefit materialises only on
+sessions where the strategy enters a position whose contract is later
+than today's close. If you want overnight holds to happen more
+regularly, that's a strategy decision (prefer next weekly over same-day
+weekly) — a separate change.
+
+Today's session entered same-day-expiry options anyway, so today
+specifically would not have benefited from the rebuild. Going forward,
+on Mondays/Wednesdays/Thursdays the strategy will enter options that
+DO live past today's close — those are the days the rebuild starts
+mattering.
+
+### What this does NOT change (Rule 3 surgical)
+- `_get_options_chain()` expiry selection logic — unchanged.
+- Autoresearch loop (`autoresearch_loop.py`) — unchanged.
+- IV history persistence (`_save_iv_history` / `_load_iv_history`) —
+  unchanged; runs same as before at session end.
+- The spot-history rolling cache (`_spot_history`) — not serialised; it
+  rebuilds in ~10 ticks from live spot.
+
+### Open follow-ups (not blockers)
+- **Strategy entry-expiry preference** — if persistent overnight holds
+  are the goal, the strategy should prefer expiries ≥ next trading day.
+  Open question whether that improves OOS — short-dated options have
+  higher gamma per ₹ premium but worse holding cost.
+- **Greeks-on-restore**: `portfolio_greeks` starts None after restore;
+  computed on the next tick's call to `_record_pnl_snapshot` /
+  `check_and_rehedge`. Brief race: if `_should_exit` is called before
+  the first tick of the day, `greeks` is None and the vega-limit gate
+  is skipped. Risk is small — restore happens before tick loop entry —
+  but a defensive `_recompute_greeks()` call right after restore would
+  remove the ambiguity.

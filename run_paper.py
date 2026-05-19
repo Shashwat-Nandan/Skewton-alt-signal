@@ -5,13 +5,23 @@ Paper-Trading Runner
 Unattended intraday loop:
   - Refuses to run on weekends or dates in holidays.csv
   - Authenticates (TOTP auto-login via kite_auth)
+  - Restores any prior-session open position from
+    data_cache/taleb_paper_state.json
   - Blocks until 09:15 IST, ticks until 15:25 IST
-  - Flattens positions + writes EOD report, then exits 0
+  - At session end, persists state to disk (no EOD flatten by default —
+    open positions exit only on strategy triggers like max_holding_period,
+    daily loss limit, vega/gap exit) or on the contract's last trading day
+  - Writes EOD report + IV history, then exits 0
   - Per-day logfile under logs/paper-YYYY-MM-DD.log
+
+Operations:
+  --force-flatten-on-exit: emergency hatch to revert to old behaviour for
+    a single session (e.g. before a maintenance window or contract switch).
 
 Assumes the process sees wall-clock IST (systemd sets TZ=Asia/Kolkata).
 """
 
+import json
 import os
 import sys
 import time
@@ -19,6 +29,7 @@ import logging
 import argparse
 from datetime import datetime, date
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -27,9 +38,15 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = str(HERE / "config.ini")
 HOLIDAYS_PATH = HERE / "holidays.csv"
 LOG_DIR = HERE / "logs"
+DATA_CACHE = HERE / "data_cache"
+STATE_FILE = DATA_CACHE / "taleb_paper_state.json"
 
 MARKET_OPEN = (9, 15)
-FLATTEN_AT = (15, 25)   # close positions before the 15:30 bell
+# Wall-clock when the tick loop ends. Open positions are NOT flattened
+# here — they survive to the next session via the state file. The only
+# session-end exits are (a) --force-flatten-on-exit (ops hatch) and
+# (b) a held leg whose contract expires today.
+SESSION_END_AT = (15, 25)
 HARD_STOP = (15, 30)    # never tick past this
 TICK_SECONDS = 60
 
@@ -96,15 +113,94 @@ def tick(hedger, log: logging.Logger):
         log.exception("check_and_rehedge failed: %s", e)
 
 
-def flatten_and_report(hedger, log: logging.Logger):
+def _has_open_position(hedger) -> bool:
+    return bool(hedger.state.positions) or abs(hedger.state.futures_hedge_delta) > 0
+
+
+def force_flatten(hedger, log: logging.Logger, reason: str):
+    """Old EOD-flatten path — used only by --force-flatten-on-exit or by
+    the expiry-day guard. The default session end persists state instead."""
+    if not _has_open_position(hedger):
+        return
     try:
-        if hedger.state.positions or abs(hedger.state.futures_hedge_delta) > 0:
-            log.info("Flattening %d positions before close", len(hedger.state.positions))
-            close_props = hedger._generate_close_all_proposals()
-            if close_props:
-                hedger.execute_proposals(close_props)
+        log.info("Flattening %d position(s) — %s",
+                 len(hedger.state.positions), reason)
+        close_props = hedger._generate_close_all_proposals()
+        if close_props:
+            hedger.execute_proposals(close_props)
     except Exception as e:
         log.exception("Flatten failed: %s", e)
+
+
+def load_prior_state(log: logging.Logger) -> Optional[dict]:
+    """Return the parsed state-file payload, or None if no file / corrupt.
+    Corrupt-JSON safe: missing/bad file falls through to fresh-start so
+    a one-time crash can't orphan every position."""
+    if not STATE_FILE.exists():
+        log.info("No prior state file at %s — starting fresh.", STATE_FILE.name)
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception as e:
+        log.exception("Failed to parse %s: %s — starting fresh.", STATE_FILE.name, e)
+        return None
+
+
+def restore_state_if_any(hedger, log: logging.Logger):
+    payload = load_prior_state(log)
+    if not payload:
+        return
+    try:
+        hedger.restore_state(payload)
+        log.info(
+            "Restored prior session (saved_at %s): %d position(s), "
+            "futures_lots=%d, cum_realized=₹%.0f, total_pnl=₹%.0f",
+            payload.get("saved_at", "?"),
+            len(hedger.state.positions),
+            hedger.state.futures_lots,
+            hedger.state.realized_pnl,
+            hedger.state.total_pnl,
+        )
+    except Exception as e:
+        log.exception("restore_state failed: %s — keeping fresh strategy "
+                      "(saved position will be ABANDONED; manual review)", e)
+
+
+def write_state_file(hedger, log: logging.Logger):
+    """Atomically persist current strategy state. Atomic write via
+    '.tmp' → os.replace so a crash mid-write can't leave a half-truncated
+    file that fails to parse next session."""
+    DATA_CACHE.mkdir(parents=True, exist_ok=True)
+    try:
+        payload = hedger.serialize_state()
+    except Exception as e:
+        log.exception("serialize_state failed: %s — state NOT persisted "
+                      "(next session will start fresh)", e)
+        return
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, default=str, indent=2))
+    os.replace(tmp, STATE_FILE)
+    log.info("State persisted: %s (%d position(s), futures_lots=%d)",
+             STATE_FILE.name, len(hedger.state.positions), hedger.state.futures_lots)
+
+
+def end_of_session(hedger, today: date, args, log: logging.Logger):
+    """At session end: (1) force-flatten on operator hatch or expiry-day,
+    (2) write EOD report, (3) save IV history, (4) persist state.
+
+    Order matters — flatten before EOD report so the report reflects the
+    post-flatten reality; persist after report so any state mutations the
+    report makes are captured."""
+    if _has_open_position(hedger):
+        if args.force_flatten_on_exit:
+            force_flatten(hedger, log, reason="OPS_FORCE (--force-flatten-on-exit)")
+        else:
+            try:
+                if hedger.legs_expire_on(today):
+                    force_flatten(hedger, log,
+                                  reason="EXPIRY (leg contract expires today)")
+            except Exception as e:
+                log.exception("Expiry check failed: %s — leaving position", e)
 
     try:
         report = hedger.generate_eod_report()
@@ -117,11 +213,20 @@ def flatten_and_report(hedger, log: logging.Logger):
     except Exception as e:
         log.exception("IV history save failed: %s", e)
 
+    write_state_file(hedger, log)
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true",
                         help="Run even on weekends/holidays (testing only)")
+    parser.add_argument("--force-flatten-on-exit", action="store_true",
+                        help="Flatten any open position at session end "
+                             "before persisting state. Operations safety "
+                             "hatch — the default is to hold positions "
+                             "across sessions and exit only on strategy "
+                             "triggers (max_holding_period_hours, daily "
+                             "loss stop, vega/gap exit) or contract expiry.")
     args = parser.parse_args()
 
     load_dotenv(HERE / ".env")
@@ -156,9 +261,13 @@ def main():
              hedger.underlying, hedger.immutable_params["total_capital"])
     log.info("Tunable params: %s", hedger.tunable_params)
 
+    # Restore any open position from yesterday's session before the tick loop.
+    restore_state_if_any(hedger, log)
+
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
-    flatten_ts = now.replace(hour=FLATTEN_AT[0], minute=FLATTEN_AT[1], second=0, microsecond=0)
+    session_end_ts = now.replace(hour=SESSION_END_AT[0], minute=SESSION_END_AT[1],
+                                  second=0, microsecond=0)
     hard_stop_ts = now.replace(hour=HARD_STOP[0], minute=HARD_STOP[1], second=0, microsecond=0)
 
     if now >= hard_stop_ts:
@@ -169,20 +278,20 @@ def main():
         sleep_until(open_ts, log)
 
     log.info("Entering tick loop (every %ds until %s)",
-             TICK_SECONDS, flatten_ts.strftime("%H:%M"))
+             TICK_SECONDS, session_end_ts.strftime("%H:%M"))
 
     try:
-        while datetime.now() < flatten_ts:
+        while datetime.now() < session_end_ts:
             tick(hedger, log)
-            remaining = (flatten_ts - datetime.now()).total_seconds()
+            remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
 
-        log.info("Flatten window reached.")
-        flatten_and_report(hedger, log)
+        log.info("Session-end window reached.")
+        end_of_session(hedger, today, args, log)
 
     except KeyboardInterrupt:
-        log.info("Interrupted — attempting graceful flatten.")
-        flatten_and_report(hedger, log)
+        log.info("Interrupted — persisting state and exiting.")
+        end_of_session(hedger, today, args, log)
         return 130
 
     log.info("Session complete. Exiting cleanly.")

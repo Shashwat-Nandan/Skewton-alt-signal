@@ -15,7 +15,7 @@ import json
 import hashlib
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -618,6 +618,156 @@ class TalebKarpathyStrategy(BaseStrategy):
             "position_count": len(self.state.positions),
             "total_transaction_costs": self.state.total_transaction_costs,
         }
+
+    # ══════════════════════════════════════════════════════════
+    # CROSS-SESSION PERSISTENCE
+    # ══════════════════════════════════════════════════════════
+
+    def serialize_state(self) -> Dict:
+        """Snapshot HedgeState so run_paper.py can persist it between sessions.
+        Counterpart of restore_state(). Used when the runner is configured to
+        hold positions overnight rather than EOD-flatten (2026-05-19).
+
+        Skips computable derivatives:
+          - portfolio_greeks: recomputed every tick from positions+spot+T
+          - bleed_history / stability_history / monte_carlo_report /
+            last_hedge_decision: rolling diagnostic outputs, rebuilt next tick
+          - _attribution_baseline: re-anchored on next entry
+        Skips runtime caches (_atm_iv_history / _spot_history) — IV history
+        has its own persistence (_save_iv_history); spot history rebuilds
+        in ~10 ticks.
+        """
+        def _iso(ts):
+            if ts is None:
+                return None
+            if isinstance(ts, datetime):
+                return ts.isoformat()
+            return str(ts)
+        return {
+            "saved_at": datetime.now().isoformat(),
+            "state": {
+                "positions": [
+                    {
+                        "tradingsymbol": p.tradingsymbol,
+                        "instrument_token": p.instrument_token,
+                        "strike": p.strike,
+                        "expiry": p.expiry,
+                        "option_type": p.option_type,
+                        "lot_size": p.lot_size,
+                        "quantity": p.quantity,
+                        "entry_price": p.entry_price,
+                        "current_price": p.current_price,
+                        "iv": p.iv,
+                    }
+                    for p in self.state.positions
+                ],
+                "entry_time": _iso(self.state.entry_time),
+                "total_pnl": self.state.total_pnl,
+                "realized_pnl": self.state.realized_pnl,
+                "unrealized_pnl": self.state.unrealized_pnl,
+                "rehedge_count": self.state.rehedge_count,
+                "gamma_scalp_pnl": self.state.gamma_scalp_pnl,
+                "theta_decay_paid": self.state.theta_decay_paid,
+                "max_drawdown": self.state.max_drawdown,
+                "peak_pnl": self.state.peak_pnl,
+                "total_transaction_costs": self.state.total_transaction_costs,
+                "closed_trades": self.state.closed_trades,
+                "_prev_snapshot_pnl": self.state._prev_snapshot_pnl,
+                "_current_day_pnl": self.state._current_day_pnl,
+                "_current_trading_date": (
+                    self.state._current_trading_date.isoformat()
+                    if self.state._current_trading_date else None
+                ),
+                "daily_pnl_history": list(self.state.daily_pnl_history),
+                "futures_hedge_delta": self.state.futures_hedge_delta,
+                "futures_entry_vwap": self.state.futures_entry_vwap,
+                "futures_lots": self.state.futures_lots,
+            },
+        }
+
+    def restore_state(self, blob: Dict) -> None:
+        """Inverse of serialize_state(). Fails loudly on shape mismatch — a
+        corrupted or partial state file must not silently degrade into a
+        fresh-start strategy (Rule 12)."""
+        from greeks_engine import OptionContract
+        s = blob["state"]
+        self.state.positions = [
+            OptionContract(
+                tradingsymbol=p["tradingsymbol"],
+                instrument_token=int(p["instrument_token"]),
+                strike=float(p["strike"]),
+                expiry=p["expiry"],
+                option_type=p["option_type"],
+                lot_size=int(p["lot_size"]),
+                quantity=int(p["quantity"]),
+                entry_price=float(p["entry_price"]),
+                current_price=float(p.get("current_price", p["entry_price"])),
+                iv=float(p.get("iv", 0.0)),
+            )
+            for p in s["positions"]
+        ]
+        et = s.get("entry_time")
+        self.state.entry_time = datetime.fromisoformat(et) if et else None
+        self.state.total_pnl = float(s["total_pnl"])
+        self.state.realized_pnl = float(s["realized_pnl"])
+        self.state.unrealized_pnl = float(s["unrealized_pnl"])
+        self.state.rehedge_count = int(s["rehedge_count"])
+        self.state.gamma_scalp_pnl = float(s["gamma_scalp_pnl"])
+        self.state.theta_decay_paid = float(s["theta_decay_paid"])
+        self.state.max_drawdown = float(s["max_drawdown"])
+        self.state.peak_pnl = float(s["peak_pnl"])
+        self.state.total_transaction_costs = float(s["total_transaction_costs"])
+        self.state.closed_trades = list(s.get("closed_trades", []))
+        self.state._prev_snapshot_pnl = float(s.get("_prev_snapshot_pnl", 0.0))
+        self.state._current_day_pnl = float(s.get("_current_day_pnl", 0.0))
+        ctd = s.get("_current_trading_date")
+        self.state._current_trading_date = (
+            date.fromisoformat(ctd) if ctd else None
+        )
+        self.state.daily_pnl_history = list(s.get("daily_pnl_history", []))
+        self.state.futures_hedge_delta = float(s["futures_hedge_delta"])
+        self.state.futures_entry_vwap = float(s["futures_entry_vwap"])
+        self.state.futures_lots = int(s["futures_lots"])
+
+    def legs_expire_on(self, today: date) -> bool:
+        """True if any held leg's contract has its last trading day on `today`.
+        Covers both option legs (each carries its own ISO expiry string) and
+        the futures hedge (looked up against the NFO instruments dump).
+        Returns False on instruments-fetch failure — a flaky API hiccup must
+        not trigger an unintended force-flatten."""
+        today_iso = today.isoformat()
+        for p in self.state.positions:
+            if not p.expiry:
+                continue
+            try:
+                if datetime.fromisoformat(p.expiry[:10]).date() == today:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        # Futures hedge: only one contract at a time, identified by the cached
+        # tradingsymbol. Look up its expiry from the instruments dump.
+        if abs(self.state.futures_hedge_delta) > 0 or self.state.futures_lots != 0:
+            try:
+                fut_symbol = self._get_futures_symbol()
+                instruments = self.kite.instruments("NFO")
+            except Exception as e:
+                logger.warning("instruments('NFO') for expiry check failed: %s", e)
+                return False
+            for row in instruments:
+                if row.get("tradingsymbol") != fut_symbol:
+                    continue
+                exp = row.get("expiry")
+                if isinstance(exp, str):
+                    try:
+                        exp = datetime.strptime(exp[:10], "%Y-%m-%d").date()
+                    except ValueError:
+                        return False
+                elif hasattr(exp, "date"):
+                    exp = exp.date()
+                if exp == today:
+                    return True
+                break
+        return False
 
     # ══════════════════════════════════════════════════════════
     # INTERNAL METHODS
