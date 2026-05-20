@@ -472,7 +472,7 @@ class PairTradingStrategy(BaseStrategy):
                     exp = datetime.strptime(exp[:10], "%Y-%m-%d").date()
                 except ValueError:
                     continue
-            elif hasattr(exp, date):
+            elif hasattr(exp, "date"):
                 exp = exp.date()
             if exp is not None:
                 expiry_by_ts[ts] = exp
@@ -851,7 +851,7 @@ class PairTradingStrategy(BaseStrategy):
             exp = row.get("expiry")
             if isinstance(exp, str):
                 return datetime.strptime(exp[:10], "%Y-%m-%d").date()
-            if hasattr(exp, date):
+            if hasattr(exp, "date"):
                 return exp.date()
             return exp
 
