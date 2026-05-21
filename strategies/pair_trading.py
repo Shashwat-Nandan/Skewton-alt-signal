@@ -283,14 +283,38 @@ class PairTradingStrategy(BaseStrategy):
 
         results = []
         is_entry_batch = (self.state.position == "FLAT")
+        filled_entry_props: List[Tuple[TradeProposal, Dict]] = []
 
+        # COMPLETE is the whitelist (not !FAILED) — PENDING/REJECTED/
+        # CANCELLED returned by _live_execute all share the property that
+        # the order did NOT settle, and applying the fill on those would
+        # book a phantom position.
         for prop in proposals:
-            result = self._paper_execute(prop) if self.is_paper_mode else self._live_execute(prop)
+            result = (self._paper_execute(prop) if self.is_paper_mode
+                      else self._live_execute(prop))
             results.append(result)
-            if result.get("status") == "FAILED":
-                logger.warning("Order FAILED for %s: %s", prop.tradingsymbol, result.get("error"))
+            if result.get("status") != "COMPLETE":
+                logger.warning(
+                    "Order not COMPLETE for %s: status=%s error=%s",
+                    prop.tradingsymbol, result.get("status"),
+                    result.get("error"),
+                )
                 continue
-            self._apply_fill(prop)
+            self._apply_fill(prop, result)
+            if is_entry_batch:
+                filled_entry_props.append((prop, result))
+
+        # Entry-batch atomicity: if any leg failed AND others filled,
+        # reverse the filled ones immediately. A naked single leg is the
+        # worst-case outcome of a hedged strategy — never leave one open.
+        if (is_entry_batch and filled_entry_props
+                and len(filled_entry_props) < len(proposals)):
+            logger.critical(
+                "ENTRY BATCH PARTIAL FILL: %d of %d legs filled — "
+                "reversing filled legs to avoid naked exposure",
+                len(filled_entry_props), len(proposals),
+            )
+            self._reverse_filled_legs(filled_entry_props)
 
         # Classify the batch outcome to set position direction
         if is_entry_batch and self.state.legs:
@@ -741,15 +765,22 @@ class PairTradingStrategy(BaseStrategy):
     # FILL HANDLING / STATE UPDATES
     # ══════════════════════════════════════════════════════════
 
-    def _apply_fill(self, prop: TradeProposal) -> None:
+    def _apply_fill(self, prop: TradeProposal,
+                    result: Optional[Dict] = None) -> None:
+        # Use the actual fill (from _live_execute polling or _paper_execute)
+        # when available; fall back to proposal values for legacy callers
+        # (direct test invocations).
+        filled_lots = (result.get("filled_lots") if result else None) or prop.quantity
+        fill_price = (result.get("average_price") if result else None) or prop.price
+
         symbol = self._symbol_from_tradingsymbol(prop.tradingsymbol)
-        signed_qty = prop.quantity if prop.transaction_type == "BUY" else -prop.quantity
+        signed_qty = filled_lots if prop.transaction_type == "BUY" else -filled_lots
 
         # Transaction cost — stock futures cost model is close enough to
         # the existing FUT branch in dynamic_hedger.estimate_transaction_cost.
         from strategies.taleb_karpathy import estimate_transaction_cost
         cost = estimate_transaction_cost(
-            prop.price, prop.quantity, prop.lot_size, prop.transaction_type,
+            fill_price, filled_lots, prop.lot_size, prop.transaction_type,
             instrument_type="FUT",
         )
         self.state.total_transaction_costs += cost
@@ -760,26 +791,26 @@ class PairTradingStrategy(BaseStrategy):
             self.state.legs.append(PairLeg(
                 symbol=symbol, tradingsymbol=prop.tradingsymbol,
                 lot_size=prop.lot_size, quantity=signed_qty,
-                entry_price=prop.price, current_price=prop.price,
+                entry_price=fill_price, current_price=fill_price,
             ))
             return
 
         old_qty = existing.quantity
         new_qty = old_qty + signed_qty
         if new_qty == 0:
-            realized = (prop.price - existing.entry_price) * old_qty * existing.lot_size
+            realized = (fill_price - existing.entry_price) * old_qty * existing.lot_size
             self.state.realized_pnl += realized
             self.state.legs.remove(existing)
             logger.info("Closed %s leg: realized ₹%.0f", symbol, realized)
         elif old_qty * signed_qty < 0:
             closed_qty = min(abs(old_qty), abs(signed_qty)) * (1 if old_qty > 0 else -1)
-            realized = (prop.price - existing.entry_price) * closed_qty * existing.lot_size
+            realized = (fill_price - existing.entry_price) * closed_qty * existing.lot_size
             self.state.realized_pnl += realized
             existing.quantity = new_qty
         else:
             # Adding to position — VWAP entry price
             existing.entry_price = (
-                existing.entry_price * old_qty + prop.price * signed_qty
+                existing.entry_price * old_qty + fill_price * signed_qty
             ) / new_qty
             existing.quantity = new_qty
 
@@ -950,14 +981,29 @@ class PairTradingStrategy(BaseStrategy):
             prop.transaction_type, prop.quantity, prop.tradingsymbol,
             prop.price, prop.rationale,
         )
-        return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
+        return {
+            "order_id": f"PAPER-{int(time.time() * 1000)}",
+            "status": "COMPLETE",
+            "filled_lots": prop.quantity,
+            "average_price": prop.price,
+            "mode": "paper",
+        }
 
     def _live_execute(self, prop: TradeProposal) -> Dict:
+        # Switched from LIMIT-at-LTP to MARKET (2026-05-21 live-readiness
+        # review): the prior LIMIT path returned status=PENDING immediately
+        # after place_order, and execute_proposals used to mutate state as
+        # if the order had filled — even when the LIMIT sat unfilled.
+        # MARKET guarantees a fill (or a clear reject), the slippage is
+        # already baked into the cost model, and we poll order_history to
+        # confirm before booking any state change.
         try:
             validate_order(prop)
         except OrderValidationError as e:
             logger.error("Order rejected pre-submit: %s — %s", e, prop)
-            return {"order_id": None, "status": "REJECTED", "error": str(e), "mode": "live"}
+            return {"order_id": None, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": f"validation: {e}", "mode": "live"}
         try:
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR, exchange="NFO",
@@ -968,10 +1014,123 @@ class PairTradingStrategy(BaseStrategy):
                 ),
                 quantity=abs(prop.quantity) * prop.lot_size,
                 product=self.kite.PRODUCT_NRML,
-                order_type=self.kite.ORDER_TYPE_LIMIT,
-                price=prop.price,
+                order_type=self.kite.ORDER_TYPE_MARKET,
                 validity=self.kite.VALIDITY_DAY,
+                tag=self._order_tag(prop),
             )
-            return {"order_id": order_id, "status": "PENDING", "mode": "live"}
         except Exception as e:
-            return {"order_id": None, "status": "FAILED", "error": str(e), "mode": "live"}
+            logger.exception("place_order failed for %s: %s",
+                             prop.tradingsymbol, e)
+            return {"order_id": None, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": f"place_order: {e}", "mode": "live"}
+
+        return self._poll_until_terminal(order_id, prop)
+
+    def _poll_until_terminal(self, order_id, prop: TradeProposal,
+                              timeout_s: float = 10.0,
+                              interval_s: float = 1.0) -> Dict:
+        # Poll order_history until terminal (COMPLETE / REJECTED /
+        # CANCELLED) or timeout. On COMPLETE we report the actual fill
+        # (filled_quantity / average_price); on anything else we cancel
+        # best-effort and return FAILED so execute_proposals skips
+        # _apply_fill and (if entry batch) triggers a reversal sweep.
+        deadline = time.monotonic() + timeout_s
+        final_status = "PENDING"
+        filled_qty = 0
+        avg_price = 0.0
+        while time.monotonic() < deadline:
+            try:
+                history = self.kite.order_history(order_id)
+                latest = history[-1] if history else {}
+                final_status = latest.get("status", "PENDING")
+                filled_qty = int(latest.get("filled_quantity", 0))
+                avg_price = float(latest.get("average_price") or 0.0)
+                if final_status in ("COMPLETE", "REJECTED", "CANCELLED"):
+                    break
+            except Exception as e:
+                logger.warning("order_history poll failed for %s: %s",
+                               order_id, e)
+            time.sleep(interval_s)
+
+        requested_shares = abs(prop.quantity) * prop.lot_size
+        if final_status == "COMPLETE":
+            filled_lots = filled_qty // prop.lot_size
+            if filled_lots * prop.lot_size != filled_qty or filled_qty == 0:
+                # Partial-fill at lot boundary or zero — refuse to book a
+                # phantom position. Operator can re-issue manually.
+                logger.error(
+                    "Partial fill not handled: order %s filled %d of %d "
+                    "shares (lot %d) — treating as FAILED",
+                    order_id, filled_qty, requested_shares, prop.lot_size,
+                )
+                return {"order_id": order_id, "status": "FAILED",
+                        "filled_lots": 0, "average_price": 0.0,
+                        "error": f"partial-fill {filled_qty}/{requested_shares}",
+                        "mode": "live"}
+            return {"order_id": order_id, "status": "COMPLETE",
+                    "filled_lots": filled_lots, "average_price": avg_price,
+                    "mode": "live"}
+
+        # Non-COMPLETE terminal or timeout: best-effort cancel if still open
+        if final_status not in ("REJECTED", "CANCELLED"):
+            try:
+                self.kite.cancel_order(
+                    variety=self.kite.VARIETY_REGULAR, order_id=order_id,
+                )
+                logger.warning(
+                    "Order %s cancelled after %.1fs (last status=%s)",
+                    order_id, timeout_s, final_status,
+                )
+            except Exception as e:
+                logger.warning("cancel_order failed for %s: %s",
+                               order_id, e)
+        return {"order_id": order_id, "status": "FAILED",
+                "filled_lots": 0, "average_price": 0.0,
+                "error": f"non-terminal after {timeout_s}s: status={final_status}",
+                "mode": "live"}
+
+    def _order_tag(self, prop: TradeProposal) -> str:
+        # Kite tag limit is 20 chars. Short symbol prefixes so the broker
+        # UI can tell algo-pair orders apart from manual flow.
+        sa = (self.symbol_a or "")[:5]
+        sb = (self.symbol_b or "")[:5]
+        return f"pair-{sa}-{sb}"[:20]
+
+    def _reverse_filled_legs(self,
+                              filled_props: List[Tuple[TradeProposal, Dict]],
+                              ) -> None:
+        # Best-effort MARKET reversal of legs that filled in an entry
+        # batch where another leg failed. Strategy MUST end the batch
+        # flat — alert CRITICAL if a reversal also fails (operator must
+        # square off manually before the next session).
+        for prop, fill_result in filled_props:
+            reverse_prop = TradeProposal(
+                tradingsymbol=prop.tradingsymbol,
+                instrument_token=prop.instrument_token,
+                strike=prop.strike, expiry=prop.expiry,
+                option_type=prop.option_type, lot_size=prop.lot_size,
+                quantity=fill_result.get("filled_lots") or prop.quantity,
+                price=fill_result.get("average_price") or prop.price,
+                transaction_type=("SELL" if prop.transaction_type == "BUY"
+                                  else "BUY"),
+                iv=prop.iv, bid_ask_spread_pct=prop.bid_ask_spread_pct,
+                margin_required=prop.margin_required,
+                rationale="UNWIND_PARTIAL_BATCH (paired leg failed)",
+            )
+            result = (self._paper_execute(reverse_prop) if self.is_paper_mode
+                      else self._live_execute(reverse_prop))
+            if result.get("status") != "COMPLETE":
+                logger.critical(
+                    "REVERSAL FAILED for %s — NAKED LEG IN MARKET. "
+                    "Manual intervention required. status=%s error=%s",
+                    prop.tradingsymbol, result.get("status"),
+                    result.get("error"),
+                )
+                continue
+            self._apply_fill(reverse_prop, result)
+            logger.info(
+                "Reversed leg %s (%d lots): post-reverse legs=%d",
+                prop.tradingsymbol, reverse_prop.quantity,
+                len(self.state.legs),
+            )

@@ -859,6 +859,154 @@ class TestLegsExpireOn:
 
 
 # ──────────────────────────────────────────────────────────
+# Live-mode order confirmation (C1) and entry-batch atomicity (C2)
+# ──────────────────────────────────────────────────────────
+
+class TestLiveExecuteConfirmation:
+    """C1: state must NOT mutate unless the order actually filled. Pre-fix,
+    _live_execute returned status=PENDING and execute_proposals mutated
+    state as if the LIMIT had filled — phantom positions on day 1 live."""
+
+    def _live_strategy(self):
+        s = _make_strategy(mode="live")
+        # Provide Kite enum constants the live path references
+        s.kite.VARIETY_REGULAR = "regular"
+        s.kite.TRANSACTION_TYPE_BUY = "BUY"
+        s.kite.TRANSACTION_TYPE_SELL = "SELL"
+        s.kite.PRODUCT_NRML = "NRML"
+        s.kite.ORDER_TYPE_MARKET = "MARKET"
+        s.kite.VALIDITY_DAY = "DAY"
+        return s
+
+    def _prop(self, qty=1, txn="BUY"):
+        return TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=qty, price=1000.0, transaction_type=txn,
+            iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
+            rationale="entry",
+        )
+
+    def test_complete_books_position_at_actual_fill_price(self):
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(return_value="ORD-1")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1003.5},
+        ])
+        s.execute_proposals([self._prop()])
+        assert len(s.state.legs) == 1
+        # Cost basis must reflect the ACTUAL fill, not the proposal price.
+        assert s.state.legs[0].entry_price == 1003.5
+
+    def test_rejected_does_not_book_position(self):
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(return_value="ORD-2")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "REJECTED", "filled_quantity": 0, "average_price": 0},
+        ])
+        s.kite.cancel_order = MagicMock()
+        s.execute_proposals([self._prop()])
+        assert s.state.legs == []
+        assert s.state.position == "FLAT"
+
+    def test_place_order_exception_does_not_book_position(self):
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(side_effect=RuntimeError("net down"))
+        s.execute_proposals([self._prop()])
+        assert s.state.legs == []
+        assert s.state.position == "FLAT"
+
+    def test_partial_fill_at_lot_boundary_is_failed(self):
+        # Requested 2 lots (200 shares), got 50 → fractional lot → FAILED.
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(return_value="ORD-3")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 50, "average_price": 1000.0},
+        ])
+        s.execute_proposals([self._prop(qty=2)])
+        assert s.state.legs == []
+
+
+class TestEntryBatchAtomicity:
+    """C2: if one leg of a two-leg entry fails, the other must be reversed.
+    A naked single leg is the worst outcome of a hedged strategy."""
+
+    def _live_strategy(self):
+        s = _make_strategy(mode="live")
+        s.kite.VARIETY_REGULAR = "regular"
+        s.kite.TRANSACTION_TYPE_BUY = "BUY"
+        s.kite.TRANSACTION_TYPE_SELL = "SELL"
+        s.kite.PRODUCT_NRML = "NRML"
+        s.kite.ORDER_TYPE_MARKET = "MARKET"
+        s.kite.VALIDITY_DAY = "DAY"
+        return s
+
+    def _props(self):
+        a = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
+            rationale="leg A entry",
+        )
+        b = TradeProposal(
+            tradingsymbol="BBB26APRFUT", instrument_token=222, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=200,
+            quantity=1, price=2000.0, transaction_type="SELL",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=40000,
+            rationale="leg B entry",
+        )
+        return [a, b]
+
+    def test_leg_b_failure_triggers_reversal_of_leg_a(self):
+        s = self._live_strategy()
+        # Track each place_order call so we can verify the reversal.
+        call_log = []
+
+        def place(*a, **kw):
+            call_log.append(kw)
+            return f"ORD-{len(call_log)}"
+
+        s.kite.place_order = place
+        s.kite.cancel_order = MagicMock()
+
+        # 3 calls expected: leg A entry (fills), leg B entry (fails),
+        # leg A reversal (fills). Driven by the position in call_log.
+        def history(order_id):
+            # Order 1 = leg A entry → COMPLETE
+            # Order 2 = leg B entry → REJECTED
+            # Order 3 = leg A reversal → COMPLETE
+            idx = int(order_id.split("-")[1])
+            if idx == 1:
+                return [{"status": "COMPLETE", "filled_quantity": 100,
+                         "average_price": 1000.0}]
+            elif idx == 2:
+                return [{"status": "REJECTED", "filled_quantity": 0,
+                         "average_price": 0}]
+            return [{"status": "COMPLETE", "filled_quantity": 100,
+                     "average_price": 1001.0}]
+
+        s.kite.order_history = history
+        s.execute_proposals(self._props())
+
+        # Three place_order calls — entry A, entry B, reversal A.
+        assert len(call_log) == 3
+        # Reversal must be opposite direction at the SAME tradingsymbol.
+        assert call_log[2]["tradingsymbol"] == "AAA26APRFUT"
+        assert call_log[2]["transaction_type"] == "SELL"
+        # Final state: flat (the reversal closed leg A; leg B never opened).
+        assert s.state.legs == []
+        assert s.state.position == "FLAT"
+
+    def test_both_legs_fail_leaves_state_clean(self):
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(side_effect=RuntimeError("market closed"))
+        s.execute_proposals(self._props())
+        assert s.state.legs == []
+        assert s.state.position == "FLAT"
+
+
+# ──────────────────────────────────────────────────────────
 # Registry
 # ──────────────────────────────────────────────────────────
 
