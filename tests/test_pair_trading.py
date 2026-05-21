@@ -1007,6 +1007,66 @@ class TestEntryBatchAtomicity:
 
 
 # ──────────────────────────────────────────────────────────
+# Contract-roll safety (C10) + tradingsymbol reverse-map (H11)
+# ──────────────────────────────────────────────────────────
+
+class TestExitUsesLegContract:
+    """C10: exit proposals must use the leg's STORED tradingsymbol, not
+    today's front-month. Pre-fix, a position held over a contract roll
+    would exit on the new front-month — opening a fresh naked position
+    while the old-contract leg sat unmanaged."""
+
+    def test_exit_uses_held_contract_after_roll(self):
+        s = _make_strategy()
+        # State: leg holds the MAY contract (we entered last month)
+        s.state.legs = [PairLeg(
+            symbol="AAA", tradingsymbol="AAA26MAYFUT", lot_size=100,
+            quantity=1, entry_price=1000.0, current_price=1010.0,
+        )]
+        s.state.position = "LONG_SPREAD"
+        # _cached_futures has today's front-month (JUNE), not what we hold
+        s._cached_futures = {
+            "AAA": {"tradingsymbol": "AAA26JUNFUT", "lot_size": 100,
+                    "expiry": "2026-06-25", "instrument_token": 222},
+        }
+        proposals = s._build_exit_proposals(
+            "TEST", 0.0, {"AAA": 1010.0},
+        )
+        assert len(proposals) == 1
+        # Must exit the MAY contract (what we hold), not JUNE (today's front)
+        assert proposals[0].tradingsymbol == "AAA26MAYFUT"
+        assert proposals[0].transaction_type == "SELL"
+        assert proposals[0].lot_size == 100
+
+
+class TestSymbolFromTradingsymbol:
+    """H11: rolled-contract fill matching + fail-loud on unknown."""
+
+    def test_matches_via_state_legs_for_rolled_contract(self):
+        s = _make_strategy()
+        s.state.legs = [PairLeg(
+            symbol="AAA", tradingsymbol="AAA26MAYFUT", lot_size=100,
+            quantity=1, entry_price=1000.0, current_price=1000.0,
+        )]
+        s._cached_futures = {
+            "AAA": {"tradingsymbol": "AAA26JUNFUT", "lot_size": 100,
+                    "expiry": "2026-06-25", "instrument_token": 222},
+        }
+        # Exit fill comes back with the MAY tradingsymbol — must resolve
+        # to the leg's symbol (AAA), not fall through.
+        assert s._symbol_from_tradingsymbol("AAA26MAYFUT") == "AAA"
+
+    def test_matches_via_cache_for_fresh_entry(self):
+        s = _make_strategy()  # state.legs empty
+        assert s._symbol_from_tradingsymbol("AAA26APRFUT") == "AAA"
+
+    def test_raises_on_unknown_tradingsymbol(self):
+        s = _make_strategy()
+        with pytest.raises(ValueError, match="Cannot reverse-map"):
+            s._symbol_from_tradingsymbol("UNKNOWN26MAYFUT")
+
+
+# ──────────────────────────────────────────────────────────
 # Registry
 # ──────────────────────────────────────────────────────────
 

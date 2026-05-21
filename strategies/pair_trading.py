@@ -649,23 +649,45 @@ class PairTradingStrategy(BaseStrategy):
     def _build_exit_proposals(
         self, reason: str, z: float, prices: Dict[str, float],
     ) -> List[TradeProposal]:
+        # Use the leg's STORED tradingsymbol, not today's front-month
+        # via _resolve_futures. Pre-fix: a position held over a roll
+        # would exit on the new front-month (opening a naked position)
+        # while the original-contract leg sat unmanaged.
         rationale = (
             f"EXIT_{reason} on {self.symbol_a}/{self.symbol_b} "
             f"z={z:.2f} entry_z={self.state.entry_z:.2f}"
         )
         proposals = []
         for leg in self.state.legs:
-            fut = self._resolve_futures(leg.symbol)
-            if not fut:
-                continue
             side = "SELL" if leg.quantity > 0 else "BUY"
+            price = prices.get(leg.symbol, leg.current_price)
             proposals.append(
-                self._make_fut_proposal(
-                    fut, abs(leg.quantity), prices.get(leg.symbol, leg.current_price),
-                    side, rationale,
-                )
+                self._make_exit_proposal_from_leg(leg, price, side, rationale)
             )
         return proposals
+
+    def _make_exit_proposal_from_leg(self, leg, price: float,
+                                      side: str, rationale: str
+                                      ) -> TradeProposal:
+        # Build the exit proposal from the leg's stored contract identity,
+        # not today's resolved front-month. instrument_token isn't required
+        # by place_order (tradingsymbol is the routing key).
+        notional = price * leg.lot_size * abs(leg.quantity)
+        return TradeProposal(
+            tradingsymbol=leg.tradingsymbol,
+            instrument_token=0,
+            strike=0.0,
+            expiry="",
+            option_type="FUT",
+            lot_size=int(leg.lot_size),
+            quantity=int(abs(leg.quantity)),
+            price=float(price),
+            transaction_type=side,
+            iv=0.0,
+            bid_ask_spread_pct=0.0,
+            margin_required=notional * 0.20,
+            rationale=rationale,
+        )
 
     def _expected_edge_passes_cost_hurdle(
         self,
@@ -909,10 +931,24 @@ class PairTradingStrategy(BaseStrategy):
             return None
 
     def _symbol_from_tradingsymbol(self, tradingsymbol: str) -> str:
+        # Existing legs first: a rolled-leg's tradingsymbol may not match
+        # today's _cached_futures (which holds today's front-month).
+        # Without this lookup, an exit fill for a rolled contract would
+        # fabricate a phantom leg keyed on the contract code.
+        for leg in self.state.legs:
+            if leg.tradingsymbol == tradingsymbol:
+                return leg.symbol
         for sym, fut in self._cached_futures.items():
             if fut["tradingsymbol"] == tradingsymbol:
                 return sym
-        return tradingsymbol
+        # Don't silently fabricate a symbol — that's how phantom legs
+        # accumulated pre-fix. Caller (_apply_fill) is exception-wrapped
+        # by tick_one so the strategy survives but the bad fill surfaces.
+        raise ValueError(
+            f"Cannot reverse-map tradingsymbol={tradingsymbol!r} to a known "
+            f"symbol. cache={[f['tradingsymbol'] for f in self._cached_futures.values()]} "
+            f"state_legs={[l.tradingsymbol for l in self.state.legs]}"
+        )
 
     def _seed_spread_history(self) -> None:
         """
