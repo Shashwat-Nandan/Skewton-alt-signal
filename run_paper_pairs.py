@@ -676,6 +676,78 @@ def build_orphan_strategies(
     return orphans
 
 
+def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
+    # Live-mode safety: state-file is the runner's view of open positions;
+    # kite.positions() is the broker's truth. They must agree before the
+    # tick loop touches anything. Paper-mode runs skip silently — there is
+    # no real broker position to reconcile against.
+    live_strategies = [s for s in strategies if getattr(s, "mode", "paper") == "live"]
+    if not live_strategies:
+        log.info("Broker reconciliation skipped (no live strategies)")
+        return
+
+    try:
+        broker_positions = kite.positions().get("net", []) or []
+    except Exception as e:
+        log.exception("kite.positions() failed: %s", e)
+        raise RuntimeError(
+            f"Broker reconciliation could not run: kite.positions() raised "
+            f"{e!r}. Refusing to start — broker state is unknown."
+        )
+
+    # Index NFO positions by tradingsymbol → signed shares (Kite's
+    # `quantity` is already signed: positive long, negative short).
+    broker_qty: Dict[str, int] = {}
+    for pos in broker_positions:
+        if pos.get("exchange") != "NFO":
+            continue
+        ts = pos.get("tradingsymbol", "")
+        qty = int(pos.get("quantity", 0))
+        if ts:
+            broker_qty[ts] = broker_qty.get(ts, 0) + qty
+
+    mismatches: List[str] = []
+    expected_tradingsymbols: set = set()
+    for s in live_strategies:
+        if s.state.position == "FLAT":
+            continue
+        for leg in s.state.legs:
+            expected_shares = leg.quantity * leg.lot_size  # signed
+            actual_shares = broker_qty.get(leg.tradingsymbol, 0)
+            expected_tradingsymbols.add(leg.tradingsymbol)
+            if expected_shares != actual_shares:
+                mismatches.append(
+                    f"{s.symbol_a}/{s.symbol_b} {leg.tradingsymbol}: "
+                    f"state expects {expected_shares} shares, broker has "
+                    f"{actual_shares}"
+                )
+
+    # Broker positions we don't know about — flag (don't refuse). Could be
+    # manual orders or another runner's positions on the same account.
+    unknown = [ts for ts, qty in broker_qty.items()
+               if qty != 0 and ts not in expected_tradingsymbols]
+    if unknown:
+        log.warning(
+            "Broker has %d NFO position(s) not tracked by this runner — "
+            "this runner will NOT manage them: %s",
+            len(unknown), unknown,
+        )
+
+    if mismatches:
+        msg = ("Broker reconciliation FAILED — refusing to start.\n  " +
+               "\n  ".join(mismatches) +
+               "\nResolve before retry: either restore the state file from "
+               "data_cache/state_backups/ (see _state_backup.py) OR square "
+               "off the broker positions manually OR (last resort) move the "
+               "state file aside and `mv state_backups state_backups.archived` "
+               "to acknowledge a clean restart.")
+        log.error(msg)
+        raise RuntimeError(msg)
+
+    log.info("Broker reconciliation OK: %d expected NFO position(s) match",
+             len(expected_tradingsymbols))
+
+
 def write_eod_sidecar(strategies, today: date, log: logging.Logger,
                        system: str = "baseline"):
     """Per-pair EOD reports for verify_pair_paper.py to consume.
@@ -791,6 +863,8 @@ def main():
         prior_state, matched_keys, args, kite, config_path, log,
     )
     strategies = strategies + orphans
+
+    reconcile_with_broker(strategies, kite, log)
 
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
