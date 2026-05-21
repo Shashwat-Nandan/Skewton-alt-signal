@@ -97,6 +97,87 @@ timed out (NSE anti-bot); operator paste is the reliable path.
 new entries added this session.
 
 ---
+
+# Live position tracker on dashboard (2026-05-20)
+
+## Motivation
+User asked for a "live position tracker" on the frontend showing positions
+taken today, currently-open positions, unrealised P&L, and a paper/live tag.
+
+Today the only way to see this is by reading the raw state JSONs:
+- `data_cache/taleb_paper_state.json` (Taleb long straddle)
+- `data_cache/pair_paper_state_baseline.json` (12 pairs, single-window screen)
+- `data_cache/pair_paper_state_persistent.json` (4 pairs, persistence-screened)
+
+The state files are rewritten every ~5s by the paper runners during market
+hours, so a polling endpoint is sufficient — no websockets needed.
+
+`backend.settings.allow_live_mode = False` everywhere right now, so all
+positions are tagged `paper`. The `mode` field is plumbed through so it
+flips automatically if/when live mode lands.
+
+## Plan
+**Backend** — new router `backend/routers/positions.py`:
+- `GET /positions` returns `{ generated_at, systems: [SystemBlock] }`
+- `SystemBlock = { name, mode: "paper"|"live", state_file_updated_at,
+  summary: {realized, unrealized, costs, total, n_open}, open_positions: [...],
+  closed_today: [...] }`
+- Reads three JSONs on each request (small files, cheap).
+- Taleb open positions: flatten `state.positions` array; entry_time comes from
+  `state.entry_time` (one timestamp for the whole straddle).
+- Pair open positions: for each pair with `state.position != FLAT`, return both
+  legs with entry/current prices and entry_time.
+- Closed-today: filter `state.closed_trades` by `exit_time` date == today
+  (server local date — the runners write timestamps in the same TZ).
+- Mode = `"live"` if `settings.allow_live_mode` else `"paper"`. (No per-row
+  override — all paper runners write to these files.)
+- Gated behind `require_session` like other routers.
+- Returns empty `systems` block (not 5xx) if a state file is missing — fresh
+  install or system not running.
+
+**Frontend**:
+- `lib/types.ts`: `PositionsResponse`, `SystemBlock`, `OpenPosition`,
+  `ClosedTrade`.
+- `lib/api.ts`: `api.positions()`.
+- `pages/PositionsPage.tsx`: per-system card with summary row + open
+  positions table + collapsible "Closed today" table. Paper/Live badge.
+- `components/Header.tsx`: add "Positions" nav link.
+- `App.tsx`: route `/positions` → `PositionsPage`.
+- React Query with `refetchInterval` of 10s during NSE market hours
+  (09:15–15:30 IST Mon–Fri), `false` otherwise. Helper in `lib/utils.ts`.
+- P&L cells coloured green/red. Numbers formatted ₹ with thousand separators.
+
+## Out of scope (v1)
+- Equity-swing positions (separate DB-backed system; user explicitly
+  excluded for v1).
+- Order-execution actions from the UI.
+- Per-trade history beyond today.
+
+## Steps
+- [x] Add backend `positions` router and wire into `main.py`
+- [x] Add types + API client
+- [x] Build `PositionsPage` + table components
+- [x] Add Header nav link + App route
+- [x] Patch nginx allowlist regex (`positions` added) — caught via the
+      public-URL verify check; loopback would not have flagged it
+- [x] Reload nginx + restart dashboard-backend
+- [ ] Manual verify in-browser: numbers match the 2026-05-20 morning report
+
+## Review
+- One new router (`positions.py`, ~210 lines) reads three state JSONs on
+  each request; <1 KB combined, no recomputation, safe to poll.
+- `mode` field plumbed from `settings.allow_live_mode` so the paper/live
+  badge flips automatically when/if live trading lands.
+- Auto-refresh gated on NSE hours via `isMarketHoursIST()` — outside hours
+  the state files don't change, so polling is wasted bandwidth.
+- nginx allowlist needed to be widened. The example file in
+  `deploy/nginx-dashboard.conf.example` had also been kept in sync.
+- Numbers reconciled against `data_cache/pair_paper_eod_2026-05-20.json`
+  and `data_cache/taleb_paper_state.json` via the smoke test
+  (`_build_taleb_block` etc.) — totals match.
+
+---
+
 # Persistence-screened pair trading — parallel paper system (2026-05-17)
 
 ## Motivation

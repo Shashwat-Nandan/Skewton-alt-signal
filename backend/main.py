@@ -25,6 +25,7 @@ from .routers import (
     market_profile,
     pair_candidates,
     pair_paper_compare,
+    positions,
     runs,
     strategies,
 )
@@ -91,6 +92,7 @@ def create_app() -> FastAPI:
     app.include_router(market_profile.router, dependencies=gated)
     app.include_router(pair_candidates.router, dependencies=gated)
     app.include_router(pair_paper_compare.router, dependencies=gated)
+    app.include_router(positions.router, dependencies=gated)
     app.include_router(equity_swing.router, dependencies=gated)
 
     @app.get("/", tags=["meta"])

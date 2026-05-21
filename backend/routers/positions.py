@@ -1,0 +1,310 @@
+"""Live position tracker.
+
+Reads the three paper-trading state JSONs that the runners rewrite every
+few seconds during market hours, and returns a unified view of:
+  - open positions per system (Taleb straddle, pair-baseline, pair-persistent)
+  - today's closed trades per system
+  - a per-system P&L summary (realized + unrealized + costs)
+
+The endpoint is read-only — it does no order placement, no recomputation,
+no Kite calls. Polling cost is one ~6 KB JSON read per system.
+
+Live vs paper: every system here writes to a `*_paper_*` file, so the
+`mode` field is currently always "paper". When/if `settings.allow_live_mode`
+flips and a live runner lands, the new state file gets wired in here and
+the mode flips with it.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import date, datetime
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+from ..settings import REPO_ROOT, get_settings
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/positions", tags=["positions"])
+
+DATA_CACHE = REPO_ROOT / "data_cache"
+
+
+# ─────────────────────────── response shape ───────────────────────────
+
+class OpenPosition(BaseModel):
+    # `group` lets the UI keep pair legs visually together; for the Taleb
+    # straddle both legs share one group "NIFTY straddle".
+    group: str
+    tradingsymbol: str
+    side: str  # "LONG" or "SHORT"
+    quantity: int  # absolute lots
+    lot_size: int
+    entry_price: float
+    current_price: Optional[float] = None
+    unrealized_pnl: Optional[float] = None
+    entry_time: Optional[str] = None
+    # Free-form context: z-score for pairs, strike/expiry for options
+    note: Optional[str] = None
+
+
+class ClosedTrade(BaseModel):
+    group: str
+    entry_time: Optional[str] = None
+    exit_time: Optional[str] = None
+    realized_pnl: float
+    transaction_costs: Optional[float] = None
+    note: Optional[str] = None
+
+
+class SystemSummary(BaseModel):
+    realized_pnl: float
+    unrealized_pnl: float
+    transaction_costs: float
+    total_pnl: float
+    n_open_positions: int
+    n_closed_today: int
+
+
+class SystemBlock(BaseModel):
+    name: str
+    label: str
+    mode: str  # "paper" | "live"
+    state_file: str
+    updated_at: Optional[str] = None
+    available: bool
+    summary: SystemSummary
+    open_positions: List[OpenPosition]
+    closed_today: List[ClosedTrade]
+
+
+class PositionsResponse(BaseModel):
+    generated_at: str
+    systems: List[SystemBlock]
+
+
+# ─────────────────────────── helpers ───────────────────────────
+
+def _empty_summary() -> SystemSummary:
+    return SystemSummary(
+        realized_pnl=0.0, unrealized_pnl=0.0, transaction_costs=0.0,
+        total_pnl=0.0, n_open_positions=0, n_closed_today=0,
+    )
+
+
+def _load_state(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        logger.warning("Failed to parse %s: %s", path, e)
+        return None
+
+
+def _is_today(iso: Optional[str], today: date) -> bool:
+    """Return True if the ISO timestamp falls on `today` (local-naive parse).
+
+    The runners write naive local-time ISO strings, so we parse naive and
+    compare to the server's local date — that matches how the operator
+    interprets "today" in the UI.
+    """
+    if not iso:
+        return False
+    try:
+        return datetime.fromisoformat(iso).date() == today
+    except ValueError:
+        return False
+
+
+def _resolve_mode() -> str:
+    return "live" if get_settings().allow_live_mode else "paper"
+
+
+# ─────────────────────────── per-system builders ───────────────────────────
+
+def _build_taleb_block(today: date) -> SystemBlock:
+    path = DATA_CACHE / "taleb_paper_state.json"
+    payload = _load_state(path)
+    if not payload:
+        return SystemBlock(
+            name="taleb", label="Taleb straddle", mode=_resolve_mode(),
+            state_file=path.name, available=False,
+            summary=_empty_summary(), open_positions=[], closed_today=[],
+        )
+
+    state = payload.get("state", {}) or {}
+    entry_time = state.get("entry_time")
+
+    open_positions: List[OpenPosition] = []
+    for p in state.get("positions", []) or []:
+        qty = int(p.get("quantity", 0))
+        if qty == 0:
+            continue
+        entry_px = float(p.get("entry_price", 0.0))
+        cur_px = p.get("current_price")
+        lot = int(p.get("lot_size", 0))
+        unrealized = None
+        if cur_px is not None:
+            unrealized = (float(cur_px) - entry_px) * qty * lot
+        strike = p.get("strike")
+        expiry = p.get("expiry")
+        opt_type = p.get("option_type")
+        note_bits = []
+        if strike is not None and opt_type:
+            note_bits.append(f"{int(strike)} {opt_type}")
+        if expiry:
+            note_bits.append(f"exp {expiry}")
+        open_positions.append(OpenPosition(
+            group="NIFTY straddle",
+            tradingsymbol=str(p.get("tradingsymbol", "")),
+            side="LONG" if qty > 0 else "SHORT",
+            quantity=abs(qty),
+            lot_size=lot,
+            entry_price=entry_px,
+            current_price=float(cur_px) if cur_px is not None else None,
+            unrealized_pnl=unrealized,
+            entry_time=entry_time,
+            note=" · ".join(note_bits) if note_bits else None,
+        ))
+
+    closed_today: List[ClosedTrade] = []
+    for t in state.get("closed_trades", []) or []:
+        if not _is_today(t.get("exit_time"), today):
+            continue
+        # The taleb schema stores gross+costs separately; report net realized
+        # as gross + costs (costs are negative).
+        gross = float(t.get("gross_pnl", 0.0))
+        costs = float(t.get("costs", 0.0))
+        closed_today.append(ClosedTrade(
+            group="NIFTY straddle",
+            entry_time=t.get("entry_time"),
+            exit_time=t.get("exit_time"),
+            realized_pnl=gross + costs,
+            transaction_costs=costs,
+            note=f"{t.get('n_rehedges', 0)} rehedges · "
+                 f"{t.get('holding_minutes', 0)} min held",
+        ))
+
+    realized = float(state.get("realized_pnl", 0.0))
+    unrealized = float(state.get("unrealized_pnl", 0.0))
+    costs = float(state.get("total_transaction_costs", 0.0))
+    return SystemBlock(
+        name="taleb", label="Taleb straddle", mode=_resolve_mode(),
+        state_file=path.name, updated_at=payload.get("saved_at"), available=True,
+        summary=SystemSummary(
+            realized_pnl=realized,
+            unrealized_pnl=unrealized,
+            transaction_costs=costs,
+            total_pnl=realized + unrealized,
+            n_open_positions=len(open_positions),
+            n_closed_today=len(closed_today),
+        ),
+        open_positions=open_positions,
+        closed_today=closed_today,
+    )
+
+
+def _build_pair_block(name: str, label: str, filename: str, today: date) -> SystemBlock:
+    path = DATA_CACHE / filename
+    payload = _load_state(path)
+    if not payload:
+        return SystemBlock(
+            name=name, label=label, mode=_resolve_mode(),
+            state_file=path.name, available=False,
+            summary=_empty_summary(), open_positions=[], closed_today=[],
+        )
+
+    open_positions: List[OpenPosition] = []
+    closed_today: List[ClosedTrade] = []
+    realized_total = 0.0
+    unrealized_total = 0.0
+    costs_total = 0.0
+
+    for pair in payload.get("pairs", []) or []:
+        pair_field = pair.get("pair", [])
+        pair_label = "/".join(pair_field) if isinstance(pair_field, (list, tuple)) else str(pair_field)
+        st = pair.get("state", {}) or {}
+
+        realized_total += float(st.get("realized_pnl", 0.0))
+        unrealized_total += float(st.get("unrealized_pnl", 0.0))
+        costs_total += float(st.get("total_transaction_costs", 0.0))
+
+        if st.get("position") and st.get("position") != "FLAT":
+            entry_time = st.get("entry_time")
+            entry_z = st.get("entry_z")
+            spread_note = (
+                f"{st.get('position')} · entry z={entry_z:+.2f}"
+                if isinstance(entry_z, (int, float))
+                else str(st.get("position", ""))
+            )
+            for leg in st.get("legs", []) or []:
+                qty = int(leg.get("quantity", 0))
+                if qty == 0:
+                    continue
+                entry_px = float(leg.get("entry_price", 0.0))
+                cur_px = leg.get("current_price")
+                lot = int(leg.get("lot_size", 0))
+                unrealized = None
+                if cur_px is not None:
+                    unrealized = (float(cur_px) - entry_px) * qty * lot
+                open_positions.append(OpenPosition(
+                    group=pair_label,
+                    tradingsymbol=str(leg.get("tradingsymbol", leg.get("symbol", ""))),
+                    side="LONG" if qty > 0 else "SHORT",
+                    quantity=abs(qty),
+                    lot_size=lot,
+                    entry_price=entry_px,
+                    current_price=float(cur_px) if cur_px is not None else None,
+                    unrealized_pnl=unrealized,
+                    entry_time=entry_time,
+                    note=spread_note,
+                ))
+
+        for t in st.get("closed_trades", []) or []:
+            if not _is_today(t.get("exit_time"), today):
+                continue
+            closed_today.append(ClosedTrade(
+                group=pair_label,
+                entry_time=t.get("entry_time"),
+                exit_time=t.get("exit_time"),
+                realized_pnl=float(t.get("realized_pnl", 0.0)),
+                transaction_costs=float(t.get("transaction_costs", 0.0)),
+                note=str(t.get("position", "")) or None,
+            ))
+
+    return SystemBlock(
+        name=name, label=label, mode=_resolve_mode(),
+        state_file=path.name, updated_at=payload.get("updated_at"), available=True,
+        summary=SystemSummary(
+            realized_pnl=realized_total,
+            unrealized_pnl=unrealized_total,
+            transaction_costs=costs_total,
+            total_pnl=realized_total + unrealized_total,
+            n_open_positions=len(open_positions),
+            n_closed_today=len(closed_today),
+        ),
+        open_positions=open_positions,
+        closed_today=closed_today,
+    )
+
+
+# ─────────────────────────── endpoint ───────────────────────────
+
+@router.get("", response_model=PositionsResponse)
+def list_positions() -> PositionsResponse:
+    today = date.today()
+    systems = [
+        _build_taleb_block(today),
+        _build_pair_block("pair_baseline", "Pair trading — baseline",
+                          "pair_paper_state_baseline.json", today),
+        _build_pair_block("pair_persistent", "Pair trading — persistent",
+                          "pair_paper_state_persistent.json", today),
+    ]
+    return PositionsResponse(
+        generated_at=datetime.now().isoformat(timespec="seconds"),
+        systems=systems,
+    )

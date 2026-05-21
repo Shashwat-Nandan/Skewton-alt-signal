@@ -8,6 +8,7 @@ import type {
   MarketProfileSymbol,
   PairCandidatesResponse,
   PaperCompareResponse,
+  PositionsResponse,
   RunDetail,
   RunSummary,
   SessionStatus,
@@ -106,6 +107,8 @@ export const api = {
     const qs = days != null ? `?days=${days}` : "";
     return http<FiiDiiResponse>(`/equity/fii-dii${qs}`);
   },
+
+  positions: () => http<PositionsResponse>("/positions"),
 
   marketProfileSymbols: () =>
     http<MarketProfileSymbol[]>("/market-profile/symbols"),

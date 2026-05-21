@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink } from "react-router-dom";
-import { LogOut, Activity, BarChart3, GitBranch, TrendingUp } from "lucide-react";
+import { LogOut, Activity, BarChart3, Briefcase, GitBranch, TrendingUp } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -42,6 +42,18 @@ export function Header() {
               }
             >
               Strategies
+            </NavLink>
+            <NavLink
+              to="/positions"
+              className={({ isActive }) =>
+                cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-muted-foreground hover:text-foreground",
+                  isActive && "text-foreground font-medium",
+                )
+              }
+            >
+              <Briefcase className="h-3.5 w-3.5" />
+              Positions
             </NavLink>
             <NavLink
               to="/market-profile"

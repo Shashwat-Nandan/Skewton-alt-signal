@@ -73,3 +73,38 @@
     font-feature-settings: "rlig" 1, "calt" 1;
   }
 }
+
+/* ────────────────────────────────────────────────────────────────
+ * Positions page — live-tracker animations.
+ * Used by PositionsPage to make polling-driven updates feel alive
+ * (pulsing live dot, brief flash when a value changes, soft fade-in
+ * on card mount). All purely CSS so they cost ~nothing.
+ * ──────────────────────────────────────────────────────────────── */
+@layer utilities {
+  @keyframes live-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 hsl(142 71% 45% / 0.6); }
+    50%      { box-shadow: 0 0 0 6px hsl(142 71% 45% / 0); }
+  }
+  .animate-live-pulse {
+    animation: live-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  @keyframes flash-up {
+    0%   { background-color: hsl(142 71% 45% / 0.18); }
+    100% { background-color: transparent; }
+  }
+  @keyframes flash-down {
+    0%   { background-color: hsl(0 73% 50% / 0.18); }
+    100% { background-color: transparent; }
+  }
+  .flash-up   { animation: flash-up 1.2s ease-out; }
+  .flash-down { animation: flash-down 1.2s ease-out; }
+
+  @keyframes fade-in-up {
+    0%   { opacity: 0; transform: translateY(8px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  .animate-fade-in-up {
+    animation: fade-in-up 0.35s ease-out both;
+  }
+}

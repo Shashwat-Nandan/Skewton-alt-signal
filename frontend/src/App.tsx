@@ -8,6 +8,7 @@ import { DashboardLoginPage } from "@/pages/DashboardLoginPage";
 import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
+import { PositionsPage } from "@/pages/PositionsPage";
 import { RunPage } from "@/pages/RunPage";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -56,6 +57,7 @@ export default function App() {
       <main className="container py-6">
         <Routes>
           <Route path="/" element={<Home />} />
+          <Route path="/positions" element={<PositionsPage />} />
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />
           <Route path="/pair-candidates" element={<PairCandidatesPage />} />

@@ -273,6 +273,58 @@ export type FiiDiiResponse = {
   rows: FiiDiiRow[];
 };
 
+// ── Live position tracker ──
+
+export type PositionMode = "paper" | "live";
+
+export type OpenPosition = {
+  group: string;
+  tradingsymbol: string;
+  side: "LONG" | "SHORT";
+  quantity: number;
+  lot_size: number;
+  entry_price: number;
+  current_price: number | null;
+  unrealized_pnl: number | null;
+  entry_time: string | null;
+  note: string | null;
+};
+
+export type ClosedTrade = {
+  group: string;
+  entry_time: string | null;
+  exit_time: string | null;
+  realized_pnl: number;
+  transaction_costs: number | null;
+  note: string | null;
+};
+
+export type PositionSystemSummary = {
+  realized_pnl: number;
+  unrealized_pnl: number;
+  transaction_costs: number;
+  total_pnl: number;
+  n_open_positions: number;
+  n_closed_today: number;
+};
+
+export type PositionSystemBlock = {
+  name: string;
+  label: string;
+  mode: PositionMode;
+  state_file: string;
+  updated_at: string | null;
+  available: boolean;
+  summary: PositionSystemSummary;
+  open_positions: OpenPosition[];
+  closed_today: ClosedTrade[];
+};
+
+export type PositionsResponse = {
+  generated_at: string;
+  systems: PositionSystemBlock[];
+};
+
 export type MarketProfileResponse = {
   symbol: string;
   name?: string | null;
