@@ -27,7 +27,7 @@ import sys
 import time
 import logging
 import argparse
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +70,39 @@ def is_trading_day(d: date, holidays: set[date]) -> tuple[bool, str]:
     if d in holidays:
         return False, f"{d} is an NSE holiday"
     return True, ""
+
+
+HOLIDAY_HORIZON_DAYS = 30
+HOLIDAYS_PER_YEAR_FLOOR = 8
+
+
+def assert_holiday_data_fresh(holidays: set[date], today: date,
+                              log: logging.Logger) -> None:
+    # holidays.csv is hand-maintained from the NSE circular; a partial
+    # or expired list silently treats lunar holidays (Holi, Diwali, etc.)
+    # as trading days. Fail loud per CLAUDE.md Rule 12.
+    if not holidays:
+        msg = ("holidays.csv loaded zero entries — refusing to start. "
+               "Populate from the NSE 'Holidays — Trading' circular.")
+        log.error(msg)
+        raise RuntimeError(msg)
+    last = max(holidays)
+    horizon = today + timedelta(days=HOLIDAY_HORIZON_DAYS)
+    if last < horizon:
+        msg = (f"holidays.csv last entry is {last}, less than "
+               f"{HOLIDAY_HORIZON_DAYS} days past today ({today}). "
+               f"Refusing to start — update from the NSE circular and "
+               f"redeploy.")
+        log.error(msg)
+        raise RuntimeError(msg)
+    this_year_count = sum(1 for h in holidays if h.year == today.year)
+    if this_year_count < HOLIDAYS_PER_YEAR_FLOOR:
+        msg = (f"holidays.csv has only {this_year_count} entries for "
+               f"{today.year}; NSE typically has 13-17 per year. The list "
+               f"is likely missing lunar holidays (Holi, Diwali, etc.). "
+               f"Refusing to start — update from the NSE circular.")
+        log.error(msg)
+        raise RuntimeError(msg)
 
 
 def setup_logging(today: date) -> logging.Logger:
@@ -236,6 +269,7 @@ def main():
     log = setup_logging(today)
 
     holidays = load_holidays(HOLIDAYS_PATH)
+    assert_holiday_data_fresh(holidays, today, log)
     ok, reason = is_trading_day(today, holidays)
     if not ok and not args.force:
         log.info("No-op: %s. Exiting.", reason)
