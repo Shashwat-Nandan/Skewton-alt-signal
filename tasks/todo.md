@@ -1,3 +1,102 @@
+# LIVE-readiness review — pair_trading first live deployment (2026-05-21)
+
+## Context
+- Today: 2026-05-21. Target: pair_trading flipped to `mode=live` ~week of 2026-05-25.
+- Other strategies (taleb_karpathy, varsity_equity_swing) stay on paper for now.
+- Approach: fresh independent review across four dimensions; agents return
+  structured gap lists, I synthesize and verify before fixing anything.
+- Dirty tree at review start: in-flight positions-tracker work (backend
+  `routers/positions.py`, frontend `PositionsPage.tsx`, related lib edits).
+  Audits will read this code in place; fixes will not collide with it
+  unless explicitly flagged in triage.
+
+## Phase 1 — Parallel audits (read-only)
+Four general-purpose subagents, each scoped to one dimension. Each returns
+a punch list of (a) what's already correct, (b) gaps with severity rationale,
+(c) recommended fix sketch. No code edits in this phase.
+
+- [ ] Strategy audit: pair_trading entry/exit/hedging/state, orphan+restore
+  path, EOD persistence, hedge-ratio drift, expiry handling
+- [ ] Broker audit: kite_auth, paper-vs-live code-path divergence, order
+  idempotency, partial fills, reject paths, throttling, reconciliation
+- [ ] Risk audit: per-leg caps, daily loss limit, max open positions,
+  kill-switch, exposure ceilings, runaway-loop guard
+- [ ] Ops audit: systemd units, secrets/env, holiday calendar, state-file
+  durability, alerting, monitoring, backup/recovery, observability
+
+## Phase 2 — Synthesize gap list
+- [ ] Reconcile findings, dedupe, severity-grade (Crit/High/Med/Low),
+  estimate fix effort per gap
+- [ ] Cross-check against `tasks/security-followups.md` to avoid
+  re-discovering known-deferred items
+- [ ] Present prioritised triage table
+
+## Phase 3 — User triage
+- [ ] User picks the Crit/High set to fix in this session
+
+## Phase 4 — Fixes
+- [ ] One change per gap. I read the actual code (not just the agent
+  summary) before editing. Verify after each fix per Rule 12.
+
+## Phase 5 — Pre-flight checklist for first live session
+- [ ] Sized-down config (1 lot, low notional cap)
+- [ ] Manual kill-switch documented and tested
+- [ ] `kite.positions()` reconciliation step before each session
+- [ ] Alert path (failure → notification) verified end-to-end
+- [ ] Documented rollback-to-paper plan
+
+## Phase 6 — Document deferred items
+- [ ] Anything not fixed → `tasks/live-readiness-deferred.md` with severity,
+  blast-radius, explicit "go-live blocker yes/no"
+
+## Review
+
+All 10 Criticals closed in 9 commits this session (one per Critical, with
+C1+C2 and C10+H11 paired by natural coupling):
+
+| Critical | Commit | One-line |
+|---|---|---|
+| C7 | `58af67a` | runners refuse to start if holidays.csv is stale or partial |
+| C5 | `907fc4b` | flag-file kill switch (HALT_ALL, HALT_NEW_ENTRIES) |
+| C8 | `561feba` | OnFailure=notify-failure@%n on all 12 trading units |
+| C9 | `1b8fb34` | atomic state-file backups + refuse-to-start-on-orphan |
+| C1, C2 | `b9fe452` | MARKET orders, poll order_history, entry-batch reversal |
+| C3 | `1e17712` | kite.positions() reconciliation in live mode |
+| C4 | `cd711c3` | --max-daily-loss-inr → HALT_DAILY_LOSS auto-trip |
+| C10, H11 | `f028329` | exit on held contract (not today's front-month); fail-loud on phantom legs |
+| C6 | `f82451e` | --mode live with triple-lock + circuit-breaker required |
+
+**Test coverage**: pair_trading test suite grew from 46 → 56 tests. All passing.
+10 new tests cover the C1/C2/C10/H11 behaviour (live PENDING/REJECTED paths,
+entry-batch reversal, exit on rolled contract, tradingsymbol reverse-map raises).
+
+**Test outside-the-suite verifications**:
+- C7 assert exercised: year-count check fires on current 6-entry file, horizon check fires near year-end, plausible 12-entry list passes.
+- C5 kill switch exercised: baseline/HALT_NEW_ENTRIES/HALT_ALL all behave per spec; transition log lines fire on flip.
+- C8 notifier exercised: direct invocation produces journal CRITICAL line as expected (external channel paths verifiable via env-vars at deploy).
+- C9 backup helper exercised: archive creates timestamped backup, prune keeps last N, assert raises iff backups exist for missing state.
+- C3 reconcile exercised: paper-only skip, live-match OK, live-mismatch raises, kite.positions() exception raises, unknown broker positions WARN.
+- C4 limit exercised: disabled (0) no-op, under-limit no-op, breach touches flag, idempotent re-check.
+- C6 gates exercised: `--mode live` without env/flag/circuit-breaker each refuses with specific message.
+
+**What's NOT done** (deliberately, with explicit go-live-blocker calls):
+See `tasks/live-readiness-deferred.md`. Top of mind from there:
+- 19 Highs documented (none are go-live blockers for a sized-down first
+  session, but H1/H3/H7 should land within first week of live).
+- Mediums + Lows enumerated for later sweeps.
+
+**Pre-flight checklist** for the first live session lives at
+`deploy/VPS_DEPLOYMENT.md` §7.9.
+
+**Data still to populate**: `holidays.csv` 2026 NSE list. The fail-loud
+guard now refuses to start until populated — operator must supply from the
+NSE "Holidays — Trading" PDF. The WebFetch attempt during this session
+timed out (NSE anti-bot); operator paste is the reliable path.
+
+**Lessons / behaviours worth preserving** — see `tasks/lessons.md` for any
+new entries added this session.
+
+---
 # Persistence-screened pair trading — parallel paper system (2026-05-17)
 
 ## Motivation

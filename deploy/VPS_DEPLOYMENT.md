@@ -454,6 +454,100 @@ sudo systemctl enable  --now taleb-hedger.timer
 
 Then in `config.ini` set `trading_mode = paper` and commit. The live unit files can stay installed — they only matter when their timer is enabled.
 
+### 7.9 Pair-trading first live session — pre-flight checklist
+
+This is the cutover procedure for `pair_trading` (`run_paper_pairs.py` / `pair-paper.service`) — the first live trading deployment in this repo. Goes in parallel with the taleb-hedger cutover in §7.1–7.8.
+
+**Before the first live session, EVERY item must be checked. Tick them off in order; do not skip.**
+
+#### Data and configuration
+
+- [ ] `holidays.csv` has been re-populated from the latest NSE "Holidays — Trading" circular for the current calendar year. Verify by running `.venv/bin/python -c "from run_paper_pairs import load_holidays, assert_holiday_data_fresh, HOLIDAYS_PATH; from datetime import date; import logging; logging.basicConfig(level=logging.INFO); assert_holiday_data_fresh(load_holidays(HOLIDAYS_PATH), date.today(), logging.getLogger())"` — should print no error.
+- [ ] `pair_candidates.csv` is fresh (`stat data_cache/pair_candidates.csv` — mtime within last 3 days). If older, run `screen-pairs.service` manually before continuing.
+- [ ] State file is **either** clean (no `data_cache/pair_paper_state_baseline.json`) **or** the held positions in it are explicitly intended to carry over. If state file is present, **reconcile mentally first** against Kite's positions UI — does the broker actually have these positions?
+- [ ] Backups exist if state is non-empty: `ls data_cache/state_backups/` — should show timestamped JSONs from the last few paper sessions.
+
+#### Live-mode gates (all four required to start)
+
+- [ ] `.env` contains `ALLOW_LIVE_MODE=true` (no quotes).
+- [ ] `--mode live` is on the systemd unit's `ExecStart` (edit `pair-paper.service` or a copy `pair-paper-live.service`).
+- [ ] `--i-understand-this-is-real-money` is also on `ExecStart`.
+- [ ] `--max-daily-loss-inr` is on `ExecStart` with a non-zero value matching your day-1 tolerance (e.g. ₹50,000 for first week).
+
+Verify the gates by running the unit manually first (do NOT wait for the timer): `sudo systemctl start pair-paper.service` then `journalctl -u pair-paper.service -n 50`. Look for the `LIVE TRADING SESSION — REAL MONEY` CRITICAL banner. If you see "Refusing to start", fix the gate it names and retry.
+
+#### Sized-down first session
+
+- [ ] `--top 1` (single pair only — not the production 12) so a blow-up affects one pair.
+- [ ] `--lots-per-leg 1` (lowest possible position size).
+- [ ] `--max-leg-notional 100000` (₹1 lakh per leg — about one lot of any NIFTY-50 STF). The runner will skip pairs whose notional exceeds this; that's the desired behaviour.
+- [ ] Only ONE runner live: disable `pair-paper-persistent.timer` for the cutover week. Two concurrent runners share the Kite session and would double per-symbol concentration.
+
+#### Kill-switch dry-run (mandatory)
+
+Practice each kill-switch path on a paper session before live. With a paper session running:
+
+```bash
+# 1. Flag-file halt (gentlest)
+touch data_cache/HALT_NEW_ENTRIES
+sleep 70  # wait one tick
+journalctl -u pair-paper.service -n 5 | grep "Entries suspended"  # should match
+rm data_cache/HALT_NEW_ENTRIES
+
+# 2. Daily-loss auto-halt (simulated): manually touch the flag, verify
+touch data_cache/HALT_DAILY_LOSS
+sleep 70
+journalctl -u pair-paper.service -n 5 | grep HALT_DAILY_LOSS
+rm data_cache/HALT_DAILY_LOSS
+
+# 3. Notify-failure smoke test (covered in §3.1)
+sudo /opt/taleb-karpathy-kite/deploy/notify-failure.sh pair-paper.service
+journalctl -t taleb-notify -n 1
+```
+
+If any of those don't produce the expected output: **do not go live**. Investigate first.
+
+#### Alerting
+
+- [ ] Either `HC_PING_URL_FAIL` OR `TELEGRAM_BOT_TOKEN`+`TELEGRAM_CHAT_ID` is set in `.env` (or both). Without one of these, failure alerts only land in the journal.
+- [ ] Confirmed receipt: trigger a failure (`sudo systemctl start <a-broken-unit>` or run the notifier script directly with a fake unit name) and verify the alert lands on your phone/wherever.
+
+#### Reconciliation will run
+
+`reconcile_with_broker` only fires when `mode == "live"`. On the first live session start, the runner will call `kite.positions()` and refuse to start if any held leg doesn't match broker reality. This is correct — but it also means:
+
+- [ ] If the state file shows open positions from prior paper sessions, **they will NOT match the broker** (which is empty for a first-live operator). You must either delete the state file (and acknowledge backups via `mv data_cache/state_backups data_cache/state_backups.archived`) OR manually populate state to match an empty book.
+
+The cleanest start: pre-cutover, force-flatten the paper session (`--force-flatten-on-exit` on the last paper run), delete the resulting state file (it'll be empty anyway), archive backups, then start fresh in live.
+
+#### During the first session
+
+Watch the journal live:
+
+```bash
+journalctl -fu pair-paper.service
+```
+
+Expect to see:
+1. `LIVE TRADING SESSION — REAL MONEY` banner
+2. `Broker reconciliation OK: ... position(s) match` (or 0 if starting clean)
+3. Tick-loop log lines every 60s (price quotes, z-scores, no entries until z crosses 2.0)
+4. If an entry fires: `[PAPER]` should NOT appear; `place_order` log line should; `_apply_fill` should follow with the actual `average_price` returned from polling.
+
+If anything looks wrong, **touch `data_cache/HALT_NEW_ENTRIES`** immediately. Investigate. If still wrong, `touch data_cache/HALT_ALL` to freeze everything, then square off on Kite's web UI.
+
+#### Rollback to paper
+
+```bash
+# Edit the unit's ExecStart back to --mode paper (or comment out the live unit)
+sudo systemctl edit pair-paper.service     # or revert your override
+sudo systemctl daemon-reload
+sudo systemctl restart pair-paper.service
+# Optionally unset ALLOW_LIVE_MODE in .env so a stray --mode live also refuses.
+```
+
+If positions are open on the broker, they'll persist regardless of the runner's mode. The paper runner will see them in `state.legs` only if state was preserved — otherwise square off manually on Kite first.
+
 ---
 
 ## 8. Troubleshooting
