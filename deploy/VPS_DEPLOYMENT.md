@@ -378,7 +378,21 @@ Plan to be at the keyboard 09:10–10:00 IST every day of the first live week.
 
 ### 7.7 Kill switch
 
-Three escalation levels, in order:
+Four escalation levels, gentlest first:
+
+0. **Flag-file halt (pair_trading only)** — atomic, no service restart, granular control over entries vs exits. Effective at the next tick (≤ 60 s):
+   ```bash
+   # stop adding new positions; existing pairs continue to exit normally
+   touch data_cache/HALT_NEW_ENTRIES
+
+   # freeze the book entirely — no entries AND no exits (positions stuck
+   # until cleared; use only if you need to pause exits too, rare)
+   touch data_cache/HALT_ALL
+
+   # resume normal operation
+   rm -f data_cache/HALT_NEW_ENTRIES data_cache/HALT_ALL
+   ```
+   Both `pair-paper.service` and `pair-paper-persistent.service` (and the live cutover unit) check these flags every tick and emit a CRITICAL/WARNING log line on transitions — `journalctl -fu pair-paper.service` confirms the flag took effect. Both runners share `data_cache/`, so either flag halts both simultaneously. **Does not affect `taleb-hedger`** — that strategy uses the systemd path below.
 
 1. **Soft halt — stop the timer; let the current session finish naturally.** The 15:25 flatten still runs, EOD report writes:
    ```bash

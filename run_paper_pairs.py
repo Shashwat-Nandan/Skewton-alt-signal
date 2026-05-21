@@ -50,6 +50,15 @@ LOG_DIR = HERE / "logs"
 DATA_CACHE = HERE / "data_cache"
 CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
 
+# Kill-switch flag files (operator-managed). HALT_ALL freezes the book
+# (no entries, no exits — use sparingly, positions cannot exit while set).
+# HALT_NEW_ENTRIES stops adding to the book; existing positions exit
+# normally via stop / mean-revert / max-hold. To halt: `touch <path>`.
+# To resume: `rm <path>`. Both runners (baseline + persistent) share
+# data_cache, so either flag halts both simultaneously.
+HALT_ALL_PATH = DATA_CACHE / "HALT_ALL"
+HALT_NEW_ENTRIES_PATH = DATA_CACHE / "HALT_NEW_ENTRIES"
+
 
 def ensure_pair_config(orig_path: str, cli_max_leg_notional: float, log: logging.Logger) -> str:
     """PairTradingStrategy.__init__ refuses to construct in paper mode without
@@ -427,15 +436,48 @@ def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: log
     return instances
 
 
-def tick_one(strategy, log: logging.Logger):
-    """One pair's iteration. Failures logged but do not kill the loop."""
+class _HaltState:
+    # Tracks halt-flag state across ticks so transitions are logged once.
+    # Kill switch hierarchy: HALT_ALL implies HALT_NEW_ENTRIES.
+    def __init__(self):
+        self.halt_all = False
+        self.halt_new = False
+
+    def refresh(self, log: logging.Logger) -> None:
+        prev_all, prev_new = self.halt_all, self.halt_new
+        self.halt_all = HALT_ALL_PATH.exists()
+        self.halt_new = self.halt_all or HALT_NEW_ENTRIES_PATH.exists()
+        if self.halt_all and not prev_all:
+            log.critical("KILL SWITCH: HALT_ALL flag present (%s) — all "
+                         "entries AND exits suspended. Positions frozen "
+                         "until flag is removed.", HALT_ALL_PATH)
+        elif prev_all and not self.halt_all:
+            log.warning("HALT_ALL flag cleared — resuming normal tick loop")
+        if self.halt_new and not prev_new and not self.halt_all:
+            log.warning("HALT_NEW_ENTRIES flag present (%s) — entries "
+                        "suspended; exits and rehedges continue normally",
+                        HALT_NEW_ENTRIES_PATH)
+        elif prev_new and not self.halt_new:
+            log.warning("HALT_NEW_ENTRIES flag cleared — resuming entries")
+
+
+def tick_one(strategy, log: logging.Logger,
+             halt_all: bool = False, halt_new_entries: bool = False):
+    """One pair's iteration. Failures logged but do not kill the loop.
+
+    HALT_ALL skips both entries and exit/rehedge checks (book frozen).
+    HALT_NEW_ENTRIES skips only entries; exits/rehedges continue."""
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
-    try:
-        proposals = strategy.scan_and_propose()
-        if proposals:
-            strategy.execute_proposals(proposals)
-    except Exception as e:
-        log.exception("[%s] scan_and_propose failed: %s", pair_label, e)
+    if halt_all:
+        return
+
+    if not halt_new_entries:
+        try:
+            proposals = strategy.scan_and_propose()
+            if proposals:
+                strategy.execute_proposals(proposals)
+        except Exception as e:
+            log.exception("[%s] scan_and_propose failed: %s", pair_label, e)
 
     try:
         rehedge = strategy.check_and_rehedge()
@@ -759,10 +801,14 @@ def main():
     log.info("Entering tick loop (every %ds until %s) over %d pair(s)",
              TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
 
+    halt_state = _HaltState()
     try:
         while datetime.now() < session_end_ts:
+            halt_state.refresh(log)
             for s in strategies:
-                tick_one(s, log)
+                tick_one(s, log,
+                         halt_all=halt_state.halt_all,
+                         halt_new_entries=halt_state.halt_new)
             remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
 
