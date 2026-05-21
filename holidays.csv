@@ -5,20 +5,25 @@
 # Source of truth: the official NSE circular "Holidays — Trading" for the
 # calendar year (nseindia.com > Resources > Exchange Communication > Holidays).
 # You MUST verify this list against the NSE circular before each year begins —
-# lunar-calendar holidays (Holi, Ram Navami, Id-ul-Fitr, Bakri Id, Muharram,
-# Diwali-Laxmi Pujan, Diwali-Balipratipada, Guru Nanak Jayanti) shift annually.
-# Weekends are auto-excluded by run_paper.py; do not list them here.
+# lunar-calendar holidays (Holi, Ram Navami, Mahavir Jayanti, Bakri Id,
+# Muharram, Ganesh Chaturthi, Dussehra, Diwali, Guru Nanak Jayanti) shift
+# annually. Weekends are auto-excluded; do not list them here. Diwali-Laxmi
+# Pujan is the muhurat trading session (special evening), not a full holiday.
 #
-# --- 2026 entries below (VERIFY AGAINST NSE CIRCULAR) ---
+# --- 2026 entries (operator-confirmed from NSE circular, 2026-05-21) ---
+2026-01-15,Municipal Corporation Election - Maharashtra
 2026-01-26,Republic Day
+2026-03-03,Holi
+2026-03-26,Shri Ram Navami
+2026-03-31,Shri Mahavir Jayanti
 2026-04-03,Good Friday
-2026-04-14,Dr. Ambedkar Jayanti
+2026-04-14,Dr. Baba Saheb Ambedkar Jayanti
 2026-05-01,Maharashtra Day
-2026-10-02,Gandhi Jayanti
+2026-05-28,Bakri Id
+2026-06-26,Muharram
+2026-09-14,Ganesh Chaturthi
+2026-10-02,Mahatma Gandhi Jayanti
+2026-10-20,Dussehra
+2026-11-10,Diwali-Balipratipada
+2026-11-24,Prakash Gurpurb Sri Guru Nanak Dev
 2026-12-25,Christmas
-#
-# TODO — fill in the lunar/variable holidays from the NSE circular:
-#   Mahashivratri, Holi, Ram Navami, Id-ul-Fitr, Bakri Id,
-#   Muharram, Ganesh Chaturthi, Dussehra, Diwali-Laxmi Pujan,
-#   Diwali-Balipratipada, Guru Nanak Jayanti, and any special trading
-#   sessions (muhurat) or mid-year additions.
