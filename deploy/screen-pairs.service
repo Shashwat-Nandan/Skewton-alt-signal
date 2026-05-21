@@ -15,8 +15,11 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 ExecStart=/opt/taleb-karpathy-kite/deploy/run_weekly_pair_screen.sh
 # -------------------------------
 
-# bhavcopy fetch ~3 min for 60 days; screen ~1 min. 15 min ceiling is generous.
-TimeoutStartSec=15min
+# bhavcopy fetch dominates (39 trading days × NSE rate-limited downloads ≈
+# 10-14 min on a slow afternoon); daily screen ~1 min; persistent screen
+# 9 windows × ~5s ≈ 1 min. 15 min was too tight — 2026-05-21 hit timeout
+# mid persistent-screen W1. 45 min gives comfortable headroom.
+TimeoutStartSec=45min
 StandardOutput=journal
 StandardError=journal
 
