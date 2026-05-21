@@ -100,9 +100,12 @@ sudo cp deploy/taleb-autoresearch.service /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.timer   /etc/systemd/system/
 sudo cp deploy/fetch-bars.service         /etc/systemd/system/
 sudo cp deploy/fetch-bars.timer           /etc/systemd/system/
+sudo cp deploy/notify-failure@.service    /etc/systemd/system/
 
 sudo systemctl daemon-reload
 ```
+
+`notify-failure@.service` is a template (note the `@`) wired in via `OnFailure=` on every other unit; it is invoked automatically when any unit fails — do not `systemctl enable` it. See §3.1 for how to point it at an alerting channel.
 
 Each `.service` file hardcodes `User=taleb` and `WorkingDirectory=/opt/taleb-karpathy-kite`. **Edit them in `/etc/systemd/system/` (or the originals before copying) if your VPS differs.**
 
@@ -131,6 +134,38 @@ systemctl list-timers 'taleb-*.timer' 'fetch-bars.timer'
 You should see three rows with `NEXT` columns at the next 09:10 IST (hedger), the next 16:30 IST (bars update), and the next Saturday 10:00 IST (autoresearch).
 
 The `fetch-bars` timer requires `bars_universe` to already be populated — see [section 11](#11-market-profile-bars-ingestion) for the one-time backfill.
+
+### 3.1 Failure alerts (`notify-failure`)
+
+Every trading `.service` carries `OnFailure=notify-failure@%n.service`. When the unit fails, systemd spawns an instance of the notifier template, which runs `deploy/notify-failure.sh`. The script:
+
+1. **Always** writes a CRITICAL line to the journal tagged `taleb-notify`. Query with:
+   ```bash
+   journalctl -t taleb-notify --since today
+   ```
+   This is the floor — even with no external channel configured, failures are surfaced here.
+
+2. **Optionally** pings external channels if the matching env vars are set in `.env` (loaded by `notify-failure@.service` via `EnvironmentFile=-`):
+
+   | Channel | Env var(s) | Setup |
+   |---|---|---|
+   | healthchecks.io | `HC_PING_URL_FAIL` | Create a check at healthchecks.io; copy the `/fail` endpoint URL (e.g. `https://hc-ping.com/<uuid>/fail`) |
+   | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Create a bot via @BotFather; send it a message; read your chat_id from `https://api.telegram.org/bot<TOKEN>/getUpdates` |
+
+   Both channels are independent — set one, both, or neither. A failed external ping logs a `user.err` line to the journal but does not propagate.
+
+**Smoke-test the notifier** before relying on it — pick any non-critical unit (e.g. `fetch-bars.service`) and force a failure:
+
+```bash
+# Inject a deliberate failure
+sudo systemctl set-environment FAIL_TEST=1
+sudo -u root /bin/false   # placeholder — adapt to your test path
+# Or, simpler: stop the unit, then run the notifier manually:
+sudo /opt/taleb-karpathy-kite/deploy/notify-failure.sh fetch-bars.service
+journalctl -t taleb-notify -n 5
+```
+
+The journal line and (if configured) the external ping should fire within 10 seconds. **If the operator setup ever changes, re-run this smoke-test** — silent notifier failures are the worst-case scenario.
 
 ---
 

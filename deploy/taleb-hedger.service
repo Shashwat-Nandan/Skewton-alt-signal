@@ -3,6 +3,7 @@ Description=Taleb Dynamic Hedger — paper trading session
 Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
+OnFailure=notify-failure@%n.service
 
 [Service]
 Type=oneshot

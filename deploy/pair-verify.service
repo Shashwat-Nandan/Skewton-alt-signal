@@ -2,6 +2,7 @@
 Description=Pair-Trading EOD verifier — paper P&L vs trailing backtest
 Wants=network-online.target
 After=network-online.target
+OnFailure=notify-failure@%n.service
 
 [Service]
 Type=oneshot

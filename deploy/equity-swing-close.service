@@ -3,6 +3,7 @@ Description=Equity Swing — post-close scan (full feature compute, entries + ex
 Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
+OnFailure=notify-failure@%n.service
 # Sequence after fetch-bars (Kite 30-min) and after the operator's
 # bhavcopy + FII/DII fetchers if present. Soft dependency: we don't
 # require these units to exist, but if they're enabled and running,

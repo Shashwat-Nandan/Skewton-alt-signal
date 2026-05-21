@@ -3,6 +3,7 @@ Description=Tick Capture — KiteTicker WebSocket for trigger-fair-value researc
 Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
+OnFailure=notify-failure@%n.service
 
 [Service]
 Type=oneshot

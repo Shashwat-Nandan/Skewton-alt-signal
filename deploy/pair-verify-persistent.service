@@ -2,6 +2,7 @@
 Description=Pair-Trading EOD verifier — persistent system (parallel to pair-verify.service)
 Wants=network-online.target
 After=network-online.target
+OnFailure=notify-failure@%n.service
 
 [Service]
 Type=oneshot
