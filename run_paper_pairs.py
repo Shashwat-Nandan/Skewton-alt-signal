@@ -60,6 +60,9 @@ CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
 # data_cache, so either flag halts both simultaneously.
 HALT_ALL_PATH = DATA_CACHE / "HALT_ALL"
 HALT_NEW_ENTRIES_PATH = DATA_CACHE / "HALT_NEW_ENTRIES"
+# Runner-set when --max-daily-loss-inr is breached. Persists across
+# session restarts; operator must `rm` to acknowledge and resume.
+HALT_DAILY_LOSS_PATH = DATA_CACHE / "HALT_DAILY_LOSS"
 
 
 def ensure_pair_config(orig_path: str, cli_max_leg_notional: float, log: logging.Logger) -> str:
@@ -448,7 +451,10 @@ class _HaltState:
     def refresh(self, log: logging.Logger) -> None:
         prev_all, prev_new = self.halt_all, self.halt_new
         self.halt_all = HALT_ALL_PATH.exists()
-        self.halt_new = self.halt_all or HALT_NEW_ENTRIES_PATH.exists()
+        halt_loss = HALT_DAILY_LOSS_PATH.exists()
+        self.halt_new = (self.halt_all
+                         or HALT_NEW_ENTRIES_PATH.exists()
+                         or halt_loss)
         if self.halt_all and not prev_all:
             log.critical("KILL SWITCH: HALT_ALL flag present (%s) — all "
                          "entries AND exits suspended. Positions frozen "
@@ -456,11 +462,15 @@ class _HaltState:
         elif prev_all and not self.halt_all:
             log.warning("HALT_ALL flag cleared — resuming normal tick loop")
         if self.halt_new and not prev_new and not self.halt_all:
-            log.warning("HALT_NEW_ENTRIES flag present (%s) — entries "
-                        "suspended; exits and rehedges continue normally",
-                        HALT_NEW_ENTRIES_PATH)
+            sources = []
+            if HALT_NEW_ENTRIES_PATH.exists():
+                sources.append("HALT_NEW_ENTRIES")
+            if halt_loss:
+                sources.append("HALT_DAILY_LOSS")
+            log.warning("Entries suspended (flags: %s); exits and rehedges "
+                        "continue normally", "+".join(sources))
         elif prev_new and not self.halt_new:
-            log.warning("HALT_NEW_ENTRIES flag cleared — resuming entries")
+            log.warning("Entry-halt flags cleared — resuming entries")
 
 
 def tick_one(strategy, log: logging.Logger,
@@ -487,6 +497,43 @@ def tick_one(strategy, log: logging.Logger,
             strategy.execute_proposals(rehedge)
     except Exception as e:
         log.exception("[%s] check_and_rehedge failed: %s", pair_label, e)
+
+
+def check_daily_loss_limit(strategies, limit_inr: float,
+                            log: logging.Logger) -> None:
+    # Aggregates session ΔP&L across all in-flight strategies (matched +
+    # orphans). On breach, touches HALT_DAILY_LOSS — caught by _HaltState
+    # next tick → entries suspended, exits continue, persists across
+    # restart so the operator must explicitly acknowledge before resuming.
+    if limit_inr <= 0:
+        return
+    if HALT_DAILY_LOSS_PATH.exists():
+        return
+    session_delta = 0.0
+    for s in strategies:
+        try:
+            session_delta += (
+                (s.state.realized_pnl + s.state.unrealized_pnl)
+                - (s._session_start_realized + s._session_start_unrealized)
+            )
+        except AttributeError:
+            # Defensively skip strategies missing baseline (shouldn't
+            # happen post-init, but a half-built orphan could trip this).
+            continue
+    if session_delta <= -limit_inr:
+        log.critical(
+            "DAILY LOSS LIMIT BREACHED: session ΔP&L = ₹%.0f vs limit "
+            "₹%.0f. Touching %s — entries suspended; existing positions "
+            "continue to exit. Operator: `rm %s` to acknowledge and "
+            "resume entries.",
+            session_delta, -limit_inr, HALT_DAILY_LOSS_PATH,
+            HALT_DAILY_LOSS_PATH,
+        )
+        try:
+            HALT_DAILY_LOSS_PATH.touch()
+        except Exception as e:
+            log.exception("Failed to write %s: %s",
+                          HALT_DAILY_LOSS_PATH, e)
 
 
 def flatten_one(strategy, log: logging.Logger, reason: str = "EOD_CLOSE"):
@@ -816,6 +863,15 @@ def main():
                              "across sessions and exit only on strategy "
                              "triggers (mean-revert, stop, max-hold) or "
                              "contract expiry.")
+    parser.add_argument("--max-daily-loss-inr", type=float, default=50_000.0,
+                        help="Aggregate session ΔP&L floor (₹). When the "
+                             "session loss across all in-flight strategies "
+                             "exceeds this, the runner touches "
+                             "data_cache/HALT_DAILY_LOSS — entries suspend, "
+                             "exits continue. Persists across restarts so "
+                             "the operator must `rm` the flag to resume. "
+                             "0 disables the check (NOT recommended for "
+                             "live). Default: 50000.")
     args = parser.parse_args()
 
     load_dotenv(HERE / ".env")
@@ -883,6 +939,9 @@ def main():
              TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
 
     halt_state = _HaltState()
+    if args.max_daily_loss_inr <= 0:
+        log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
+                    "circuit breaker for runaway losses this session")
     try:
         while datetime.now() < session_end_ts:
             halt_state.refresh(log)
@@ -890,6 +949,7 @@ def main():
                 tick_one(s, log,
                          halt_all=halt_state.halt_all,
                          halt_new_entries=halt_state.halt_new)
+            check_daily_loss_limit(strategies, args.max_daily_loss_inr, log)
             remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
 

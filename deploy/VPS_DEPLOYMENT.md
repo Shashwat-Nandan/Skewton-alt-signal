@@ -429,6 +429,8 @@ Four escalation levels, gentlest first:
    ```
    Both `pair-paper.service` and `pair-paper-persistent.service` (and the live cutover unit) check these flags every tick and emit a CRITICAL/WARNING log line on transitions — `journalctl -fu pair-paper.service` confirms the flag took effect. Both runners share `data_cache/`, so either flag halts both simultaneously. **Does not affect `taleb-hedger`** — that strategy uses the systemd path below.
 
+   A third file — `data_cache/HALT_DAILY_LOSS` — is touched **automatically** by the runner when the cumulative session ΔP&L breaches `--max-daily-loss-inr` (default ₹50,000). It has the same effect as `HALT_NEW_ENTRIES` (entries stop, exits continue) and persists across restarts so a session-end ≠ acknowledgement. Operator clears with `rm data_cache/HALT_DAILY_LOSS` after reviewing the journal for the breach details.
+
 1. **Soft halt — stop the timer; let the current session finish naturally.** The 15:25 flatten still runs, EOD report writes:
    ```bash
    sudo systemctl stop taleb-hedger-live.timer
