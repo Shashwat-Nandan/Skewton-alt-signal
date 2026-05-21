@@ -33,6 +33,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from _state_backup import archive_state_backup, assert_no_orphan_backups
+
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = str(HERE / "config.ini")
@@ -169,13 +171,18 @@ def load_prior_state(log: logging.Logger) -> Optional[dict]:
     """Return the parsed state-file payload, or None if no file / corrupt.
     Corrupt-JSON safe: missing/bad file falls through to fresh-start so
     a one-time crash can't orphan every position."""
-    if not STATE_FILE.exists():
+    if not STATE_FILE.exists() or STATE_FILE.stat().st_size == 0:
+        # Refuse to silently start fresh if backups exist — broker may
+        # still hold positions from the last backup.
+        assert_no_orphan_backups(STATE_FILE, log)
         log.info("No prior state file at %s — starting fresh.", STATE_FILE.name)
         return None
     try:
         return json.loads(STATE_FILE.read_text())
     except Exception as e:
-        log.exception("Failed to parse %s: %s — starting fresh.", STATE_FILE.name, e)
+        log.exception("Failed to parse %s: %s.", STATE_FILE.name, e)
+        assert_no_orphan_backups(STATE_FILE, log)
+        log.info("No backups present — starting fresh.")
         return None
 
 
@@ -215,6 +222,7 @@ def write_state_file(hedger, log: logging.Logger):
     os.replace(tmp, STATE_FILE)
     log.info("State persisted: %s (%d position(s), futures_lots=%d)",
              STATE_FILE.name, len(hedger.state.positions), hedger.state.futures_lots)
+    archive_state_backup(STATE_FILE, log)
 
 
 def end_of_session(hedger, today: date, args, log: logging.Logger):

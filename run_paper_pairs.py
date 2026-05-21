@@ -42,6 +42,8 @@ from typing import Dict, List
 import pandas as pd
 from dotenv import load_dotenv
 
+from _state_backup import archive_state_backup, assert_no_orphan_backups
+
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = str(HERE / "config.ini")
@@ -530,14 +532,18 @@ def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
     """Return {pair_key → blob} from the prior session's state file, or {}
     if no file exists. pair_key is 'A/B' (matches strategy serialise format)."""
     path = state_file_path(system)
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
+        # Refuse to silently start fresh if backups exist — broker may
+        # still hold positions from the last backup.
+        assert_no_orphan_backups(path, log)
         log.info("No prior state file at %s — starting fresh.", path)
         return {}
     try:
         payload = json.loads(path.read_text())
     except Exception as e:
-        log.exception("Failed to parse state file %s: %s — starting fresh.",
-                      path, e)
+        log.exception("Failed to parse state file %s: %s.", path, e)
+        assert_no_orphan_backups(path, log)
+        log.info("No backups present — starting fresh.")
         return {}
     out: Dict[str, Dict] = {}
     for blob in payload.get("pairs", []):
@@ -573,6 +579,7 @@ def write_state_file(strategies, system: str, log: logging.Logger):
     tmp.write_text(json.dumps(payload, default=str, indent=2))
     os.replace(tmp, path)
     log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
+    archive_state_backup(path, log)
 
 
 def restore_matching_strategies(
