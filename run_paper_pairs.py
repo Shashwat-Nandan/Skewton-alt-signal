@@ -407,7 +407,7 @@ def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: log
             s = PairTradingStrategy(
                 kite=kite,
                 config_path=config_path,
-                mode="paper",
+                mode=args.mode,
                 symbol_a=a,
                 symbol_b=b,
                 hedge_ratio=beta,
@@ -698,7 +698,7 @@ def build_orphan_strategies(
             sa, sb = pair[0], pair[1]
             saved_beta = float(blob["hedge_ratio"])
             s = PairTradingStrategy(
-                kite=kite, config_path=config_path, mode="paper",
+                kite=kite, config_path=config_path, mode=args.mode,
                 symbol_a=sa, symbol_b=sb, hedge_ratio=saved_beta,
             )
             s.entry_z = args.entry_z
@@ -872,6 +872,19 @@ def main():
                              "the operator must `rm` the flag to resume. "
                              "0 disables the check (NOT recommended for "
                              "live). Default: 50000.")
+    parser.add_argument("--mode", choices=["paper", "live", "signals"],
+                        default="paper",
+                        help="Execution mode. paper (default): mock fills, "
+                             "no real orders. live: real money via Kite — "
+                             "requires ALLOW_LIVE_MODE=true in .env AND "
+                             "--i-understand-this-is-real-money AND "
+                             "--max-daily-loss-inr > 0. signals: emit "
+                             "JSONL signals only, no fills.")
+    parser.add_argument("--i-understand-this-is-real-money",
+                        dest="i_understand", action="store_true",
+                        help="Required confirmation flag for --mode live. "
+                             "Doubles as a typo-tripwire so a refactor "
+                             "can't accidentally flip the runner to live.")
     args = parser.parse_args()
 
     load_dotenv(HERE / ".env")
@@ -879,6 +892,35 @@ def main():
 
     today = datetime.now().date()
     log = setup_logging(today, args.system)
+
+    # Live-mode safety gate. Three independent locks so a refactor or
+    # typo can't push real money into the market:
+    #   (1) --mode live CLI flag (default paper)
+    #   (2) ALLOW_LIVE_MODE=true env var (mirrors backend/settings.py)
+    #   (3) --i-understand-this-is-real-money CLI confirmation flag
+    # Plus the circuit-breaker must be armed (--max-daily-loss-inr > 0).
+    if args.mode == "live":
+        env_allow = os.environ.get("ALLOW_LIVE_MODE", "").strip().lower()
+        if env_allow != "true":
+            raise RuntimeError(
+                "--mode live requires ALLOW_LIVE_MODE=true in the "
+                "environment (set in .env). Refusing to start. "
+                f"Current value: {env_allow!r}"
+            )
+        if not args.i_understand:
+            raise RuntimeError(
+                "--mode live requires the --i-understand-this-is-real-money "
+                "confirmation flag. Refusing to start."
+            )
+        if args.max_daily_loss_inr <= 0:
+            raise RuntimeError(
+                "--mode live requires --max-daily-loss-inr > 0 (circuit "
+                "breaker). Refusing to start."
+            )
+        log.critical("=" * 60)
+        log.critical("LIVE TRADING SESSION — REAL MONEY [system=%s]",
+                     args.system)
+        log.critical("=" * 60)
 
     holidays = load_holidays(HOLIDAYS_PATH)
     assert_holiday_data_fresh(holidays, today, log)
@@ -888,7 +930,8 @@ def main():
         return 0
 
     log.info("=" * 60)
-    log.info("PAIR-TRADING PAPER SESSION — %s [system=%s]", today, args.system)
+    log.info("PAIR-TRADING %s SESSION — %s [system=%s]",
+             args.mode.upper(), today, args.system)
     log.info("Candidates: %s", args.candidates)
     log.info("=" * 60)
 
