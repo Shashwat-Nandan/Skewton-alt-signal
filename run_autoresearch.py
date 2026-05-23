@@ -85,8 +85,11 @@ def main():
     parser.add_argument("--experiments", type=int, default=50,
                         help="Number of experiments to run (default: 50)")
     parser.add_argument("--metric", type=str, default="sharpe_ratio",
-                        choices=["sharpe_ratio", "net_pnl", "calmar_ratio", "sortino_ratio"],
-                        help="Primary metric to optimize (default: sharpe_ratio)")
+                        choices=["sharpe_ratio", "net_pnl", "calmar_ratio",
+                                 "sortino_ratio", "gamma_theta_ratio"],
+                        help="Primary metric to optimize (default: sharpe_ratio). "
+                             "gamma_theta_ratio is the Phase 2.4 Taleb-framework "
+                             "efficiency metric (realized scalp / realized theta).")
     parser.add_argument("--eval-cycles", type=int, default=3,
                         help="Backtest replays per experiment (default: 3)")
     parser.add_argument("--days", type=int, default=5,
@@ -184,65 +187,79 @@ def main():
             except Exception as e:
                 logger.warning("Pre-screen holdout backtest failed: %s — proceeding", e)
 
-    # Patch _run_experiment to use historical or synthetic data
-    def patched_run(params):
-        import copy as cp
-        original_params = cp.deepcopy(loop.hedger.tunable_params)
-        loop.hedger.tunable_params = cp.deepcopy(params)
-        cycle_metrics = []
+    # When --data is not provided AND captured tape sessions exist,
+    # use autoresearch_loop._run_experiment as-is — it prefers
+    # captured tape over synthetic (Phase 2.3) and applies the
+    # variance penalty (Phase 2.4) on cycle-averaged metrics. The
+    # monkey-patch below was written before those landed and only
+    # handles historical CSV / synthetic GBM; skipping it lets the
+    # captured-tape path run.
+    from backtest import list_captured_sessions
+    if args.data is None and list_captured_sessions(args.underlying):
+        logger.info(
+            "No --data flag; using captured-tape replay path "
+            "(autoresearch_loop._run_experiment Phase 2.3)."
+        )
+    else:
+        # Patch _run_experiment to use historical or synthetic data
+        def patched_run(params):
+            import copy as cp
+            original_params = cp.deepcopy(loop.hedger.tunable_params)
+            loop.hedger.tunable_params = cp.deepcopy(params)
+            cycle_metrics = []
 
-        if historical_windows:
-            # Historical mode: sample random windows for each cycle
-            for cycle in range(loop.eval_cycles):
-                try:
-                    window = historical_windows[
-                        np.random.randint(0, len(historical_windows))
-                    ]
-                    results = run_backtest(
-                        window, underlying=args.underlying, tunable_params=params
-                    )
-                    m = results["metrics"]
-                    if m.get("total_trades", 0) == 0:
-                        logger.debug("  Cycle %d: 0 trades — penalty %.0f",
-                                     cycle + 1, ZERO_TRADE_PENALTY)
-                        m = {**m, loop.primary_metric: ZERO_TRADE_PENALTY}
-                    cycle_metrics.append(m)
-                except Exception as e:
-                    logger.warning("Cycle %d failed: %s", cycle + 1, e)
-                    return -999999.0
-        else:
-            # Synthetic mode: generate fresh data per cycle
-            for cycle in range(loop.eval_cycles):
-                try:
-                    data = generate_synthetic_data(
-                        underlying=args.underlying, days=args.days, ticks_per_day=12
-                    )
-                    results = run_backtest(
-                        data, underlying=args.underlying, tunable_params=params
-                    )
-                    m = results["metrics"]
-                    if m.get("total_trades", 0) == 0:
-                        logger.debug("  Cycle %d: 0 trades — penalty %.0f",
-                                     cycle + 1, ZERO_TRADE_PENALTY)
-                        m = {**m, loop.primary_metric: ZERO_TRADE_PENALTY}
-                    cycle_metrics.append(m)
-                except Exception as e:
-                    logger.warning("Cycle %d failed: %s", cycle + 1, e)
-                    return -999999.0
+            if historical_windows:
+                # Historical mode: sample random windows for each cycle
+                for cycle in range(loop.eval_cycles):
+                    try:
+                        window = historical_windows[
+                            np.random.randint(0, len(historical_windows))
+                        ]
+                        results = run_backtest(
+                            window, underlying=args.underlying, tunable_params=params
+                        )
+                        m = results["metrics"]
+                        if m.get("total_trades", 0) == 0:
+                            logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                         cycle + 1, ZERO_TRADE_PENALTY)
+                            m = {**m, loop.primary_metric: ZERO_TRADE_PENALTY}
+                        cycle_metrics.append(m)
+                    except Exception as e:
+                        logger.warning("Cycle %d failed: %s", cycle + 1, e)
+                        return -999999.0
+            else:
+                # Synthetic mode: generate fresh data per cycle
+                for cycle in range(loop.eval_cycles):
+                    try:
+                        data = generate_synthetic_data(
+                            underlying=args.underlying, days=args.days, ticks_per_day=12
+                        )
+                        results = run_backtest(
+                            data, underlying=args.underlying, tunable_params=params
+                        )
+                        m = results["metrics"]
+                        if m.get("total_trades", 0) == 0:
+                            logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                         cycle + 1, ZERO_TRADE_PENALTY)
+                            m = {**m, loop.primary_metric: ZERO_TRADE_PENALTY}
+                        cycle_metrics.append(m)
+                    except Exception as e:
+                        logger.warning("Cycle %d failed: %s", cycle + 1, e)
+                        return -999999.0
 
-        loop.hedger.tunable_params = original_params
-        if not cycle_metrics:
-            return -999999.0
-        values = [m.get(loop.primary_metric, 0) for m in cycle_metrics]
-        avg = np.mean(values)
-        total_capital = loop.hedger.immutable_params.get("total_capital", 500000)
-        max_dd = max(m.get("max_drawdown", 0) for m in cycle_metrics)
-        max_dd_pct = (max_dd / total_capital) * 100 if total_capital > 0 else 0
-        if max_dd_pct > loop.max_dd_threshold:
-            logger.info("  DD %.2f%% exceeds threshold — penalizing", max_dd_pct)
-            avg = -999999.0
-        return avg
-    loop._run_experiment = patched_run
+            loop.hedger.tunable_params = original_params
+            if not cycle_metrics:
+                return -999999.0
+            values = [m.get(loop.primary_metric, 0) for m in cycle_metrics]
+            avg = np.mean(values)
+            total_capital = loop.hedger.immutable_params.get("total_capital", 500000)
+            max_dd = max(m.get("max_drawdown", 0) for m in cycle_metrics)
+            max_dd_pct = (max_dd / total_capital) * 100 if total_capital > 0 else 0
+            if max_dd_pct > loop.max_dd_threshold:
+                logger.info("  DD %.2f%% exceeds threshold — penalizing", max_dd_pct)
+                avg = -999999.0
+            return avg
+        loop._run_experiment = patched_run
 
     # ── Run ──
     data_desc = f"historical ({args.data})" if args.data else f"synthetic ({args.days} days)"

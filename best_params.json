@@ -1,8 +1,8 @@
 {
   "best_params": {
-    "rehedge_delta_threshold": 0.5345,
+    "rehedge_delta_threshold": 0.6454,
     "gamma_scalp_band_pct": 1.5,
-    "position_size_pct": 7.7378,
+    "position_size_pct": 12.9409,
     "vega_limit": 4000.0,
     "max_holding_period_hours": 22.0,
     "entry_iv_percentile_min": 10.0,
@@ -11,17 +11,22 @@
     "mc_worst_path_loss_pct": 3.0,
     "cost_hurdle_factor": 2.5288,
     "min_rv_iv_ratio": 1.222,
-    "rv_window_days": 5.0
+    "rv_window_days": 6.5847,
+    "skew_pct_max": 80.0,
+    "enable_regime_dispatch": true,
+    "max_layered_structures": 2,
+    "t0_band_factor": 0.5
   },
   "best_metric": {
-    "net_pnl": 4364.783062685003
+    "net_pnl": -1954.0001849500381
   },
   "total_experiments": 30,
-  "timestamp": "2026-05-08T06:00:15.729015",
+  "timestamp": "2026-05-23T15:36:49.136867",
+  "_seed_note": "Seeded with Phase 3 flags enabled (regime_dispatch=true, layered=2, t0=0.5) so the autoresearch hill-climber explores the regime-routed structure space rather than tying at 0.0 across the legacy-only float space.",
   "_migrations": [
     {
       "date": "2026-05-23",
-      "reason": "Phase 1.2 cost gate switched from LINEAR (scalp ≥ cost × hurdle) to CUBE-ROOT (scalp ≥ cost × hurdle^(1/3)). The original tuned value 1.3624 expected the linear gate; under cube-root the effective threshold would have dropped to 1.36^(1/3) ≈ 1.11× cost — much looser than the tuned optimum. Migrated to 1.3624^3 = 2.5288 so the new cube-root gate produces the same effective threshold the optimizer found. Re-run autoresearch on captured tape to find the true Phase 1.2 optimum."
+      "reason": "Phase 1.2 cost gate switched from LINEAR (scalp \u2265 cost \u00d7 hurdle) to CUBE-ROOT (scalp \u2265 cost \u00d7 hurdle^(1/3)). The original tuned value 1.3624 expected the linear gate; under cube-root the effective threshold would have dropped to 1.36^(1/3) \u2248 1.11\u00d7 cost \u2014 much looser than the tuned optimum. Migrated to 1.3624^3 = 2.5288 so the new cube-root gate produces the same effective threshold the optimizer found. Re-run autoresearch on captured tape to find the true Phase 1.2 optimum."
     }
   ]
 }

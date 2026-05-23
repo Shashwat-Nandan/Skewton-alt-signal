@@ -81,6 +81,10 @@ class HedgeResearchLoop:
         # 70 means "block in the top 30%". The autoresearch loop tunes
         # how aggressively to defer entries when skew is rich.
         "skew_pct_max": (70.0, 100.0),
+        # Phase 5: T-0 (expiry day) band tightening factor. 1.0 = disabled,
+        # 0.33 = aggressive sticky-strike harvest. Tighter values produce
+        # more rehedges on expiry day; the cost gate still filters sub-EV.
+        "t0_band_factor": (0.33, 1.0),
     }
 
     def __init__(self, hedger, config_path: str = "config.ini"):
@@ -503,14 +507,30 @@ class HedgeResearchLoop:
             )
 
     def _save_best_params(self):
-        """Save best parameters to a JSON file for easy loading."""
+        """Save best parameters to a JSON file for easy loading.
+
+        Preserves out-of-schema fields (e.g. `_migrations` semantic-shift
+        history) from the previous file so they survive each autoresearch
+        run instead of being clobbered.
+        """
+        best_file = "best_params.json"
+        preserved = {}
+        try:
+            with open(best_file) as f:
+                existing = json.load(f)
+            for k, v in existing.items():
+                if k not in ("best_params", "best_metric",
+                             "total_experiments", "timestamp"):
+                    preserved[k] = v
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
         output = {
             "best_params": self.best_params,
             "best_metric": {self.primary_metric: self.best_metric_value},
             "total_experiments": self.experiment_number,
             "timestamp": datetime.now().isoformat(),
+            **preserved,
         }
-        best_file = "best_params.json"
         with open(best_file, "w") as f:
             json.dump(output, f, indent=2)
         logger.info("Best parameters saved to %s", best_file)
