@@ -1,10 +1,15 @@
 """
 tick_capture.py — Append-only KiteTicker capture for trigger-fair-value research.
 
-Subscribes via KiteTicker WebSocket to:
-  - NIFTY 50 spot
-  - Current-month NIFTY futures
-  - Current-week NIFTY options, ±5 strikes × {CE, PE} around current spot
+Subscribes via KiteTicker WebSocket to, for each requested underlying:
+  - Index spot (NIFTY 50 / NIFTY BANK)
+  - Earliest-expiry futures
+  - Current-week options, ±5 strikes × {CE, PE} around live spot
+
+Default is NIFTY only. Pass --underlyings NIFTY,BANKNIFTY to also capture
+BANKNIFTY (~24 extra tokens; 4.3× finer hedge granularity for the gamma
+scalper). load_captured_tape(date, underlying=...) in backtest.py already
+filters by underlying name, so mixed-underlying JSONL replays cleanly.
 
 Writes one JSON line per tick to data_cache/ticks/ticks-YYYY-MM-DD.jsonl until
 15:30 IST. First line is a session header with the resolved instrument map.
@@ -34,7 +39,8 @@ REPO = Path(__file__).parent
 LOG_DIR = REPO / "logs"
 TICKS_DIR = REPO / "data_cache" / "ticks"
 STRIKES_EACH_SIDE = 5
-STRIKE_STEP = 50  # NIFTY weekly strikes are 50pt apart
+STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100}
+SPOT_DISPLAY_SYMBOLS = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
 
 
 def setup_logging(today):
@@ -48,47 +54,60 @@ def setup_logging(today):
     return logging.getLogger("tick_capture")
 
 
-def resolve_instruments(kite, log):
-    """Return (subscribe_tokens, token_to_symbol_map). Picks NIFTY spot, the
-    earliest-expiry NIFTY future, and ±5 strikes × {CE, PE} of the current-week
-    options around live spot at the moment of resolution."""
+def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
+    """Return (subscribe_tokens, token_to_symbol_map) for one underlying.
+    Picks index spot, the earliest-expiry future, and ±5 strikes × {CE, PE}
+    of the current-week options around live spot at the moment of resolution.
+
+    `nfo_cache` is the NFO instrument list — pass it in when resolving multiple
+    underlyings so we don't re-fetch the (large) master per underlying."""
+    if underlying not in SPOT_DISPLAY_SYMBOLS:
+        raise ValueError(
+            f"Unknown underlying {underlying!r}; expected one of "
+            f"{sorted(SPOT_DISPLAY_SYMBOLS)}"
+        )
     today = datetime.now(IST).date()
+    spot_symbol = SPOT_DISPLAY_SYMBOLS[underlying]
+    strike_step = STRIKE_STEPS[underlying]
 
     nse = kite.instruments("NSE")
-    spot_row = next((i for i in nse if i["tradingsymbol"] == "NIFTY 50"), None)
+    spot_row = next((i for i in nse if i["tradingsymbol"] == spot_symbol), None)
     if not spot_row:
-        raise RuntimeError("NIFTY 50 spot not found in NSE instrument master")
+        raise RuntimeError(
+            f"{spot_symbol} spot not found in NSE instrument master"
+        )
     spot_token = spot_row["instrument_token"]
 
-    nfo = kite.instruments("NFO")
-    nifty_fut = sorted(
-        (i for i in nfo if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"
+    nfo = nfo_cache if nfo_cache is not None else kite.instruments("NFO")
+    futs = sorted(
+        (i for i in nfo if i["name"] == underlying and i["instrument_type"] == "FUT"
          and i["expiry"] >= today),
         key=lambda i: i["expiry"],
     )
-    if not nifty_fut:
-        raise RuntimeError("No NIFTY futures contracts found in NFO master")
-    fut = nifty_fut[0]
+    if not futs:
+        raise RuntimeError(f"No {underlying} futures contracts found in NFO master")
+    fut = futs[0]
     fut_token = fut["instrument_token"]
 
-    nifty_opts = [i for i in nfo if i["name"] == "NIFTY"
-                  and i["instrument_type"] in ("CE", "PE")
-                  and i["expiry"] >= today]
-    if not nifty_opts:
-        raise RuntimeError("No NIFTY options contracts found in NFO master")
-    weekly_expiry = min(i["expiry"] for i in nifty_opts)
-    weekly_opts = [o for o in nifty_opts if o["expiry"] == weekly_expiry]
+    opts = [i for i in nfo if i["name"] == underlying
+            and i["instrument_type"] in ("CE", "PE")
+            and i["expiry"] >= today]
+    if not opts:
+        raise RuntimeError(f"No {underlying} options contracts found in NFO master")
+    weekly_expiry = min(i["expiry"] for i in opts)
+    weekly_opts = [o for o in opts if o["expiry"] == weekly_expiry]
 
-    spot_ltp = kite.quote(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
-    atm = round(spot_ltp / STRIKE_STEP) * STRIKE_STEP
-    strike_set = {atm + STRIKE_STEP * k
+    spot_key = f"NSE:{spot_symbol}"
+    spot_ltp = kite.quote([spot_key])[spot_key]["last_price"]
+    atm = round(spot_ltp / strike_step) * strike_step
+    strike_set = {atm + strike_step * k
                   for k in range(-STRIKES_EACH_SIDE, STRIKES_EACH_SIDE + 1)}
     selected = sorted(
         (o for o in weekly_opts if o["strike"] in strike_set),
         key=lambda o: (o["strike"], o["instrument_type"]),
     )
 
-    token_to_symbol = {spot_token: "NIFTY 50",
+    token_to_symbol = {spot_token: spot_symbol,
                        fut_token: fut["tradingsymbol"]}
     tokens = [spot_token, fut_token]
     for o in selected:
@@ -96,13 +115,28 @@ def resolve_instruments(kite, log):
         tokens.append(o["instrument_token"])
 
     log.info(
-        "Resolved %d instruments: spot=NIFTY 50, fut=%s (exp %s), %d options "
+        "[%s] Resolved %d instruments: spot=%s, fut=%s (exp %s), %d options "
         "exp=%s ATM=%d strikes=%s",
-        len(tokens), fut["tradingsymbol"], fut["expiry"],
+        underlying, len(tokens), spot_symbol, fut["tradingsymbol"], fut["expiry"],
         len(selected), weekly_expiry, atm,
         sorted({o["strike"] for o in selected}),
     )
     return tokens, token_to_symbol
+
+
+def resolve_instruments(kite, log, underlyings):
+    """Resolve subscribe sets for every requested underlying and merge into
+    one (tokens, token_to_symbol) pair. NFO master is fetched once and shared
+    across underlyings. A failure on any underlying raises and aborts capture
+    for the day — running partial would silently drop a leg from the dataset."""
+    nfo_cache = kite.instruments("NFO")
+    all_tokens: list[int] = []
+    all_token_to_symbol: dict[int, str] = {}
+    for u in underlyings:
+        tokens, sym_map = resolve_instruments_for(kite, log, u, nfo_cache=nfo_cache)
+        all_tokens.extend(tokens)
+        all_token_to_symbol.update(sym_map)
+    return all_tokens, all_token_to_symbol
 
 
 _OUT_FILE = None
@@ -166,7 +200,24 @@ def main():
                         help="Auth and resolve the day's subscribe set, then "
                              "exit 0 without opening the WebSocket. Use for "
                              "pre-market sanity checks.")
+    parser.add_argument(
+        "--underlyings", type=str, default="NIFTY",
+        help="Comma-separated underlyings to capture (default: NIFTY). "
+             "Set to 'NIFTY,BANKNIFTY' to capture both. Each underlying adds "
+             "~24 tokens (1 spot + 1 fut + 22 options) — well under Kite's "
+             "3000-token cap. load_captured_tape() in backtest.py filters by "
+             "underlying name, so mixed-underlying JSONLs replay cleanly.",
+    )
     args = parser.parse_args()
+    underlyings = [u.strip().upper() for u in args.underlyings.split(",") if u.strip()]
+    if not underlyings:
+        print("--underlyings must list at least one symbol", file=sys.stderr)
+        return 2
+    unknown = [u for u in underlyings if u not in SPOT_DISPLAY_SYMBOLS]
+    if unknown:
+        print(f"Unknown underlying(s): {unknown}. Known: "
+              f"{sorted(SPOT_DISPLAY_SYMBOLS)}", file=sys.stderr)
+        return 2
 
     today = datetime.now(IST).date()
     _LOG = setup_logging(today)
@@ -182,7 +233,8 @@ def main():
     prof = kite.profile()
     _LOG.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
 
-    tokens, sym_map = resolve_instruments(kite, _LOG)
+    _LOG.info("Resolving instruments for: %s", ",".join(underlyings))
+    tokens, sym_map = resolve_instruments(kite, _LOG, underlyings)
     _SUBSCRIBE_TOKENS = tokens
     _TOKEN_TO_SYMBOL = sym_map
 
