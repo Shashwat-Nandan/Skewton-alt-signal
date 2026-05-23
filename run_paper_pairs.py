@@ -602,12 +602,18 @@ def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
     return out
 
 
-def write_state_file(strategies, system: str, log: logging.Logger):
+def write_state_file(strategies, system: str, log: logging.Logger,
+                     archive: bool = True):
     """Atomically persist current strategy state. Each strategy emits its own
     serialize_state() blob; runner adds a system/timestamp header.
 
     Atomic write: write to '.tmp' then os.replace, so a crash mid-write
     can't leave a half-truncated file that fails to parse next session.
+
+    archive=False skips the timestamped backup + log line — used by the
+    intraday tick-loop persist, which fires every minute and would
+    otherwise churn through the 30-slot backup ring in half an hour and
+    drown the journal in "State persisted" lines.
     """
     path = state_file_path(system)
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
@@ -625,8 +631,9 @@ def write_state_file(strategies, system: str, log: logging.Logger):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, default=str, indent=2))
     os.replace(tmp, path)
-    log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
-    archive_state_backup(path, log)
+    if archive:
+        log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
+        archive_state_backup(path, log)
 
 
 def restore_matching_strategies(
@@ -993,6 +1000,10 @@ def main():
                          halt_all=halt_state.halt_all,
                          halt_new_entries=halt_state.halt_new)
             check_daily_loss_limit(strategies, args.max_daily_loss_inr, log)
+            try:
+                write_state_file(strategies, args.system, log, archive=False)
+            except Exception as e:
+                log.exception("Intraday state persist failed: %s — continuing", e)
             remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
 
