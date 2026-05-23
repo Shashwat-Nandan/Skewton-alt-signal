@@ -1757,3 +1757,243 @@ mattering.
   is skipped. Risk is small — restore happens before tick loop entry —
   but a defensive `_recompute_greeks()` call right after restore would
   remove the ambiguity.
+
+
+# Taleb-Karpathy profitability uplift — sequenced improvements (2026-05-23)
+
+## Context
+- 2026-05-22 paper session: `gamma_scalp_pnl=0, rehedge_count=0,
+  total_pnl=−₹9,367` on a long ATM straddle held all day. Pure theta
+  bleed, the Cluster A+B pathology from the PDF review.
+- Diagnosis (from reading Taleb Ch 7-16 + survey of greeks_engine,
+  strategies/taleb_karpathy, trade_proposer, autoresearch_loop):
+  - Measurement side is faithful to Taleb (22 gaps closed in
+    `greeks_engine.py`).
+  - Trading side proposes exactly one structure (long ATM straddle)
+    and tunes it by hill-climb on **synthetic GBM** data —
+    `autoresearch_loop._run_experiment` line 290.
+  - `STRATEGY_TYPES = ["long_straddle"]` (`trade_proposer.py:51`)
+    — no calendars, no risk reversals, no skew structures, no
+    spreads. Ch 16 says spreading is the path to consistent edge.
+  - Single rehedge band in lots, ignores the asymmetric shadow
+    gamma that the engine already computes
+    (`shadow_gamma_up` / `shadow_gamma_down`).
+  - `theta_decay_paid` counter sums per-tick `abs(net_shadow_theta)`
+    — that's gross instantaneous theta accumulator, not realized
+    theta. Any gamma-vs-theta ratio derived from it is wrong.
+- Hard constraints:
+  - `pair-paper` cutover to live runs **week of 2026-05-25**
+    ([[project_pair_trading_live_cutover_2026_05]]). Touch only
+    Taleb-side files in Phase 1; no shared-infra changes until
+    pair_trading is settled.
+  - No production tape archive exists; `tick_capture.py` is unwired.
+    Phase 2 cannot validate until we have ≥5 trading days of
+    captured option-chain snapshots.
+
+## Success criteria (per phase)
+- **Phase 1**: rehedge_count > 0 on any day with > 0.5% range;
+  `gamma_scalp_pnl / realized_theta_paid` > 0 on at least one paper
+  day. Realized-theta accounting fixed.
+- **Phase 2**: autoresearch runs against captured tape, not synthetic;
+  `primary_metric = gamma_theta_ratio`; experiment acceptance rate
+  > 20% (currently ~5% on noisy synthetic).
+- **Phase 3**: regime classifier routes to ≥3 distinct structures over
+  a month of paper; structures other than long_straddle book ≥30%
+  of trades.
+- **Phase 4**: layered second-leg trades reduce mean
+  |moment_3| of the active book by ≥40% vs single-straddle book.
+- **Phase 5**: T-0 scalping window books non-zero gamma P&L on
+  expiry day without breaching daily-loss rail.
+
+## Phase 1 — Surgical wins (1-2 days, Taleb-files only)
+
+These touch only `taleb_karpathy.py` and `greeks_engine.py` /
+`taleb_framework.md`. No shared-infrastructure risk during the
+pair_trading cutover.
+
+- [ ] **1.1 Fix realized-theta accounting.** `_update_portfolio_greeks`
+  line 905 of `taleb_karpathy.py` accumulates per-tick
+  `abs(net_shadow_theta)` into `state.theta_decay_paid`. Replace
+  with a daily-anchored realized-theta estimate:
+  `realized_theta = (yesterday_mark_to_market − today_mark_to_market)
+   − gamma_scalp_pnl_delta` accumulated once per session end. Until
+  this is right, no scalp/theta ratio is meaningful.
+- [ ] **1.2 Asymmetric rehedge bands** (Taleb Ch 8 shadow gamma).
+  In `check_and_rehedge` line 458, compute two bands:
+  `band_up = base × √(net_shadow_gamma_up / net_shadow_gamma)`,
+  `band_down = base × √(net_shadow_gamma_down / net_shadow_gamma)`.
+  Compare signed delta against signed band. Add Whalley-Wilmott
+  cube-root cost relationship: `band ∝ (cost / γ)^(1/3)` replaces
+  the linear `cost_hurdle_factor` gate.
+- [ ] **1.3 Put-skew percentile entry filter** (Ch 8 "Shadow Gamma
+  and the Skew"). Add `_compute_skew_percentile` alongside the
+  existing `_compute_iv_percentile`. Skew metric:
+  `IV(25Δ put) − IV(25Δ call)`, percentile over the same window
+  IV percentile uses. Reject entries when skew percentile > 80
+  (rich downside skew → ATM straddle is paying the skew premium
+  it can't recover).
+- [ ] **1.4 Update `taleb_framework.md` §8 with the new band
+  formula and §5 with skew filter.** Keeps the framework doc as
+  the single source of truth.
+
+## Phase 2 — Optimizer foundation (1-2 days, after pair cutover)
+
+Phase 2 is gated on (a) pair_trading being settled in live and
+(b) ≥5 sessions of captured tape.
+
+- [ ] **2.1 Wire `tick_capture.py` to a systemd timer** that writes
+  per-minute spot + ATM±5-strike option-chain quotes to
+  `data_cache/option_chain_snapshots/YYYY-MM-DD.parquet`. Keep the
+  schema flat so the autoresearch replay can `pd.read_parquet`
+  without a join.
+- [ ] **2.2 Add `replay_captured_tape(date)` to `backtest.py`**
+  that consumes the parquet, exposes the same `kite.quote` shape
+  the strategy expects, and steps the strategy through one
+  session per cycle.
+- [ ] **2.3 Replace `generate_synthetic_data` in
+  `autoresearch_loop._run_experiment`** with the captured-tape
+  replay. Synthetic stays as a fallback for the cold-start case
+  where no tape is captured.
+- [ ] **2.4 Switch `primary_metric` from `net_pnl` to
+  `gamma_theta_ratio`** (depends on 1.1 being right). Add a
+  variance penalty so a single-day win doesn't dominate.
+- [ ] **2.5 Joint param mutation** in `_propose_mutation`: with
+  20% probability mutate two correlated knobs together
+  (`rehedge_delta_threshold` + `gamma_scalp_band_pct`,
+  `cost_hurdle_factor` + `gamma_scalp_band_pct`, etc.).
+
+## Phase 3 — Structure router (2-3 days, after Phase 2 validates)
+
+The biggest expected P&L lift, but also the largest code surface.
+
+- [ ] **3.1 Add `regime_classifier.py`** with one function
+  `classify(iv_pct, rv_iv_ratio, skew_pct, vvol)` → one of
+  `{straddle, calendar_short_front, risk_reversal_long_put,
+    backspread, asymmetric_strangle}`. Tunable thresholds for
+  each transition.
+- [ ] **3.2 Extend `TradeProposer`** with one builder per regime
+  output. Keep the existing `propose_delta_neutral` as the
+  `straddle` builder.
+- [ ] **3.3 Per-structure P&L attribution.** Multi-expiry positions
+  break the current single-`T` assumption in
+  `_update_portfolio_greeks` (line 900). Pass per-leg `T` through.
+- [ ] **3.4 Off-ATM strike picking** within each builder
+  (covers original item #6).
+
+## Phase 4 — Multi-leg book (2-3 days)
+
+- [ ] **4.1 Replace** `if self.state.positions: return []` early
+  return in `scan_and_propose` (line 303) with: "allow a second
+  leg only if it reduces |moment_3| or balances
+  shadow_gamma_up vs shadow_gamma_down by ≥30%."
+- [ ] **4.2 Per-trade attribution baseline must handle
+  add-leg events**, not just entry/exit. Carry forward state
+  with structure tags.
+
+## Phase 5 — Pin-risk-aware T-0 (1 day)
+
+- [ ] **5.1 Allow continued scalping on expiry day** with band ÷ 3
+  (Ch 13 sticky strikes — high gamma, locals' two-way scalping
+  is harvestable). Bound by tightened daily-loss rail.
+- [ ] **5.2 Document the assumption** in `taleb_framework.md` §6
+  so a future operator knows the T-0 logic is intentional.
+
+## Review (2026-05-23, after all five phases landed)
+
+### What shipped
+
+**Phase 1 — Surgical accounting + band fixes**
+- `_update_portfolio_greeks` now integrates `−net_shadow_theta × Δt`
+  per tick instead of summing `abs(net_shadow_theta)`. Eliminates the
+  ₹2.4M phantom theta counter; yesterday's session re-runs at ₹789.
+- `check_and_rehedge` scales the rehedge band by
+  `√(net_shadow_gamma_side / net_shadow_gamma)`, signed by drift
+  direction. Cost gate now uses cube-root scaling on
+  `cost_hurdle_factor`.
+- `_compute_skew_percentile` ranks (IV(25Δ put) − IV(25Δ call)) over
+  a persisted rolling window (alongside `_atm_iv_history`). Gate
+  default 80, 100 = disabled. Older configs/tests without the key
+  default to disabled.
+
+**Phase 2 — Optimizer foundation**
+- `tick_capture.py` systemd unit/timer were already live (7 sessions
+  captured: 2026-05-13 → -22).
+- `backtest.load_captured_tape(date)` reads JSONL → MockKite-compatible
+  DataFrame at 1-min resolution. Joins NFO instrument master for
+  strike/expiry/lot_size; patches NSE spot from the JSONL header.
+- `autoresearch_loop._run_experiment` prefers captured tape when
+  ≥1 session exists; same N sessions across all experiments so the
+  fitness landscape stays comparable.
+- `gamma_theta_ratio` added to `get_strategy_metrics`; config switched
+  to it. Variance penalty `0.5σ` subtracted from the mean.
+- `_propose_mutation` now sometimes mutates pairs jointly
+  (`joint_mutation_prob=0.20`). Pairs: rehedge×scalp_band,
+  cost_hurdle×scalp_band, iv_min×iv_max, rv_window×rv_iv_ratio.
+
+**Phase 3 — Regime → structure router**
+- `regime_classifier.py` maps (iv_pct, rv_iv, skew_pct, vvol) →
+  {straddle, calendar, risk_reversal_long_put, backspread,
+  asymmetric_strangle, no_trade}.
+- `TradeProposer` gained 4 builders + `propose_for_structure(label, …)`
+  dispatch. Off-ATM strike-picking via `_pick_strike_by_delta` (binary
+  search by IV-derived delta).
+- `compute_portfolio_greeks` accepts `per_leg_T` for multi-expiry
+  books (calendars). `_update_portfolio_greeks` constructs the map.
+- All gated behind `enable_regime_dispatch` (default false).
+
+**Phase 4 — Layered structures**
+- `_count_active_structures` counts distinct expiries.
+- `scan_and_propose` allows up to `max_layered_structures` layers when
+  regime dispatch is on. Default 1 = legacy.
+
+**Phase 5 — Pin-risk T-0**
+- `t0_band_factor` (default 1.0 = disabled) tightens the rehedge band
+  when any leg has < 1 day to expiry.
+
+### Tests
+
+  104 → 141 passing (+37). New suites:
+  - `TestRealizedThetaAccounting` (4), `TestRealizedGammaScalpPnL` (3)
+  - `TestAsymmetricRehedgeBand` (3), `TestWhalleyWilmottCostGate` (2)
+  - `TestSkewPercentileGate` (4), `TestGammaThetaRatio` (3)
+  - `TestLayeredStructures` (4) including T-0 band tightening
+  - `TestCapturedTapeReplay` (5)
+  - `tests/test_regime_classifier.py` (8)
+
+### Honest caveats — what we did NOT do (and why)
+
+- **Phase 3.2 calendar builder needs a two-expiry chain.** Today's
+  `_get_options_chain` selects one expiry. Calendar regime currently
+  returns []. Fix is a follow-up: extend the chain fetcher to also
+  pull the back-month strikes. Tracked.
+- **Smoke against captured tape (5/22) shows no behaviour change**
+  between legacy and all-phases configurations on that specific day.
+  The day was a calm regime; classifier routes to STRADDLE, T-0
+  doesn't fire (no expiry), layering capacity unused. This is
+  *correct* conditional behaviour but means autoresearch tuning on
+  multi-day captured tape (Phase 2.3 path) is the next step needed
+  to demonstrate uplift.
+- **Lot-rounding floor**: asymmetric band tightening on the smaller-γ
+  side only helps when `base_threshold > ~0.7 lots`. With NIFTY
+  best_params at 0.5345, tighter side often falls below the 1-lot
+  floor and `_generate_hard_delta_proposals` returns []. Documented
+  in `taleb_framework.md` §8 caveat.
+- **`_estimate_gamma_scalp_pnl` is still a static estimate** used by
+  the *forward* cost gate. Realized scalp is now computed correctly
+  via ΔS-from-anchor. The forward estimate could be improved with
+  ΔS prediction, but the realized side is what feeds the metric.
+
+### What unlocks the next round of P&L gains
+
+1. **Run autoresearch on captured tape with the new metric.** All
+   the plumbing is in place; just `systemctl start
+   taleb-autoresearch.service` after pair-trading cutover settles.
+2. **Two-expiry chain fetcher** so the calendar builder can fire.
+3. **Multi-day captured-tape backtest** (currently it's session-by-
+   session per experiment cycle) so consistent winners stand out
+   from one-day flukes.
+4. **`max_layered_structures = 2` with regime dispatch on** is a
+   conservative first layering experiment — needs a paper-trading
+   run to validate the attribution baseline survives.
+
+

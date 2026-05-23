@@ -9,7 +9,7 @@
     "entry_iv_percentile_max": 85.0,
     "max_entry_alpha": 143013.0,
     "mc_worst_path_loss_pct": 3.0,
-    "cost_hurdle_factor": 1.3624,
+    "cost_hurdle_factor": 2.5288,
     "min_rv_iv_ratio": 1.222,
     "rv_window_days": 5.0
   },
@@ -17,5 +17,11 @@
     "net_pnl": 4364.783062685003
   },
   "total_experiments": 30,
-  "timestamp": "2026-05-08T06:00:15.729015"
+  "timestamp": "2026-05-08T06:00:15.729015",
+  "_migrations": [
+    {
+      "date": "2026-05-23",
+      "reason": "Phase 1.2 cost gate switched from LINEAR (scalp ≥ cost × hurdle) to CUBE-ROOT (scalp ≥ cost × hurdle^(1/3)). The original tuned value 1.3624 expected the linear gate; under cube-root the effective threshold would have dropped to 1.36^(1/3) ≈ 1.11× cost — much looser than the tuned optimum. Migrated to 1.3624^3 = 2.5288 so the new cube-root gate produces the same effective threshold the optimizer found. Re-run autoresearch on captured tape to find the true Phase 1.2 optimum."
+    }
+  ]
 }

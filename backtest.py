@@ -135,16 +135,39 @@ class MockKite:
                 "instrument_type": row["option_type"],
                 "lot_size": int(row.get("lot_size", 25)),
             })
-        # Add futures
-        instruments.append({
-            "tradingsymbol": f"{self.underlying}FUTMOCK",
-            "instrument_token": 999999,
-            "name": self.underlying,
-            "strike": 0,
-            "expiry": options["expiry"].iloc[0] if not options.empty else "",
-            "instrument_type": "FUT",
-            "lot_size": int(options.iloc[0].get("lot_size", 25)) if not options.empty else 25,
-        })
+        # Futures: prefer the captured-tape FUT row (review-fix #7).
+        # The captured tape (load_captured_tape) emits real
+        # NIFTY26MAYFUT rows but the first FUT tick may arrive AFTER
+        # the strategy's first instruments() call, so scan the FULL
+        # data timeline — instruments are an exchange directory, not
+        # tick-bound. Without this fix the strategy cached a synthetic
+        # NIFTYFUTMOCK that has no matching quote in tick_data,
+        # silently degrading every rehedge to a no-op.
+        fut_rows = self.data[self.data["option_type"] == "FUT"].drop_duplicates("symbol")
+        if not fut_rows.empty:
+            for _, frow in fut_rows.iterrows():
+                instruments.append({
+                    "tradingsymbol": frow["symbol"],
+                    "instrument_token": hash(frow["symbol"]) % 1000000,
+                    "name": self.underlying,
+                    "strike": 0,
+                    "expiry": frow.get("expiry", ""),
+                    "instrument_type": "FUT",
+                    "lot_size": int(frow.get("lot_size", 25)),
+                })
+        else:
+            # Synthetic-data path (generate_synthetic_data has no FUT
+            # rows) — keep the legacy placeholder so existing tests
+            # and synthetic backtests continue to work.
+            instruments.append({
+                "tradingsymbol": f"{self.underlying}FUTMOCK",
+                "instrument_token": 999999,
+                "name": self.underlying,
+                "strike": 0,
+                "expiry": options["expiry"].iloc[0] if not options.empty else "",
+                "instrument_type": "FUT",
+                "lot_size": int(options.iloc[0].get("lot_size", 25)) if not options.empty else 25,
+            })
         return instruments
 
     def place_order(self, **kwargs):
@@ -234,6 +257,180 @@ def generate_synthetic_data(
                     })
 
     return pd.DataFrame(rows)
+
+
+def _find_instruments_csv(date_iso: str, underlying: str = "NIFTY") -> Optional[Path]:
+    """Locate the data_cache/instruments_<UNDERLYING>_<YYYYMMDD>.csv whose
+    date is closest to (and ≤) the requested session date. The instrument
+    master is what we join JSONL tick rows against to recover
+    strike/expiry/lot_size — none of which the ticks themselves carry."""
+    target = date_iso.replace("-", "")
+    cache = Path("data_cache")
+    if not cache.exists():
+        return None
+    pattern = f"instruments_{underlying}_*.csv"
+    candidates = sorted(cache.glob(pattern))
+    # Prefer the most recent file on or before target date.
+    on_or_before = [p for p in candidates if p.stem.split("_")[-1] <= target]
+    if on_or_before:
+        return on_or_before[-1]
+    # Fall back to the closest-dated file (may be later than target).
+    return candidates[-1] if candidates else None
+
+
+def load_captured_tape(
+    date_iso: str, underlying: str = "NIFTY",
+    resolution: str = "1min",
+) -> pd.DataFrame:
+    """Phase 2.2: convert a tick-capture JSONL session into the DataFrame
+    schema `MockKite` expects, so `run_backtest(...)` can replay it
+    exactly as it does synthetic data.
+
+    Args:
+        date_iso: ISO date string ('2026-05-22'); reads
+            data_cache/ticks/ticks-<date>.jsonl
+        underlying: NIFTY / BANKNIFTY / etc; chooses the instrument
+            master CSV to join against
+        resolution: pandas offset alias for downsampling ('1min',
+            '5min', 'tick'). 'tick' returns every line — heavy memory.
+
+    Returns DataFrame with columns matching `generate_synthetic_data`:
+        timestamp, symbol, underlying_price, strike, option_type,
+        expiry, last_price, bid, ask, lot_size, iv
+
+    Raises FileNotFoundError if either the tick file or the instruments
+    master is absent — fail loud rather than silently degrade (Rule 12)."""
+    import json
+    tick_file = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
+    if not tick_file.exists():
+        raise FileNotFoundError(f"Tick capture not found: {tick_file}")
+
+    instr_csv = _find_instruments_csv(date_iso, underlying)
+    if instr_csv is None:
+        raise FileNotFoundError(
+            f"No data_cache/instruments_{underlying}_*.csv found — "
+            "the JSONL ticks lack expiry/strike metadata and need the "
+            "instrument master to enrich. Run fetch_historical_data.py "
+            "or similar to refresh the cache."
+        )
+    instr = pd.read_csv(instr_csv)
+    instr = instr.set_index("instrument_token")
+
+    # Stream the JSONL. Header maps tokens → tradingsymbols (used for
+    # the spot token which isn't in the NFO instrument master).
+    rows = []
+    header_token_to_symbol = {}
+    with tick_file.open() as f:
+        header = json.loads(f.readline())
+        for entry in header.get("instruments", []):
+            header_token_to_symbol[int(entry["token"])] = entry["tradingsymbol"]
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                t = json.loads(line)
+            except json.JSONDecodeError:
+                # Truncated tail line at the end of a session is normal
+                # if the watchdog cut the WebSocket mid-write.
+                continue
+            tok = t.get("instrument_token")
+            ts = t.get("exchange_timestamp")
+            lp = t.get("last_price")
+            if tok is None or ts is None or lp is None:
+                continue
+            rows.append((tok, ts, lp))
+
+    df = pd.DataFrame(rows, columns=["instrument_token", "timestamp", "last_price"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    if resolution != "tick":
+        # Bucket to the requested resolution per (token); keep LAST tick
+        # in each bucket (Kite's last_price is by convention "last trade").
+        df = (
+            df.set_index("timestamp")
+              .groupby("instrument_token")["last_price"]
+              .resample(resolution).last()
+              .dropna()
+              .reset_index()
+        )
+
+    # Join the NFO instrument master for strike/expiry/lot_size on
+    # derivatives, then patch the spot token (which lives on NSE and
+    # isn't in the NFO master) from the JSONL session header.
+    enriched = df.join(
+        instr[["tradingsymbol", "name", "expiry", "strike", "lot_size", "instrument_type"]],
+        on="instrument_token", how="left",
+    )
+    spot_display_symbol = _INDEX_SPOT_SYMBOLS.get(
+        underlying, f"NSE:{underlying}",
+    ).split(":", 1)[-1]
+    is_spot = enriched["tradingsymbol"].isna() & enriched["instrument_token"].map(
+        lambda t: header_token_to_symbol.get(int(t)) == spot_display_symbol
+    )
+    enriched.loc[is_spot, "tradingsymbol"] = spot_display_symbol
+    enriched.loc[is_spot, "name"] = underlying
+    enriched.loc[is_spot, "instrument_type"] = "IDX"
+    enriched.loc[is_spot, "expiry"] = ""
+    enriched.loc[is_spot, "strike"] = 0.0
+    enriched.loc[is_spot, "lot_size"] = _DEFAULT_LOT_SIZE.get(underlying, 25)
+
+    # Filter to NIFTY-family rows that successfully joined or were
+    # patched as spot. Other tokens (older expiries that rolled off,
+    # cross-name carry-overs) drop here.
+    enriched = enriched.dropna(subset=["tradingsymbol", "instrument_type"])
+    enriched = enriched[enriched["name"] == underlying]
+
+    # Build the MockKite schema. Spot rows need symbol set to the bare
+    # underlying name so MockKite.quote('NSE:NIFTY 50') resolves.
+    enriched["symbol"] = enriched["tradingsymbol"].where(~is_spot, underlying)
+    enriched["option_type"] = enriched["instrument_type"]
+
+    # underlying_price: forward-fill the last-known spot into every
+    # option row. A plain merge(how="left") would leave NaN for option
+    # ticks in any minute where the spot stream didn't deliver a sample
+    # (the Kite spot websocket and the F&O websocket are separate
+    # streams, so misses are routine). merge_asof with
+    # direction="backward" maps each enriched row to the most-recent
+    # spot tick at-or-before its timestamp. Both inputs MUST be sorted
+    # on the join key — sort here once; the final caller's sort is
+    # cheap on the result.
+    spot_rows = (
+        enriched[is_spot][["timestamp", "last_price"]]
+        .rename(columns={"last_price": "underlying_price"})
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp", keep="last")
+    )
+    enriched = enriched.sort_values("timestamp")
+    enriched = pd.merge_asof(
+        enriched, spot_rows, on="timestamp", direction="backward",
+    )
+    # Leading NaN — option ticks arriving before the first spot sample
+    # in the session (the F&O websocket can start streaming before the
+    # NSE spot stream). Backfill from the first known spot so warmup
+    # rows still carry a usable underlying_price; without this they
+    # propagate NaN into argmin(|strike-spot|) downstream.
+    enriched["underlying_price"] = enriched["underlying_price"].bfill()
+
+    # Synthetic bid/ask around last_price — matches what generate_synthetic_data
+    # produces. Real intraday spreads are smaller than this 0.2% band; the
+    # MockKite quote() recomputes its own 0.15% band anyway.
+    enriched["bid"] = enriched["last_price"] * 0.998
+    enriched["ask"] = enriched["last_price"] * 1.002
+    enriched["iv"] = 0.0  # populated by hedger on demand
+
+    columns = ["timestamp", "symbol", "underlying_price", "strike",
+               "option_type", "expiry", "last_price", "bid", "ask",
+               "lot_size", "iv"]
+    return enriched[columns].sort_values("timestamp").reset_index(drop=True)
+
+
+def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
+    """Return ISO date strings for which tick captures exist."""
+    ticks_dir = Path("data_cache") / "ticks"
+    if not ticks_dir.exists():
+        return []
+    return sorted(p.stem.replace("ticks-", "") for p in ticks_dir.glob("ticks-*.jsonl"))
 
 
 def run_backtest(

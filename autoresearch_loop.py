@@ -73,9 +73,14 @@ class HedgeResearchLoop:
         "entry_iv_percentile_max": (50.0, 95.0),
         "max_entry_alpha": (5000.0, 150000.0),
         "mc_worst_path_loss_pct": (1.0, 10.0),
-        "cost_hurdle_factor": (1.0, 3.0),
+        "cost_hurdle_factor": (1.0, 8.0),  # raised: cube-root scaling in
+        # Phase 1.2 means hurdle=8 demands only 2× scalp/cost, not 8×
         "min_rv_iv_ratio": (0.6, 1.5),
         "rv_window_days": (2.0, 15.0),
+        # Phase 1.3: put-skew percentile gate. 95 means "rarely block";
+        # 70 means "block in the top 30%". The autoresearch loop tunes
+        # how aggressively to defer entries when skew is rich.
+        "skew_pct_max": (70.0, 100.0),
     }
 
     def __init__(self, hedger, config_path: str = "config.ini"):
@@ -235,42 +240,98 @@ class HedgeResearchLoop:
     # MUTATION ENGINE
     # ══════════════════════════════════════════════════════════════
 
-    def _propose_mutation(self) -> Tuple[Dict, str, float, float]:
-        """
-        Mutate ONE random parameter within its valid range.
+    # Phase 2.5: pairs of params that are mechanically correlated and
+    # benefit from joint perturbation. The hill-climber's univariate
+    # walk can't reach combinations where both knobs need to move in
+    # lockstep — e.g. widening the rehedge band only helps if the
+    # cost-hurdle stays consistent, otherwise the cost gate now blocks
+    # what the band would have allowed. With probability
+    # `joint_mutation_prob` the proposer mutates one pair instead of
+    # one param.
+    JOINT_PAIRS = [
+        ("rehedge_delta_threshold", "gamma_scalp_band_pct"),
+        ("cost_hurdle_factor", "gamma_scalp_band_pct"),
+        ("entry_iv_percentile_min", "entry_iv_percentile_max"),
+        ("min_rv_iv_ratio", "rv_window_days"),
+    ]
 
-        Strategy: Gaussian random walk with step size proportional
-        to the parameter's range. This encourages local exploration
-        (small improvements) while occasionally making larger jumps.
-        """
-        params = copy.deepcopy(self.baseline_params)
-        param_name = random.choice(list(self.TUNABLE_RANGES.keys()))
+    def _mutate_one(self, params: Dict, param_name: str) -> Tuple[float, float]:
+        """Single-param Gaussian step + range clamp + rounding.
+        Returns (old_value, new_value). Mutates `params` in place so
+        callers can chain multiple mutations within one experiment."""
         low, high = self.TUNABLE_RANGES[param_name]
         old_value = params[param_name]
-
-        # Gaussian step: mean=0, std=mutation_step * range
         param_range = high - low
         step = np.random.normal(0, self.mutation_step * param_range)
         new_value = old_value + step
-
-        # Clamp to valid range
         new_value = max(low, min(high, new_value))
 
-        # Round appropriately
-        if param_name in ("entry_iv_percentile_min", "entry_iv_percentile_max"):
+        # Per-param rounding rules. Keep these consistent with the
+        # tunable schema in strategies/taleb_karpathy.py.
+        if param_name in ("entry_iv_percentile_min", "entry_iv_percentile_max",
+                          "skew_pct_max"):
             new_value = round(new_value, 0)
         elif param_name == "vega_limit":
             new_value = round(new_value, 0)
         else:
             new_value = round(new_value, 4)
 
-        # Ensure IV min < IV max
+        # Cross-param invariants enforced at write-time.
         if param_name == "entry_iv_percentile_min":
             new_value = min(new_value, params.get("entry_iv_percentile_max", 95) - 5)
         elif param_name == "entry_iv_percentile_max":
             new_value = max(new_value, params.get("entry_iv_percentile_min", 10) + 5)
 
         params[param_name] = new_value
+        return old_value, new_value
+
+    def _propose_mutation(self) -> Tuple[Dict, str, float, float]:
+        """
+        Propose a parameter mutation. Either single-param (default) or
+        joint pair (Phase 2.5) with probability `joint_mutation_prob`.
+
+        For single-param: Gaussian random walk with step size
+        proportional to the parameter's range.
+
+        For joint-pair: Both params in the pair receive independent
+        Gaussian steps in the same experiment, exposing the hill-
+        climber to ridges in the fitness landscape that univariate
+        moves can't traverse.
+        """
+        params = copy.deepcopy(self.baseline_params)
+        joint_prob = self.config.getfloat(
+            "autoresearch", "joint_mutation_prob", fallback=0.0,
+        )
+        do_joint = (joint_prob > 0
+                    and random.random() < joint_prob
+                    and any(all(p in params for p in pair)
+                            for pair in self.JOINT_PAIRS))
+
+        if do_joint:
+            # Pick a joint pair where both keys are in baseline_params
+            # (skip if a tunable was added since the params snapshot).
+            available = [p for p in self.JOINT_PAIRS
+                         if all(k in params for k in p)]
+            pair = random.choice(available)
+            primary, secondary = pair
+            old_v1, new_v1 = self._mutate_one(params, primary)
+            old_v2, new_v2 = self._mutate_one(params, secondary)
+            # We log the primary in the canonical fields; the secondary
+            # is appended to the descriptor so the TSV row reflects the
+            # joint move.
+            return (params, f"{primary}+{secondary}",
+                    old_v1, new_v1)
+
+        # Default: single-param walk.
+        param_name = random.choice(list(self.TUNABLE_RANGES.keys()))
+        if param_name not in params:
+            # New tunable not yet in baseline — seed from midpoint of
+            # its range so subsequent mutations have somewhere to walk
+            # from. Without this, a tunable added after the loop started
+            # never gets explored.
+            low, high = self.TUNABLE_RANGES[param_name]
+            params[param_name] = (low + high) / 2
+        old_value, new_value = self._mutate_one(params, param_name)
         return params, param_name, old_value, new_value
 
     # ══════════════════════════════════════════════════════════════
@@ -281,17 +342,49 @@ class HedgeResearchLoop:
         """
         Run the hedging strategy with given parameters over historical replay.
 
-        Uses the backtest harness to replay synthetic or historical data through
-        the hedger with the candidate parameters. This replaces the old live/paper
-        sleep-based evaluation, producing deterministic and meaningful metrics.
+        Phase 2.3: prefers captured tape sessions when available
+        (data_cache/ticks/ticks-*.jsonl). Each cycle replays one
+        session; over `eval_cycles` cycles we sample the most recent
+        sessions. Falls back to synthetic-GBM data when no captures
+        exist (cold-start or testing).
+
+        Synthetic data lacks every property Taleb Ch 15 says matters
+        for option-strategy P&L (fat tails, vol regimes, skew, biased-
+        asset asymmetry). Tuning on synthetic was the silent ceiling
+        on the previous autoresearch loop — see the 2026-05-23 PDF-
+        review entry in tasks/todo.md.
 
         Returns the primary metric value.
         """
-        from backtest import generate_synthetic_data, run_backtest
+        from backtest import (
+            generate_synthetic_data, run_backtest,
+            list_captured_sessions, load_captured_tape,
+        )
 
         # Apply params to hedger so the backtest picks them up
         original_params = copy.deepcopy(self.hedger.tunable_params)
         self.hedger.tunable_params = copy.deepcopy(params)
+
+        underlying = getattr(self.hedger, "underlying", "NIFTY")
+        captured = list_captured_sessions(underlying)
+        # Pick the most recent N sessions matching eval_cycles. Replaying
+        # the SAME N sessions across all experiments keeps the metric
+        # comparable — a different per-cycle seed (as the old synthetic
+        # path used) made fitness landscapes noisy enough that the
+        # one-at-a-time hill-climber couldn't separate signal from luck.
+        replay_sessions = captured[-self.eval_cycles:] if captured else []
+        use_tape = len(replay_sessions) >= 1
+        if use_tape:
+            logger.info(
+                "Replaying %d captured sessions: %s",
+                len(replay_sessions), replay_sessions,
+            )
+        else:
+            logger.info(
+                "No captured tape in data_cache/ticks/ — falling back "
+                "to synthetic GBM (Ch 15 properties absent; tuning on "
+                "this is structurally limited)."
+            )
 
         cycle_metrics = []
 
@@ -299,11 +392,16 @@ class HedgeResearchLoop:
             logger.debug("  Cycle %d/%d", cycle + 1, self.eval_cycles)
 
             try:
-                # Generate a fresh synthetic dataset per cycle (different random seed)
-                underlying = getattr(self.hedger, "underlying", "NIFTY")
-                data = generate_synthetic_data(
-                    underlying=underlying, days=10, ticks_per_day=12,
-                )
+                if use_tape:
+                    # Cycle over the captured sessions in order, wrapping
+                    # if eval_cycles > len(replay_sessions).
+                    session_date = replay_sessions[cycle % len(replay_sessions)]
+                    data = load_captured_tape(session_date, underlying)
+                    logger.debug("    session %s rows=%d", session_date, len(data))
+                else:
+                    data = generate_synthetic_data(
+                        underlying=underlying, days=10, ticks_per_day=12,
+                    )
                 results = run_backtest(
                     data, underlying=underlying,
                     config_path=getattr(self, "_config_path", "config.ini"),
@@ -327,7 +425,22 @@ class HedgeResearchLoop:
             return -999999.0
 
         primary_values = [m.get(self.primary_metric, 0) for m in cycle_metrics]
-        avg_metric = np.mean(primary_values)
+        avg_metric = float(np.mean(primary_values))
+
+        # Phase 2.4: variance penalty. A single-cycle win shouldn't be
+        # rewarded as much as a consistent winner — particularly when
+        # primary_metric is gamma_theta_ratio (high single-day numerator
+        # variance is common). penalty_factor is the coefficient on the
+        # std-dev term; 0.5 means "subtract half a stddev from the mean".
+        # The autoresearch [section] can tune this if needed; default
+        # is moderate enough that a wide-but-fat-positive distribution
+        # still wins over an unstable spike.
+        if len(primary_values) >= 2:
+            penalty = float(np.std(primary_values))
+            penalty_factor = self.config.getfloat(
+                "autoresearch", "variance_penalty", fallback=0.5,
+            )
+            avg_metric -= penalty_factor * penalty
 
         # Also check drawdown constraint (convert absolute drawdown to % of capital)
         total_capital = self.hedger.immutable_params.get("total_capital", 500000)

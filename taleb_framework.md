@@ -139,6 +139,50 @@ If you hedge using standard gamma, you'll underestimate how much delta
 changes on down moves. Your rehedge will be too small, leaving you
 with residual directional risk exactly when markets are most dangerous.
 
+### Asymmetric Rehedge Bands (Phase 1.2, 2026-05-23)
+
+Standard implementation: one symmetric `rehedge_delta_threshold` for both
+directions. This understates the case Taleb describes — when γ_down >
+γ_up, the operator wants tighter triggers on the side where the next
+move expands vol.
+
+The current band formula uses the side-specific shadow gammas the engine
+already computes:
+
+```
+band_up_lots   = base_threshold × √(net_shadow_gamma_up   / net_shadow_gamma)
+band_down_lots = base_threshold × √(net_shadow_gamma_down / net_shadow_gamma)
+```
+
+Signed delta is compared against signed band. The √ scaling is gentler
+than Whalley-Wilmott's γ^(2/3) on the band itself (we apply the (2/3)
+exponent below in the cost gate); the net effect is moderate tightening
+where shadow gamma is smaller.
+
+**Caveat — lot rounding floor**: NIFTY's lot size of 75 means any band
+below 0.5 lots cannot produce a hedge (the proposal generator rounds
+to ≥1 lot). So in practice the asymmetric tightening helps mainly when
+the operator's base threshold is wide enough (≥ ~0.7 lots) that the
+tighter side stays above the rounding floor. With the autoresearch
+loop's current best at base = 0.5345, the asymmetry mostly benefits
+via *deferring overtrades on the loose side*.
+
+### Whalley-Wilmott Cost Gate (Phase 1.2, 2026-05-23)
+
+The optimal-rebalance result (Whalley & Wilmott 1997) gives a band
+width ∝ (cost / γ)^(1/3) — the cube root softens the linear
+cost-hurdle that we previously used. Translated to a scalp/cost
+inequality:
+
+```
+ww_required_scalp = round_trip_cost × cost_hurdle^(1/3)
+```
+
+A linear hurdle of 8.0 (previously meaning "scalp must beat 8× cost")
+becomes a cube-root hurdle of ≈2.0 — much more permissive. The
+autoresearch loop's range for `cost_hurdle_factor` was widened to
+[1.0, 8.0] to accommodate.
+
 ## 5. Vega and Volatility Surface
 
 **Vega** measures sensitivity to changes in implied volatility.
@@ -161,7 +205,12 @@ Our system:
 1. Monitors portfolio vega continuously
 2. Hard limit prevents excessive vega concentration
 3. Entry timing filtered by IV percentile (avoid buying expensive vol)
-4. Calendar spreads can isolate gamma from vega if needed
+4. Entry timing filtered by **put-skew percentile** (Phase 1.3) —
+   reject ATM straddle when IV(25Δ put) − IV(25Δ call) sits in the top
+   quintile of its history; rich skew is premium an ATM body cannot
+   recover via delta-hedged gamma, per Ch 15 path-dependence rule.
+   Default `skew_pct_max = 80`; 100 disables.
+5. Calendar spreads can isolate gamma from vega if needed (Phase 3+)
 
 ## 6. Theta — The Cost of Carry
 
@@ -177,8 +226,15 @@ Theta is NOT linear — it accelerates as expiry approaches:
 - 7 DTE: theta roughly 2x the 30 DTE level
 - 1 DTE: theta is extreme (expiry gamma spikes)
 
-Our system avoids holding positions into the last trading day
-to prevent theta crush and pin risk.
+Our system flattens any leg whose last trading day is today
+(via `legs_expire_on(today)` in `run_paper.py`), to prevent
+settlement risk. Intraday on T-0, however, scalping is **allowed
+and tightened** via the Phase 5 `t0_band_factor` knob (default
+1.0 = disabled). Setting `t0_band_factor = 0.33` exploits the
+sticky-strike harvest Taleb describes in Ch 13: pin behaviour
+near a high-OI strike produces two-way locals' scalping that a
+tight rehedge band captures. Cost gate still filters sub-EV
+trades.
 
 ## 7. The Gamma-Theta Tradeoff
 
@@ -202,7 +258,28 @@ gamma_theta_ratio = cumulative_gamma_pnl / cumulative_theta_paid
 - Ratio < 1.0: Strategy is losing (paying too much rent)
 - Ratio = 1.0: Breakeven (implied vol = realized vol)
 
-The autoresearch loop optimizes parameters to maximize this ratio.
+The autoresearch loop optimizes parameters to maximize this ratio
+(Phase 2.4 — primary_metric switch).
+
+### Realized vs Estimated Accounting (Phase 1.1, 2026-05-23)
+
+Both numerator and denominator are now **realized**, not estimates:
+
+- `gamma_scalp_pnl`: incremented at each rehedge by `0.5 × |γ| × (ΔS)²`
+  where ΔS is the actual spot move since the last rehedge anchor
+  (`_last_rehedge_spot`). Before this fix, every rehedge credited a
+  static `0.5 × γ × (band × spot)²` regardless of the realized move —
+  so the counter grew even on flat tapes with no real P&L captured.
+- `theta_decay_paid`: integrated as `-net_shadow_theta × elapsed_days`
+  over the interval since the last update. Positive when long premium
+  (rupees lost to time), negative when short premium (rupees earned).
+  Before this fix, the counter accumulated `abs(net_shadow_theta)`
+  every tick — a gross instantaneous accumulator, not realized decay.
+
+Anchors live on `HedgeState` (`_last_theta_anchor_time`,
+`_last_rehedge_spot`) and are cleared when the book goes flat, so the
+next entry starts a fresh integration window. Both fields are
+serialized; older state files without them tolerate restore.
 
 ## 8. Practical Rehedging Rules
 

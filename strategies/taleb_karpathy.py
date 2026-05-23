@@ -11,6 +11,7 @@ Enhanced with all 22 Taleb gaps:
 """
 
 import time
+import math
 import json
 import hashlib
 import logging
@@ -30,6 +31,9 @@ from trade_proposer import TradeProposer, TradeProposal
 from risk_analyzer import (
     RiskAnalyzer, MonteCarloReport, StabilityReport,
     BleedForecast, HedgeDecision,
+)
+from regime_classifier import (
+    RegimeFeatures, Structure, Thresholds as RegimeThresholds, classify,
 )
 
 from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
@@ -174,6 +178,14 @@ class HedgeState:
     stability_history: List[StabilityReport] = field(default_factory=list)
     last_hedge_decision: Optional[HedgeDecision] = None
     monte_carlo_report: Optional[MonteCarloReport] = None
+    # Anchor for realized-theta integration. Set on first tick that has
+    # positions, cleared when book goes flat. theta_decay_paid is
+    # accumulated as -net_shadow_theta × (now − anchor) / 1 day.
+    _last_theta_anchor_time: Optional[datetime] = None
+    # Anchor for realized gamma-scalp P&L. Set on entry and after each
+    # rehedge. The realized scalp at rehedge is 0.5 × |γ| × (ΔS)² where
+    # ΔS is the actual spot move since the anchor — not a static band.
+    _last_rehedge_spot: Optional[float] = None
 
 
 class TalebKarpathyStrategy(BaseStrategy):
@@ -228,6 +240,40 @@ class TalebKarpathyStrategy(BaseStrategy):
             # window (default 5 days) gate entries on the structural thesis.
             "min_rv_iv_ratio": self.config.getfloat("strategy", "min_rv_iv_ratio", fallback=1.0),
             "rv_window_days": self.config.getfloat("strategy", "rv_window_days", fallback=5.0),
+            # ── Phase 1.3: put-skew percentile gate (Taleb Ch 8 / Ch 15) ──
+            # Skew = IV(25Δ put) − IV(25Δ call). Percentile-ranked over a
+            # rolling window. When skew is unusually rich, an ATM straddle
+            # pays a premium it can't recover via delta-hedging — the
+            # right structure is a risk reversal or ratio, not the body.
+            # Default 80 means: reject straddle entry when current skew
+            # sits in the top quintile of its history. 100 disables.
+            "skew_pct_max": self.config.getfloat("strategy", "skew_pct_max", fallback=80.0),
+            # Phase 3.1: enable regime → structure dispatch. When True,
+            # scan_and_propose routes through regime_classifier.classify
+            # and may emit any of {straddle, calendar, risk reversal,
+            # backspread, asymmetric strangle, no_trade}. When False
+            # (default during Phase 3 rollout), only straddles are
+            # emitted — same behaviour as before Phase 3.
+            "enable_regime_dispatch": self.config.getboolean(
+                "strategy", "enable_regime_dispatch", fallback=False,
+            ),
+            # Phase 4: cap on parallel structures the book can hold.
+            # 1 = legacy (one structure at a time). 2-3 = layered books
+            # that the regime classifier can use to combine e.g. a
+            # straddle with a hedging risk reversal. Higher than ~3
+            # makes the attribution / exit logic harder to reason
+            # about and risks oversizing aggregate notional.
+            "max_layered_structures": self.config.getint(
+                "strategy", "max_layered_structures", fallback=1,
+            ),
+            # Phase 5: T-0 (expiry day) band tightening factor. When a
+            # leg has < 1 day to expiry, multiply the rehedge band by
+            # this factor. 1.0 = disabled (legacy). 0.33 = aggressive
+            # sticky-strike harvest. Tightens the band only; the cost
+            # gate continues to filter sub-EV rehedges.
+            "t0_band_factor": self.config.getfloat(
+                "strategy", "t0_band_factor", fallback=1.0,
+            ),
         }
 
         # Overlay autoresearch optimum on top of config defaults so the
@@ -286,6 +332,9 @@ class TalebKarpathyStrategy(BaseStrategy):
         # entry has typically already fired.
         self._spot_history: List[Tuple[datetime, float]] = []
         self._spot_history_max_size = 2000  # ~1.5 days of 1-min ticks or weeks of 5-min
+        # Phase 1.3: rolling history of (25Δ put IV − 25Δ call IV) used to
+        # rank current skew. Persisted alongside _atm_iv_history.
+        self._skew_history: List[float] = []
         self._load_iv_history()
         self._load_spot_history()
 
@@ -294,14 +343,35 @@ class TalebKarpathyStrategy(BaseStrategy):
     # ══════════════════════════════════════════════════════════
 
     def scan_and_propose(self) -> List[TradeProposal]:
-        """Full scan → filter → stability test → MC sizing → propose cycle."""
-        # One straddle at a time: rest of the engine (entry_time, max_holding,
-        # attribution, exit gates) is written for a single active trade.
-        # Without this guard, a tick that passes all entry gates while a
-        # position is open stacks fills onto existing legs and silently blows
-        # past position_size_pct.
+        """Full scan → filter → stability test → MC sizing → propose cycle.
+
+        Phase 4: when `max_layered_structures` > 1, allow a second
+        (or third…) structure to layer on top of an existing book —
+        provided the new structure's type differs from any active one
+        and the same per-entry filters (vega cap, alpha cap, MC sizing)
+        still pass. Each layer is still treated as a discrete entry by
+        the attribution baseline; the existing close-all-on-flat logic
+        continues to work because per-leg netting is unaffected.
+
+        max_layered_structures = 1 (default) preserves the legacy
+        one-structure-at-a-time invariant — required by the existing
+        attribution / exit / MC code paths until they're audited for
+        multi-structure books in a follow-up.
+        """
+        # Phase 4 layering check. Robust to tests / contexts that
+        # bypass __init__ (no tunable_params dict yet) — fall back to
+        # legacy "one structure at a time" behaviour.
+        tunable = getattr(self, "tunable_params", {}) or {}
+        max_layers = tunable.get("max_layered_structures", 1)
         if self.state.positions:
-            return []
+            existing_struct_count = self._count_active_structures()
+            if existing_struct_count >= max_layers:
+                return []
+            # Layering allowed, but only when regime dispatch is on —
+            # the legacy straddle-only path doesn't make sense to
+            # layer (would just be more of the same).
+            if not tunable.get("enable_regime_dispatch", False):
+                return []
         if not self._pre_trade_checks():
             return []
 
@@ -320,28 +390,87 @@ class TalebKarpathyStrategy(BaseStrategy):
             logger.info("IV percentile %.1f outside [%.0f, %.0f]. Waiting.", iv_percentile, iv_min, iv_max)
             return []
 
+        # Phase 1.3 / 3.1: compute skew percentile (mutates _skew_history)
+        # whether or not the legacy gate is enabled, so the regime
+        # classifier always has a fresh observation. The legacy gate
+        # remains in place for operators who want a hard block on rich
+        # skew; the regime classifier instead ROUTES rich-skew regimes
+        # to RISK_REVERSAL_LONG_PUT.
+        skew_pct = self._compute_skew_percentile(chain, spot)
+        skew_max = self.tunable_params.get("skew_pct_max", 100.0)
+        regime_enabled = self.tunable_params.get(
+            "enable_regime_dispatch", False,
+        )
+        if skew_max < 100.0 and not regime_enabled and skew_pct > skew_max:
+            logger.info(
+                "Skew percentile %.1f > max %.1f — ATM straddle would "
+                "pay rich downside skew; waiting (or enable regime "
+                "dispatch to route to risk reversal)",
+                skew_pct, skew_max,
+            )
+            return []
+
         # RV/IV regime gate: long-straddle thesis is RV > IV. Without this,
         # we pay theta and earn gamma that roughly cancels in calm regimes.
         # Returns None during warmup, in which case the gate is permissive.
+        # When regime dispatch is enabled, RV/IV becomes a FEATURE not
+        # a HARD BLOCK — biased-asset / backspread regimes legitimately
+        # trade at low RV/IV.
         atm_iv = self._atm_iv_history[-1] if self._atm_iv_history else None
         rv_window = self.tunable_params.get("rv_window_days", 5.0)
         min_ratio = self.tunable_params.get("min_rv_iv_ratio", 1.0)
         realized_vol = self._compute_realized_vol(rv_window)
+        rv_iv_ratio = None
         if atm_iv and realized_vol is not None:
-            ratio = realized_vol / atm_iv
-            if ratio < min_ratio:
+            rv_iv_ratio = realized_vol / atm_iv
+            if not regime_enabled and rv_iv_ratio < min_ratio:
                 logger.info(
                     "RV/IV ratio %.2f < min %.2f (RV %.1f%% / IV %.1f%% over %.1fd) — waiting for vol expansion",
-                    ratio, min_ratio, realized_vol*100, atm_iv*100, rv_window,
+                    rv_iv_ratio, min_ratio, realized_vol*100, atm_iv*100, rv_window,
                 )
                 return []
 
-        proposals = self.proposer.propose_delta_neutral(
-            chain=chain, spot=spot,
-            capital=self.immutable_params["total_capital"],
-            position_size_pct=self.tunable_params["position_size_pct"],
-            greeks_engine=self.greeks,
-        )
+        # Phase 3.1 dispatch: when enabled, the regime classifier picks
+        # the structure. When disabled (default), preserve legacy
+        # behaviour (always long ATM straddle).
+        if regime_enabled:
+            # vol-of-vol from recent ATM IV samples — std / mean.
+            vvol = None
+            if len(self._atm_iv_history) >= 10:
+                tail = self._atm_iv_history[-20:]
+                mean_iv = float(np.mean(tail))
+                if mean_iv > 0:
+                    vvol = float(np.std(tail)) / mean_iv
+            features = RegimeFeatures(
+                iv_percentile=iv_percentile,
+                rv_iv_ratio=rv_iv_ratio if rv_iv_ratio is not None else 1.0,
+                skew_percentile=skew_pct,
+                vol_of_vol=vvol,
+            )
+            structure = classify(features)
+            logger.info(
+                "Regime classifier → %s (iv_pct=%.1f, rv_iv=%.2f, "
+                "skew_pct=%.1f, vvol=%s)",
+                structure.value, iv_percentile,
+                rv_iv_ratio if rv_iv_ratio is not None else float("nan"),
+                skew_pct,
+                f"{vvol:.3f}" if vvol is not None else "n/a",
+            )
+            if structure == Structure.NO_TRADE:
+                return []
+            proposals = self.proposer.propose_for_structure(
+                structure=structure.value, chain=chain, spot=spot,
+                capital=self.immutable_params["total_capital"],
+                position_size_pct=self.tunable_params["position_size_pct"],
+                greeks_engine=self.greeks,
+            )
+        else:
+            proposals = self.proposer.propose_delta_neutral(
+                chain=chain, spot=spot,
+                capital=self.immutable_params["total_capital"],
+                position_size_pct=self.tunable_params["position_size_pct"],
+                greeks_engine=self.greeks,
+            )
         proposals = self._apply_risk_filters(proposals, spot)
 
         # ── Gap #22: Alpha check — reject if gamma is too expensive ──
@@ -454,26 +583,95 @@ class TalebKarpathyStrategy(BaseStrategy):
         if self._should_exit(greeks, spot):
             return self._generate_close_all_proposals()
 
-        # Check if rehedge needed
-        threshold = self.tunable_params["rehedge_delta_threshold"]
+        # ── Asymmetric, vol-aware rehedge band (Taleb Ch 8 shadow gamma) ──
+        # The base threshold is rescaled per direction using the side-specific
+        # shadow gamma the engine already computes. For biased assets like
+        # NIFTY/BANKNIFTY, downside gamma exceeds upside gamma because vol
+        # expands on sell-offs. A single symmetric band leaves too much
+        # downside delta on the book exactly when it matters most.
+        #
+        # Scaling: band_lots = base × √(γ_side / γ_avg). Sqrt is gentler
+        # than the Whalley-Wilmott γ^(2/3) on the band itself; the (2/3)
+        # exponent shows up below in the cost-side gate. The net effect is
+        # tighter triggers on the side where γ_side < γ_avg (less gamma
+        # per unit delta → drift represents a bigger price move → hedge
+        # sooner) and looser triggers on the gamma-heavy side.
+        base_threshold = self.tunable_params["rehedge_delta_threshold"]
         lot_size = self._get_lot_size()
-        delta_in_lots = abs(greeks.net_discrete_delta) / lot_size
+        delta = greeks.net_discrete_delta  # signed
+        g_avg = max(abs(greeks.net_shadow_gamma), abs(greeks.net_gamma), 1e-6)
+        g_up = max(abs(greeks.net_shadow_gamma_up), g_avg * 0.1)
+        g_down = max(abs(greeks.net_shadow_gamma_down), g_avg * 0.1)
+        # delta > 0 (long-side drift): a hedge would SELL futures, prompted
+        # by an UP-move. Use shadow_gamma_up. Mirror for delta < 0.
+        if delta >= 0:
+            band_lots = base_threshold * math.sqrt(g_up / g_avg)
+        else:
+            band_lots = base_threshold * math.sqrt(g_down / g_avg)
 
-        if delta_in_lots < threshold:
+        # Phase 5: T-0 band tightening (Taleb Ch 13 sticky-strike harvest).
+        # On expiry day, gamma is huge — even small moves create big
+        # delta drift. Tightening the band lets us scalp aggressively
+        # into pin behaviour. Default factor=1.0 (no change); set < 1.0
+        # to enable. Bounded by the existing cost gate so we don't
+        # rehedge into negative-EV trades.
+        t0_factor = self.tunable_params.get("t0_band_factor", 1.0)
+        if t0_factor < 1.0 and self.state.positions:
+            now = self._clock()
+            min_days_to_exp = float("inf")
+            for p in self.state.positions:
+                if not p.expiry:
+                    continue
+                try:
+                    exp = datetime.fromisoformat(p.expiry[:10])
+                    days = (exp - now).total_seconds() / 86400.0
+                    if days < min_days_to_exp:
+                        min_days_to_exp = days
+                except (TypeError, ValueError):
+                    continue
+            if min_days_to_exp < 1.0:
+                band_lots *= t0_factor
+                logger.info(
+                    "Phase 5 T-0 tightening: band ×%.2f (min %.2f days to "
+                    "expiry) → band=%.3f lots",
+                    t0_factor, min_days_to_exp, band_lots,
+                )
+        delta_in_lots = abs(delta) / lot_size
+
+        if delta_in_lots < band_lots:
             return []
 
-        logger.info("Delta drift: %.1f discrete (%.2f lots) > threshold %.2f", greeks.net_discrete_delta, delta_in_lots, threshold)
+        logger.info(
+            "Delta drift: %.1f discrete (%.2f lots) > band %.2f "
+            "(side=%s, γ_up=%.4f γ_down=%.4f γ_avg=%.4f)",
+            delta, delta_in_lots, band_lots,
+            "up" if delta >= 0 else "down", g_up, g_down, g_avg,
+        )
 
-        # ── Cost-aware rehedge gate (Taleb Ch 16: balance gamma capture vs txn costs) ──
+        # ── Whalley-Wilmott cost gate (Taleb Ch 16: balance gamma vs cost) ──
+        # WW's optimal-band result gives required-move-to-rehedge ∝
+        # (cost / γ)^(1/3). Translating to scalp/cost gives required
+        # scalp ∝ cost × (cost / γ × spot²)^(2/3) — or, more pragmatically,
+        # scalp must beat cost × hurdle^(1/3). The cube-root softens the
+        # linear hurdle: a 2× cost only demands a 1.26× larger scalp, not
+        # a 2× larger one. This recovers scalps that the previous linear
+        # gate killed when γ was modest and cost was high.
         expected_scalp = self._estimate_gamma_scalp_pnl(greeks, spot)
-        hedge_lots = max(abs(round(greeks.net_discrete_delta / lot_size)), 1)
+        hedge_lots = max(abs(round(delta / lot_size)), 1)
         cost_one_side = estimate_transaction_cost(spot, hedge_lots, lot_size, "BUY", "FUT")
         estimated_round_trip_cost = cost_one_side * 2
         cost_hurdle = self.tunable_params["cost_hurdle_factor"]
-        if expected_scalp < estimated_round_trip_cost * cost_hurdle:
+        # cost_hurdle is the linear-equivalent (still a tunable). Apply the
+        # cube root so the autoresearch loop's existing tuning range stays
+        # meaningful — hurdle=1.5 (old linear) becomes ~1.14 (cube-root),
+        # hurdle=8 becomes ~2.0. Operator can set hurdle=1.0 to disable.
+        ww_required = estimated_round_trip_cost * (cost_hurdle ** (1 / 3))
+        if expected_scalp < ww_required:
             logger.info(
-                "Skipping rehedge: expected scalp %.0f < %.1fx cost %.0f",
-                expected_scalp, cost_hurdle, estimated_round_trip_cost,
+                "Skipping rehedge: scalp %.0f < WW threshold %.0f "
+                "(cost %.0f, hurdle %.2f → cube-root %.2f)",
+                expected_scalp, ww_required, estimated_round_trip_cost,
+                cost_hurdle, cost_hurdle ** (1 / 3),
             )
             return []
 
@@ -488,9 +686,22 @@ class TalebKarpathyStrategy(BaseStrategy):
         else:
             proposals = self._generate_hard_delta_proposals(greeks, spot)
 
-        # Track gamma scalp P/L
-        scalp_pnl = self._estimate_gamma_scalp_pnl(greeks, spot)
-        self.state.gamma_scalp_pnl += scalp_pnl
+        # Realized gamma-scalp P/L: 0.5 × γ × (ΔS)² where ΔS is the actual
+        # spot move since the last anchor (entry or prior rehedge). The
+        # SIGN of γ matters: a long-gamma book scalps positive on any
+        # move; a short-gamma book LOSES money to realized vol — taking
+        # abs(γ) would silently invert that loss into a fictitious gain
+        # and bias the autoresearch metric toward the losing parameter
+        # set under Phase 3+ regimes that book short-gamma legs.
+        anchor_spot = self.state._last_rehedge_spot
+        if anchor_spot is not None and anchor_spot > 0:
+            dS = spot - anchor_spot
+            gamma_for_scalp = (
+                greeks.net_shadow_gamma if greeks.net_shadow_gamma != 0
+                else greeks.net_gamma
+            )
+            self.state.gamma_scalp_pnl += 0.5 * gamma_for_scalp * dS * dS
+        self.state._last_rehedge_spot = spot
         self.state.rehedge_count += 1
 
         return proposals
@@ -507,19 +718,32 @@ class TalebKarpathyStrategy(BaseStrategy):
         if not spot or spot <= 0:
             logger.warning("EOD report: spot unavailable; returning degraded report")
             return {"status": "spot_unavailable", "n_positions": len(self.state.positions)}
-        T = time_to_expiry(self.state.positions[0].expiry, self._clock()) if self.state.positions[0].expiry else 1/365
+        # Build per-leg T for multi-expiry books (calendars / diagonals
+        # from Phase 3). Single-expiry books pass per_leg_T=None and
+        # the helpers fall back to a single T as before.
+        clock_now = self._clock()
+        per_leg_T = {}
+        for p in self.state.positions:
+            if p.expiry:
+                per_leg_T[p.tradingsymbol] = time_to_expiry(p.expiry, clock_now)
+        T = next(iter(per_leg_T.values()), 1/365)
+        per_leg_arg = per_leg_T if len(set(per_leg_T.values())) > 1 else None
         self._update_portfolio_greeks()
         pf = self.state.portfolio_greeks
 
-        # Bleed forecast
-        bleed = self.risk.bleed_forecast(self.state.positions, spot, T)
+        # Bleed forecast (review-fix #5: pass per_leg_T)
+        bleed = self.risk.bleed_forecast(
+            self.state.positions, spot, T, per_leg_T=per_leg_arg,
+        )
         self.state.bleed_history.append(bleed)
 
         # Neutrality check
         neutrality = self.risk.neutrality_check(pf)
 
-        # Method of squares
-        squares = self.risk.method_of_squares(self.state.positions, spot, T)
+        # Method of squares (review-fix #5: pass per_leg_T)
+        squares = self.risk.method_of_squares(
+            self.state.positions, spot, T, per_leg_T=per_leg_arg,
+        )
 
         report = {
             "timestamp": datetime.now().isoformat(),
@@ -603,6 +827,23 @@ class TalebKarpathyStrategy(BaseStrategy):
             if downside_std > 0:
                 sortino_ratio = (np.mean(arr) / downside_std) * np.sqrt(252)
 
+        # Phase 2.4: gamma_theta_ratio is the Taleb-framework efficiency
+        # metric. Numerator is realized gamma scalp P&L (Phase 1.1 fix);
+        # denominator is realized theta decay (Phase 1.1 fix). Ratio > 1
+        # means scalps exceeded the time-decay rent — the strategy's
+        # core thesis. Both inputs are now realized (not estimates), so
+        # this ratio is well-defined.
+        gamma_scalp = self.state.gamma_scalp_pnl
+        theta_paid = self.state.theta_decay_paid
+        # Guard against tiny / non-positive denominators. When theta is
+        # near zero (just-entered or short-premium book) the ratio is
+        # not meaningful — return 0 so the autoresearch loop's variance
+        # penalty doesn't get fed a divide-by-zero infinity.
+        if theta_paid > 1.0:
+            gamma_theta_ratio = gamma_scalp / theta_paid
+        else:
+            gamma_theta_ratio = 0.0
+
         return {
             "net_pnl": total_pnl,
             "realized_pnl": self.state.realized_pnl,
@@ -612,8 +853,9 @@ class TalebKarpathyStrategy(BaseStrategy):
             "sharpe_ratio": sharpe_ratio,
             "calmar_ratio": calmar_ratio,
             "sortino_ratio": sortino_ratio,
-            "gamma_scalp_pnl": self.state.gamma_scalp_pnl,
-            "theta_decay_paid": self.state.theta_decay_paid,
+            "gamma_scalp_pnl": gamma_scalp,
+            "theta_decay_paid": theta_paid,
+            "gamma_theta_ratio": gamma_theta_ratio,
             "rehedge_count": self.state.rehedge_count,
             "position_count": len(self.state.positions),
             "total_transaction_costs": self.state.total_transaction_costs,
@@ -682,6 +924,11 @@ class TalebKarpathyStrategy(BaseStrategy):
                 "futures_hedge_delta": self.state.futures_hedge_delta,
                 "futures_entry_vwap": self.state.futures_entry_vwap,
                 "futures_lots": self.state.futures_lots,
+                # Anchors for realized-theta and realized-gamma-scalp
+                # accounting. Re-anchored at the next tick if missing,
+                # so absence in an older blob is tolerated by restore.
+                "_last_theta_anchor_time": _iso(self.state._last_theta_anchor_time),
+                "_last_rehedge_spot": self.state._last_rehedge_spot,
             },
         }
 
@@ -728,6 +975,14 @@ class TalebKarpathyStrategy(BaseStrategy):
         self.state.futures_hedge_delta = float(s["futures_hedge_delta"])
         self.state.futures_entry_vwap = float(s["futures_entry_vwap"])
         self.state.futures_lots = int(s["futures_lots"])
+        # Optional fields — older state files predate Phase 1.1
+        # realized-accounting anchors; tolerate their absence.
+        lta = s.get("_last_theta_anchor_time")
+        self.state._last_theta_anchor_time = (
+            datetime.fromisoformat(lta) if lta else None
+        )
+        lrs = s.get("_last_rehedge_spot")
+        self.state._last_rehedge_spot = float(lrs) if lrs is not None else None
 
     def legs_expire_on(self, today: date) -> bool:
         """True if any held leg's contract has its last trading day on `today`.
@@ -876,6 +1131,24 @@ class TalebKarpathyStrategy(BaseStrategy):
         dS = spot * self.tunable_params["gamma_scalp_band_pct"] / 100.0
         return 0.5 * gamma * dS ** 2
 
+    def _count_active_structures(self) -> int:
+        """Phase 4: estimate how many distinct *structures* the book
+        holds, used by `scan_and_propose` to decide whether layering is
+        allowed under `max_layered_structures`.
+
+        A "structure" here is a unique expiry — a straddle is one
+        expiry (both CE and PE same expiry), a calendar spans two
+        expiries (so counts as two), a risk reversal sits on one
+        expiry (one). This is coarse — it doesn't distinguish a
+        straddle from a strangle at the same expiry — but it's
+        sufficient to enforce "don't layer two of the same structure"
+        which is the load-bearing invariant for the existing
+        attribution / exit code.
+        """
+        if not self.state.positions:
+            return 0
+        return len({p.expiry for p in self.state.positions if p.expiry})
+
     def _proposals_to_contracts(self, proposals):
         """Convert proposals to OptionContract list for analysis."""
         contracts = []
@@ -892,17 +1165,61 @@ class TalebKarpathyStrategy(BaseStrategy):
     def _update_portfolio_greeks(self):
         if not self.state.positions:
             self.state.portfolio_greeks = PortfolioGreeks()
+            # Flat book: drop the theta anchor so the next entry starts a
+            # fresh integration window.
+            self.state._last_theta_anchor_time = None
             return
         spot = self._get_spot_price()
         if not spot or spot <= 0:
             logger.warning("Cannot update portfolio greeks: spot unavailable; keeping last value")
             return
-        T = time_to_expiry(self.state.positions[0].expiry, self._clock()) if self.state.positions[0].expiry else 1/365
-        self.state.portfolio_greeks = self.greeks.compute_portfolio_greeks(self.state.positions, spot, T)
+        # Phase 3.3: build a per-leg T map. Single-expiry books (all
+        # legs share an expiry, like a vanilla straddle) use the default
+        # T from the first position. Multi-expiry books (calendars,
+        # diagonals from Phase 3.2) need each leg priced at its own T —
+        # otherwise the back-month gamma and theta are wrong by orders
+        # of magnitude. Empty expiry strings (futures) fall back to the
+        # default T which the greeks engine ignores for option_type=FUT.
+        clock_now = self._clock()
+        per_leg_T = {}
+        default_T = None
+        for p in self.state.positions:
+            if not p.expiry:
+                continue
+            t_p = time_to_expiry(p.expiry, clock_now)
+            per_leg_T[p.tradingsymbol] = t_p
+            if default_T is None:
+                default_T = t_p
+        if default_T is None:
+            default_T = 1 / 365
+        # If all legs share T, fall back to the single-T path (per_leg_T
+        # is then redundant; passing None keeps the call cleaner).
+        unique_T = set(per_leg_T.values())
+        per_leg_arg = per_leg_T if len(unique_T) > 1 else None
+        T = default_T
+        self.state.portfolio_greeks = self.greeks.compute_portfolio_greeks(
+            self.state.positions, spot, T, per_leg_T=per_leg_arg,
+        )
         # Include futures hedge in net delta (both analytical and discrete)
         self.state.portfolio_greeks.net_delta += self.state.futures_hedge_delta
         self.state.portfolio_greeks.net_discrete_delta += self.state.futures_hedge_delta
-        self.state.theta_decay_paid += abs(self.state.portfolio_greeks.net_shadow_theta)
+        # Realized theta accounting: integrate -net_shadow_theta over the
+        # interval since the last update. net_shadow_theta is in ₹/day
+        # (greeks_engine returns daily theta after dividing by 365), so
+        # multiplying by elapsed days gives ₹ of decay realized over that
+        # interval. The sign is flipped so theta_decay_paid grows positive
+        # for a long-premium book (rupees lost to time) and shrinks for a
+        # short-premium book (rupees earned). The previous abs(...) sum
+        # was a gross instantaneous accumulator, not realized decay.
+        now = self._clock()
+        anchor = self.state._last_theta_anchor_time
+        if anchor is not None:
+            elapsed_days = (now - anchor).total_seconds() / 86400.0
+            if elapsed_days > 0:
+                self.state.theta_decay_paid += (
+                    -self.state.portfolio_greeks.net_shadow_theta * elapsed_days
+                )
+        self.state._last_theta_anchor_time = now
 
     def execute_proposals(self, proposals):
         # signals mode: emit each proposal to the dashboard JSONL feed and
@@ -1006,6 +1323,14 @@ class TalebKarpathyStrategy(BaseStrategy):
 
         if is_entry_batch and self.state.positions:
             self.state.entry_time = self._clock()
+            # Anchor the rehedge-spot tracker at the entry spot so the
+            # first scalp computes ΔS from the actual entry price, not
+            # from None. Use the entry-leg spot estimate via the most
+            # recent quote; fall back to a fresh _get_spot_price() call.
+            entry_spot = self._get_spot_price()
+            self.state._last_rehedge_spot = (
+                entry_spot if entry_spot and entry_spot > 0 else None
+            )
             # Snapshot the cumulative counters as of *before* this batch ran
             # so per-trade attribution captures both entry- and exit-side
             # costs in the gross/costs columns. Without the pre-batch snapshot
@@ -1055,6 +1380,9 @@ class TalebKarpathyStrategy(BaseStrategy):
                 })
                 self.state._attribution_baseline = None
             self.state.entry_time = None  # Reset so next entry gets a fresh timestamp
+            # Drop the rehedge-spot anchor; theta anchor is dropped in
+            # _update_portfolio_greeks() when it sees an empty book.
+            self.state._last_rehedge_spot = None
             self._record_pnl_snapshot()
 
         # Evaluate consecutive loss streak based on NET realized P/L of the batch
@@ -1337,6 +1665,115 @@ class TalebKarpathyStrategy(BaseStrategy):
         from scipy.stats import percentileofscore
         return percentileofscore(self._atm_iv_history, atm_iv)
 
+    def _compute_skew_percentile(self, chain, spot):
+        """Phase 1.3: percentile rank of IV(25Δ put) − IV(25Δ call).
+
+        Why this matters: NIFTY/BANKNIFTY exhibit persistent put skew —
+        downside strikes trade at higher IV than upside strikes. When
+        the skew is *unusually rich* (high percentile), an ATM straddle
+        is paying for both legs at a vol that's higher than the
+        symmetric-pricing world would set — particularly the put leg.
+        That premium isn't fully recoverable through delta-hedged gamma
+        scalping under standard BS dynamics; Ch 15 ("path dependence")
+        argues the skew should be traded directly via risk reversals or
+        ratios rather than absorbed into an ATM body.
+
+        Method:
+          - For each strike in the chain, fetch market price and back
+            out IV; compute the option's delta given that IV.
+          - Pick the put with delta nearest −0.25 (long-dated put-OTM
+            tail) and the call nearest +0.25.
+          - Skew = IV_put_25Δ − IV_call_25Δ. Append to rolling history,
+            return percentile against the history. Returns 50.0 during
+            warmup (< 30 observations) so the filter doesn't bite.
+
+        Performance: this is called every flat-book scan_and_propose
+        tick. We BATCH the option-chain quotes into a single
+        kite.quote([...]) call so a 40-strike weekly costs one REST
+        request, not 40 — Kite Connect's documented quote limit is
+        ~3/sec, so per-strike iteration would breach the rate limit
+        within seconds and the swallowed exceptions would make the
+        gate silently inert (review-fix #6).
+        """
+        from scipy.stats import percentileofscore
+
+        if chain.empty:
+            return 50.0
+        try:
+            expiry_str = str(chain.iloc[0]["expiry"])
+            T = time_to_expiry(expiry_str, self._clock())
+            if T <= 0:
+                return 50.0
+        except Exception:
+            return 50.0
+
+        # Single batched quote() for the whole chain. Kite returns a
+        # dict keyed by the same symbol string we passed in; missing
+        # keys (illiquid strikes, no trade today) simply don't appear
+        # in the result. The single network call avoids the per-strike
+        # rate-limit failure mode flagged in code review.
+        relevant = chain[
+            chain["instrument_type"].isin(("CE", "PE"))
+            & chain["strike"].notna()
+            & chain["tradingsymbol"].notna()
+        ]
+        if relevant.empty:
+            return 50.0
+        symbols = [f"NFO:{s}" for s in relevant["tradingsymbol"]]
+        try:
+            quotes = self.kite.quote(symbols) or {}
+        except Exception as e:
+            logger.warning(
+                "Skew batch quote failed (%s: %s) — returning neutral 50.0",
+                type(e).__name__, e,
+            )
+            return 50.0
+
+        best_put = {"delta_distance": float("inf"), "iv": None}
+        best_call = {"delta_distance": float("inf"), "iv": None}
+
+        for _, row in relevant.iterrows():
+            opt_type = row["instrument_type"]
+            strike = row["strike"]
+            symbol = row["tradingsymbol"]
+            q = quotes.get(f"NFO:{symbol}")
+            if not q:
+                continue
+            price = q.get("last_price", 0)
+            if not price or price <= 0:
+                continue
+            try:
+                iv = implied_volatility_bisect(price, spot, strike, T, 0.065, opt_type)
+                if not (0.03 < iv < 3.0):
+                    continue
+                d = self.greeks.delta(spot, strike, T, iv, opt_type)
+            except Exception as e:
+                logger.debug("Skew IV/delta failed for %s: %s", symbol, e)
+                continue
+            # Put: target delta −0.25. Call: target delta +0.25.
+            target = -0.25 if opt_type == "PE" else 0.25
+            dist = abs(d - target)
+            slot = best_put if opt_type == "PE" else best_call
+            if dist < slot["delta_distance"]:
+                slot["delta_distance"] = dist
+                slot["iv"] = iv
+
+        if best_put["iv"] is None or best_call["iv"] is None:
+            return 50.0
+        # Skew = put IV − call IV. Positive ⇒ put skew (typical Indian
+        # equity index). Negative ⇒ reverse skew (unusual; happens in
+        # gold-like assets per Taleb Ch 15).
+        skew = best_put["iv"] - best_call["iv"]
+
+        self._skew_history.append(skew)
+        if len(self._skew_history) > self._iv_history_max_size:
+            self._skew_history = self._skew_history[-self._iv_history_max_size:]
+        self._save_iv_history()
+
+        if len(self._skew_history) < 30:
+            return 50.0
+        return percentileofscore(self._skew_history, skew)
+
     def _record_spot_sample(self, ts: datetime, spot: float):
         """Append a spot quote to the rolling history. Dedup on timestamp so
         the same tick doesn't get counted twice when both scan_and_propose
@@ -1396,9 +1833,21 @@ class TalebKarpathyStrategy(BaseStrategy):
             return
         try:
             data = json.loads(path.read_text())
-            hist = data.get("atm_iv", []) if isinstance(data, dict) else data
+            if isinstance(data, dict):
+                hist = data.get("atm_iv", [])
+                skew = data.get("skew", [])
+            else:
+                hist = data
+                skew = []
             self._atm_iv_history = [float(x) for x in hist if 0.01 < float(x) < 3.0]
-            logger.info("Loaded %d ATM IV observations from %s", len(self._atm_iv_history), path)
+            # Skew is in absolute IV difference (typically −0.5 to +0.5);
+            # range-filter conservatively so corrupted entries don't poison
+            # the percentile.
+            self._skew_history = [float(x) for x in skew if -1.0 < float(x) < 1.0]
+            logger.info(
+                "Loaded %d ATM IV and %d skew observations from %s",
+                len(self._atm_iv_history), len(self._skew_history), path,
+            )
         except (json.JSONDecodeError, OSError, ValueError) as e:
             logger.warning("Could not load IV history from %s: %s", path, e)
 
@@ -1411,6 +1860,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             path.write_text(json.dumps({
                 "underlying": self.underlying,
                 "atm_iv": self._atm_iv_history,
+                "skew": self._skew_history,
                 "updated_at": datetime.now().isoformat(),
             }))
         except OSError as e:

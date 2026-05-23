@@ -244,11 +244,29 @@ class GreeksEngine:
             ddeltadvol=self.ddeltadvol(S,K,T,sigma,otype)*m,
         )
 
-    def compute_portfolio_greeks(self, positions, spot_price, T, price_range_pct=8.0, price_steps=33):
+    def compute_portfolio_greeks(self, positions, spot_price, T, price_range_pct=8.0, price_steps=33,
+                                  per_leg_T=None):
+        """Aggregate position Greeks at spot S.
+
+        Args:
+            positions: iterable of OptionContract.
+            spot_price: current spot S.
+            T: default time-to-expiry (years) for legs without an
+                explicit override. Used when all legs share an expiry.
+            per_leg_T: optional dict {tradingsymbol: T_years} for
+                multi-expiry books (Phase 3.3). Calendar / diagonal
+                spreads have legs at different expiries; passing one T
+                for both would misprice the back-month gamma and theta
+                meaningfully. When `per_leg_T` is provided and contains
+                a key for a leg, that T overrides the default.
+        """
         pf = PortfolioGreeks()
         S = spot_price
         for opt in positions:
-            g = self.compute_option_greeks(opt, S, T)
+            leg_T = T
+            if per_leg_T is not None:
+                leg_T = per_leg_T.get(opt.tradingsymbol, T)
+            g = self.compute_option_greeks(opt, S, leg_T)
             pf.net_delta += g.delta; pf.net_discrete_delta += g.discrete_delta
             pf.net_gamma += g.gamma
             pf.net_theta += g.theta; pf.net_vega += g.vega
@@ -259,7 +277,11 @@ class GreeksEngine:
             pf.net_charm += g.charm
             pf.net_gamma_bleed += g.gamma_bleed
             pf.net_ddeltadvol += g.ddeltadvol
-            days = max(T * 365, 1)
+            # Days-to-expiry MUST use the per-leg T, not the default —
+            # otherwise multi-expiry books (calendars, diagonals) bucket
+            # back-month vega into the front-month bucket and apply the
+            # wrong DTE weight, defeating the very purpose of per_leg_T.
+            days = max(leg_T * 365, 1)
             pf.net_modified_vega += g.vega * self.modified_vega_weight(days)
             bucket = self._get_vega_bucket(days)
             pf.vega_buckets[bucket] = pf.vega_buckets.get(bucket, 0) + g.vega
@@ -276,16 +298,19 @@ class GreeksEngine:
             pf.net_alpha = pf.net_shadow_theta / pf.net_shadow_gamma
         elif abs(pf.net_gamma) > 1e-10:
             pf.net_alpha = pf.net_theta / pf.net_gamma
-        # P/L, delta, gamma profiles
+        # P/L, delta, gamma profiles. Per-leg T applies here too — a
+        # back-month leg in a calendar has materially different gamma
+        # at the same spot than the front-month leg.
         prices = np.linspace(S*(1-price_range_pct/100), S*(1+price_range_pct/100), price_steps)
         for p in prices:
             pnl, dlt, gam = 0.0, 0.0, 0.0
             for opt in positions:
                 sig0 = opt.iv if opt.iv > 0 else 0.2
                 sig_p = self.vol_at_price(sig0, S, p)
-                pnl += (self.bs_price(p, opt.strike, T, sig_p, opt.option_type) - self.bs_price(S, opt.strike, T, sig0, opt.option_type)) * opt.quantity * opt.lot_size
-                dlt += self.delta(p, opt.strike, T, sig_p, opt.option_type) * opt.quantity * opt.lot_size
-                gam += self.gamma(p, opt.strike, T, sig_p) * opt.quantity * opt.lot_size
+                leg_T = T if per_leg_T is None else per_leg_T.get(opt.tradingsymbol, T)
+                pnl += (self.bs_price(p, opt.strike, leg_T, sig_p, opt.option_type) - self.bs_price(S, opt.strike, leg_T, sig0, opt.option_type)) * opt.quantity * opt.lot_size
+                dlt += self.delta(p, opt.strike, leg_T, sig_p, opt.option_type) * opt.quantity * opt.lot_size
+                gam += self.gamma(p, opt.strike, leg_T, sig_p) * opt.quantity * opt.lot_size
             pf.pnl_profile[round(p,2)] = round(pnl,2)
             pf.delta_profile[round(p,2)] = round(dlt,2)
             pf.gamma_profile[round(p,2)] = round(gam,4)

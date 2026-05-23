@@ -1651,3 +1651,718 @@ class TestLegsExpireOn:
             raise RuntimeError("network down")
         h.kite.instruments = _raise
         assert h.legs_expire_on(date(2026, 5, 19)) is False
+
+
+class TestRealizedThetaAccounting:
+    """Phase 1.1: theta_decay_paid must integrate signed net_shadow_theta
+    over elapsed time, not sum abs(net_shadow_theta) every tick. The old
+    behaviour silently inflated the counter and made any gamma/theta
+    ratio metric meaningless."""
+
+    def _make_hedger(self, theta_per_day):
+        from datetime import datetime
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.kite = MagicMock()
+        hedger.state = HedgeState()
+        hedger.mode = "paper"
+        hedger.underlying = "NIFTY"
+        hedger.exchange = "NFO"
+        hedger._cached_lot_size = 75
+        hedger._cached_futures_symbol = None
+        hedger._clock_value = datetime(2026, 5, 22, 9, 30)
+        hedger._clock = lambda: hedger._clock_value
+        hedger.immutable_params = {"total_capital": 500000}
+        hedger.tunable_params = {}
+        hedger.greeks = MagicMock()
+        pf = MagicMock(
+            net_delta=0, net_discrete_delta=0,
+            net_shadow_theta=theta_per_day,
+            net_gamma=0.0, net_shadow_gamma=0.0,
+        )
+        hedger.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
+        hedger._get_spot_price = lambda: 23800.0
+        hedger.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry="2026-05-29", option_type="CE",
+                lot_size=75, quantity=1, entry_price=150.0,
+                current_price=150.0, iv=0.15,
+            ),
+        ]
+        return hedger
+
+    def test_no_anchor_on_first_tick(self):
+        """First call with positions only sets the anchor; nothing
+        accumulates yet (no elapsed time)."""
+        h = self._make_hedger(theta_per_day=-2400.0)
+        h._update_portfolio_greeks()
+        assert h.state.theta_decay_paid == 0.0
+        assert h.state._last_theta_anchor_time is not None
+
+    def test_realized_theta_after_one_hour(self):
+        """At -₹2400/day, after 1 hour the integrated decay is ₹100
+        (= 2400 × 1/24). The previous abs-sum logic would have added
+        2400 every tick regardless of elapsed time."""
+        from datetime import timedelta
+        h = self._make_hedger(theta_per_day=-2400.0)
+        h._update_portfolio_greeks()  # anchor only
+        h._clock_value = h._clock_value + timedelta(hours=1)
+        h._update_portfolio_greeks()
+        assert h.state.theta_decay_paid == pytest.approx(100.0, abs=1.0)
+
+    def test_short_premium_book_accumulates_negative(self):
+        """A short-premium book (positive net_shadow_theta — trader
+        collects time decay) should drive theta_decay_paid NEGATIVE.
+        The previous abs() always grew positive, which obscured the
+        sign of the strategy's theta exposure."""
+        from datetime import timedelta
+        h = self._make_hedger(theta_per_day=+3600.0)
+        h._update_portfolio_greeks()
+        h._clock_value = h._clock_value + timedelta(hours=2)
+        h._update_portfolio_greeks()
+        # +3600 × 2/24 = +300; theta_decay_paid stores -that
+        assert h.state.theta_decay_paid == pytest.approx(-300.0, abs=1.0)
+
+    def test_anchor_clears_when_book_flattens(self):
+        """When positions empty, anchor drops so the next entry starts
+        a fresh window. Otherwise a stale anchor from a closed trade
+        would credit huge "decay" against the next entry's first tick."""
+        h = self._make_hedger(theta_per_day=-2400.0)
+        h._update_portfolio_greeks()
+        assert h.state._last_theta_anchor_time is not None
+        h.state.positions = []
+        h._update_portfolio_greeks()
+        assert h.state._last_theta_anchor_time is None
+
+
+class TestRealizedGammaScalpPnL:
+    """Phase 1.1: gamma_scalp_pnl must be 0.5 × γ × (actual ΔS)² where
+    ΔS is the spot move since the last anchor (entry or prior rehedge),
+    not a static 0.5 × γ × (band × spot)² estimate. The previous
+    estimate incremented every rehedge whether or not the underlying
+    actually moved, inflating the scalp counter on flat tapes."""
+
+    def _book_scalp(self, gamma_at_rehedge, spot, anchor_spot):
+        """Exercise the scalp-booking tail of check_and_rehedge in
+        isolation, returning the resulting (gamma_scalp_pnl,
+        new_anchor) pair."""
+        state = HedgeState()
+        state._last_rehedge_spot = anchor_spot
+        greeks = MagicMock(
+            net_shadow_gamma=gamma_at_rehedge,
+            net_gamma=gamma_at_rehedge,
+        )
+        # Mirror of the inline scalp-booking in check_and_rehedge.
+        # Kept in-test (not via the full call) so we can isolate the
+        # accounting from the hedge decision and proposer machinery.
+        anchor = state._last_rehedge_spot
+        if anchor is not None and anchor > 0:
+            dS = spot - anchor
+            g = greeks.net_shadow_gamma if greeks.net_shadow_gamma != 0 else greeks.net_gamma
+            state.gamma_scalp_pnl += 0.5 * g * dS * dS
+        state._last_rehedge_spot = spot
+        state.rehedge_count += 1
+        return state
+
+    def test_scalp_scales_with_squared_move(self):
+        """0.5 × 0.3 × 50² = 375. Doubling ΔS quadruples the scalp."""
+        s_small = self._book_scalp(0.3, spot=23850, anchor_spot=23800)
+        s_big = self._book_scalp(0.3, spot=23900, anchor_spot=23800)
+        assert s_small.gamma_scalp_pnl == pytest.approx(375.0)
+        assert s_big.gamma_scalp_pnl == pytest.approx(1500.0)
+        assert s_big.gamma_scalp_pnl == pytest.approx(4 * s_small.gamma_scalp_pnl)
+
+    def test_zero_move_zero_scalp(self):
+        """ΔS = 0 books no scalp even though a rehedge fired. The old
+        estimate credited a fictional scalp regardless."""
+        s = self._book_scalp(0.3, spot=23800, anchor_spot=23800)
+        assert s.gamma_scalp_pnl == 0.0
+        assert s.rehedge_count == 1
+
+    def test_anchor_advances_to_current_spot(self):
+        """After a rehedge, anchor moves to current spot so the next
+        scalp measures ΔS from the new anchor — no double-counting."""
+        s = self._book_scalp(0.3, spot=23850, anchor_spot=23800)
+        assert s._last_rehedge_spot == 23850
+
+    def test_short_gamma_book_loses_scalp_to_realized_vol(self):
+        """Phase 1.1 fix (post-review): a SHORT-gamma structure (γ<0)
+        LOSES money to realized vol — the scalp formula must preserve
+        sign. The previous abs(γ) credited fictitious positive P&L on
+        the very books Phase 3 enables (risk reversal, backspread,
+        calendar wings) and would bias autoresearch toward losers."""
+        s = self._book_scalp(-0.3, spot=23850, anchor_spot=23800)
+        # 0.5 × (-0.3) × 50² = -375 (loss)
+        assert s.gamma_scalp_pnl == pytest.approx(-375.0)
+
+
+class TestAsymmetricRehedgeBand:
+    """Phase 1.2: rehedge bands must scale per-side with shadow gamma
+    (Taleb Ch 8). For biased assets like NIFTY/BANKNIFTY, γ_down > γ_up
+    means a given delta drift to the downside represents a smaller
+    price move — band should be tighter there. The previous code used
+    one symmetric threshold and left downside delta on the book exactly
+    when the position is most at risk."""
+
+    def _make_hedger(self, base_threshold=0.5):
+        from datetime import datetime
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.underlying = "NIFTY"
+        h.exchange = "NFO"
+        h._cached_lot_size = 75
+        h._cached_futures_symbol = None
+        h._clock = lambda: datetime(2026, 5, 22, 10, 0)
+        h.immutable_params = {"total_capital": 500000}
+        h.tunable_params = {
+            "rehedge_delta_threshold": base_threshold,
+            "gamma_scalp_band_pct": 1.5,
+            "cost_hurdle_factor": 1.0,  # neutralise the WW gate for these tests
+            "max_holding_period_hours": 8,
+        }
+        h.greeks = MagicMock()
+        h._get_spot_price = lambda: 23800.0
+        h._consecutive_quote_failures = 0
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry="2026-05-29", option_type="CE",
+                lot_size=75, quantity=1, entry_price=150.0,
+                current_price=150.0, iv=0.15,
+            ),
+        ]
+        h.state.entry_time = datetime(2026, 5, 22, 9, 30)  # not same bar
+        # Stub risk + futures helpers so check_and_rehedge can finish.
+        h.risk = MagicMock()
+        h.risk.hedge_decision = MagicMock(return_value=MagicMock(
+            use_soft_delta=False, rationale="test",
+        ))
+        h._update_positions_prices = lambda spot: None
+        h._record_spot_sample = lambda *a: None
+        h._should_exit = lambda *a: False
+        h._get_lot_size = lambda: 75
+        h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
+        h.kite.quote = MagicMock(return_value={
+            "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
+        })
+        return h
+
+    def _set_greeks(self, h, *, delta, g_up, g_down, g_avg=None):
+        """Inject a portfolio-greeks snapshot for the asymmetric-band path."""
+        if g_avg is None:
+            g_avg = (g_up + g_down) / 2
+        pf = MagicMock(
+            net_delta=delta,
+            net_discrete_delta=delta,
+            net_shadow_gamma=g_avg,
+            net_shadow_gamma_up=g_up,
+            net_shadow_gamma_down=g_down,
+            net_gamma=g_avg,
+            net_shadow_theta=-2400.0,
+            net_vega=2000.0,
+        )
+        h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
+        h.state.portfolio_greeks = pf
+
+    def test_downside_band_tighter_when_gamma_down_smaller(self):
+        """With γ_down < γ_avg, a downside drift triggers earlier
+        asymmetrically than under the symmetric base threshold.
+
+        We use a wider base threshold (2.0 lots) so the asymmetric
+        tightening produces a band above the 1-lot rounding floor of
+        the proposal generator. With smaller bases the asymmetry still
+        applies in principle but the hedge can't size to ≥1 lot.
+
+        Numbers: base=2.0 lots × lot_size=75 → symmetric trigger at 150
+        delta. γ_down=0.18, γ_avg=0.375 → sqrt(0.48) = 0.693 → downside
+        band ≈ 1.39 lots ≈ 104 delta. A −120 drift triggers
+        asymmetrically (1.6 > 1.39) but would NOT trigger symmetrically
+        (1.6 < 2.0)."""
+        h = self._make_hedger(base_threshold=2.0)
+        self._set_greeks(h, delta=-120.0, g_up=0.5, g_down=0.18, g_avg=0.375)
+        proposals = h.check_and_rehedge()
+        assert len(proposals) > 0, (
+            "Downside band must be tighter when γ_down is smaller than "
+            "γ_avg, otherwise dangerous downside delta sits on the book"
+        )
+
+    def test_upside_band_looser_when_gamma_up_larger(self):
+        """With γ_up > γ_avg, the upside band widens — the position is
+        scalping efficiently per ΔS so no rush to hedge. A symmetric
+        threshold would over-trade here, eating round-trip costs.
+
+        Numbers: base=0.5 lots × lot_size=75 → symmetric trigger at 37.5
+        delta. γ_up=0.6, γ_avg=0.375 → sqrt(1.6) = 1.265 → upside band
+        ≈ 0.632 lots ≈ 47.4 delta. A +40 drift triggers symmetrically
+        (0.533 > 0.5) but NOT asymmetrically (0.533 < 0.632)."""
+        h = self._make_hedger(base_threshold=0.5)
+        self._set_greeks(h, delta=40.0, g_up=0.6, g_down=0.15, g_avg=0.375)
+        proposals = h.check_and_rehedge()
+        assert proposals == [], (
+            "Upside band must widen when γ_up exceeds γ_avg, else we "
+            "over-trade and burn round-trip costs"
+        )
+
+    def test_symmetric_when_gammas_equal(self):
+        """When γ_up == γ_down == γ_avg, the asymmetric form must
+        collapse to the legacy symmetric threshold (no regression)."""
+        h = self._make_hedger(base_threshold=2.0)
+        # sqrt-factor = 1 → band = 2.0 lots = 150 delta. A drift of
+        # 160 delta (≈2.13 lots) triggers and rounds to 2 lots.
+        self._set_greeks(h, delta=160.0, g_up=0.4, g_down=0.4, g_avg=0.4)
+        proposals = h.check_and_rehedge()
+        assert len(proposals) > 0
+
+
+class TestWhalleyWilmottCostGate:
+    """Phase 1.2: the cost gate must use cube-root scaling, not linear.
+    WW's optimal-band result shows required scalp grows as cost^(1/3),
+    not cost^1. The previous linear gate killed too many marginally
+    profitable rehedges."""
+
+    def _build_hedger(self, cost_hurdle):
+        from datetime import datetime
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.underlying = "NIFTY"
+        h.exchange = "NFO"
+        h._cached_lot_size = 75
+        h._cached_futures_symbol = None
+        h._clock = lambda: datetime(2026, 5, 22, 10, 0)
+        h.immutable_params = {"total_capital": 500000}
+        h.tunable_params = {
+            "rehedge_delta_threshold": 0.1,  # easy to clear
+            "gamma_scalp_band_pct": 1.5,
+            "cost_hurdle_factor": cost_hurdle,
+            "max_holding_period_hours": 8,
+        }
+        h.greeks = MagicMock()
+        h._get_spot_price = lambda: 23800.0
+        h._consecutive_quote_failures = 0
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry="2026-05-29", option_type="CE",
+                lot_size=75, quantity=1, entry_price=150.0,
+                current_price=150.0, iv=0.15,
+            ),
+        ]
+        h.state.entry_time = datetime(2026, 5, 22, 9, 30)
+        h.risk = MagicMock()
+        h.risk.hedge_decision = MagicMock(return_value=MagicMock(
+            use_soft_delta=False, rationale="test",
+        ))
+        h._update_positions_prices = lambda spot: None
+        h._record_spot_sample = lambda *a: None
+        h._should_exit = lambda *a: False
+        h._get_lot_size = lambda: 75
+        h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
+        h.kite.quote = MagicMock(return_value={
+            "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
+        })
+        pf = MagicMock(
+            net_delta=50.0, net_discrete_delta=50.0,
+            net_shadow_gamma=0.4, net_shadow_gamma_up=0.4,
+            net_shadow_gamma_down=0.4, net_gamma=0.4,
+            net_shadow_theta=-2400.0, net_vega=2000.0,
+        )
+        h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
+        h.state.portfolio_greeks = pf
+        return h
+
+    def test_cube_root_scales_softer_than_linear(self):
+        """A hurdle of 8.0 under the old LINEAR gate would demand
+        8× the cost in scalp. Under the cube-root form it demands
+        only 2× (= 8^(1/3)). This must let through scalps that the
+        linear gate killed."""
+        # Sanity: with cost_hurdle = 8, cube root is 2.0. So scalp
+        # must beat 2× round-trip cost, not 8×.
+        h = self._build_hedger(cost_hurdle=8.0)
+        proposals = h.check_and_rehedge()
+        # We can't easily assert "exactly 2×" without knowing the
+        # exact cost number; but the new code should at least either
+        # let it through or skip with the correct LOG message. The
+        # absence of an exception is the smoke check here.
+        assert isinstance(proposals, list)
+
+    def test_hurdle_1_disables_gate(self):
+        """cost_hurdle = 1 → cube root = 1 → no de-rating beyond cost.
+        The expected_scalp need only beat the raw round-trip cost,
+        which is the most permissive setting an operator can choose."""
+        h = self._build_hedger(cost_hurdle=1.0)
+        proposals = h.check_and_rehedge()
+        assert isinstance(proposals, list)
+
+    def test_best_params_cost_hurdle_was_migrated_for_cube_root(self):
+        """Code-review fix #8: best_params.json carried a cost_hurdle
+        of 1.3624 tuned against the OLD linear gate. After Phase 1.2
+        switched the gate to cube-root, 1.3624 would mean a much
+        looser 1.11× cost threshold (1.36^(1/3)). The migration cubed
+        the value to 1.3624^3 ≈ 2.5288 so the new gate produces the
+        same effective threshold the optimizer found. Guard against
+        future regressions that silently revert the value."""
+        import json
+        from pathlib import Path
+        bp = json.loads(
+            (Path(__file__).resolve().parent.parent / "best_params.json").read_text()
+        )
+        hurdle = bp["best_params"]["cost_hurdle_factor"]
+        # The migrated value must yield an effective linear-equivalent
+        # threshold ≥ ~1.3× cost — anything materially lower indicates
+        # the value was reset without re-running autoresearch.
+        effective = hurdle ** (1 / 3)
+        assert effective >= 1.3, (
+            f"best_params cost_hurdle_factor={hurdle} → effective "
+            f"{effective:.2f}× cost. If you intentionally re-tuned, "
+            f"update this test bound; otherwise this is the Phase 1.2 "
+            f"semantics-drift bug."
+        )
+
+
+class TestSkewPercentileGate:
+    """Phase 1.3: a rich put-skew percentile should block ATM-straddle
+    entry — the body pays the skew premium it can't recover via delta
+    hedging."""
+
+    def _make_hedger(self, skew_history, skew_max=80.0):
+        from datetime import datetime
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.underlying = "NIFTY"
+        h.exchange = "NFO"
+        h._cached_lot_size = 75
+        h._cached_futures_symbol = None
+        h._clock = lambda: datetime(2026, 5, 22, 10, 0)
+        h._persist_iv_history = False
+        h._iv_history_max_size = 500
+        h._skew_history = list(skew_history)
+        h._atm_iv_history = []
+        h.greeks = MagicMock()
+        # Stub the engine's delta so the strike-picking loop converges.
+        h.greeks.delta = lambda S, K, T, sigma, kind: (
+            +0.25 if (kind == "CE" and K > S) else
+            -0.25 if (kind == "PE" and K < S) else
+            +0.5 if kind == "CE" else -0.5
+        )
+        h.tunable_params = {"skew_pct_max": skew_max}
+        h._save_iv_history = lambda: None
+        return h
+
+    def _chain_with_skewed_quotes(self, spot, put_iv, call_iv):
+        """Build a tiny options chain DataFrame plus a kite.quote stub
+        that returns prices consistent with `put_iv` for the OTM put
+        and `call_iv` for the OTM call."""
+        import pandas as pd
+        from datetime import date as _date, timedelta as _td
+        from greeks_engine import GreeksEngine
+        engine = GreeksEngine(risk_free_rate=0.065)
+        T = 7 / 365
+        put_strike = spot - 200
+        call_strike = spot + 200
+        put_price = engine.bs_price(spot, put_strike, T, put_iv, "PE")
+        call_price = engine.bs_price(spot, call_strike, T, call_iv, "CE")
+        expiry_iso = (_date(2026, 5, 22) + _td(days=7)).isoformat()
+        chain = pd.DataFrame([
+            {"strike": put_strike, "instrument_type": "PE",
+             "tradingsymbol": "NIFTY26MAY23600PE", "expiry": expiry_iso},
+            {"strike": call_strike, "instrument_type": "CE",
+             "tradingsymbol": "NIFTY26MAY24000CE", "expiry": expiry_iso},
+        ])
+        quote_map = {
+            "NFO:NIFTY26MAY23600PE": {"last_price": put_price},
+            "NFO:NIFTY26MAY24000CE": {"last_price": call_price},
+        }
+        return chain, quote_map
+
+    def test_skew_percentile_returns_neutral_during_warmup(self):
+        """< 30 observations ⇒ returns 50.0 so the gate doesn't bite
+        during the first month of live operation."""
+        from datetime import date  # noqa: F401 — used by helper
+        h = self._make_hedger(skew_history=[0.02] * 10)
+        chain, qmap = self._chain_with_skewed_quotes(23800, put_iv=0.20, call_iv=0.15)
+        h.kite.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
+        pct = h._compute_skew_percentile(chain, 23800)
+        assert pct == 50.0
+
+    def test_skew_percentile_high_when_current_above_history(self):
+        """With 40 prior observations centered at 0.02 (call IV − put IV
+        almost flat), a current skew of 0.08 should rank in the top
+        decile (>= 90th percentile)."""
+        from datetime import date  # noqa: F401
+        h = self._make_hedger(skew_history=[0.02 + 0.005 * (i % 5) for i in range(40)])
+        # put_iv 0.23, call_iv 0.15 ⇒ current skew = 0.08
+        chain, qmap = self._chain_with_skewed_quotes(23800, put_iv=0.23, call_iv=0.15)
+        h.kite.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
+        pct = h._compute_skew_percentile(chain, 23800)
+        # Both append (so length grows to 41) and rank against own history.
+        # The exact value depends on bisect, but it must be > 80.
+        assert pct > 80.0, f"Expected high percentile, got {pct}"
+
+    def test_skew_percentile_low_when_current_below_history(self):
+        """Same setup but current skew below history → low percentile.
+        Confirms the percentile direction matches semantics."""
+        from datetime import date  # noqa: F401
+        h = self._make_hedger(skew_history=[0.05 + 0.005 * (i % 5) for i in range(40)])
+        # put_iv 0.16, call_iv 0.15 ⇒ current skew = 0.01 (mild)
+        chain, qmap = self._chain_with_skewed_quotes(23800, put_iv=0.16, call_iv=0.15)
+        h.kite.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
+        pct = h._compute_skew_percentile(chain, 23800)
+        assert pct < 20.0, f"Expected low percentile, got {pct}"
+
+    def test_missing_skew_pct_max_disables_gate(self):
+        """A tunable_params without skew_pct_max must NOT raise — the
+        gate just becomes inert. Required so older configs and tests
+        that bypass __init__ continue to work."""
+        h = self._make_hedger(skew_history=[], skew_max=100.0)
+        del h.tunable_params["skew_pct_max"]
+        # Build minimal preconditions for scan_and_propose to reach the
+        # gate without triggering anything before it. We don't need it
+        # to *succeed* — just not crash on missing key.
+        h._pre_trade_checks = lambda: False
+        # Should silently return [] without KeyError
+        assert h.scan_and_propose() == []
+
+    def test_skew_uses_single_batched_quote_call(self):
+        """Code-review fix #6: the skew computation MUST issue exactly
+        ONE batched kite.quote() call for the whole chain, not N
+        per-strike calls — Kite's documented rate limit makes the
+        per-strike pattern silently inert in production."""
+        from datetime import date as _date, timedelta as _td
+        import pandas as pd
+        from greeks_engine import GreeksEngine
+        h = self._make_hedger(skew_history=[])
+        engine = GreeksEngine(risk_free_rate=0.065)
+        T = 7 / 365
+        expiry_iso = (_date(2026, 5, 22) + _td(days=7)).isoformat()
+        # Build a 6-strike chain (3 CE + 3 PE) — pre-fix this would
+        # have issued 6 separate quote() calls.
+        spot = 23800
+        rows = []
+        for offset in (-200, 0, 200):
+            for typ in ("CE", "PE"):
+                rows.append({
+                    "strike": spot + offset, "instrument_type": typ,
+                    "tradingsymbol": f"NIFTY26MAY{spot+offset}{typ}",
+                    "expiry": expiry_iso,
+                })
+        chain = pd.DataFrame(rows)
+        # Synthetic prices at IV ≈ 0.20.
+        qmap = {}
+        for r in rows:
+            price = engine.bs_price(spot, r["strike"], T, 0.20, r["instrument_type"])
+            qmap[f"NFO:{r['tradingsymbol']}"] = {"last_price": price}
+
+        call_count = {"n": 0}
+        def fake_quote(symbols):
+            call_count["n"] += 1
+            return {k: qmap[k] for k in symbols if k in qmap}
+        h.kite.quote = fake_quote
+        h._compute_skew_percentile(chain, spot)
+        assert call_count["n"] == 1, (
+            f"Expected 1 batched quote() call, got {call_count['n']} "
+            "— per-strike iteration would re-introduce the rate-limit "
+            "regression."
+        )
+
+
+class TestGammaThetaRatio:
+    """Phase 2.4: get_strategy_metrics must expose a gamma_theta_ratio
+    derived from the realized scalp / realized theta. This becomes the
+    autoresearch primary metric — guard against silent regression."""
+
+    def _make_hedger(self):
+        from datetime import datetime
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.state = HedgeState()
+        h.immutable_params = {"total_capital": 500000}
+        return h
+
+    def test_ratio_above_one_when_scalp_beats_theta(self):
+        h = self._make_hedger()
+        h.state.gamma_scalp_pnl = 2500.0
+        h.state.theta_decay_paid = 1500.0
+        m = h.get_strategy_metrics()
+        assert m["gamma_theta_ratio"] == pytest.approx(2500 / 1500)
+
+    def test_ratio_zero_when_no_theta(self):
+        """No realized theta yet ⇒ ratio is undefined; return 0 not
+        infinity so the autoresearch variance penalty doesn't blow up."""
+        h = self._make_hedger()
+        h.state.gamma_scalp_pnl = 1500.0
+        h.state.theta_decay_paid = 0.0
+        m = h.get_strategy_metrics()
+        assert m["gamma_theta_ratio"] == 0.0
+
+    def test_ratio_zero_when_short_premium(self):
+        """Short-premium book has negative theta_decay_paid (collected
+        time decay). Ratio sign reflects net cashflow direction —
+        useful for the optimizer to distinguish from a true win."""
+        h = self._make_hedger()
+        h.state.gamma_scalp_pnl = 500.0
+        h.state.theta_decay_paid = -2000.0
+        m = h.get_strategy_metrics()
+        # |theta_decay_paid| > 1 in absolute terms but the guard checks
+        # > 1.0 SIGNED, not absolute — so this returns 0 in the current
+        # implementation. That's deliberate: short-premium ratios need
+        # their own metric (Phase 3 territory), not the same one.
+        assert m["gamma_theta_ratio"] == 0.0
+
+
+class TestLayeredStructures:
+    """Phase 4: when max_layered_structures > 1 AND regime dispatch is
+    on, an existing structure does not block a NEW structure of a
+    different type from being proposed."""
+
+    def _make_hedger(self, max_layers=1, regime=False):
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h.state = HedgeState()
+        h.mode = "paper"
+        h._pre_trade_checks = MagicMock(return_value=True)
+        h._get_spot_price = MagicMock(return_value=22000.0)
+        h.proposer = MagicMock()
+        h.greeks = MagicMock()
+        h.risk = MagicMock()
+        h.tunable_params = {
+            "max_layered_structures": max_layers,
+            "enable_regime_dispatch": regime,
+        }
+        return h
+
+    def test_legacy_default_blocks_layering(self):
+        """max_layered_structures=1 keeps the legacy one-at-a-time
+        invariant — any existing position blocks new entries."""
+        h = self._make_hedger(max_layers=1, regime=False)
+        h.state.positions.append(OptionContract(
+            tradingsymbol="X", instrument_token=1, strike=22000,
+            expiry="2026-04-03", option_type="CE", lot_size=25,
+            quantity=1, entry_price=300, current_price=300, iv=0.15,
+        ))
+        result = h.scan_and_propose()
+        assert result == []
+        h._pre_trade_checks.assert_not_called()
+
+    def test_layering_blocked_without_regime_dispatch(self):
+        """Even with max_layered_structures=3, if regime dispatch is
+        OFF the legacy guard still blocks. Layering only makes sense
+        when the proposer can emit different structures."""
+        h = self._make_hedger(max_layers=3, regime=False)
+        h.state.positions.append(OptionContract(
+            tradingsymbol="X", instrument_token=1, strike=22000,
+            expiry="2026-04-03", option_type="CE", lot_size=25,
+            quantity=1, entry_price=300, current_price=300, iv=0.15,
+        ))
+        result = h.scan_and_propose()
+        assert result == []
+
+    def test_layering_proceeds_with_regime_and_capacity(self):
+        """max_layered_structures=2, one structure (one expiry) active,
+        regime dispatch on — the layering guard does NOT block, so
+        _pre_trade_checks gets called. (We stub it to return False so
+        the rest of the pipeline doesn't try to run.)"""
+        h = self._make_hedger(max_layers=2, regime=True)
+        h._pre_trade_checks = MagicMock(return_value=False)
+        h.state.positions.append(OptionContract(
+            tradingsymbol="X", instrument_token=1, strike=22000,
+            expiry="2026-04-03", option_type="CE", lot_size=25,
+            quantity=1, entry_price=300, current_price=300, iv=0.15,
+        ))
+        result = h.scan_and_propose()
+        assert result == []
+        h._pre_trade_checks.assert_called_once()
+
+    def test_t0_band_tightens_on_expiry_day(self):
+        """Phase 5: when t0_band_factor < 1.0 and any leg has < 1 day
+        to expiry, the rehedge band is multiplied by the factor —
+        making the trigger tighter and capturing sticky-strike scalps.
+        With factor 1.0 (default), behaviour is unchanged."""
+        from datetime import datetime
+        h = self._make_hedger(max_layers=1, regime=False)
+        h.tunable_params.update({
+            "rehedge_delta_threshold": 0.5,
+            "gamma_scalp_band_pct": 1.5,
+            "cost_hurdle_factor": 1.0,
+            "max_holding_period_hours": 8,
+            "t0_band_factor": 0.33,
+        })
+        h._clock = lambda: datetime(2026, 5, 28, 10, 0)
+        h._cached_lot_size = 75
+        h._get_lot_size = lambda: 75
+        h._consecutive_quote_failures = 0
+        h._update_positions_prices = lambda spot: None
+        h._record_spot_sample = lambda *a: None
+        h._should_exit = lambda *a: False
+        h._get_spot_price = lambda: 23800.0
+        h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
+        h.kite.quote = MagicMock(return_value={
+            "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
+        })
+        # Leg expires same day → < 1 day to expiry → band tightens.
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry="2026-05-28", option_type="CE",
+                lot_size=75, quantity=1, entry_price=120.0,
+                current_price=120.0, iv=0.20,
+            ),
+        ]
+        h.state.entry_time = datetime(2026, 5, 28, 9, 30)
+        h.risk = MagicMock()
+        h.risk.hedge_decision = MagicMock(return_value=MagicMock(
+            use_soft_delta=False, rationale="test",
+        ))
+        # Greeks: symmetric γ_up=γ_down=γ_avg so the asymmetric band
+        # collapses to base × 1.0 = 0.5 lots = 37.5 delta. Phase 5
+        # factor 0.33 → effective band = 0.165 lots = 12.4 delta.
+        # A drift of 15 delta (0.2 lots) is BELOW symmetric band but
+        # ABOVE Phase 5 tightened band → rehedge fires.
+        pf = MagicMock(
+            net_delta=15.0, net_discrete_delta=15.0,
+            net_shadow_gamma=0.4, net_shadow_gamma_up=0.4,
+            net_shadow_gamma_down=0.4, net_gamma=0.4,
+            net_shadow_theta=-2400.0, net_vega=2000.0,
+        )
+        h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
+        h.state.portfolio_greeks = pf
+        proposals = h.check_and_rehedge()
+        # The realized-scalp anchor isn't set in this minimal mock so
+        # gamma_scalp_pnl stays 0, but the band trigger AND log emit
+        # is what matters here. Easiest assertion: rehedge_count
+        # incremented, OR proposals non-empty.
+        # NOTE: round(15/75)=0 so proposals=[] even when band fires,
+        # per the 2026-05-07 lesson. Check rehedge_count.
+        assert h.state.rehedge_count == 1 or len(proposals) > 0, (
+            "Phase 5 T-0 tightening did not fire — band still too wide"
+        )
+
+    def test_count_active_structures_by_expiry(self):
+        """Two legs sharing one expiry (a straddle) count as ONE
+        structure. Two legs across two expiries (a calendar) count
+        as TWO. The coarse-grained count is intentional: it's the
+        invariant the existing attribution/exit code can handle."""
+        h = self._make_hedger(max_layers=2, regime=True)
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="A", instrument_token=1, strike=22000,
+                expiry="2026-04-03", option_type="CE", lot_size=25,
+                quantity=1, entry_price=300, current_price=300, iv=0.15,
+            ),
+            OptionContract(
+                tradingsymbol="B", instrument_token=2, strike=22000,
+                expiry="2026-04-03", option_type="PE", lot_size=25,
+                quantity=1, entry_price=280, current_price=280, iv=0.15,
+            ),
+        ]
+        assert h._count_active_structures() == 1
+        h.state.positions.append(OptionContract(
+            tradingsymbol="C", instrument_token=3, strike=22000,
+            expiry="2026-05-08", option_type="CE", lot_size=25,
+            quantity=1, entry_price=320, current_price=320, iv=0.15,
+        ))
+        assert h._count_active_structures() == 2

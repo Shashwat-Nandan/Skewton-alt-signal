@@ -283,38 +283,49 @@ class RiskAnalyzer:
     def bleed_forecast(
         self, positions: List[OptionContract], spot: float, T: float,
         expected_vol_change: float = -0.005,
+        per_leg_T: dict = None,
     ) -> BleedForecast:
         """
         Taleb Ch 11: Compute overnight bleed — delta/gamma drift from time + vol changes.
 
         Forward bleed: effect of time advancing (expiry shrinking).
         Backward bleed: effect of vol changing (can reverse or amplify time effect).
+
+        per_leg_T (Phase 3 / review-fix #5): optional {tradingsymbol: T_years}
+        for multi-expiry books. Without it, all legs use the same T,
+        which mis-prices back-month bleed in calendars/diagonals.
         """
         bf = BleedForecast()
         dt = 1.0 / 365.0
-        T_tomorrow = max(T - dt, 1/365)
 
         delta_today = delta_tomorrow = 0.0
         gamma_today = gamma_tomorrow = 0.0
         theta_today = theta_tomorrow = 0.0
         sg_up_today = sg_down_today = 0.0
 
+        def _leg_T(opt):
+            if per_leg_T is not None:
+                return per_leg_T.get(opt.tradingsymbol, T)
+            return T
+
         for opt in positions:
             sigma = opt.iv or 0.2
             m = opt.quantity * opt.lot_size
+            T_leg = _leg_T(opt)
+            T_leg_tomorrow = max(T_leg - dt, 1/365)
 
             # Today
-            delta_today += self.greeks.delta(spot, opt.strike, T, sigma, opt.option_type) * m
-            gamma_today += self.greeks.gamma(spot, opt.strike, T, sigma) * m
-            theta_today += self.greeks.theta(spot, opt.strike, T, sigma, opt.option_type) * m
-            _, su, sd = self.greeks.shadow_gamma_directional(spot, opt.strike, T, sigma, opt.option_type)
+            delta_today += self.greeks.delta(spot, opt.strike, T_leg, sigma, opt.option_type) * m
+            gamma_today += self.greeks.gamma(spot, opt.strike, T_leg, sigma) * m
+            theta_today += self.greeks.theta(spot, opt.strike, T_leg, sigma, opt.option_type) * m
+            _, su, sd = self.greeks.shadow_gamma_directional(spot, opt.strike, T_leg, sigma, opt.option_type)
             sg_up_today += su * m; sg_down_today += sd * m
 
             # Tomorrow (time + vol change)
             sigma_new = max(sigma + expected_vol_change, 0.03)
-            delta_tomorrow += self.greeks.delta(spot, opt.strike, T_tomorrow, sigma_new, opt.option_type) * m
-            gamma_tomorrow += self.greeks.gamma(spot, opt.strike, T_tomorrow, sigma_new) * m
-            theta_tomorrow += self.greeks.theta(spot, opt.strike, T_tomorrow, sigma_new, opt.option_type) * m
+            delta_tomorrow += self.greeks.delta(spot, opt.strike, T_leg_tomorrow, sigma_new, opt.option_type) * m
+            gamma_tomorrow += self.greeks.gamma(spot, opt.strike, T_leg_tomorrow, sigma_new) * m
+            theta_tomorrow += self.greeks.theta(spot, opt.strike, T_leg_tomorrow, sigma_new, opt.option_type) * m
 
         bf.delta_bleed = delta_today - delta_tomorrow
         bf.gamma_bleed = gamma_today - gamma_tomorrow
@@ -324,14 +335,14 @@ class RiskAnalyzer:
         # Negate charm because charm = delta(T-dt) - delta(T) = delta_tomorrow - delta_today,
         # but forward_bleed should = delta_today - delta_tomorrow (Taleb p.191).
         bf.forward_bleed = -sum(
-            self.greeks.charm(spot, o.strike, T, o.iv or 0.2, o.option_type) * o.quantity * o.lot_size
+            self.greeks.charm(spot, o.strike, _leg_T(o), o.iv or 0.2, o.option_type) * o.quantity * o.lot_size
             for o in positions
         )
         # Backward bleed (vol change component)
         bf.backward_bleed = bf.delta_bleed - bf.forward_bleed
 
         bf.shadow_theta_total = sum(
-            self.greeks.shadow_theta(spot, o.strike, T, o.iv or 0.2, o.option_type) * o.quantity * o.lot_size
+            self.greeks.shadow_theta(spot, o.strike, _leg_T(o), o.iv or 0.2, o.option_type) * o.quantity * o.lot_size
             for o in positions
         )
 
@@ -409,13 +420,23 @@ class RiskAnalyzer:
     def method_of_squares(
         self, positions: List[OptionContract], spot: float, T: float,
         strike_buckets: int = 5, time_buckets: int = 3,
+        per_leg_T: dict = None,
     ) -> Dict[str, Dict[str, float]]:
         """
         Taleb Ch 9, pp. 164-166: Cut position into squares of strike × time
         and estimate vega per square. Catches bumpy risk profiles.
+
+        per_leg_T (review-fix #5): {tradingsymbol: T_years} for
+        multi-expiry books. Without it, back-month strikes are priced
+        with the front-month T and the per-square vega is wrong.
         """
         if not positions:
             return {}
+
+        def _leg_T(opt):
+            if per_leg_T is not None:
+                return per_leg_T.get(opt.tradingsymbol, T)
+            return T
 
         strikes = sorted(set(o.strike for o in positions))
         min_k, max_k = min(strikes), max(strikes)
@@ -446,9 +467,10 @@ class RiskAnalyzer:
                     if k_lo <= opt.strike < k_hi:
                         sigma = opt.iv or 0.2
                         m = opt.quantity * opt.lot_size
-                        vega_in_square += self.greeks.vega(spot, opt.strike, T, sigma) * m
-                        gamma_in_square += self.greeks.gamma(spot, opt.strike, T, sigma) * m
-                        delta_in_square += self.greeks.delta(spot, opt.strike, T, sigma, opt.option_type) * m
+                        T_leg = _leg_T(opt)
+                        vega_in_square += self.greeks.vega(spot, opt.strike, T_leg, sigma) * m
+                        gamma_in_square += self.greeks.gamma(spot, opt.strike, T_leg, sigma) * m
+                        delta_in_square += self.greeks.delta(spot, opt.strike, T_leg, sigma, opt.option_type) * m
 
                 if abs(vega_in_square) > 0.01 or abs(gamma_in_square) > 0.0001:
                     squares[label] = {

@@ -4,7 +4,11 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from backtest import generate_synthetic_data, MockKite, run_backtest
+from pathlib import Path
+from backtest import (
+    generate_synthetic_data, MockKite, run_backtest,
+    load_captured_tape, list_captured_sessions,
+)
 
 
 class TestSyntheticData:
@@ -155,3 +159,115 @@ class TestBacktestIntegration:
         )
         # Realized PnL should equal total PnL once flat
         assert abs(last_row["total_pnl"] - last_row["realized_pnl"]) < 1e-6
+
+
+class TestCapturedTapeReplay:
+    """Phase 2.2: load_captured_tape converts JSONL ticks to the
+    MockKite-compatible DataFrame schema. Tests skip cleanly when no
+    captured sessions are present in data_cache/ — replay is an
+    operational feature that depends on having run tick_capture on a
+    real Kite session."""
+
+    @pytest.fixture
+    def captured_sessions(self):
+        sessions = list_captured_sessions()
+        if not sessions:
+            pytest.skip("No captured tick sessions in data_cache/ticks/")
+        return sessions
+
+    def test_list_captured_sessions_iso_format(self, captured_sessions):
+        """Each entry must be a valid ISO date string."""
+        from datetime import date
+        for s in captured_sessions:
+            # raises ValueError if malformed
+            date.fromisoformat(s)
+
+    def test_load_produces_mockkite_schema(self, captured_sessions):
+        """The DataFrame must contain every column MockKite reads,
+        else the replay path silently degrades to no-trades."""
+        df = load_captured_tape(captured_sessions[-1])
+        required = {"timestamp", "symbol", "underlying_price", "strike",
+                    "option_type", "expiry", "last_price", "bid", "ask",
+                    "lot_size", "iv"}
+        missing = required - set(df.columns)
+        assert not missing, f"Missing columns: {missing}"
+
+    def test_load_includes_spot_rows(self, captured_sessions):
+        """A session without spot ticks fails to feed the strategy's
+        spot-quote path. Symbol 'NIFTY' (bare underlying) is what
+        MockKite looks up for the spot."""
+        df = load_captured_tape(captured_sessions[-1])
+        spot_rows = df[df["symbol"] == "NIFTY"]
+        assert len(spot_rows) > 0, (
+            "No spot rows. Likely cause: the JSONL header's spot token "
+            "wasn't patched into the enriched DataFrame — replay would "
+            "silently no-trade."
+        )
+
+    def test_load_missing_session_raises(self):
+        """Fail loud when the requested date has no tick file. Silent
+        degradation would have the autoresearch loop's tape-replay
+        cycle quietly produce 0-trade penalties."""
+        with pytest.raises(FileNotFoundError):
+            load_captured_tape("2099-01-01")
+
+    def test_minute_resolution_collapses_ticks(self, captured_sessions):
+        """1-minute resampling must yield fewer rows than tick resolution
+        on a real session (otherwise the resampling didn't fire)."""
+        # 5min must be smaller than 1min for any session with traffic.
+        df_1m = load_captured_tape(captured_sessions[-1], resolution="1min")
+        df_5m = load_captured_tape(captured_sessions[-1], resolution="5min")
+        assert len(df_5m) < len(df_1m), (
+            "5min and 1min returned same row count — resampling did not "
+            "collapse buckets"
+        )
+
+    def test_real_futures_surfaced_in_mockkite_instruments(self, captured_sessions):
+        """Code-review fix #7: load_captured_tape emits real FUT rows
+        (e.g. NIFTY26MAYFUT) and MockKite.instruments must return them
+        rather than the synthetic NIFTYFUTMOCK placeholder. Pre-fix,
+        the strategy cached the placeholder symbol and every futures
+        hedge silently failed because tick_data contained the REAL
+        futures symbol the placeholder couldn't match."""
+        df = load_captured_tape(captured_sessions[-1])
+        kite = MockKite(df, "NIFTY")
+        instruments = kite.instruments("NFO")
+        fut_rows = [i for i in instruments if i["instrument_type"] == "FUT"]
+        assert len(fut_rows) > 0, "No FUT in MockKite.instruments"
+        symbols = {i["tradingsymbol"] for i in fut_rows}
+        assert "NIFTYFUTMOCK" not in symbols, (
+            "Synthetic FUTMOCK leaked into captured-tape MockKite — "
+            "the real FUT row was not surfaced."
+        )
+        # The surfaced symbol must be quotable somewhere in the
+        # session — advance the tick clock until quote() resolves it.
+        # (The first tick at 09:03 predates the first FUT print at
+        # 09:07; MockKite filters quote() to current tick so we need
+        # to step forward.)
+        real_fut = fut_rows[0]["tradingsymbol"]
+        for _ in range(50):
+            q = kite.quote([f"NFO:{real_fut}"])
+            if q and f"NFO:{real_fut}" in q:
+                return
+            if not kite.advance_tick():
+                break
+        raise AssertionError(
+            f"MockKite.quote never resolved the captured FUT symbol "
+            f"{real_fut} after 50 ticks."
+        )
+
+    def test_underlying_price_forward_filled(self, captured_sessions):
+        """Code-review fix #4: option rows in minutes lacking a spot
+        tick must still carry a non-NaN underlying_price (forward-fill
+        via merge_asof). Pre-fix the merge produced NaN spot for
+        any spot-tick gap, poisoning downstream Greeks / IV percentile."""
+        import pandas as pd  # noqa: F401
+        df = load_captured_tape(captured_sessions[-1])
+        option_rows = df[df["option_type"].isin(["CE", "PE"])]
+        assert len(option_rows) > 0, "Captured tape has no option rows"
+        nan_spot = option_rows["underlying_price"].isna().sum()
+        assert nan_spot == 0, (
+            f"{nan_spot} option rows have NaN underlying_price — "
+            f"merge_asof forward-fill regression"
+        )
+

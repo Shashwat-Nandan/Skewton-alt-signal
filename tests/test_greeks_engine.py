@@ -119,3 +119,31 @@ class TestPortfolioGreeks:
         T = 30 / 365
         pf = engine.compute_portfolio_greeks(positions, 22000, T)
         assert pf.net_gamma < 0
+
+    def test_per_leg_T_buckets_back_month_separately(self, engine):
+        """Code-review fix #3: a calendar with front T=3d and back T=45d
+        must put each leg's vega in its own bucket. Before the fix, both
+        legs used the default T and BOTH landed in '0-30d', erasing the
+        term-structure exposure the per_leg_T plumbing was meant to
+        surface."""
+        positions = [
+            OptionContract("NIFTY_FRONT_CE", 0, 22000, "2026-04-03", "CE", 25, 1, 200, 200, 0.15),
+            OptionContract("NIFTY_BACK_CE",  0, 22000, "2026-05-22", "CE", 25, 1, 350, 350, 0.18),
+        ]
+        per_leg_T = {
+            "NIFTY_FRONT_CE": 3 / 365,
+            "NIFTY_BACK_CE":  45 / 365,
+        }
+        pf = engine.compute_portfolio_greeks(
+            positions, 22000, T=3/365, per_leg_T=per_leg_T,
+        )
+        assert "0-30d" in pf.vega_buckets, (
+            f"Front-month vega missing from 0-30d: {pf.vega_buckets}"
+        )
+        assert "30-60d" in pf.vega_buckets, (
+            f"Back-month vega missing from 30-60d (review-fix #3 "
+            f"regression): {pf.vega_buckets}"
+        )
+        # Both buckets should hold strictly positive vega for long calls
+        assert pf.vega_buckets["0-30d"] > 0
+        assert pf.vega_buckets["30-60d"] > 0
