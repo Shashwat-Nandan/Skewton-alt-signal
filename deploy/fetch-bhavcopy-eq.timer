@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire fetch-bhavcopy-eq.service Mon-Fri at 18:00 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 18:00 IST — NSE publishes the UDiFF cash-market bhavcopy ~17:30-18:00.
+# Running at 18:00 gives ~30 min of headroom; the script's per-symbol
+# merge is idempotent so a missed bar gets backfilled on the next run.
+# Sequenced before equity-swing-close.timer (18:30 IST).
+OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Kolkata
+
+# Persistent catch-up: if the VPS was down at 18:00, run when it comes
+# back — fetch_bhavcopy_eq.py is idempotent (re-fetching same date is a
+# no-op against the per-symbol CSVs).
+Persistent=true
+
+RandomizedDelaySec=120
+
+Unit=fetch-bhavcopy-eq.service
+
+[Install]
+WantedBy=timers.target

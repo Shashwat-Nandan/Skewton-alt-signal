@@ -1,14 +1,8 @@
 [Unit]
-Description=Equity Swing — post-close scan (full feature compute, entries + exits)
-Documentation=https://github.com/anthropics/claude-code
+Description=Daily NSE FII/DII aggregate flow fetch (equity-swing overlay + dashboard)
 Wants=network-online.target
 After=network-online.target
 OnFailure=notify-failure@%n.service
-# Sequence after fetch-bars (Kite 30-min), fetch-bhavcopy-eq (EQ
-# daily bhavcopy, 18:00 IST) and fetch-fii-dii (17:00 IST). The
-# strategy now fails loud if today's EQ bar isn't in the panel, so
-# fetch-bhavcopy-eq is effectively a hard dependency at runtime.
-After=fetch-bars.service fetch-bhavcopy-eq.service fetch-fii-dii.service
 
 [Service]
 Type=oneshot
@@ -18,10 +12,10 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_equity_swing.py --scan close --mode paper
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/fetch_fii_dii.py
 # -------------------------------
 
-TimeoutStartSec=0
+TimeoutStartSec=5min
 StandardOutput=journal
 StandardError=journal
 

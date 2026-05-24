@@ -1,13 +1,17 @@
 [Unit]
-Description=Fire equity-swing-close.service Mon–Fri at 15:35 IST
+Description=Fire equity-swing-close.service Mon–Fri at 18:30 IST
 Documentation=man:systemd.timer(5)
 
 [Timer]
-# 15:35 IST — 5 min after the bell. Bhavcopy F&O / FII-DII tend to
-# land at NSE within a few minutes of close. Operator should have
-# fetch-bars.timer / fetch_fii_dii cron-equivalents firing earlier
-# in the same window so the strategy has fresh OHLCV + flow data.
-OnCalendar=Mon..Fri *-*-* 15:35:00 Asia/Kolkata
+# 18:30 IST — sequenced AFTER fetch-fii-dii.timer (17:00) and
+# fetch-bhavcopy-eq.timer (18:00) so the strategy operates on today's
+# settled EQ bhavcopy and the day's FII/DII flow. NSE publishes the
+# UDiFF cash-market bhavcopy ~17:30-18:00 IST, so 18:30 leaves a
+# 30-min buffer for fetcher retries and per-symbol cache rebuild.
+#
+# Previously fired at 15:35 (5 min after close), which was too early
+# for the EQ bhavcopy and left the strategy scanning a stale panel.
+OnCalendar=Mon..Fri *-*-* 18:30:00 Asia/Kolkata
 
 # Persistent catch-up: the close scan IS the entries scan, so a late
 # fire might open positions stale by a day. That's still preferable to

@@ -196,8 +196,8 @@ def _persist_proposals(strategy, scan_kind: str, log: logging.Logger) -> tuple[i
             exit_reason=pos.exit_reason or "MANUAL",
             pnl=float(pos.pnl),
         )
-        log.info("[DB CLOSE] id=%d %s @ ₹%.2f reason=%s pnl=₹%+,.0f",
-                 pid, pos.symbol, pos.exit_px or 0, pos.exit_reason, pos.pnl)
+        log.info("[DB CLOSE] id=%d %s @ ₹%.2f reason=%s pnl=₹%s",
+                 pid, pos.symbol, pos.exit_px or 0, pos.exit_reason, f"{pos.pnl:+,.0f}")
         n_close += 1
 
     strategy._db_id_by_symbol = db_ids
@@ -254,6 +254,47 @@ def main() -> int:
              strategy.params["risk_reward"],
              int(strategy.params["mp_enabled"]), int(strategy.params["oi_enabled"]),
              int(strategy.params["fii_enabled"]))
+
+    # Anchor the scan at today (close) or the most recent prior trading day
+    # (open). Then verify the panel actually contains that date — otherwise
+    # the strategy silently scans whatever stale date max() finds, hiding a
+    # broken fetch cron. CLAUDE.md Rule 12: surface the failure.
+    strategy.set_current_date(pd.Timestamp(today))
+    strategy._ensure_features()
+    if not strategy._features:
+        log.error("EQ panel loaded zero symbols — equity_ohlcv/ cache is empty. "
+                  "Run fetch_bhavcopy_eq.py first.")
+        return 1
+    panel_max = max(f.index.max() for f in strategy._features.values())
+    panel_max_date = panel_max.date() if hasattr(panel_max, "date") else panel_max
+    if args.scan == "close":
+        # Close scan anchors to today's bar — fetch-bhavcopy-eq must have run.
+        if panel_max_date < today:
+            log.error(
+                "EQ panel latest date is %s, expected today (%s). "
+                "fetch-bhavcopy-eq.service likely failed or didn't run. "
+                "Refusing to scan stale data — fix the panel and re-run.",
+                panel_max_date, today,
+            )
+            return 1
+    else:
+        # Open scan runs before today's bhavcopy lands; anchor at the
+        # panel's max date (= most recent prior trading day) and warn if
+        # that's more than 4 calendar days behind (covers long weekends
+        # and Diwali). 4 days = Fri→Tue worst case.
+        days_behind = (today - panel_max_date).days
+        if days_behind > 4:
+            log.error(
+                "EQ panel latest date is %s, more than 4 days behind today (%s). "
+                "fetch-bhavcopy-eq.service has likely been failing. "
+                "Refusing to scan — fix the panel and re-run.",
+                panel_max_date, today,
+            )
+            return 1
+        if days_behind > 1:
+            log.warning("EQ panel is %d days behind today — proceeding with stale anchor",
+                        days_behind)
+        strategy.set_current_date(panel_max)
 
     # Resume open paper positions from the DB so SL/target/time-stop logic
     # has full state across cron runs.

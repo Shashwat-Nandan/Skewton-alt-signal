@@ -642,8 +642,8 @@ class VarsityEquitySwingStrategy(BaseStrategy):
             pos.pnl = (proposal.price - pos.entry_px) * pos.qty
             pos.status = "CLOSED"
             self.closed_positions.append(pos)
-            logger.info("[PAPER CLOSE] %s qty=%d @ ₹%.2f reason=%s pnl=₹%+,.0f",
-                        sym, pos.qty, pos.exit_px, pos.exit_reason, pos.pnl)
+            logger.info("[PAPER CLOSE] %s qty=%d @ ₹%.2f reason=%s pnl=₹%s",
+                        sym, pos.qty, pos.exit_px, pos.exit_reason, f"{pos.pnl:+,.0f}")
             return {"status": "PAPER_CLOSE", "tradingsymbol": sym,
                     "exit_px": pos.exit_px, "pnl": pos.pnl,
                     "reason": pos.exit_reason}

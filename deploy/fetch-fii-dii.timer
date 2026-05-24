@@ -1,0 +1,21 @@
+[Unit]
+Description=Fire fetch-fii-dii.service Mon-Fri at 17:00 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 17:00 IST — NSE's fiidiiTradeReact endpoint serves the latest day's
+# aggregate within ~30-60 min of close (15:30 IST). 17:00 gives a buffer.
+# The fetcher writes data_cache/fii_dii/<DATE>.json idempotently and is
+# read by both the equity-swing FII overlay and the frontend dashboard.
+OnCalendar=Mon..Fri *-*-* 17:00:00 Asia/Kolkata
+
+# Persistent catch-up: re-running on the same date is a no-op (file
+# overwrite is benign — same content from NSE).
+Persistent=true
+
+RandomizedDelaySec=120
+
+Unit=fetch-fii-dii.service
+
+[Install]
+WantedBy=timers.target
