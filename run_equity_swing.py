@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -143,6 +144,245 @@ def _load_open_positions_into_strategy(strategy, log: logging.Logger) -> int:
             n += 1
         except (KeyError, TypeError, ValueError) as e:
             log.warning("skip stale row id=%s: %s", r.get("id"), e)
+    return n
+
+
+_PENDING_MAX_AGE_DAYS = 5            # calendar days — drops zombie signals after long downtime
+_PENDING_GAP_ATR_THRESHOLD = 1.5     # |open − signal_close| / atr above this = skip
+
+
+def _scalar_open_from_panel(f: pd.DataFrame, today_ts: pd.Timestamp) -> float:
+    """Look up today's open price as a scalar; raise if the panel is malformed.
+
+    Defends against the duplicate-date pathology where ``f.loc[today_ts, "open"]``
+    returns a Series (multiple rows with same index value) — that's a panel bug,
+    not a market event, and we surface it loudly instead of crashing on
+    ``float(Series)``.
+    """
+    val = f.loc[today_ts, "open"]
+    if isinstance(val, pd.Series):
+        if len(val) == 1:
+            val = val.iloc[0]
+        else:
+            raise ValueError(
+                f"panel has {len(val)} rows for {today_ts.date()} — "
+                "duplicate-date ingest, refusing to fill"
+            )
+    return float(val)
+
+
+def _fill_pending_entries(strategy, today: date, log: logging.Logger) -> tuple[int, int, int, int]:
+    """Materialize PENDING entry rows into open positions at today's open.
+
+    Re-anchors SL/target to the actual fill price using the signal's stored
+    sl_distance / target_distance. Each row resolves to one of FILLED /
+    SKIPPED_GAP / SKIPPED_STALE / SKIPPED_OPEN in the DB. The per-row
+    try/except ensures a single bad row never aborts the whole batch
+    (CLAUDE.md Rule 12). Returns ``(filled, skipped_gap, skipped_stale,
+    skipped_open)``.
+    """
+    from backend import db
+    from strategies.varsity_equity_swing import EquityPosition
+
+    pending = db.list_equity_pending_entries(status="PENDING")
+    if not pending:
+        return 0, 0, 0, 0
+
+    today_ts = pd.Timestamp(today)
+    filled = skipped_gap = skipped_stale = skipped_open = 0
+    # Bind the attribute up front so partial-progress mutations propagate
+    # even if a later row raises — prevents _persist_proposals from
+    # double-inserting an equity_positions row we already created.
+    db_ids = getattr(strategy, "_db_id_by_symbol", None)
+    if db_ids is None:
+        db_ids = {}
+        strategy._db_id_by_symbol = db_ids
+
+    for row in pending:
+        sym = row["symbol"]
+        try:
+            signal_dt = date.fromisoformat(row["signal_dt"])
+            age_days = (today - signal_dt).days
+
+            if age_days > _PENDING_MAX_AGE_DAYS:
+                note = f"signal aged {age_days}d > {_PENDING_MAX_AGE_DAYS}d max"
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_STALE", note=note)
+                log.warning("[PENDING SKIP] %s — %s", sym, note)
+                skipped_stale += 1
+                continue
+
+            if sym in strategy.positions:
+                note = "symbol already has an open position; dropping pending"
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_OPEN", note=note)
+                log.info("[PENDING SKIP] %s — %s", sym, note)
+                skipped_open += 1
+                continue
+
+            f = strategy._features.get(sym)
+            if f is None or today_ts not in f.index:
+                note = f"no panel row for {today} (symbol dropped from universe or bhavcopy gap)"
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_STALE", note=note)
+                log.warning("[PENDING SKIP] %s — %s", sym, note)
+                skipped_stale += 1
+                continue
+
+            open_px = _scalar_open_from_panel(f, today_ts)
+            if not math.isfinite(open_px) or open_px <= 0:
+                note = f"non-positive or non-finite open price ({open_px}) — corrupt bar"
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_STALE", note=note)
+                log.warning("[PENDING SKIP] %s — %s", sym, note)
+                skipped_stale += 1
+                continue
+
+            atr = float(row["atr"])
+            signal_close = float(row["signal_close"])
+            sl_distance = float(row["sl_distance"])
+            target_distance = float(row["target_distance"])
+
+            # Defense in depth: NaN/inf at any of these inputs means a poison
+            # row got past _queue_pending_entries' validation (or was hand-
+            # INSERTed). Fail loud rather than open a position with NaN SL.
+            if not all(math.isfinite(x) and x > 0
+                       for x in (atr, signal_close, sl_distance, target_distance)):
+                note = (f"non-finite stored fields "
+                        f"(atr={atr}, close={signal_close}, "
+                        f"sl_d={sl_distance}, tgt_d={target_distance})")
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_STALE", note=note)
+                log.warning("[PENDING SKIP] %s — %s", sym, note)
+                skipped_stale += 1
+                continue
+
+            gap_atr = abs(open_px - signal_close) / atr
+
+            if gap_atr > _PENDING_GAP_ATR_THRESHOLD:
+                note = (f"gap {gap_atr:.2f}×ATR exceeds {_PENDING_GAP_ATR_THRESHOLD}×; "
+                        f"open=₹{open_px:.2f} signal_close=₹{signal_close:.2f}")
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_GAP", note=note)
+                log.info("[PENDING SKIP] %s — %s", sym, note)
+                skipped_gap += 1
+                continue
+
+            sl = open_px - sl_distance
+            target = open_px + target_distance
+            rationale = (row["rationale"] or "")
+            if rationale:
+                rationale += "; "
+            rationale += (f"filled at next-day open ₹{open_px:.2f} "
+                          f"(signal {signal_dt} close ₹{signal_close:.2f}, "
+                          f"gap {gap_atr:.2f}×ATR)")
+
+            pos = EquityPosition(
+                symbol=sym, side=row["side"],
+                entry_dt=today_ts,
+                entry_px=open_px,
+                qty=int(row["qty"]),
+                initial_sl=sl, target=target,
+                atr_at_entry=atr,
+                rationale=rationale,
+            )
+            # Seed last_mtm_dt to today's bar date — otherwise _persist_proposals
+            # would later write wall-clock now() into a column meant to hold the
+            # bar date, breaking staleness dashboards.
+            pos.last_mtm_dt = today_ts
+            strategy.positions[sym] = pos
+
+            pid = db.insert_equity_position({
+                "symbol": pos.symbol, "side": pos.side,
+                "entry_dt": pos.entry_dt.isoformat(),
+                "entry_px": pos.entry_px, "qty": pos.qty,
+                "initial_sl": pos.initial_sl, "current_sl": pos.current_sl,
+                "target": pos.target, "atr_at_entry": pos.atr_at_entry,
+                "rationale": pos.rationale,
+                "last_mtm_dt": pos.last_mtm_dt.isoformat(),
+                "last_mtm_px": pos.last_mtm_px,
+                "high_watermark": pos.high_watermark,
+            }, opened_by_scan="close")
+            db_ids[sym] = pid
+            db.update_equity_pending_entry_status(
+                row["id"], "FILLED",
+                note=f"position id={pid} @ ₹{open_px:.2f}",
+            )
+            log.info("[PENDING FILL] id=%d %s qty=%d @ ₹%.2f SL=₹%.2f TGT=₹%.2f "
+                     "(signal %s close ₹%.2f, gap %.2f×ATR)",
+                     pid, sym, pos.qty, open_px, sl, target,
+                     signal_dt, signal_close, gap_atr)
+            filled += 1
+        except Exception as e:
+            # Per-row isolation: log + mark SKIPPED_STALE with the error so the
+            # row doesn't get retried tomorrow with the same fault.
+            note = f"unhandled error: {type(e).__name__}: {e}"
+            log.exception("[PENDING ERROR] %s — %s", sym, note)
+            try:
+                db.update_equity_pending_entry_status(row["id"], "SKIPPED_STALE", note=note)
+            except Exception:
+                log.exception("[PENDING ERROR] %s — also failed to mark row", sym)
+            skipped_stale += 1
+
+    return filled, skipped_gap, skipped_stale, skipped_open
+
+
+_REQUIRED_SNAPSHOT_KEYS = ("atr", "entry", "sl", "target")
+
+
+def _queue_pending_entries(proposals, today: date, log: logging.Logger) -> int:
+    """Persist today's entry proposals to ``equity_pending_entries``.
+
+    Replaces direct ``execute_proposals`` for entries — fills happen at the
+    *next* close-scan run using that day's official open. Dedupes against
+    existing PENDING rows so a same-day re-run doesn't double-queue.
+
+    Required snapshot keys (atr/entry/sl/target) are validated loudly;
+    a missing key raises KeyError so a strategy-side refactor that drops
+    one becomes a visible crash, not silently-dropped signals.
+    """
+    from backend import db
+
+    n = 0
+    for prop in proposals:
+        sym = prop.tradingsymbol
+        if db.has_pending_entry_for_symbol(sym):
+            log.info("[PENDING DEDUPE] %s already pending — skipping new signal", sym)
+            continue
+
+        snap = prop.greeks_snapshot or {}
+        missing = [k for k in _REQUIRED_SNAPSHOT_KEYS if k not in snap]
+        if missing:
+            raise KeyError(
+                f"proposal for {sym} missing required greeks_snapshot keys "
+                f"{missing}; strategy contract violated — refusing to queue"
+            )
+
+        atr = float(snap["atr"])
+        signal_close = float(snap["entry"])
+        sl_distance = signal_close - float(snap["sl"])
+        target_distance = float(snap["target"]) - signal_close
+
+        # Reject NaN/inf as well as non-positive — NaN <= 0 is False so the
+        # naive guard would let it through and produce a position with NaN
+        # SL/target that check_and_rehedge can never exit (NaN comparisons
+        # are always False).
+        if not all(math.isfinite(x) and x > 0
+                   for x in (atr, sl_distance, target_distance)):
+            log.warning("[PENDING SKIP] %s — invalid metrics "
+                        "(atr=%s sl_d=%s tgt_d=%s); proposal dropped",
+                        sym, atr, sl_distance, target_distance)
+            continue
+
+        pid = db.insert_equity_pending_entry(
+            signal_dt=today.isoformat(),
+            symbol=sym,
+            side="LONG",
+            signal_close=signal_close,
+            sl_distance=sl_distance,
+            target_distance=target_distance,
+            atr=atr,
+            qty=int(prop.quantity),
+            rationale=prop.rationale,
+        )
+        log.info("[PENDING QUEUE] id=%d %s qty=%d signal_close=₹%.2f "
+                 "sl_d=₹%.2f tgt_d=₹%.2f — fills at next session open",
+                 pid, sym, prop.quantity, signal_close, sl_distance, target_distance)
+        n += 1
     return n
 
 
@@ -301,10 +541,26 @@ def main() -> int:
     if args.mode == "paper":
         n_resumed = _load_open_positions_into_strategy(strategy, log)
         log.info("Resumed %d open paper positions from DB", n_resumed)
-    n_opens_before = len(strategy.positions)
-    n_closed_before = len(strategy.closed_positions)
 
-    # Run rehedge first (exit triggers), then scan (new entries).
+    n_closed_before = len(strategy.closed_positions)
+    n_open_before_fill = len(strategy.positions)
+
+    # Fill yesterday's queued entry signals at TODAY'S OPEN (from bhavcopy
+    # panel). Close-scan only — open-scan doesn't have today's official
+    # bhavcopy yet, so pending fills wait until evening.
+    n_filled_today = 0
+    if args.scan == "close" and args.mode == "paper":
+        f_filled, f_skip_gap, f_skip_stale, f_skip_open = _fill_pending_entries(
+            strategy, today, log)
+        n_filled_today = f_filled
+        if f_filled or f_skip_gap or f_skip_stale or f_skip_open:
+            log.info("Pending entries: %d filled, %d skipped (gap), "
+                     "%d skipped (stale), %d skipped (already-open)",
+                     f_filled, f_skip_gap, f_skip_stale, f_skip_open)
+
+    # Run rehedge first (exit triggers), then scan (new entries). Same-day
+    # SL/target hits on positions just filled at today's open are caught
+    # here because check_and_rehedge walks today's bar's [low, high].
     try:
         exits = strategy.check_and_rehedge()
         if exits:
@@ -314,13 +570,19 @@ def main() -> int:
         log.exception("check_and_rehedge failed: %s", e)
 
     n_signals = 0
+    n_queued = 0
     if args.scan == "close":
         try:
             entries = strategy.scan_and_propose()
             n_signals = len(entries)
             if entries:
-                log.info("scan produced %d entry proposal(s)", len(entries))
-                strategy.execute_proposals(entries)
+                log.info("scan produced %d entry proposal(s) — queueing for next-day open",
+                         len(entries))
+                if args.mode == "paper":
+                    n_queued = _queue_pending_entries(entries, today, log)
+                else:
+                    # signals mode: still write JSONL via strategy
+                    strategy.execute_proposals(entries)
         except Exception as e:
             log.exception("scan_and_propose failed: %s", e)
     else:
@@ -333,13 +595,22 @@ def main() -> int:
     # Scan summary row
     if args.mode == "paper":
         n_closed_today = len(strategy.closed_positions) - n_closed_before
+        # Net open delta = fills - same-day-closes. Use this for n_trades so a
+        # position filled at today's open that exits same-day in rehedge
+        # counts as ONE round-trip, not two events (n_filled + n_closed both
+        # incremented). The naive sum was an over-counting bug.
+        n_opens_net = max(0, len(strategy.positions) - n_open_before_fill)
+        notes = None
+        if n_queued:
+            notes = f"queued {n_queued} pending entry(ies) for next session"
         db.insert_equity_scan(
             scan_dt=datetime.now().isoformat(),
             scan_kind=args.scan, mode=args.mode,
             n_signals=n_signals,
-            n_trades=n_closed_today + (len(strategy.positions) - n_opens_before),
+            n_trades=n_closed_today + n_opens_net,
             n_open_positions=len(strategy.positions),
             n_closed_today=n_closed_today,
+            notes=notes,
         )
 
     # EOD-ish report

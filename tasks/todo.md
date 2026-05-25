@@ -1,3 +1,133 @@
+# equity-swing entry-fill correction — next-day open via PENDING queue (2026-05-25)
+
+## Problem
+Close-scan emits entry signals after market hours (18:30 IST, post-bhavcopy).
+The old `_paper_execute` immediately opened positions at the signal-day
+close — a fill that's impossible to achieve in reality (the close auction is
+already done). Paper P&L therefore baked in a free overnight gap and would
+systematically overstate live performance. Surfaced when user asked: "Swing
+trade gave signal post market closure. SO how will these trade enter into
+position?"
+
+## Design (confirmed via AskUserQuestion 2026-05-25)
+- [x] SL/target re-anchor to actual next-day open (distances preserved in
+      ATR terms; absolute levels shift with the gap).
+- [x] Skip if next session's open gaps > 1.5×ATR from signal close
+      (status=`SKIPPED_GAP`).
+- [x] Pending entries stored in new `equity_pending_entries` DB table
+      (status: PENDING / FILLED / SKIPPED_GAP / SKIPPED_STALE).
+- [x] Max age 5 calendar days; older signals dropped to avoid zombie
+      fills after long downtime.
+
+## Implementation
+- [x] Add `equity_pending_entries` table + indexes to `backend/db.py` SCHEMA.
+- [x] Add `insert_equity_pending_entry`, `list_equity_pending_entries`,
+      `has_pending_entry_for_symbol`, `update_equity_pending_entry_status`
+      helpers.
+- [x] `_fill_pending_entries(strategy, today, log)` in `run_equity_swing.py`
+      — runs before rehedge in close-scan only.
+- [x] `_queue_pending_entries(proposals, today, log)` replaces direct
+      `execute_proposals(entries)` for entries in close-scan paper mode.
+- [x] Bookkeeping: `n_trades = n_closed_today + n_filled_today`;
+      scan-summary `notes` field gets the queued count.
+
+## Tests (10 new, all pass — `tests/test_equity_pending_entries.py`)
+- [x] QUEUE: SL/target stored as distances, not absolute levels.
+- [x] QUEUE: dedupe skips existing PENDING for same symbol.
+- [x] QUEUE: invalid (inverted) SL/TGT dropped.
+- [x] FILL: entry_px = next-day open; SL/target re-anchored; ATR distance
+      preserved at exactly 2.5×.
+- [x] FILL: gap > 1.5×ATR → SKIPPED_GAP.
+- [x] FILL: boundary case (gap = 1.45×ATR) still fills.
+- [x] FILL: signal older than 5 days → SKIPPED_STALE (even with zero gap).
+- [x] FILL: panel missing today's bar → SKIPPED_STALE.
+- [x] FILL: symbol already open → SKIPPED_STALE (no double-fill).
+- [x] ROUND-TRIP: queue today → fill tomorrow end-to-end.
+- [x] All 38 pre-existing equity tests still pass.
+
+## Data migration (one-shot, 2026-05-25)
+The 4 positions opened earlier today under the old logic were rolled back:
+- equity_positions ids 6,7,8,9 (DIVISLAB, MARICO, SUNPHARMA, ABB) →
+  status='CLOSED', exit_reason='REQUEUED', pnl=0, exit_px=entry_px.
+- Equivalent rows inserted into `equity_pending_entries` with
+  signal_dt=2026-05-25; tomorrow's 18:30 close-scan will fill them at the
+  actual 2026-05-26 open price.
+- DB backed up to `data_cache/dashboard.db.before-pending-rollback-2026-05-25`
+  before the mutation. Transaction wrapped so partial failure cannot leave a
+  hybrid state.
+
+## Review
+Behaviour change summary:
+- Paper accounting now matches what a real live execution would deliver
+  (MOO order placed overnight, fills at next-day open). Removes the
+  systematic optimism in historic paper P&L.
+- 1-day reporting delay between signal generation and position-row creation
+  in `equity_positions` (signal Day N → fill+persist on Day N+1's 18:30
+  close scan). Acceptable: matches reality, no information is lost (PENDING
+  rows are queryable in the interim).
+- The skipped-gap rule (1.5×ATR) is a real edge filter: any signal where
+  the market gaps hard before fill is by-design a different setup than the
+  one screened, so dropping it preserves the strategy's distribution
+  assumptions.
+- SONACOMS/DRREDDY positions (entered 2026-05-08 under old logic) left
+  unchanged — they've been managed for 17 days, their entry price is part
+  of the live trail, and re-queueing them would require re-running the
+  whole post-2026-05-08 management loop.
+
+## Live-mode note
+When Phase 5 live execution lands, `_queue_pending_entries` becomes the
+hook for actually placing an MOO order overnight rather than just writing
+to a DB queue. The PENDING table's status state machine
+(PENDING → FILLED / SKIPPED_GAP / SKIPPED_STALE / SKIPPED_OPEN) maps
+cleanly onto broker ack/reject states.
+
+## Code-review pass (5-angle high-effort, 2026-05-25)
+Ran the `code-review` skill at high effort before commit. 5 finder angles
+in parallel produced 30+ candidates; after dedupe and self-verify, 7
+must-fixes landed in the same change set, 6 deferred to
+`tasks/live-readiness-deferred.md` as EQ-FU-1 … EQ-FU-6.
+
+Must-fixes applied:
+- [x] `_queue_pending_entries`: `NaN <= 0` is False — silently passed NaN
+      distances through to FILL where they produced un-exitable positions
+      (NaN comparisons in `check_and_rehedge`'s `low <= NaN <= high`
+      always False). Now uses `math.isfinite(x) and x > 0`.
+- [x] `_queue_pending_entries`: required snapshot keys (atr/entry/sl/target)
+      are now hard-required — missing one raises `KeyError` loudly instead
+      of silently degrading to wrong defaults. Rule 12.
+- [x] `_fill_pending_entries`: per-row try/except so one corrupt row
+      can't abort the rest of the batch. Bad row → SKIPPED_STALE +
+      log.exception; others still process.
+- [x] `_fill_pending_entries`: `_scalar_open_from_panel` helper coerces
+      `f.loc[today_ts,'open']` to scalar and raises ValueError on
+      duplicate-date Series (caught by the per-row except → SKIPPED_STALE
+      instead of crashing the scan).
+- [x] `_fill_pending_entries`: defense-in-depth `math.isfinite(...) and
+      x > 0` check on stored row fields (atr, signal_close, distances).
+      SQLite NOT NULL already blocks NaN at insert time, but this
+      remains as belt-and-braces.
+- [x] `_fill_pending_entries`: `pos.last_mtm_dt = today_ts` seeded so
+      `_persist_proposals` doesn't later write wall-clock `now()` into a
+      column that should hold the bar date.
+- [x] `_fill_pending_entries`: "symbol already open" now → `SKIPPED_OPEN`
+      (new status), kept separate from `SKIPPED_STALE` so analytics on
+      stale-pending volume aren't confounded by routine reentry suppression.
+- [x] Scan-summary `n_trades`: switched from `n_closed + n_filled` (which
+      double-counted same-day open→close round-trips) to
+      `n_closed + max(0, len(positions) - n_open_before_fill)` which
+      correctly nets a same-day round-trip to 1.
+- [x] `_fill_pending_entries` binds `strategy._db_id_by_symbol` up-front
+      (when the attribute doesn't exist) so partial-loop mutations
+      propagate even if a later row raises — eliminates the latent
+      double-INSERT race the previous lazy-getattr pattern would have
+      enabled if anyone wrapped the call in try/except.
+
+Tests: 5 new (queue-NaN, missing-key KeyError, per-row isolation,
+duplicate-date Series, SQLite-blocks-NaN-at-schema). Plus existing 10
+updated for 4-tuple return + SKIPPED_OPEN. All 53 equity tests pass.
+
+---
+
 # LIVE-readiness review — pair_trading first live deployment (2026-05-21)
 
 ## Context

@@ -1,5 +1,54 @@
 # Live-readiness review — deferred items
 
+## Equity-swing next-day-open fill — review follow-ups (2026-05-25)
+
+Surfaced during the 5-angle code review of the PENDING-queue change; not
+blocking the commit but worth doing before the next iteration.
+
+### EQ-FU-1 (High) — Missing `/equity/pending-entries` API + dashboard tile
+After the close-scan, today's signals live in `equity_pending_entries` until
+tomorrow's 18:30 fill. Operator dashboard surfaces nothing in the interim:
+`/equity/positions` is empty (no fills yet), `/equity/signals` is JSONL-only
+(written in signals mode, not paper), `/equity/scans` shows only aggregate
+counts. Add `GET /equity/pending-entries?status=PENDING` and a frontend
+tile. Violates CLAUDE.md Rule 12 (fail loud / surface state) once the
+system runs in production paper mode.
+
+### EQ-FU-2 (High) — Backtest doesn't apply gap-skip / max-age filters
+`backtest_varsity_equity.py` fills every signal at next-day open with no
+filter; live `_fill_pending_entries` enforces `gap > 1.5×ATR → SKIPPED_GAP`
+and `age > 5d → SKIPPED_STALE`. Autoresearch sweeps optimise params against
+a higher trade count than live will deliver — high-gap days are exactly
+the asymmetric tails that drive most of the PnL variance. Reconcile by
+porting the gap filter into the backtester (or factor the constants into a
+shared module). Per CLAUDE.md Rule 7 (don't average two patterns; pick one).
+
+### EQ-FU-3 (Medium) — Atomicity gap under autocommit
+`_fill_pending_entries` inserts the equity_positions row and updates the
+pending-status row as two separate autocommit statements. A process kill
+between them leaves OPEN position + still-PENDING row. Self-heals next run
+via the SKIPPED_OPEN branch (no double-position), but worth wrapping in
+`BEGIN IMMEDIATE / COMMIT` the next time we touch this code.
+
+### EQ-FU-4 (Low) — `opened_by_scan='close'` hardcoded
+`_fill_pending_entries` hardcodes `opened_by_scan="close"`. Currently safe
+(call site is gated to close-scan), but if a future change wires the
+open-scan to pre-fill pendings from a Kite live quote, the audit column
+will lie. Parameterise as `scan_kind`.
+
+### EQ-FU-5 (Low) — Signals-mode never drains pending rows
+Pending fills are paper-only. An operator dry-run with `--mode signals`
+leaves PENDING rows untouched until they age to SKIPPED_STALE at day 6.
+Documented in todo.md but not in the runner header — add a note.
+
+### EQ-FU-6 (Low) — Same-day fill+exit lacks audit marker
+A pending that fills at today's open and exits same-day via rehedge gets a
+bare SL_HIT / TARGET_HIT exit_reason. Worth a SAME_DAY marker (or
+resolution_note suffix) so backtest-vs-paper-vs-live consistency checks
+can isolate these synthetic-stop trades.
+
+---
+
 This file lists the gaps found in the 2026-05-21 four-dimension live-readiness
 audit (strategy / broker / risk / ops) that were **not** fixed in the cutover
 push. Each is tagged with severity, blast-radius, and an explicit go-live

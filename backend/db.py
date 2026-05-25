@@ -167,6 +167,38 @@ CREATE TABLE IF NOT EXISTS equity_scans (
 
 CREATE INDEX IF NOT EXISTS idx_eq_scans_dt
     ON equity_scans (scan_dt DESC);
+
+-- Entry-signal queue: close-scan emits entry signals AFTER market hours,
+-- so a real fill cannot happen at signal-day close. Instead each signal
+-- lands here as PENDING and the NEXT close-scan fills it at that day's
+-- open (the official open from bhavcopy). Status transitions:
+--   PENDING       — written by close-scan after signal generated
+--   FILLED        — next close-scan opened a position at next-day open
+--   SKIPPED_GAP   — next-day open gapped > 1.5×ATR from signal close
+--   SKIPPED_STALE — no usable next-day bar (panel missing or aged > 5d)
+-- One PENDING row per symbol at a time; the runner dedupes before insert.
+CREATE TABLE IF NOT EXISTS equity_pending_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_dt TEXT NOT NULL,              -- ISO date of close-scan that emitted it
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT 'LONG',
+    signal_close REAL NOT NULL,           -- close price the signal was anchored on
+    sl_distance REAL NOT NULL,            -- absolute ₹ distance: atr × stop_multiplier
+    target_distance REAL NOT NULL,        -- absolute ₹ distance: atr × stop_multiplier × RR
+    atr REAL NOT NULL,
+    qty INTEGER NOT NULL,
+    rationale TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution_note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_eq_pending_status
+    ON equity_pending_entries (status, signal_dt DESC);
+
+CREATE INDEX IF NOT EXISTS idx_eq_pending_symbol
+    ON equity_pending_entries (symbol, signal_dt DESC);
 """
 
 
@@ -547,6 +579,70 @@ def insert_equity_scan(
          n_open_positions, n_closed_today, notes),
     )
     return int(cur.lastrowid)
+
+
+def insert_equity_pending_entry(
+    signal_dt: str,
+    symbol: str,
+    side: str,
+    signal_close: float,
+    sl_distance: float,
+    target_distance: float,
+    atr: float,
+    qty: int,
+    rationale: Optional[str],
+) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO equity_pending_entries
+            (signal_dt, symbol, side, signal_close, sl_distance, target_distance,
+             atr, qty, rationale, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+        """,
+        (signal_dt, symbol, side, signal_close, sl_distance, target_distance,
+         atr, qty, rationale, datetime.now().isoformat()),
+    )
+    return int(cur.lastrowid)
+
+
+def list_equity_pending_entries(status: str = "PENDING",
+                                 limit: int = 500) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM equity_pending_entries WHERE status = ? "
+        " ORDER BY signal_dt ASC, id ASC LIMIT ?",
+        (status, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_pending_entry_for_symbol(symbol: str) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM equity_pending_entries "
+        " WHERE symbol = ? AND status = 'PENDING' LIMIT 1",
+        (symbol,),
+    ).fetchone()
+    return row is not None
+
+
+def update_equity_pending_entry_status(
+    pending_id: int,
+    status: str,
+    note: Optional[str] = None,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE equity_pending_entries
+           SET status         = ?,
+               resolved_at    = ?,
+               resolution_note = ?
+         WHERE id = ?
+        """,
+        (status, datetime.now().isoformat(), note, pending_id),
+    )
 
 
 def list_equity_scans(limit: int = 50) -> List[Dict[str, Any]]:
