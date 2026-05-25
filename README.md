@@ -129,9 +129,10 @@ This README is a map. The detailed docs are:
 
 | For… | See |
 | --- | --- |
-| System topology, subsystems, data flow | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
-| Taleb's framework: shadow gamma, rehedging rules, Indian-market adaptations | [`taleb_framework.md`](taleb_framework.md) |
-| Autoresearch loop: mutation strategy, hold-out, safety rails | [`autoresearch_pattern.md`](autoresearch_pattern.md) |
+| Docs index (per-strategy + per-cron deep-dives) | [`docs/README.md`](docs/README.md) |
+| System topology, subsystems, data flow | [`docs/architecture.md`](docs/architecture.md) |
+| Taleb's framework: shadow gamma, rehedging rules, Indian-market adaptations | [`docs/strategies/taleb_framework.md`](docs/strategies/taleb_framework.md) |
+| Autoresearch loop: mutation strategy, hold-out, safety rails | [`docs/research/autoresearch_pattern.md`](docs/research/autoresearch_pattern.md) |
 | The hedger as a packaged "skill" + Taleb compliance checklist | [`SKILL.md`](SKILL.md) |
 | Dashboard backend: endpoints, modes, OAuth setup | [`backend/README.md`](backend/README.md) |
 | VPS install: systemd timers, nginx, certbot, secrets, troubleshooting | [`deploy/VPS_DEPLOYMENT.md`](deploy/VPS_DEPLOYMENT.md) |
