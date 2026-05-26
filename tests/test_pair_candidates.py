@@ -62,7 +62,7 @@ class TestPairCandidates:
         csv.write_text(FULL_CSV)
         _point_at(monkeypatch, csv)
 
-        r = client.get("/pair-candidates")
+        r = client.get("/api/pair-candidates")
         assert r.status_code == 200
         body = r.json()
         assert body["generated_at"] is not None
@@ -76,7 +76,7 @@ class TestPairCandidates:
 
     def test_missing_csv_returns_503(self, client, tmp_path, monkeypatch):
         _point_at(monkeypatch, tmp_path / "does-not-exist.csv")
-        r = client.get("/pair-candidates")
+        r = client.get("/api/pair-candidates")
         assert r.status_code == 503
         assert "screen_pairs" in r.json()["detail"]
 
@@ -86,7 +86,7 @@ class TestPairCandidates:
         csv.write_text(LEGACY_CSV)
         _point_at(monkeypatch, csv)
 
-        r = client.get("/pair-candidates")
+        r = client.get("/api/pair-candidates")
         assert r.status_code == 200
         body = r.json()
         assert len(body["candidates"]) == 1
@@ -112,7 +112,7 @@ class TestPairCandidates:
         csv.write_text(MALFORMED_CSV)
         _point_at(monkeypatch, csv)
 
-        r = client.get("/pair-candidates")
+        r = client.get("/api/pair-candidates")
         assert r.status_code == 200
         body = r.json()
         assert len(body["candidates"]) == 2
@@ -129,7 +129,7 @@ class TestPairCandidates:
         csv.write_text(FULL_CSV.split("\n", 1)[0] + "\n")
         _point_at(monkeypatch, csv)
 
-        r = client.get("/pair-candidates")
+        r = client.get("/api/pair-candidates")
         assert r.status_code == 200
         body = r.json()
         assert body["candidates"] == []

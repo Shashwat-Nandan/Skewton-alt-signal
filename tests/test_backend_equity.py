@@ -68,14 +68,14 @@ def _seed_position(symbol: str, status: str = "OPEN", **overrides) -> int:
 
 class TestPositions:
     def test_empty(self, client):
-        r = client.get("/equity/positions")
+        r = client.get("/api/equity/positions")
         assert r.status_code == 200
         assert r.json() == {"positions": []}
 
     def test_returns_open_and_closed_by_default(self, client):
         _seed_position("INFY", status="OPEN")
         _seed_position("RELIANCE", status="CLOSED")
-        r = client.get("/equity/positions")
+        r = client.get("/api/equity/positions")
         assert r.status_code == 200
         body = r.json()
         assert len(body["positions"]) == 2
@@ -87,7 +87,7 @@ class TestPositions:
     def test_filter_open(self, client):
         _seed_position("INFY", status="OPEN")
         _seed_position("RELIANCE", status="CLOSED")
-        r = client.get("/equity/positions?status=open")
+        r = client.get("/api/equity/positions?status=open")
         assert r.status_code == 200
         body = r.json()
         assert len(body["positions"]) == 1
@@ -96,7 +96,7 @@ class TestPositions:
 
     def test_filter_closed_carries_exit_fields(self, client):
         _seed_position("RELIANCE", status="CLOSED")
-        r = client.get("/equity/positions?status=closed")
+        r = client.get("/api/equity/positions?status=closed")
         assert r.status_code == 200
         body = r.json()
         assert len(body["positions"]) == 1
@@ -107,7 +107,7 @@ class TestPositions:
         assert p["pnl"] == pytest.approx(800.0)
 
     def test_invalid_status_400(self, client):
-        r = client.get("/equity/positions?status=garbage")
+        r = client.get("/api/equity/positions?status=garbage")
         assert r.status_code == 400
 
 
@@ -120,7 +120,7 @@ class TestSignals:
 
     def test_missing_file_returns_empty(self, client, tmp_path):
         # No logs/signals-<today>.jsonl exists; response has empty signals.
-        r = client.get("/equity/signals")
+        r = client.get("/api/equity/signals")
         assert r.status_code == 200
         body = r.json()
         assert body["signals"] == []
@@ -147,7 +147,7 @@ class TestSignals:
                 "quantity": 1, "price": 2500.0,
             },
         ])
-        r = client.get("/equity/signals?date=2026-05-08")
+        r = client.get("/api/equity/signals?date=2026-05-08")
         assert r.status_code == 200
         body = r.json()
         assert body["date"] == "2026-05-08"
@@ -170,18 +170,18 @@ class TestSignals:
                 "quantity": 10, "price": 1500.0,
             }) + "\n"
         )
-        r = client.get("/equity/signals?date=2026-05-08")
+        r = client.get("/api/equity/signals?date=2026-05-08")
         assert r.status_code == 200
         assert len(r.json()["signals"]) == 1
 
     def test_invalid_date_400(self, client):
-        r = client.get("/equity/signals?date=not-a-date")
+        r = client.get("/api/equity/signals?date=not-a-date")
         assert r.status_code == 400
 
 
 class TestScans:
     def test_empty(self, client):
-        r = client.get("/equity/scans")
+        r = client.get("/api/equity/scans")
         assert r.status_code == 200
         assert r.json() == {"scans": []}
 
@@ -194,7 +194,7 @@ class TestScans:
             scan_dt="2026-05-08T09:30:00", scan_kind="open", mode="paper",
             n_signals=0, n_trades=1, n_open_positions=2, n_closed_today=1,
         )
-        r = client.get("/equity/scans")
+        r = client.get("/api/equity/scans")
         body = r.json()
         assert r.status_code == 200
         assert len(body["scans"]) == 2
@@ -206,7 +206,7 @@ class TestScans:
 class TestFiiDii:
     def test_missing_cache_returns_503(self, client):
         # FII_CACHE_DIR was redirected to a path that doesn't exist.
-        r = client.get("/equity/fii-dii")
+        r = client.get("/api/equity/fii-dii")
         assert r.status_code == 503
         assert "fetch_fii_dii" in r.json()["detail"]
 
@@ -225,7 +225,7 @@ class TestFiiDii:
                 {"category": "DII", "buyValue": 500.0,
                  "sellValue": 500.0 - dii_net, "netValue": dii_net},
             ]))
-        r = client.get("/equity/fii-dii")
+        r = client.get("/api/equity/fii-dii")
         assert r.status_code == 200
         body = r.json()
         assert body["generated_at"] is not None

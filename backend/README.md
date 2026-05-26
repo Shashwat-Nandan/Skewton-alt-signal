@@ -16,16 +16,16 @@ OpenAPI docs at <http://localhost:8000/docs>.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Health check + version |
-| `GET` | `/auth/status` | Whether a Kite session is cached + the user profile |
-| `GET` | `/auth/login` | Returns the Kite login URL the SPA should redirect to |
-| `GET` | `/auth/callback` | OAuth redirect target — exchanges `request_token` for `access_token` and bounces to the SPA |
-| `POST` | `/auth/logout` | Clears the cached session |
-| `GET` | `/strategies` | List of registered strategies + parameter schemas |
-| `GET` | `/strategies/{name}/params` | Parameter schema for one strategy |
-| `POST` | `/runs` | Body `{strategy, mode, params}` — starts a backgrounded run |
-| `GET` | `/runs` | All runs (active + recent) |
-| `GET` | `/runs/{id}` | Full state including signal feed, trades, P&L history |
-| `POST` | `/runs/{id}/stop` | Asks the run's tick loop to exit |
+| `GET` | `/api/auth/status` | Whether a Kite session is cached + the user profile |
+| `GET` | `/api/auth/login` | Returns the Kite login URL the SPA should redirect to |
+| `GET` | `/api/auth/callback` | OAuth redirect target — exchanges `request_token` for `access_token` and bounces to the SPA |
+| `POST` | `/api/auth/logout` | Clears the cached session |
+| `GET` | `/api/strategies` | List of registered strategies + parameter schemas |
+| `GET` | `/api/strategies/{name}/params` | Parameter schema for one strategy |
+| `POST` | `/api/runs` | Body `{strategy, mode, params}` — starts a backgrounded run |
+| `GET` | `/api/runs` | All runs (active + recent) |
+| `GET` | `/api/runs/{id}` | Full state including signal feed, trades, P&L history |
+| `POST` | `/api/runs/{id}/stop` | Asks the run's tick loop to exit |
 
 ## Modes
 
@@ -34,9 +34,9 @@ OpenAPI docs at <http://localhost:8000/docs>.
 
 ## Dashboard password
 
-Every API route except `/session/*` is gated behind a single shared
+Every API route except `/api/session/*` is gated behind a single shared
 password. The session lives in a signed HttpOnly cookie issued by
-`POST /session/login`; the cookie is honoured for 7 days and then the
+`POST /api/session/login`; the cookie is honoured for 7 days and then the
 user has to log in again. Backend refuses to start if either env var
 below is empty.
 
@@ -65,22 +65,22 @@ that the VPS daemon uses. Register a Kite Connect app once:
 1. Go to <https://developers.kite.trade/> and create a new app.
 2. Set the **redirect URL** to exactly:
    ```
-   http://127.0.0.1:8000/auth/callback
+   http://127.0.0.1:8000/api/auth/callback
    ```
    (must match `KITE_REDIRECT_URL` below).
 3. Add to `.env` at the repo root:
    ```
    KITE_API_KEY=<your_api_key>
    KITE_API_SECRET=<your_api_secret>
-   KITE_REDIRECT_URL=http://127.0.0.1:8000/auth/callback
+   KITE_REDIRECT_URL=http://127.0.0.1:8000/api/auth/callback
    # DASHBOARD_URL=http://localhost:5173   # default — override in prod
    ```
    `DASHBOARD_URL` is the public URL where the SPA is served. The
    backend redirects browsers there after the OAuth callback. Default
    `http://localhost:5173` matches the Vite dev server out of the box.
-4. Start the backend, open <http://localhost:8000/auth/login> in a browser,
-   complete login on Kite — you'll be redirected back to `/auth/callback`,
-   token cached to `.kite_session.json`, ready for `POST /runs`.
+4. Start the backend, open <http://localhost:8000/api/auth/login> in a browser,
+   complete login on Kite — you'll be redirected back to `/api/auth/callback`,
+   token cached to `.kite_session.json`, ready for `POST /api/runs`.
 
 The token is valid until ~6 AM IST the next day; re-login refreshes it.
 

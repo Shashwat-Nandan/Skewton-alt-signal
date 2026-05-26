@@ -23,8 +23,10 @@ class Settings(BaseSettings):
     kite_api_secret: str = ""
     # Must match the redirect URL set on the Kite developer console exactly.
     # Default works for `uvicorn backend.main:app --port 8000` on the same host
-    # the user is browsing from.
-    kite_redirect_url: str = "http://127.0.0.1:8000/auth/callback"
+    # the user is browsing from. NOTE: when bumping the /api/* prefix here,
+    # update the redirect URL on https://developers.kite.trade/ in the same
+    # change — Kite will reject mismatched callbacks at OAuth time.
+    kite_redirect_url: str = "http://127.0.0.1:8000/api/auth/callback"
 
     # Where the OAuth access token is cached. Reuses the path the existing
     # headless TOTP daemon uses so a single token file serves both paths.

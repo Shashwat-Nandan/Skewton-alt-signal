@@ -8,7 +8,7 @@ to keep in mind for the rest of the codebase:
 
 - `require_session` is the only dependency callers should use. Add it to
   every router that handles operator state.
-- `/session/login`, `/session/logout`, and `/session/me` are public —
+- `/api/session/login`, `/api/session/logout`, and `/api/session/me` are public —
   they CANNOT be gated behind themselves.
 - Cookie attributes are HttpOnly + SameSite=Lax + Secure-on-HTTPS. Lax (not
   Strict) is required so the Kite OAuth callback (a top-level cross-site

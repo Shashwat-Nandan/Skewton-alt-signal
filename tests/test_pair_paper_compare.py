@@ -116,7 +116,7 @@ class TestPairPaperCompare:
             _pair_report("CIPLA", "ITC", realized=1500.0, n_trades=2),
         ])
 
-        r = client.get(f"/pair-paper-compare?days=5&end={END}")
+        r = client.get(f"/api/pair-paper-compare?days=5&end={END}")
         assert r.status_code == 200
         body = r.json()
         assert body["start_date"] == EXPECTED_DAYS[0].isoformat()
@@ -158,7 +158,7 @@ class TestPairPaperCompare:
 
     def test_no_eod_files_returns_empty_window(self, client):
         # No sidecars at all — endpoint must still 200 with zero-filled aggregate.
-        r = client.get(f"/pair-paper-compare?days=5&end={END}")
+        r = client.get(f"/api/pair-paper-compare?days=5&end={END}")
         assert r.status_code == 200
         body = r.json()
         assert len(body["daily"]) == 5
@@ -178,7 +178,7 @@ class TestPairPaperCompare:
         _write_eod(cache, EXPECTED_DAYS[0], "baseline", [
             _pair_report("RELIANCE", "TCS", realized=1000.0),
         ])
-        r = client.get(f"/pair-paper-compare?days=5&end={END}")
+        r = client.get(f"/api/pair-paper-compare?days=5&end={END}")
         body = r.json()
         agg = {row["system"]: row for row in body["aggregate"]}
         assert agg["baseline"]["net_pnl"] == pytest.approx(1000.0)
@@ -198,7 +198,7 @@ class TestPairPaperCompare:
             "{this is not valid json"
         )
 
-        r = client.get(f"/pair-paper-compare?days=5&end={END}")
+        r = client.get(f"/api/pair-paper-compare?days=5&end={END}")
         assert r.status_code == 200
         body = r.json()
         day0 = body["daily"][0]
@@ -214,7 +214,7 @@ class TestPairPaperCompare:
         _write_eod(cache, EXPECTED_DAYS[-1], "baseline", [
             _pair_report("RELIANCE", "TCS", realized=500.0),
         ])
-        r = client.get(f"/pair-paper-compare?days=5&end=2026-05-17")
+        r = client.get(f"/api/pair-paper-compare?days=5&end=2026-05-17")
         assert r.status_code == 200
         body = r.json()
         dates = [row["date"] for row in body["daily"]]
@@ -236,29 +236,29 @@ class TestPairPaperCompare:
         _write_eod(cache, EXPECTED_DAYS[0], "persistent", [
             _pair_report("C", "D", realized=2000.0),      # max=2000 (raises C/D to 2000)
         ])
-        r = client.get(f"/pair-paper-compare?days=5&end={END}")
+        r = client.get(f"/api/pair-paper-compare?days=5&end={END}")
         body = r.json()
         order = [row["pair"] for row in body["per_pair"]]
         # A/B (max=10000), then C/D (max=2000), then E/F (max=500)
         assert order == ["A/B", "C/D", "E/F"]
 
     def test_invalid_end_date_returns_400(self, client):
-        r = client.get("/pair-paper-compare?days=3&end=not-a-date")
+        r = client.get("/api/pair-paper-compare?days=3&end=not-a-date")
         assert r.status_code == 400
         assert "end" in r.json()["detail"].lower()
 
     def test_single_system_param_returns_400(self, client):
-        r = client.get(f"/pair-paper-compare?days=3&systems=baseline")
+        r = client.get(f"/api/pair-paper-compare?days=3&systems=baseline")
         assert r.status_code == 400
         assert "at least 2" in r.json()["detail"]
 
     def test_days_above_max_returns_422(self, client):
         # FastAPI Query(ge=1, le=30) enforces the bound — 31 should 422.
-        r = client.get(f"/pair-paper-compare?days=31")
+        r = client.get(f"/api/pair-paper-compare?days=31")
         assert r.status_code == 422
 
     def test_days_below_min_returns_422(self, client):
-        r = client.get(f"/pair-paper-compare?days=0")
+        r = client.get(f"/api/pair-paper-compare?days=0")
         assert r.status_code == 422
 
     def test_unknown_system_returns_empty_data_not_error(self, client):
@@ -268,7 +268,7 @@ class TestPairPaperCompare:
         _write_eod(cache, EXPECTED_DAYS[0], "baseline", [
             _pair_report("A", "B", realized=1000.0),
         ])
-        r = client.get(f"/pair-paper-compare?days=5&end={END}&systems=baseline,nonsense")
+        r = client.get(f"/api/pair-paper-compare?days=5&end={END}&systems=baseline,nonsense")
         assert r.status_code == 200
         agg = {row["system"]: row for row in r.json()["aggregate"]}
         assert agg["baseline"]["net_pnl"] == pytest.approx(1000.0)

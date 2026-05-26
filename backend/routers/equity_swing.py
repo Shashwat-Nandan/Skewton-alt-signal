@@ -1,20 +1,20 @@
 """
 Equity-swing API.
 
-  GET  /equity/positions?status=open|closed
+  GET  /api/equity/positions?status=open|closed
        Returns rows from the ``equity_positions`` table written by
        ``run_equity_swing.py``. Default returns both, with OPEN first.
 
-  GET  /equity/signals?date=YYYY-MM-DD
+  GET  /api/equity/signals?date=YYYY-MM-DD
        Tails ``logs/signals-<date>.jsonl`` and returns the subset emitted
        by ``varsity_equity_swing``. Today's file is the default. Survives
        missing-file (returns an empty list with ``generated_at=null``).
 
-  GET  /equity/scans?limit=N
+  GET  /api/equity/scans?limit=N
        Recent scan invocations (n_signals, n_trades, mode). Used by the
        page header to show last-scan timing & counts.
 
-  GET  /equity/fii-dii?days=N
+  GET  /api/equity/fii-dii?days=N
        Per-day FII/DII net flow + rolling 5-day sums, as read by the
        strategy overlay. 503s when the cache directory is empty (no
        fetches have run yet) so the frontend can render a "no data"

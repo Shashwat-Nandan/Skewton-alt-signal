@@ -81,19 +81,22 @@ def create_app() -> FastAPI:
         https_only=settings.dashboard_url.startswith("https://"),
     )
 
-    # The /session/* router stays public — it's how callers acquire a session
-    # in the first place. Every other router is gated.
-    app.include_router(dashboard_session.router)
+    # Every API path lives under /api/* so it never collides with the SPA's
+    # client-side router. Before this prefix, a hard refresh of /positions or
+    # /market-profile in the browser hit the API regex in nginx and returned
+    # JSON instead of the SPA's index.html. /api/session/* stays public —
+    # it's how callers acquire a session in the first place.
+    app.include_router(dashboard_session.router, prefix="/api")
 
     gated = [Depends(require_session)]
-    app.include_router(auth.router, dependencies=gated)
-    app.include_router(strategies.router, dependencies=gated)
-    app.include_router(runs.router, dependencies=gated)
-    app.include_router(market_profile.router, dependencies=gated)
-    app.include_router(pair_candidates.router, dependencies=gated)
-    app.include_router(pair_paper_compare.router, dependencies=gated)
-    app.include_router(positions.router, dependencies=gated)
-    app.include_router(equity_swing.router, dependencies=gated)
+    app.include_router(auth.router, prefix="/api", dependencies=gated)
+    app.include_router(strategies.router, prefix="/api", dependencies=gated)
+    app.include_router(runs.router, prefix="/api", dependencies=gated)
+    app.include_router(market_profile.router, prefix="/api", dependencies=gated)
+    app.include_router(pair_candidates.router, prefix="/api", dependencies=gated)
+    app.include_router(pair_paper_compare.router, prefix="/api", dependencies=gated)
+    app.include_router(positions.router, prefix="/api", dependencies=gated)
+    app.include_router(equity_swing.router, prefix="/api", dependencies=gated)
 
     @app.get("/", tags=["meta"])
     def root():

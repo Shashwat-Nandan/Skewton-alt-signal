@@ -38,17 +38,17 @@ READY_TIMEOUT_S="${READY_TIMEOUT_S:-60}"
 # for HTML5 router fallback, so the meta endpoint is unreachable through
 # the public host by design. The SPA never calls it.
 ROUTES=(
-    "/session/me|200"
-    "/auth/status|401"
-    "/strategies|401"
-    "/runs|401"
-    "/market-profile/symbols|401"
-    "/pair-candidates|401"
-    "/pair-paper-compare|401"
-    "/equity/positions|401"
-    "/equity/signals|401"
-    "/equity/scans|401"
-    "/equity/fii-dii|401"
+    "/api/session/me|200"
+    "/api/auth/status|401"
+    "/api/strategies|401"
+    "/api/runs|401"
+    "/api/market-profile/symbols|401"
+    "/api/pair-candidates|401"
+    "/api/pair-paper-compare|401"
+    "/api/equity/positions|401"
+    "/api/equity/signals|401"
+    "/api/equity/scans|401"
+    "/api/equity/fii-dii|401"
 )
 
 wait_ready() {
@@ -109,7 +109,7 @@ for base in "${BASES[@]}"; do
     # Gate on /session/me reachability first. Skips this base's per-route
     # probes if the backend never came up — avoids 10× redundant failure
     # rows that obscure the root cause in deploy logs.
-    if ! wait_ready "${base%/}/session/me"; then
+    if ! wait_ready "${base%/}/api/session/me"; then
         fail=1
         continue
     fi

@@ -35,7 +35,7 @@ def client(tmp_path):
         # is held by TestClient and replayed on every subsequent request.
         # Tests that exercise the unauthenticated surface should use a
         # fresh TestClient (see TestDashboardSession below).
-        r = c.post("/session/login", json={"password": "test-password"})
+        r = c.post("/api/session/login", json={"password": "test-password"})
         assert r.status_code == 204, r.text
         yield c
     db.reset_for_tests(None)
@@ -65,20 +65,20 @@ class TestMeta:
         assert body["live_mode_enabled"] is False
 
     def test_strategies_list(self, client):
-        r = client.get("/strategies")
+        r = client.get("/api/strategies")
         assert r.status_code == 200
         names = [s["name"] for s in r.json()]
         assert "taleb_karpathy" in names
         assert "pair_trading" in names
 
     def test_strategies_params_known(self, client):
-        r = client.get("/strategies/pair_trading/params")
+        r = client.get("/api/strategies/pair_trading/params")
         assert r.status_code == 200
         param_names = {p["name"] for p in r.json()}
         assert {"entry_z", "exit_z", "stop_z"}.issubset(param_names)
 
     def test_strategies_params_unknown(self, client):
-        r = client.get("/strategies/bogus/params")
+        r = client.get("/api/strategies/bogus/params")
         assert r.status_code == 404
 
 
@@ -90,7 +90,7 @@ class TestAuth:
     def test_status_unauthenticated(self, client):
         # No token cached → not authed
         with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
-            r = client.get("/auth/status")
+            r = client.get("/api/auth/status")
         assert r.status_code == 200
         assert r.json()["authenticated"] is False
 
@@ -100,7 +100,7 @@ class TestAuth:
              patch("backend.kite_oauth.verify_token", return_value={
                  "user_id": "AB1234", "user_name": "Test User", "email": "test@example.com",
              }):
-            r = client.get("/auth/status")
+            r = client.get("/api/auth/status")
         assert r.status_code == 200
         body = r.json()
         assert body["authenticated"] is True
@@ -111,24 +111,24 @@ class TestAuth:
         # Settings has no api_key → 500 with helpful message
         with patch("backend.kite_oauth.get_login_url",
                    side_effect=RuntimeError("KITE_API_KEY is not set...")):
-            r = client.get("/auth/login")
+            r = client.get("/api/auth/login")
         assert r.status_code == 500
         assert "KITE_API_KEY" in r.json()["detail"]
 
     def test_login_url_ok(self, client):
         with patch("backend.kite_oauth.get_login_url",
                    return_value="https://kite.zerodha.com/connect/login?api_key=XYZ&v=3"):
-            r = client.get("/auth/login")
+            r = client.get("/api/auth/login")
         assert r.status_code == 200
         assert r.json()["login_url"].startswith("https://kite.zerodha.com")
 
     def test_callback_missing_token(self, client):
-        r = client.get("/auth/callback?status=error")
+        r = client.get("/api/auth/callback?status=error")
         assert r.status_code == 400
 
     def test_logout_clears_session(self, client):
         with patch("backend.kite_oauth.clear_cached_session") as mock_clear:
-            r = client.post("/auth/logout")
+            r = client.post("/api/auth/logout")
         assert r.status_code == 200
         mock_clear.assert_called_once()
 
@@ -139,18 +139,18 @@ class TestAuth:
 
 class TestRuns:
     def test_list_runs_empty(self, client):
-        r = client.get("/runs")
+        r = client.get("/api/runs")
         assert r.status_code == 200
         assert r.json() == []
 
     def test_create_run_unknown_strategy(self, client):
-        r = client.post("/runs", json={
+        r = client.post("/api/runs", json={
             "strategy": "bogus", "mode": "paper", "params": {},
         })
         assert r.status_code == 400
 
     def test_create_run_live_rejected(self, client):
-        r = client.post("/runs", json={
+        r = client.post("/api/runs", json={
             "strategy": "pair_trading", "mode": "live", "params": {},
         })
         assert r.status_code == 403
@@ -158,7 +158,7 @@ class TestRuns:
 
     def test_create_run_unauthenticated(self, client):
         with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
-            r = client.post("/runs", json={
+            r = client.post("/api/runs", json={
                 "strategy": "pair_trading", "mode": "paper", "params": {},
             })
         assert r.status_code == 401
@@ -174,7 +174,7 @@ class TestRuns:
              patch("backend.run_manager.get_strategy",
                    return_value=lambda **kw: fake_strategy):
             # Create
-            r = client.post("/runs", json={
+            r = client.post("/api/runs", json={
                 "strategy": "pair_trading", "mode": "paper", "params": {},
             })
             assert r.status_code == 201
@@ -182,11 +182,11 @@ class TestRuns:
             assert r.json()["status"] == "RUNNING"
 
             # List shows it
-            r = client.get("/runs")
+            r = client.get("/api/runs")
             assert any(run["id"] == run_id for run in r.json())
 
             # Detail
-            r = client.get(f"/runs/{run_id}")
+            r = client.get(f"/api/runs/{run_id}")
             assert r.status_code == 200
             body = r.json()
             assert body["id"] == run_id
@@ -196,14 +196,14 @@ class TestRuns:
             assert "pnl_history" in body
 
             # Stop
-            r = client.post(f"/runs/{run_id}/stop")
+            r = client.post(f"/api/runs/{run_id}/stop")
             assert r.status_code == 200
             assert r.json()["status"] in ("STOPPING", "STOPPED")
 
     def test_get_run_not_found(self, client):
-        r = client.get("/runs/does-not-exist")
+        r = client.get("/api/runs/does-not-exist")
         assert r.status_code == 404
 
     def test_stop_run_not_found(self, client):
-        r = client.post("/runs/does-not-exist/stop")
+        r = client.post("/api/runs/does-not-exist/stop")
         assert r.status_code == 404

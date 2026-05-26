@@ -137,6 +137,6 @@ silently degrades the FII gate but doesn't break the strategy.
 | `data_cache/fii_dii/YYYY-MM-DD.json` | Per-day cache |
 | `strategies/_fii_dii.py` | Consumer: 5d cumulative net signal |
 | `strategies/varsity_equity_swing.py` (`_signal_at`) | Uses `fii_boost` in scoring |
-| `backend/routers/equity_swing.py` | `/equity/fii-dii` route serves the cache to the dashboard |
+| `backend/routers/equity_swing.py` | `/api/equity/fii-dii` route serves the cache to the dashboard |
 | `deploy/fetch-fii-dii.service` / `.timer` | systemd cron |
 | `deploy/notify-failure@.service` | Failure alert |

@@ -279,13 +279,13 @@ class TestApi:
         c = TestClient(app)
         login_client(c)
         # Symbols list
-        r = c.get("/market-profile/symbols")
+        r = c.get("/api/market-profile/symbols")
         assert r.status_code == 200
         syms = r.json()
         assert any(s["symbol"] == "XYZ" for s in syms)
 
         # Profile fetch
-        r = c.get("/market-profile/XYZ?days=720&tick_size=1.0")
+        r = c.get("/api/market-profile/XYZ?days=720&tick_size=1.0")
         assert r.status_code == 200
         j = r.json()
         assert j["symbol"] == "XYZ"
@@ -294,7 +294,7 @@ class TestApi:
         assert j["composite"]["val"] <= j["composite"]["poc"] <= j["composite"]["vah"]
 
         # Daily mode includes per-day breakdown
-        r = c.get("/market-profile/XYZ?days=720&mode=daily&tick_size=1.0")
+        r = c.get("/api/market-profile/XYZ?days=720&mode=daily&tick_size=1.0")
         assert r.status_code == 200
         j = r.json()
         assert "daily" in j and len(j["daily"]) >= 1
@@ -306,7 +306,7 @@ class TestApi:
         from tests._helpers import login_client
         c = TestClient(app)
         login_client(c)
-        r = c.get("/market-profile/GHOST")
+        r = c.get("/api/market-profile/GHOST")
         assert r.status_code == 404
         assert "bars_universe" in r.json()["detail"]
 
@@ -318,6 +318,6 @@ class TestApi:
         from tests._helpers import login_client
         c = TestClient(app)
         login_client(c)
-        r = c.get("/market-profile/ABC")
+        r = c.get("/api/market-profile/ABC")
         assert r.status_code == 404
         assert "No 30m bars" in r.json()["detail"]

@@ -7,5 +7,5 @@ def login_client(client) -> None:
     """Acquire a dashboard session on `client`. Tests that build their own
     TestClient (rather than using the shared `client` fixture) need to call
     this once after construction so subsequent gated routes don't 401."""
-    r = client.post("/session/login", json={"password": "test-password"})
+    r = client.post("/api/session/login", json={"password": "test-password"})
     assert r.status_code == 204, r.text

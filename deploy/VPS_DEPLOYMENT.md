@@ -595,15 +595,15 @@ screen-scrape that the headless services use). One-time setup:
 1. Sign in at <https://developers.kite.trade/> and create a new app.
 2. Set **Redirect URL** to *exactly* the URL nginx will serve, e.g.:
    ```
-   https://dashboard.example.com/auth/callback
+   https://dashboard.example.com/api/auth/callback
    ```
-   For a same-host VPS without HTTPS yet, `http://<vps-ip>/auth/callback`
+   For a same-host VPS without HTTPS yet, `http://<vps-ip>/api/auth/callback`
    works for testing — Kite enforces an exact string match.
 3. Copy the API key + secret into `/opt/taleb-karpathy-kite/.env`:
    ```
    KITE_API_KEY=...
    KITE_API_SECRET=...
-   KITE_REDIRECT_URL=https://dashboard.example.com/auth/callback
+   KITE_REDIRECT_URL=https://dashboard.example.com/api/auth/callback
    DASHBOARD_URL=https://dashboard.example.com
    ```
    `DASHBOARD_URL` is the public origin where users open the SPA — the
@@ -657,9 +657,9 @@ idempotent and takes ~30 s on a 2 vCPU box.
 
 ### 10.4 nginx site
 
-`deploy/nginx-dashboard.conf.example` is the template — three rules:
-proxy `/auth`, `/strategies`, `/runs` to the backend, serve everything
-else from `frontend/dist/` with HTML5-router fallback to `index.html`.
+`deploy/nginx-dashboard.conf.example` is the template — one rule:
+proxy `/api/*` to the backend, serve everything else from `frontend/dist/`
+with HTML5-router fallback to `index.html`.
 
 ```bash
 sudo apt-get install -y nginx
@@ -688,7 +688,7 @@ the certificate paths.
 3. Pick a strategy + mode (signals or paper) + start.
 4. The run page should poll every 2s and show ticks accumulating.
 
-If `/auth/login` fails with `KITE_API_KEY is not set`, the systemd unit
+If `/api/auth/login` fails with `KITE_API_KEY is not set`, the systemd unit
 isn't reading `.env` — check the `EnvironmentFile=` line in
 `dashboard-backend.service` matches your repo path. If the redirect
 back from Kite errors with "redirect URI mismatch", the URL in the
@@ -713,7 +713,7 @@ mv /opt/taleb-karpathy-kite/data_cache/dashboard.db{,.bak}
 sudo systemctl start dashboard-backend.service
 ```
 
-The dashboard never trades real money in this build (`POST /runs` with
+The dashboard never trades real money in this build (`POST /api/runs` with
 `mode=live` returns 403). To unlock live, set `ALLOW_LIVE_MODE=true`
 in `.env` and restart — but the recommended live path remains the
 headless `taleb-hedger.service` above, which has the audit trail and
@@ -723,7 +723,7 @@ TOTP automation that browser-driven sessions don't.
 
 ## 11. Market Profile bars ingestion
 
-The `/market-profile` dashboard tab reads 30-min OHLCV bars stored in
+The `/api/market-profile` dashboard tab reads 30-min OHLCV bars stored in
 `data_cache/dashboard.db` (`bars` and `bars_universe` tables). The
 `fetch-bars.timer` keeps the corpus current, but it only runs the
 **incremental** path — first you need a one-time backfill to populate

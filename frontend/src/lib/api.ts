@@ -31,9 +31,15 @@ export class UnauthorizedError extends Error {
  * Thin typed wrapper around fetch. The backend is same-origin in dev (Vite
  * proxy) and same-origin in prod (served behind the same reverse proxy), so
  * we never set an Origin or include credentials explicitly.
+ *
+ * Every API call goes through /api/* so the path space stays disjoint from
+ * the SPA's client-side router. Without this, a hard refresh on a route like
+ * /positions hit the nginx API regex and returned JSON instead of the SPA.
  */
+const API_BASE = "/api";
+
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",

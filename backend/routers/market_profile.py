@@ -1,11 +1,11 @@
 """
 Market Profile API.
 
-  GET  /market-profile/symbols
+  GET  /api/market-profile/symbols
        Returns the universe ingested so far, with bar-range metadata so
        the frontend selector can show coverage at a glance.
 
-  GET  /market-profile/{symbol}?days=N&period_minutes=30&mode=composite|daily
+  GET  /api/market-profile/{symbol}?days=N&period_minutes=30&mode=composite|daily
        Returns the computed Market Profile (POC, VAH/VAL, IB, bins).
        In `composite` mode (default) all bars in the window become a
        single profile. In `daily` mode the response includes one profile

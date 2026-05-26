@@ -38,7 +38,7 @@ queue, no broker, no shared object between them — only the filesystem.
                           ┌──────────────────┴──────────────────┐
                           │                                     │
                    OAuth redirect                       OAuth redirect
-                   /auth/callback                       /auth/callback
+                   /api/auth/callback                       /api/auth/callback
                           │                                     │
                           ▼                                     ▼
 ┌──────────────────────────────────┐      ┌────────────────────────────────────┐
@@ -51,8 +51,8 @@ queue, no broker, no shared object between them — only the filesystem.
        ┌─────────────────────┐                    ┌──────────────────────┐
        │   nginx (VPS only)  │                    │   Vite dev server    │
        │   serves dist/      │                    │   serves SPA + proxy │
-       │   proxies /auth,    │                    │   /auth /strategies  │
-       │   /strategies, /runs│                    │   /runs → :8000      │
+       │   proxies /api/* to │                    │   /api/* → :8000     │
+       │   uvicorn :8000     │                    │                      │
        └──────────┬──────────┘                    └──────────┬───────────┘
                   │                                           │
                   └──────────────────┬────────────────────────┘
@@ -126,10 +126,10 @@ re-authenticate on the next invocation if `_is_token_valid()` fails.
 | Component | Role |
 |---|---|
 | `backend/main.py` | FastAPI app factory + lifespan handler (initialises SQLite schema, hydrates orphan runs to STOPPED, cancels live tasks on shutdown). |
-| `backend/kite_oauth.py` | OAuth redirect flow: `get_login_url()` → user authenticates on Kite → `/auth/callback` exchanges `request_token` → cached in `.kite_session.json` (same path as the TOTP daemon — one cache serves both). |
+| `backend/kite_oauth.py` | OAuth redirect flow: `get_login_url()` → user authenticates on Kite → `/api/auth/callback` exchanges `request_token` → cached in `.kite_session.json` (same path as the TOTP daemon — one cache serves both). |
 | `backend/run_manager.py` | In-memory `RunManager` that owns one asyncio task per active run. Per-tick: calls strategy `scan_and_propose` + `check_and_rehedge`, writes proposals + PnL snapshot to SQLite. |
 | `backend/routers/` | Three thin routers (`auth`, `strategies`, `runs`) — the only public API surface. |
-| `frontend/src/` | React 18 + TS + Tailwind + shadcn primitives. Two pages (Home, RunPage). Polls `/runs/{id}` every 2 s while `RUNNING`. |
+| `frontend/src/` | React 18 + TS + Tailwind + shadcn primitives. Two pages (Home, RunPage). Polls `/api/runs/{id}` every 2 s while `RUNNING`. |
 
 The dashboard runs the **same** `BaseStrategy` subclasses as the daemon —
 they don't know which process they're inside. The only difference is the
@@ -207,7 +207,7 @@ That's it. The dashboard discovers it automatically; no other wiring.
 | `paper` | Mock fill (`_paper_execute`) → log line + state update (positions, P&L, costs) | Yes | No |
 | `live` | `_live_execute` → `kite.place_order(...)` returning a `PENDING` order_id; state updated on assumed fill | Yes | **Yes** |
 
-The dashboard's `POST /runs` rejects `live`; the daemon path uses `paper`.
+The dashboard's `POST /api/runs` rejects `live`; the daemon path uses `paper`.
 `live` is only reachable today by the (deliberately separate) `run_live.py`
 the operator copies from `run_paper.py` after deleting the paper guard. See
 `deploy/VPS_DEPLOYMENT.md` §7.
@@ -262,9 +262,9 @@ backend/
 ├── db.py              # sqlite3 schema + helpers
 ├── routers/
 │   ├── __init__.py
-│   ├── auth.py        # /auth/{status,login,callback,logout}
-│   ├── strategies.py  # /strategies, /strategies/{name}/params
-│   └── runs.py        # /runs, /runs/{id}, /runs/{id}/stop
+│   ├── auth.py        # /api/auth/{status,login,callback,logout}
+│   ├── strategies.py  # /api/strategies, /api/strategies/{name}/params
+│   └── runs.py        # /api/runs, /api/runs/{id}, /api/runs/{id}/stop
 └── README.md          # OAuth setup checklist
 ```
 
@@ -290,20 +290,20 @@ SPA — the run is just terminal.
 | Method | Path | Body / params | Returns |
 |---|---|---|---|
 | `GET` | `/` | — | `{name, version, live_mode_enabled}` |
-| `GET` | `/auth/status` | — | `AuthStatus` (authenticated + profile) |
-| `GET` | `/auth/login` | — | `{login_url}` (SPA `window.location.assign`s) |
-| `GET` | `/auth/callback` | `request_token`, `status` (from Kite) | 302 → `{DASHBOARD_URL}/?login=success` |
-| `POST` | `/auth/logout` | — | `{status: "ok"}`, clears `.kite_session.json` |
-| `GET` | `/strategies` | — | `[{name, description, params}]` |
-| `GET` | `/strategies/{name}/params` | — | `[ParamSpec]` (form schema) |
-| `POST` | `/runs` | `{strategy, mode, params}` | `RunSummary`, 201. 400 unknown strategy, 403 live mode, 401 no Kite session, 500 strategy init failure |
-| `GET` | `/runs` | — | `[RunSummary]` (live + DB historical, merged) |
-| `GET` | `/runs/{id}` | — | `RunDetail` (summary + signals + trades + pnl_history from DB) |
-| `POST` | `/runs/{id}/stop` | — | `RunSummary`, status flips to STOPPING then STOPPED |
-| `GET` | `/equity/positions` | `status=open\|closed` (opt) | `{positions: [EquityPosition]}` from cron path's paper book |
-| `GET` | `/equity/signals` | `date=YYYY-MM-DD` (opt, default today) | Tail of `logs/signals-{date}.jsonl` filtered to varsity_equity_swing |
-| `GET` | `/equity/scans` | `limit=N` (opt) | `{scans: [EquityScan]}` — recent cron invocations |
-| `GET` | `/equity/fii-dii` | `days=N` (opt) | Per-day FII/DII net flow + rolling 5-day sums. 503 if cache empty |
+| `GET` | `/api/auth/status` | — | `AuthStatus` (authenticated + profile) |
+| `GET` | `/api/auth/login` | — | `{login_url}` (SPA `window.location.assign`s) |
+| `GET` | `/api/auth/callback` | `request_token`, `status` (from Kite) | 302 → `{DASHBOARD_URL}/?login=success` |
+| `POST` | `/api/auth/logout` | — | `{status: "ok"}`, clears `.kite_session.json` |
+| `GET` | `/api/strategies` | — | `[{name, description, params}]` |
+| `GET` | `/api/strategies/{name}/params` | — | `[ParamSpec]` (form schema) |
+| `POST` | `/api/runs` | `{strategy, mode, params}` | `RunSummary`, 201. 400 unknown strategy, 403 live mode, 401 no Kite session, 500 strategy init failure |
+| `GET` | `/api/runs` | — | `[RunSummary]` (live + DB historical, merged) |
+| `GET` | `/api/runs/{id}` | — | `RunDetail` (summary + signals + trades + pnl_history from DB) |
+| `POST` | `/api/runs/{id}/stop` | — | `RunSummary`, status flips to STOPPING then STOPPED |
+| `GET` | `/api/equity/positions` | `status=open\|closed` (opt) | `{positions: [EquityPosition]}` from cron path's paper book |
+| `GET` | `/api/equity/signals` | `date=YYYY-MM-DD` (opt, default today) | Tail of `logs/signals-{date}.jsonl` filtered to varsity_equity_swing |
+| `GET` | `/api/equity/scans` | `limit=N` (opt) | `{scans: [EquityScan]}` — recent cron invocations |
+| `GET` | `/api/equity/fii-dii` | `days=N` (opt) | Per-day FII/DII net flow + rolling 5-day sums. 503 if cache empty |
 
 CORS: `dashboard_url` only (default `http://localhost:5173`).
 
@@ -340,7 +340,7 @@ Per-tick DB writes:
 ```
 frontend/
 ├── package.json
-├── vite.config.ts            # dev proxy /auth /strategies /runs → :8000
+├── vite.config.ts            # dev proxy /api/* → :8000
 ├── tailwind.config.js        # shadcn HSL variables, dark-first
 ├── tsconfig*.json
 ├── index.html
@@ -365,17 +365,17 @@ frontend/
     │   └── EODReportCard.tsx # raw JSON snapshot
     └── pages/
         ├── Home.tsx          # auth gate → LoginCard | StrategyForm + RunsList
-        └── RunPage.tsx       # /runs/:id with live polling
+        └── RunPage.tsx       # /api/runs/:id with live polling
 ```
 
 ### 6.2 Polling cadence
 
 | Query | Cadence |
 |---|---|
-| `/auth/status` | On mount, manual invalidation after login |
-| `/strategies` | On mount (forever cached after first hit) |
-| `/runs` | Every 3 s while Home page is mounted |
-| `/runs/{id}` | Every 2 s while `status === RUNNING \|\| STOPPING`, otherwise off |
+| `/api/auth/status` | On mount, manual invalidation after login |
+| `/api/strategies` | On mount (forever cached after first hit) |
+| `/api/runs` | Every 3 s while Home page is mounted |
+| `/api/runs/{id}` | Every 2 s while `status === RUNNING \|\| STOPPING`, otherwise off |
 
 React Query handles the caching + dedup. There is no WebSocket / SSE — for
 the v1 traffic profile (one operator, ≤ a handful of active runs), polling
@@ -412,15 +412,15 @@ Two flows, one cache file.
         └────────────────┘       │       └────────────────────┘
                      ▲           │           ▲
                      │           │           │
-           run_paper / run /     │       /auth/login →
-           run_autoresearch      │       /auth/callback
+           run_paper / run /     │       /api/auth/login →
+           run_autoresearch      │       /api/auth/callback
                                  │
                           (used by both)
 ```
 
 | | TOTP path | OAuth path |
 |---|---|---|
-| Used by | `run_paper.py`, `run.py`, `run_autoresearch.py` | Dashboard `POST /runs` |
+| Used by | `run_paper.py`, `run.py`, `run_autoresearch.py` | Dashboard `POST /api/runs` |
 | Trigger | Process startup | User clicks "Login with Kite" |
 | Inputs | `KITE_USER_ID`, `KITE_PASSWORD`, `KITE_TOTP_KEY` from `.env` | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` from `.env` |
 | Mechanism | POST to `/api/login` + `/api/twofa` with auto-generated TOTP | Browser-side redirect to `kite.zerodha.com/connect/login`, callback exchanges request_token |
@@ -587,7 +587,7 @@ Index: `idx_pnl_run_id ON (run_id, id)`. Same access pattern as proposals.
 ### 9.4 Lifecycle of a row
 
 ```
-POST /runs
+POST /api/runs
    └─▶ db.insert_run(run)                    INSERT INTO runs (..., status='RUNNING')
                                              tick_count = n_signals = n_trades = 0
 
@@ -598,7 +598,7 @@ per tick (scan + execute):
    └─▶ db.update_run_tick(...)               UPDATE runs SET tick_count, last_tick_at,
                                                               last_eod_report_json
 
-POST /runs/{id}/stop
+POST /api/runs/{id}/stop
    └─▶ db.update_run_status(id, 'STOPPING')  UPDATE runs SET status='STOPPING'
         and the asyncio Event wakes the loop
 
@@ -651,14 +651,14 @@ SELECT name, COUNT(*) AS rows FROM (
 |---|---|---|---|
 | `KITE_API_KEY` | OAuth + TOTP | — | From developers.kite.trade |
 | `KITE_API_SECRET` | OAuth + TOTP | — | Same |
-| `KITE_REDIRECT_URL` | OAuth | `http://127.0.0.1:8000/auth/callback` | Must byte-match the URL registered on the Kite app |
+| `KITE_REDIRECT_URL` | OAuth | `http://127.0.0.1:8000/api/auth/callback` | Must byte-match the URL registered on the Kite app |
 | `KITE_USER_ID` | TOTP daemon | — | |
 | `KITE_PASSWORD` | TOTP daemon | — | |
 | `KITE_TOTP_KEY` | TOTP daemon | — | The seed Kite gives when you enroll 2FA |
 | `DASHBOARD_URL` | Dashboard | `http://localhost:5173` | Public URL of the SPA. Drives the post-OAuth redirect target and CORS allowlist. Override in prod. |
 | `DB_PATH` | Dashboard | `data_cache/dashboard.db` | Relocate the SQLite store if needed |
 | `TICK_INTERVAL_SECONDS` | Dashboard | `60` | Per-run tick cadence |
-| `ALLOW_LIVE_MODE` | Dashboard | `false` | Set true to let `POST /runs` accept `mode="live"` |
+| `ALLOW_LIVE_MODE` | Dashboard | `false` | Set true to let `POST /api/runs` accept `mode="live"` |
 
 ### 10.2 `config.ini` (gitignored, repo root)
 
@@ -715,8 +715,7 @@ npm install         # first time
 npm run dev          # http://localhost:5173 with API proxy
 ```
 
-Vite proxies `/auth`, `/strategies`, `/runs` to `:8000` so everything is
-same-origin in the browser.
+Vite proxies `/api/*` to `:8000` so everything is same-origin in the browser.
 
 ### 12.2 VPS production
 

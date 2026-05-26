@@ -27,11 +27,11 @@ server {
     add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
 
     # ── Rate-limited login endpoint ──────────────────────────────
-    # `location = /session/login` matches before the regex below so the
-    # rate-limit applies just to this path. burst=5 + nodelay = a real
-    # operator can fast-retry a typo, but a brute-force attempt eats the
-    # budget within seconds and gets 429s.
-    location = /session/login {
+    # `location = /api/session/login` matches before the prefix block below
+    # so the rate-limit applies just to this path. burst=5 + nodelay = a
+    # real operator can fast-retry a typo, but a brute-force attempt eats
+    # the budget within seconds and gets 429s.
+    location = /api/session/login {
         limit_req zone=dashboard_login burst=5 nodelay;
         limit_req_status 429;
         proxy_pass http://127.0.0.1:8000;
@@ -43,11 +43,11 @@ server {
         proxy_read_timeout 60s;
     }
 
-    # Backend API — nine prefixes only. Anything else falls through
-    # to the SPA. Keep this list in sync with the routers registered in
-    # backend/main.py. /session is the dashboard-password gate; everything
-    # else is gated behind it server-side.
-    location ~ ^/(session|auth|strategies|runs|market-profile|pair-candidates|pair-paper-compare|positions|equity)(/|$) {
+    # Backend API — everything under /api/*. The SPA's client-side router
+    # owns every other path, so a hard refresh of /positions or
+    # /market-profile in the browser falls through to index.html instead
+    # of hitting JSON.
+    location /api/ {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

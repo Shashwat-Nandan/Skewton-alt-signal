@@ -4,9 +4,9 @@ Kite OAuth — browser redirect flow for the dashboard.
 Distinct from kite_auth.KiteAuthManager (the headless TOTP screen-scrape used
 by the unattended VPS daemon). This module is the user-driven OAuth flow:
 
-  1. Frontend hits GET /auth/login → 302 to https://kite.zerodha.com/connect/login
+  1. Frontend hits GET /api/auth/login → 302 to https://kite.zerodha.com/connect/login
   2. User authenticates on Kite's site
-  3. Kite redirects to GET /auth/callback?request_token=...
+  3. Kite redirects to GET /api/auth/callback?request_token=...
   4. Backend exchanges request_token + api_secret → access_token via SDK
   5. Token cached to .kite_session.json (compatible with the daemon path)
 """
