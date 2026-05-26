@@ -62,6 +62,15 @@ def _make_strategy(
     s.max_leg_notional = max_leg_notional
     s.min_edge_multiplier = min_edge_multiplier
     s.total_capital = 500_000
+    # H5: default cooldown disabled in unit tests so existing entry/exit
+    # tests keep their pre-H5 behaviour. Cooldown-specific tests opt in by
+    # mutating s.stop_cooldown_minutes after construction.
+    s.stop_cooldown_minutes = 0
+    s._pending_exit_reason = None
+    # H19: no injected NFO dump by default; helpers that need
+    # _resolve_futures or legs_expire_on lookups mock kite.instruments
+    # directly so the lazy-fetch path still works.
+    s._nfo_instruments_cache = None
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
     s._cached_futures = {
@@ -472,6 +481,149 @@ class TestExit:
 
 
 # ──────────────────────────────────────────────────────────
+# H5 — post-STOP cooldown
+# ──────────────────────────────────────────────────────────
+
+class TestStopCooldown:
+    """A pair that stops out at z=4.2 must not re-enter on the very next
+    tick. The cooldown arms ONLY on STOP — MEAN_REVERT and MAX_HOLD allow
+    immediate re-entry. The gate persists across state save/restore."""
+
+    def _stage_long_spread(self, s, entry_z=-2.5, price_a=1000.0, price_b=2000.0):
+        s.state.position = "LONG_SPREAD"
+        s.state.entry_time = s._clock()
+        s.state.entry_z = entry_z
+        s.state.entry_spread = entry_z * 1.0
+        s.state.effective_stop_z = max(s.stop_z, abs(entry_z) + s.safety_buffer)
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
+                    quantity=1, entry_price=price_a, current_price=price_a),
+            PairLeg(symbol="BBB", tradingsymbol="BBB26APRFUT", lot_size=200,
+                    quantity=-1, entry_price=price_b, current_price=price_b),
+        ]
+
+    def _force_stop_then_close(self, s):
+        """Call _build_exit_proposals(STOP, …), then run execute_proposals on
+        the returned legs so the book actually flattens — that's the path
+        that promotes the reason onto state."""
+        proposals = s._build_exit_proposals(
+            reason="STOP", z=4.2,
+            prices={"AAA": 1010.0, "BBB": 2000.0},
+        )
+        s.execute_proposals(proposals)
+
+    def test_stop_arms_cooldown_and_blocks_immediate_reentry(self):
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 60
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+
+        assert s.state.position == "FLAT"
+        assert s.state.last_exit_reason == "STOP"
+        assert s.state.last_exit_time == s._clock()
+        # Even at a clean re-entry z, the gate must hold.
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1994.0}}  # spread=3 → z=3.0 entry signal
+        )
+        assert s.scan_and_propose() == []
+
+    def test_reentry_allowed_after_cooldown_elapses(self):
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 60
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        # Jump the clock past the cooldown window.
+        original_clock = s._clock()
+        s._clock = lambda: original_clock + timedelta(minutes=61)
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1994.0}}
+        )
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2, "Cooldown elapsed — re-entry should fire"
+
+    def test_mean_revert_exit_does_not_arm_cooldown(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 60
+        self._stage_long_spread(s)
+        proposals = s._build_exit_proposals(
+            reason="MEAN_REVERT", z=0.0,
+            prices={"AAA": 1000.0, "BBB": 2000.0},
+        )
+        s.execute_proposals(proposals)
+        assert s.state.last_exit_reason == "MEAN_REVERT"
+        # _is_in_stop_cooldown gates only on reason=='STOP', so no block.
+        assert s._is_in_stop_cooldown() is False
+
+    def test_zero_minutes_disables_cooldown(self):
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 0
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1994.0}}
+        )
+        assert len(s.scan_and_propose()) == 2
+
+    def test_cooldown_persists_through_state_roundtrip(self):
+        """STOP at 14:30 IST → state saved → restored next morning. The
+        cooldown should still gate re-entry until 60 min from the STOP."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 60
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        blob = s.serialize_state()
+
+        # Rebuild and restore.
+        s2 = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                            spread_history=[-1.0, 1.0] * 30)
+        s2.stop_cooldown_minutes = 60
+        s2._clock = lambda: s._clock() + timedelta(minutes=30)  # next morning, 30 min in
+        s2.restore_state(blob)
+        assert s2.state.last_exit_reason == "STOP"
+        # 30 min < 60 min cooldown → still blocked.
+        assert s2._is_in_stop_cooldown() is True
+        # Advance another 31 min → past cooldown.
+        s2._clock = lambda: s._clock() + timedelta(minutes=61)
+        assert s2._is_in_stop_cooldown() is False
+
+    def test_old_state_without_cooldown_keys_restores_clean(self):
+        """Backwards-compatibility: a pre-H5 state file (no last_exit_* keys)
+        must restore as 'no active cooldown', not blow up."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 60
+        blob = {
+            "pair": ["AAA", "BBB"],
+            "hedge_ratio": 0.5,
+            "state": {
+                "position": "FLAT",
+                "entry_z": 0.0,
+                "entry_time": None,
+                "entry_spread": 0.0,
+                "effective_stop_z": 0.0,
+                "legs": [],
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "total_transaction_costs": 0.0,
+                "closed_trades": [],
+                # NOTE: deliberately missing last_exit_time / last_exit_reason
+            },
+        }
+        s.restore_state(blob)
+        assert s.state.last_exit_time is None
+        assert s.state.last_exit_reason is None
+        assert s._is_in_stop_cooldown() is False
+
+
+# ──────────────────────────────────────────────────────────
 # Mode dispatch / signals JSONL
 # ──────────────────────────────────────────────────────────
 
@@ -856,6 +1008,78 @@ class TestLegsExpireOn:
             raise RuntimeError("network down")
         s.kite.instruments = _raise
         assert s.legs_expire_on(d(2026, 5, 28)) is False
+
+
+# ──────────────────────────────────────────────────────────
+# H19 — injected NFO instruments cache
+# ──────────────────────────────────────────────────────────
+
+class TestNfoInstrumentsCache:
+    """H19: the runner pre-fetches kite.instruments('NFO') once and injects
+    it into every strategy. With the injection, _get_nfo_instruments must
+    never touch kite.instruments(); without it, the lazy fallback path
+    fetches on first use and caches in-instance for subsequent calls."""
+
+    def test_injected_cache_bypasses_kite_instruments(self):
+        from datetime import date as d
+        rows = [
+            {"tradingsymbol": "AAA26MAYFUT", "expiry": "2026-05-28",
+             "name": "AAA", "instrument_type": "FUT"},
+        ]
+        s = _make_strategy()
+        s._nfo_instruments_cache = rows  # simulate runner injection
+        # Make kite.instruments explode if called — proves the injection
+        # path is wired through both call sites.
+        def _explode(*a, **k):
+            raise AssertionError("kite.instruments() called despite "
+                                  "injected cache being present")
+        s.kite.instruments = _explode
+
+        # legs_expire_on uses the cache directly.
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol="AAA26MAYFUT", lot_size=100,
+                    quantity=1, entry_price=1000.0, current_price=1000.0),
+        ]
+        assert s.legs_expire_on(d(2026, 5, 28)) is True
+
+        # _resolve_futures uses the cache too.
+        s._cached_futures.clear()  # force the lookup
+        s._clock = lambda: datetime(2026, 5, 20, 10, 0)
+        fut = s._resolve_futures("AAA")
+        assert fut is not None
+        assert fut["tradingsymbol"] == "AAA26MAYFUT"
+
+    def test_lazy_fetch_populates_cache_on_first_call(self):
+        """Without injection, the first _get_nfo_instruments fetches from
+        kite, fills the in-instance cache, and subsequent calls reuse it."""
+        rows = [
+            {"tradingsymbol": "AAA26MAYFUT", "expiry": "2026-05-28",
+             "name": "AAA", "instrument_type": "FUT"},
+        ]
+        s = _make_strategy()
+        s._nfo_instruments_cache = None
+        fetch_count = [0]
+        def _instr(seg):
+            fetch_count[0] += 1
+            return rows
+        s.kite.instruments = _instr
+
+        assert s._get_nfo_instruments() == rows
+        assert s._get_nfo_instruments() == rows  # cache hit
+        assert fetch_count[0] == 1, (
+            f"expected 1 fetch, got {fetch_count[0]} — lazy cache not working"
+        )
+
+    def test_lazy_fetch_failure_returns_empty(self):
+        """A kite.instruments exception must return [] (so callers
+        short-circuit) and NOT corrupt the cache to a partial state."""
+        s = _make_strategy()
+        s._nfo_instruments_cache = None
+        def _raise(*a, **k):
+            raise RuntimeError("network down")
+        s.kite.instruments = _raise
+        assert s._get_nfo_instruments() == []
+        assert s._nfo_instruments_cache is None  # not poisoned
 
 
 # ──────────────────────────────────────────────────────────

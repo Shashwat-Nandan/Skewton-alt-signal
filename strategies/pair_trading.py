@@ -78,6 +78,12 @@ class PairState:
     unrealized_pnl: float = 0.0
     total_transaction_costs: float = 0.0
     closed_trades: List[dict] = field(default_factory=list)
+    # H5: cooldown bookkeeping. Set when execute_proposals flattens the book,
+    # consulted by scan_and_propose to gate re-entry. Only STOP exits trigger
+    # the cooldown gate; MEAN_REVERT and MAX_HOLD record the reason for
+    # diagnostics but allow immediate re-entry.
+    last_exit_time: Optional[datetime] = None
+    last_exit_reason: Optional[str] = None
 
 
 class PairTradingStrategy(BaseStrategy):
@@ -92,6 +98,7 @@ class PairTradingStrategy(BaseStrategy):
         symbol_a: Optional[str] = None,
         symbol_b: Optional[str] = None,
         hedge_ratio: Optional[float] = None,
+        nfo_instruments: Optional[List[dict]] = None,
     ):
         super().__init__(kite, config_path=config_path, mode=mode)
 
@@ -169,6 +176,14 @@ class PairTradingStrategy(BaseStrategy):
         # ~5-day time-stop guidance.
         self.max_holding_days = int(cfg.get("max_holding_days", 7))
 
+        # H5: post-STOP re-entry cooldown. Without this, a pair that stops
+        # out at z=4.2 will re-enter on the very next tick (z still > entry_z)
+        # — observed historically as runaway churn at ~₹6-10k/hr per pair on
+        # bad days. 60 min default lets the spread either revert (so re-entry
+        # is wanted) or drift further (so re-entry is correctly blocked by
+        # max_entry_z). Only STOP exits arm the gate.
+        self.stop_cooldown_minutes = int(cfg.get("stop_cooldown_minutes", 60))
+
         # Optional per-leg notional cap (₹). Without it, high-β pairs can
         # silently deploy huge amounts (e.g. β=10 with 1 lot of A → ~10 lots
         # of B by notional). When set, sizing scales BOTH legs down so the
@@ -193,6 +208,15 @@ class PairTradingStrategy(BaseStrategy):
         self.state = PairState()
         self._spread_history: List[float] = []
         self._cached_futures: Dict[str, dict] = {}  # symbol → {tradingsymbol, lot_size, expiry}
+        # H5: transient stash for the reason carried from _build_exit_proposals
+        # into execute_proposals (which promotes it onto state once the book is
+        # actually flat). Not persisted — only state.last_exit_* survives.
+        self._pending_exit_reason: Optional[str] = None
+        # H19: session-wide NFO instruments dump (~150k rows, ~5MB). The
+        # runner fetches it once at startup and injects it here so 12 pairs
+        # × 360 ticks/day on expiry day don't each re-fetch. None = no cache
+        # injected; _get_nfo_instruments() lazy-fills from kite on first use.
+        self._nfo_instruments_cache: Optional[List[dict]] = nfo_instruments
         self._clock = datetime.now
         # Session-start P&L snapshot — re-captured if/when restore_state runs.
         # Lets generate_eod_report() emit per-session delta fields even when
@@ -224,6 +248,12 @@ class PairTradingStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         if self.state.position != "FLAT":
+            return []
+        # H5: post-STOP cooldown. Keeps a freshly-stopped pair out of the
+        # entry pipeline until the gate elapses, regardless of how favourable
+        # z looks — the very signal that just stopped us is the signal we
+        # would re-enter on.
+        if self._is_in_stop_cooldown():
             return []
         spread, prices = self._observe_spread()
         if spread is None:
@@ -329,6 +359,12 @@ class PairTradingStrategy(BaseStrategy):
             self.state.entry_spread = 0.0
             self.state.effective_stop_z = 0.0
             self.state.unrealized_pnl = 0.0
+            # H5: promote the reason stashed by _build_exit_proposals onto
+            # state so scan_and_propose can enforce the cooldown across
+            # ticks (and sessions, via state serialization).
+            self.state.last_exit_time = self._clock()
+            self.state.last_exit_reason = self._pending_exit_reason
+            self._pending_exit_reason = None
 
         return results
 
@@ -403,6 +439,15 @@ class PairTradingStrategy(BaseStrategy):
                     self._serialise_closed_trade(t)
                     for t in self.state.closed_trades
                 ],
+                # H5: post-STOP cooldown bookkeeping. Persisted so a stop-out
+                # at 14:30 IST still gates re-entry at next session's open.
+                # Older state files without these keys restore as None on the
+                # next line — equivalent to no active cooldown.
+                "last_exit_time": (
+                    self.state.last_exit_time.isoformat()
+                    if self.state.last_exit_time else None
+                ),
+                "last_exit_reason": self.state.last_exit_reason,
             },
         }
 
@@ -446,6 +491,14 @@ class PairTradingStrategy(BaseStrategy):
             self._deserialise_closed_trade(t)
             for t in state_blob.get("closed_trades", [])
         ]
+        # H5: cooldown bookkeeping. .get() with None default keeps older
+        # state files (pre-H5) backwards-compatible — no key → no active
+        # cooldown, which matches their prior behaviour.
+        last_exit_time = state_blob.get("last_exit_time")
+        self.state.last_exit_time = (
+            datetime.fromisoformat(last_exit_time) if last_exit_time else None
+        )
+        self.state.last_exit_reason = state_blob.get("last_exit_reason")
         # Re-baseline session deltas against the restored cumulative figures.
         self._capture_session_baseline()
 
@@ -474,16 +527,28 @@ class PairTradingStrategy(BaseStrategy):
                     pass
         return out
 
+    def _get_nfo_instruments(self) -> List[dict]:
+        """H19: return the injected NFO dump if the runner pre-fetched one,
+        otherwise fall back to a lazy kite.instruments('NFO') call that
+        also fills the cache so subsequent ticks reuse it. Returns [] on
+        fetch failure so callers can short-circuit safely."""
+        if self._nfo_instruments_cache is not None:
+            return self._nfo_instruments_cache
+        try:
+            self._nfo_instruments_cache = self.kite.instruments("NFO") or []
+        except Exception as e:
+            logger.warning("instruments('NFO') failed: %s", e)
+            return []
+        return self._nfo_instruments_cache
+
     def legs_expire_on(self, today: date) -> bool:
         """True if any open leg's futures contract has its last trading day
         on `today`. The paper runner uses this to force-flatten before
         contract expiry rather than holding a contract into settlement."""
         if not self.state.legs:
             return False
-        try:
-            instruments = self.kite.instruments("NFO")
-        except Exception as e:
-            logger.warning("instruments('NFO') for expiry check failed: %s", e)
+        instruments = self._get_nfo_instruments()
+        if not instruments:
             return False
         expiry_by_ts: Dict[str, date] = {}
         for row in instruments:
@@ -646,6 +711,32 @@ class PairTradingStrategy(BaseStrategy):
             self._make_fut_proposal(fut_b, qty_b, prices[self.symbol_b], side_b, rationale),
         ]
 
+    def _is_in_stop_cooldown(self) -> bool:
+        """H5: True if the last exit was a STOP and the cooldown window has
+        not yet elapsed. Default cooldown is 60 min — long enough that the
+        spread either reverts (so re-entry is wanted on its own merits) or
+        drifts further (so re-entry would have been wrong anyway).
+        Set stop_cooldown_minutes=0 to disable. Reasons other than STOP
+        don't arm the gate."""
+        if self.stop_cooldown_minutes <= 0:
+            return False
+        if self.state.last_exit_reason != "STOP":
+            return False
+        if self.state.last_exit_time is None:
+            return False
+        elapsed_min = (
+            (self._clock() - self.state.last_exit_time).total_seconds() / 60.0
+        )
+        if elapsed_min < self.stop_cooldown_minutes:
+            logger.info(
+                "[%s/%s] STOP cooldown active: %.1f of %d min elapsed since "
+                "last stop-out — no re-entry yet.",
+                self.symbol_a, self.symbol_b,
+                elapsed_min, self.stop_cooldown_minutes,
+            )
+            return True
+        return False
+
     def _build_exit_proposals(
         self, reason: str, z: float, prices: Dict[str, float],
     ) -> List[TradeProposal]:
@@ -653,6 +744,10 @@ class PairTradingStrategy(BaseStrategy):
         # via _resolve_futures. Pre-fix: a position held over a roll
         # would exit on the new front-month (opening a naked position)
         # while the original-contract leg sat unmanaged.
+        # H5: stash the reason so execute_proposals can promote it onto
+        # state once the legs actually fill and the book goes flat. The
+        # exit proposals themselves only carry it in the rationale string.
+        self._pending_exit_reason = reason
         rationale = (
             f"EXIT_{reason} on {self.symbol_a}/{self.symbol_b} "
             f"z={z:.2f} entry_z={self.state.entry_z:.2f}"
@@ -884,10 +979,8 @@ class PairTradingStrategy(BaseStrategy):
         front-month STF on `symbol`, cached per session."""
         if symbol in self._cached_futures:
             return self._cached_futures[symbol]
-        try:
-            instruments = self.kite.instruments("NFO")
-        except Exception as e:
-            logger.warning("instruments('NFO') failed: %s", e)
+        instruments = self._get_nfo_instruments()
+        if not instruments:
             return None
 
         today = self._clock().date()

@@ -75,6 +75,14 @@ Closed Highs (2026-05-26 "what happens when the runner dies" worklist):
 1acc96f pair_trading: silent-fail heartbeat — exit non-zero on N errored ticks (H3)
 ```
 
+Closed Highs (2026-05-26 "kite-API hygiene + same-tick re-entry" worklist):
+```
+TBD     pair_trading: post-STOP re-entry cooldown                              (H5)
+TBD     pair_trading: kite-client token-bucket throttle (8 req/s, burst 8)     (H14)
+TBD     pair_trading: session-wide NFO instruments cache (runner-injected)     (H19)
+```
+(SHAs fill in at commit time — search this file for "TBD" after the commit.)
+
 The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 - **High**: will lose money or block trading under a common failure mode
 - **Medium**: degrades reliability or observability; unlikely to lose money directly
@@ -83,13 +91,6 @@ The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 ---
 
 ## Highs
-
-### H5 — Same-tick re-entry / no cooldown after stop
-**Go-live blocker:** No
-**Source:** risk audit
-**Risk:** Pair stops at z=4.2; next tick z still 4.2 → re-enters → stops → re-enters. ~₹6-10k/hr in friction per pair on a bad day.
-**Fix sketch:** persist `_last_exit_time` + `_last_exit_reason` on the strategy. If reason was STOP, refuse re-entry for `--stop-cooldown-minutes` (default 60).
-**Effort:** ~45 min, plus state-file schema bump.
 
 ### H6 — `max_holding_days` is calendar days, not trading days
 **Go-live blocker:** No (cosmetic vs backtest; doesn't lose money)
@@ -140,13 +141,6 @@ The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 **Fix sketch:** track `Σ open_notional` across all active strategies; refuse new entries when above `--max-book-notional-inr`.
 **Effort:** ~45 min.
 
-### H14 — Kite rate-limit throttling
-**Go-live blocker:** No (single pair, single runner, low QPS)
-**Source:** broker audit
-**Risk:** With `--top 12` × multiple `kite.quote`/`kite.instruments` calls clustered at second-0 of each minute, can clear Kite's 10 r/s ceiling. 429s log as "quote failed" → no z → no trade.
-**Fix sketch:** `Throttler(rate=8, per=1)` decorator around kite calls; cache `kite.instruments("NFO")` for the whole session (rather than per-symbol miss).
-**Effort:** ~1 hr.
-
 ### H15 — `kite.margins()` pre-check
 **Go-live blocker:** No (mitigated by C2 entry-batch reversal — but reactive, not preventive)
 **Source:** risk audit
@@ -166,13 +160,6 @@ The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 **Source:** strategy audit
 **Risk:** On expiry day, `kite.instruments("NFO")` failure → return False → position carried into cash settlement.
 **Fix sketch:** retry 3× with backoff; if still failing, abort runner rather than silently proceed.
-**Effort:** ~30 min.
-
-### H19 — Cache `kite.instruments("NFO")` session-wide
-**Go-live blocker:** No (related to H14)
-**Source:** broker audit
-**Risk:** Per-symbol cache miss → full `kite.instruments("NFO")` (~5MB, ~150k rows) re-fetched. Compounds rate-limit risk.
-**Fix sketch:** cache at runner level, inject into strategies once at init.
 **Effort:** ~30 min.
 
 ---

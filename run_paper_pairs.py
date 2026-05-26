@@ -38,7 +38,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -413,7 +413,10 @@ def select_pairs(top: int, log: logging.Logger,
     return picks
 
 
-def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: logging.Logger):
+def build_strategies(
+    pairs: pd.DataFrame, args, kite, config_path: str, log: logging.Logger,
+    *, nfo_instruments: Optional[List[dict]] = None,
+):
     from strategies.pair_trading import PairTradingStrategy
 
     instances: List[PairTradingStrategy] = []
@@ -427,6 +430,7 @@ def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: log
                 symbol_a=a,
                 symbol_b=b,
                 hedge_ratio=beta,
+                nfo_instruments=nfo_instruments,
             )
         except Exception as e:
             log.exception("Could not init %s/%s: %s — skipping", a, b, e)
@@ -441,14 +445,16 @@ def build_strategies(pairs: pd.DataFrame, args, kite, config_path: str, log: log
         s.max_holding_days = args.max_holding_days
         s.lots_per_leg = args.lots_per_leg
         s.max_leg_notional = args.max_leg_notional
+        s.stop_cooldown_minutes = args.stop_cooldown_minutes
 
         log.info(
             "Init %s/%s β=%.4f entry_z=%.2f exit_z=%.2f stop_z=%.2f "
             "lookback=%dd max_hold=%dd lots=%d max_leg_notional=₹%.0f "
-            "spread_history_seed=%d",
+            "stop_cooldown=%dmin spread_history_seed=%d",
             a, b, beta, s.entry_z, s.exit_z, s.stop_z,
             s.lookback_days, s.max_holding_days, s.lots_per_leg,
-            s.max_leg_notional, len(s._spread_history),
+            s.max_leg_notional, s.stop_cooldown_minutes,
+            len(s._spread_history),
         )
         instances.append(s)
 
@@ -860,6 +866,7 @@ def restore_matching_strategies(
 def build_orphan_strategies(
     prior_state: Dict[str, Dict], matched_keys: set,
     args, kite, config_path: str, log: logging.Logger,
+    *, nfo_instruments: Optional[List[dict]] = None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -884,6 +891,7 @@ def build_orphan_strategies(
             s = PairTradingStrategy(
                 kite=kite, config_path=config_path, mode=args.mode,
                 symbol_a=sa, symbol_b=sb, hedge_ratio=saved_beta,
+                nfo_instruments=nfo_instruments,
             )
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
@@ -892,6 +900,7 @@ def build_orphan_strategies(
             s.max_holding_days = args.max_holding_days
             s.lots_per_leg = args.lots_per_leg
             s.max_leg_notional = args.max_leg_notional
+            s.stop_cooldown_minutes = args.stop_cooldown_minutes
             s.restore_state(blob)
             orphans.append(s)
             log.info(
@@ -1022,6 +1031,31 @@ def main():
     parser.add_argument("--lookback", type=int, default=60, dest="lookback_days")
     parser.add_argument("--max-hold", type=int, default=7, dest="max_holding_days")
     parser.add_argument("--lots-per-leg", type=int, default=1)
+    parser.add_argument("--kite-rate-per-sec", type=float, default=8.0,
+                        dest="kite_rate_per_sec",
+                        help="Token-bucket refill rate (req/s) for the kite "
+                             "client. Kite's per-key ceiling is 10/s; we "
+                             "default 2 below to leave headroom for retries "
+                             "and the dashboard process sharing the key. "
+                             "Calls block on the bucket — never 429. "
+                             "(default: 8.0)")
+    parser.add_argument("--kite-burst", type=int, default=8,
+                        dest="kite_burst",
+                        help="Token-bucket burst size. The first N≤burst "
+                             "calls after idle pass through without "
+                             "throttling; sustained pressure throttles to "
+                             "--kite-rate-per-sec. (default: 8)")
+    parser.add_argument("--stop-cooldown-minutes", type=int, default=60,
+                        dest="stop_cooldown_minutes",
+                        help="After a STOP-OUT exit, refuse re-entry on the "
+                             "same pair for this many minutes. Without it, a "
+                             "pair stopped at z=4.2 re-enters on the very "
+                             "next tick (z still > entry_z) — observed as "
+                             "runaway churn at ₹6-10k/hr per pair. The "
+                             "cooldown survives state-file restore so a "
+                             "stop at 14:30 still gates next-morning entry. "
+                             "Other exit reasons (MEAN_REVERT, MAX_HOLD) "
+                             "are unaffected. 0 disables (default: 60).")
     parser.add_argument("--max-leg-notional", type=float, default=1_000_000,
                         help="Per-leg ₹ cap (required for paper mode)")
     parser.add_argument("--force", action="store_true",
@@ -1134,16 +1168,53 @@ def main():
     log.info("Authenticating...")
     auth = KiteAuthManager(CONFIG_PATH)
     kite = auth.get_kite()
+
+    # H14: wrap the kite client in a token-bucket throttler before any
+    # call goes through. 12 pairs × 2 quote calls/tick at second-0 of
+    # every minute would otherwise cluster above Kite's 10 r/s ceiling
+    # and start 429-ing — symptoms in old logs: "quote failed for
+    # X26MAYFUT: Unknown Content-Type (text/html ... 502: Bad gateway)"
+    # which is the upstream reaction. Calls block on the bucket; they
+    # don't fail.
+    from kite_throttle import KiteRateLimiter, throttle_kite
+    kite_limiter = KiteRateLimiter(
+        rate_per_sec=args.kite_rate_per_sec, burst=args.kite_burst,
+    )
+    kite = throttle_kite(kite, kite_limiter)
+
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
+    log.info(
+        "Kite throttle armed: rate=%.1f req/s, burst=%d",
+        args.kite_rate_per_sec, args.kite_burst,
+    )
 
-    strategies = build_strategies(pairs, args, kite, config_path, log)
+    # H19: prefetch the ~150k-row NFO instruments dump once and inject it
+    # into every strategy. Before this, each pair re-fetched on first
+    # _resolve_futures call (2 per pair) and on every legs_expire_on tick
+    # (12 pairs × 360 ticks = 4,320 calls/day on expiry day). Fetched once
+    # here means N strategies share a single ~5MB roundtrip.
+    try:
+        nfo_instruments = kite.instruments("NFO") or []
+        log.info("Prefetched NFO instruments dump: %d rows", len(nfo_instruments))
+    except Exception as e:
+        log.warning(
+            "instruments('NFO') prefetch failed (%s) — strategies will "
+            "fall back to per-instance lazy fetch", e,
+        )
+        nfo_instruments = None
+
+    strategies = build_strategies(
+        pairs, args, kite, config_path, log,
+        nfo_instruments=nfo_instruments,
+    )
 
     # Restore prior-session state (no-op if no state file exists yet).
     prior_state = load_prior_state(args.system, log)
     matched_keys = restore_matching_strategies(strategies, prior_state, log)
     orphans = build_orphan_strategies(
         prior_state, matched_keys, args, kite, config_path, log,
+        nfo_instruments=nfo_instruments,
     )
     strategies = strategies + orphans
 
