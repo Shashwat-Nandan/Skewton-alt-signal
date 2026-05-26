@@ -474,20 +474,36 @@ class _HaltState:
 
 
 def tick_one(strategy, log: logging.Logger,
-             halt_all: bool = False, halt_new_entries: bool = False):
+             halt_all: bool = False, halt_new_entries: bool = False) -> bool:
     """One pair's iteration. Failures logged but do not kill the loop.
+
+    Returns True iff `execute_proposals` was *called* this tick — i.e. a
+    scan or rehedge produced at least one proposal that we attempted to
+    execute. The caller uses this to trigger an immediate state persist
+    so a SIGKILL between strategies can lose at most one in-flight tick's
+    worth of state, not an entire tick's worth.
+
+    Note: True does NOT guarantee broker-side fill. `execute_proposals`
+    returns normally without mutating state in signals-mode, when every
+    order comes back non-COMPLETE (REJECTED/CANCELLED/PENDING), or when
+    an entry-batch partial fill is reversed back to FLAT. Persisting in
+    these "attempted but no-op" cases is harmless — write_state_file is
+    idempotent against unchanged state, and the value of this signal is
+    that it covers every case where state *might* have changed.
 
     HALT_ALL skips both entries and exit/rehedge checks (book frozen).
     HALT_NEW_ENTRIES skips only entries; exits/rehedges continue."""
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if halt_all:
-        return
+        return False
 
+    attempted_execution = False
     if not halt_new_entries:
         try:
             proposals = strategy.scan_and_propose()
             if proposals:
                 strategy.execute_proposals(proposals)
+                attempted_execution = True
         except Exception as e:
             log.exception("[%s] scan_and_propose failed: %s", pair_label, e)
 
@@ -495,8 +511,11 @@ def tick_one(strategy, log: logging.Logger,
         rehedge = strategy.check_and_rehedge()
         if rehedge:
             strategy.execute_proposals(rehedge)
+            attempted_execution = True
     except Exception as e:
         log.exception("[%s] check_and_rehedge failed: %s", pair_label, e)
+
+    return attempted_execution
 
 
 def check_daily_loss_limit(strategies, limit_inr: float,
@@ -1020,9 +1039,23 @@ def main():
         while datetime.now() < session_end_ts:
             halt_state.refresh(log)
             for s in strategies:
-                tick_one(s, log,
-                         halt_all=halt_state.halt_all,
-                         halt_new_entries=halt_state.halt_new)
+                attempted = tick_one(s, log,
+                                     halt_all=halt_state.halt_all,
+                                     halt_new_entries=halt_state.halt_new)
+                if attempted:
+                    # Persist immediately so a SIGKILL before the next
+                    # strategy in this tick can't lose state mutations
+                    # from the call we just made. write_state_file is
+                    # fsync-durable (H4), so the post-rename state
+                    # survives power loss too. A no-op execute_proposals
+                    # (all-rejected, signals-mode) still triggers a write
+                    # here; that's harmless and the safer side to err on.
+                    try:
+                        write_state_file(strategies, args.system, log,
+                                         archive=False)
+                    except Exception as e:
+                        log.exception("Per-fill state persist failed: %s "
+                                      "— continuing", e)
             check_daily_loss_limit(strategies, args.max_daily_loss_inr, log)
             try:
                 write_state_file(strategies, args.system, log, archive=False)
