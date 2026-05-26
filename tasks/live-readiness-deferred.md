@@ -77,11 +77,8 @@ Closed Highs (2026-05-26 "what happens when the runner dies" worklist):
 
 Closed Highs (2026-05-26 "kite-API hygiene + same-tick re-entry" worklist):
 ```
-TBD     pair_trading: post-STOP re-entry cooldown                              (H5)
-TBD     pair_trading: kite-client token-bucket throttle (8 req/s, burst 8)     (H14)
-TBD     pair_trading: session-wide NFO instruments cache (runner-injected)     (H19)
+d192814 pair_trading: H5 stop cooldown + H14 kite throttle + H19 NFO cache (single bundled commit)
 ```
-(SHAs fill in at commit time — search this file for "TBD" after the commit.)
 
 The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 - **High**: will lose money or block trading under a common failure mode
