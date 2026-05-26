@@ -148,6 +148,87 @@ class TestWriteStateFile:
         assert len(payload["pairs"]) == 1
         assert payload["pairs"][0]["pair"] == ["A", "B"]
 
+    # ──────────────────────────────────────────────────────
+    # Power-loss durability (H4 from tasks/live-readiness-deferred.md)
+    # ──────────────────────────────────────────────────────
+
+    def _trivial_strategy(self):
+        s = MagicMock()
+        s.symbol_a, s.symbol_b = "A", "B"
+        s.serialize_state.return_value = {"pair": ["A", "B"], "state": {}}
+        return s
+
+    def test_fsync_called_on_file_and_parent_dir(
+        self, isolated_data_cache, log, monkeypatch,
+    ):
+        """Both the tmp file's data and the parent directory's entry must
+        be fsync'd. Without the file fsync, the rename could expose
+        unflushed data; without the dir fsync, the rename itself isn't
+        durable across power loss on ext4 with default journaling."""
+        fsynced_targets = []
+        real_fsync = os.fsync
+
+        def tracking_fsync(fd):
+            # /proc/self/fd/<n> is the kernel's view of what path the fd
+            # was opened with — gives us a way to identify file-vs-dir
+            # fsyncs without mocking the world.
+            try:
+                fsynced_targets.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:
+                fsynced_targets.append(f"<fd:{fd}>")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", tracking_fsync)
+        write_state_file([self._trivial_strategy()], "baseline", log)
+
+        path = state_file_path("baseline")
+        assert len(fsynced_targets) == 2, (
+            f"expected fsync on tmp file + parent dir, got {fsynced_targets}"
+        )
+        file_target, dir_target = fsynced_targets
+        # First fsync is on '<state>.json.tmp' inside DATA_CACHE.
+        assert Path(file_target).name == path.name + ".tmp"
+        assert Path(file_target).parent.resolve() == path.parent.resolve()
+        # Second fsync is on the containing directory itself.
+        assert Path(dir_target).resolve() == path.parent.resolve()
+
+    def test_fsync_order_file_before_replace_dir_after(
+        self, isolated_data_cache, log, monkeypatch,
+    ):
+        """The sequence matters: tmp-file fsync must precede the rename
+        (otherwise rename can succeed with unflushed payload), and dir
+        fsync must follow (otherwise the rename itself isn't durable)."""
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def trace_fsync(fd):
+            events.append("fsync")
+            return real_fsync(fd)
+
+        def trace_replace(src, dst):
+            events.append("replace")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "fsync", trace_fsync)
+        monkeypatch.setattr(os, "replace", trace_replace)
+        write_state_file([self._trivial_strategy()], "baseline", log)
+
+        assert events == ["fsync", "replace", "fsync"], events
+
+    def test_fsync_failure_propagates(
+        self, isolated_data_cache, log, monkeypatch,
+    ):
+        """A failing fsync (disk full, EIO) is exactly the silent-data-loss
+        class fsync exists to surface — it must raise, so the tick-loop's
+        `except: log.exception` sees it. Rule 12."""
+        def boom(fd):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", boom)
+        with pytest.raises(OSError, match="No space left on device"):
+            write_state_file([self._trivial_strategy()], "baseline", log)
+
 
 # ──────────────────────────────────────────────────────────
 # restore_matching_strategies

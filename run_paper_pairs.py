@@ -604,11 +604,22 @@ def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
 
 def write_state_file(strategies, system: str, log: logging.Logger,
                      archive: bool = True):
-    """Atomically persist current strategy state. Each strategy emits its own
-    serialize_state() blob; runner adds a system/timestamp header.
+    """Atomically and durably persist current strategy state. Each strategy
+    emits its own serialize_state() blob; runner adds a system/timestamp
+    header.
 
-    Atomic write: write to '.tmp' then os.replace, so a crash mid-write
-    can't leave a half-truncated file that fails to parse next session.
+    Crash- and power-loss-safe write:
+      1. write payload to '<path>.tmp'
+      2. fsync the tmp file's fd — forces data blocks to disk before any
+         metadata change is journaled. Without this, ext4 (`data=ordered`)
+         could journal the rename's inode update while the data blocks
+         are still in page cache; a crash before the data flush would
+         replay the rename pointing at unflushed (effectively empty) data.
+      3. os.replace(tmp, path) — atomic rename, no half-truncated file
+      4. fsync the parent dir's fd — directory-entry changes from the
+         rename are metadata that the journal records but doesn't commit
+         to disk synchronously; this forces it so the rename itself
+         survives power loss.
 
     archive=False skips the timestamped backup + log line — used by the
     intraday tick-loop persist, which fires every minute and would
@@ -629,8 +640,21 @@ def write_state_file(strategies, system: str, log: logging.Logger,
             log.exception("serialize_state failed for %s/%s: %s",
                           s.symbol_a, s.symbol_b, e)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, default=str, indent=2))
+    # Use Python's file object (which loops over os.write internally to
+    # handle partial-write returns) + an explicit fsync on the fd before
+    # close. Default mode = 0o666 & ~umask, matching the old
+    # `tmp.write_text(...)` so prod (UMask=0027 → 0o640) and dev
+    # (umask 0022 → 0o644) behaviour is unchanged.
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, default=str, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     if archive:
         log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
         archive_state_backup(path, log)
