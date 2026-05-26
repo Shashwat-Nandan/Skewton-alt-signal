@@ -948,6 +948,7 @@ class TestActivePositionGuard:
 
     @pytest.fixture
     def mock_hedger(self):
+        from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.kite = kite
@@ -958,12 +959,16 @@ class TestActivePositionGuard:
         hedger.proposer = MagicMock()
         hedger.greeks = MagicMock()
         hedger.risk = MagicMock()
+        # Held expiry is 2027-04-03; clock at 2027-04-01 keeps the T-0
+        # expiry-day guard disarmed so the legacy single-structure gate
+        # is exercised here.
+        hedger._clock = lambda: datetime(2027, 4, 1, 10, 0)
         return hedger
 
     def test_open_book_skips_entry_pipeline(self, mock_hedger):
         mock_hedger.state.positions.append(OptionContract(
-            tradingsymbol="NIFTY26403CE22000", instrument_token=1,
-            strike=22000, expiry="2026-04-03", option_type="CE",
+            tradingsymbol="NIFTY27403CE22000", instrument_token=1,
+            strike=22000, expiry="2027-04-03", option_type="CE",
             lot_size=25, quantity=2, entry_price=300, current_price=300, iv=0.15,
         ))
 
@@ -2220,6 +2225,7 @@ class TestLayeredStructures:
     different type from being proposed."""
 
     def _make_hedger(self, max_layers=1, regime=False):
+        from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         h.kite = MagicMock()
         h.state = HedgeState()
@@ -2229,6 +2235,9 @@ class TestLayeredStructures:
         h.proposer = MagicMock()
         h.greeks = MagicMock()
         h.risk = MagicMock()
+        # Held expiry is 2027-04-03; clock at 2027-04-01 keeps min_days_to_exp > 1
+        # so the T-0 expiry-day guard stays disarmed for layering tests.
+        h._clock = lambda: datetime(2027, 4, 1, 10, 0)
         h.tunable_params = {
             "max_layered_structures": max_layers,
             "enable_regime_dispatch": regime,
@@ -2241,7 +2250,7 @@ class TestLayeredStructures:
         h = self._make_hedger(max_layers=1, regime=False)
         h.state.positions.append(OptionContract(
             tradingsymbol="X", instrument_token=1, strike=22000,
-            expiry="2026-04-03", option_type="CE", lot_size=25,
+            expiry="2027-04-03", option_type="CE", lot_size=25,
             quantity=1, entry_price=300, current_price=300, iv=0.15,
         ))
         result = h.scan_and_propose()
@@ -2255,7 +2264,7 @@ class TestLayeredStructures:
         h = self._make_hedger(max_layers=3, regime=False)
         h.state.positions.append(OptionContract(
             tradingsymbol="X", instrument_token=1, strike=22000,
-            expiry="2026-04-03", option_type="CE", lot_size=25,
+            expiry="2027-04-03", option_type="CE", lot_size=25,
             quantity=1, entry_price=300, current_price=300, iv=0.15,
         ))
         result = h.scan_and_propose()
@@ -2270,12 +2279,30 @@ class TestLayeredStructures:
         h._pre_trade_checks = MagicMock(return_value=False)
         h.state.positions.append(OptionContract(
             tradingsymbol="X", instrument_token=1, strike=22000,
-            expiry="2026-04-03", option_type="CE", lot_size=25,
+            expiry="2027-04-03", option_type="CE", lot_size=25,
             quantity=1, entry_price=300, current_price=300, iv=0.15,
         ))
         result = h.scan_and_propose()
         assert result == []
         h._pre_trade_checks.assert_called_once()
+
+    def test_layering_blocked_on_expiry_day(self):
+        """T-0 guard: even with max_layers=2 and regime dispatch ON,
+        an existing leg expiring today blocks any new structure —
+        gamma/cost burn on T-0 makes additional layers negative-EV
+        (saw 9 rehedges in 13 min on 2026-05-26 May expiry)."""
+        from datetime import datetime
+        h = self._make_hedger(max_layers=2, regime=True)
+        h._clock = lambda: datetime(2026, 5, 26, 9, 20)
+        h.state.positions.append(OptionContract(
+            tradingsymbol="NIFTY26MAY24000CE", instrument_token=1,
+            strike=24000, expiry="2026-05-26", option_type="CE",
+            lot_size=65, quantity=1, entry_price=48.65,
+            current_price=48.65, iv=0.20,
+        ))
+        result = h.scan_and_propose()
+        assert result == []
+        h._pre_trade_checks.assert_not_called()
 
     def test_t0_band_tightens_on_expiry_day(self):
         """Phase 5: when t0_band_factor < 1.0 and any leg has < 1 day

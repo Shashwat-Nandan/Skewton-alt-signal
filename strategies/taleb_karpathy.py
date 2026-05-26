@@ -364,6 +364,31 @@ class TalebKarpathyStrategy(BaseStrategy):
         tunable = getattr(self, "tunable_params", {}) or {}
         max_layers = tunable.get("max_layered_structures", 1)
         if self.state.positions:
+            # T-0 block: never layer on expiry day. _count_active_structures
+            # counts unique expiries, so same-expiry/same-strike straddles
+            # stack as "1 structure" and slip past the max_layers gate —
+            # on 2026-05-26 (May expiry) this let the book grow to 24 lots
+            # in 13 minutes; 9 rehedges burned ₹14,279 / 93% of gross loss.
+            now = self._clock()
+            min_days_to_exp = float("inf")
+            for p in self.state.positions:
+                if not p.expiry:
+                    continue
+                try:
+                    exp = datetime.fromisoformat(p.expiry[:10])
+                    days = (exp - now).total_seconds() / 86400.0
+                    if days < min_days_to_exp:
+                        min_days_to_exp = days
+                except (TypeError, ValueError):
+                    continue
+            if min_days_to_exp < 1.0:
+                logger.info(
+                    "Layering disabled on expiry day (min %.2f days to "
+                    "expiry) — managing existing structure(s) only.",
+                    min_days_to_exp,
+                )
+                return []
+
             existing_struct_count = self._count_active_structures()
             if existing_struct_count >= max_layers:
                 return []
