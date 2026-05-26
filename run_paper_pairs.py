@@ -38,7 +38,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, NamedTuple
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -119,6 +119,21 @@ QUALITY_MAX_PVALUE = 0.025
 # many pairs in the book. Prevents one stock's idiosyncratic move from
 # driving multiple positions' P&L in the same direction.
 LEG_CONCENTRATION_CAP = 2
+
+# Silent-fail heartbeat. If every strategy has at least one operation
+# (scan or rehedge) raise for this many consecutive ticks, the runner
+# touches a sentinel file, logs CRITICAL, and exits non-zero so
+# notify-failure@%n alerts the operator. See TickOutcome.errored for why
+# the per-strategy signal is "any op raised" rather than "every op
+# raised". Real failure modes: token expired mid-session, kite API
+# outage, accidental network isolation. Default 3 ticks ≈ 3 min of
+# total silence.
+SILENT_FAIL_THRESHOLD = 3
+SILENT_FAIL_FLAG_TEMPLATE = "pair_paper_silent_fail_{system}.flag"
+
+
+def silent_fail_flag_path(system: str) -> Path:
+    return DATA_CACHE / SILENT_FAIL_FLAG_TEMPLATE.format(system=system)
 
 
 def load_holidays(path: Path) -> set[date]:
@@ -474,31 +489,56 @@ class _HaltState:
             log.warning("Entry-halt flags cleared — resuming entries")
 
 
+class TickOutcome(NamedTuple):
+    """What happened in one strategy's tick.
+
+    attempted_execution — True iff `execute_proposals` was called. Drives
+        the per-attempt state persist (H1). True does NOT guarantee a
+        broker-side fill: execute_proposals can return normally without
+        mutating state in signals-mode, when every leg comes back
+        non-COMPLETE, or when a partial entry batch is reversed to FLAT.
+        Persisting in those no-op cases is harmless.
+
+    errored — True iff any operation this tick raised. Drives the
+        silent-fail heartbeat (H3): three consecutive ticks where every
+        strategy reports errored = systemic failure (token expired,
+        kite API down, network isolation), and the runner escalates.
+
+        Why "any" rather than "every op raised": scan_and_propose and
+        check_and_rehedge each short-circuit before touching kite
+        depending on whether the pair is FLAT (scan returns [] when
+        held; rehedge returns [] when flat). Under a dead token, one
+        op raises while the *other* returns trivially without exercising
+        the failing dependency — counting only "every op raised" would
+        miss the systemic failure for both held and flat pairs. The
+        n_errored == n_ran heartbeat-level threshold still requires
+        every strategy to be flagged, so isolated transient errors on
+        a single pair don't escalate.
+
+        halt_all → errored=False (nothing ran, no signal).
+    """
+    attempted_execution: bool
+    errored: bool
+
+
 def tick_one(strategy, log: logging.Logger,
-             halt_all: bool = False, halt_new_entries: bool = False) -> bool:
+             halt_all: bool = False,
+             halt_new_entries: bool = False) -> TickOutcome:
     """One pair's iteration. Failures logged but do not kill the loop.
 
-    Returns True iff `execute_proposals` was *called* this tick — i.e. a
-    scan or rehedge produced at least one proposal that we attempted to
-    execute. The caller uses this to trigger an immediate state persist
-    so a SIGKILL between strategies can lose at most one in-flight tick's
-    worth of state, not an entire tick's worth.
-
-    Note: True does NOT guarantee broker-side fill. `execute_proposals`
-    returns normally without mutating state in signals-mode, when every
-    order comes back non-COMPLETE (REJECTED/CANCELLED/PENDING), or when
-    an entry-batch partial fill is reversed back to FLAT. Persisting in
-    these "attempted but no-op" cases is harmless — write_state_file is
-    idempotent against unchanged state, and the value of this signal is
-    that it covers every case where state *might* have changed.
+    Returns a TickOutcome with two booleans the caller uses to drive
+    per-attempt state persist (H1) and silent-fail heartbeat (H3) — see
+    `TickOutcome` docstring for the per-field contract.
 
     HALT_ALL skips both entries and exit/rehedge checks (book frozen).
     HALT_NEW_ENTRIES skips only entries; exits/rehedges continue."""
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if halt_all:
-        return False
+        return TickOutcome(attempted_execution=False, errored=False)
 
     attempted_execution = False
+    error_count = 0
+
     if not halt_new_entries:
         try:
             proposals = strategy.scan_and_propose()
@@ -506,6 +546,7 @@ def tick_one(strategy, log: logging.Logger,
                 strategy.execute_proposals(proposals)
                 attempted_execution = True
         except Exception as e:
+            error_count += 1
             log.exception("[%s] scan_and_propose failed: %s", pair_label, e)
 
     try:
@@ -514,9 +555,11 @@ def tick_one(strategy, log: logging.Logger,
             strategy.execute_proposals(rehedge)
             attempted_execution = True
     except Exception as e:
+        error_count += 1
         log.exception("[%s] check_and_rehedge failed: %s", pair_label, e)
 
-    return attempted_execution
+    return TickOutcome(attempted_execution=attempted_execution,
+                       errored=error_count > 0)
 
 
 def install_signal_handlers(log: logging.Logger) -> None:
@@ -533,6 +576,80 @@ def install_signal_handlers(log: logging.Logger) -> None:
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     log.info("SIGTERM handler installed (treated as KeyboardInterrupt; "
              "systemd stop will run end_of_session)")
+
+
+class HeartbeatTracker:
+    """Counts consecutive ticks where every running strategy errored.
+
+    The runner's per-strategy try/except blocks swallow scan/rehedge
+    failures so one bad pair can't take down the loop. That's right for
+    isolated faults — but a *systemic* fault (token expired mid-session,
+    kite API down) makes every pair fail every tick, and the runner
+    would otherwise exit 0 SUCCESS at 15:25 with nothing traded ("silent
+    dead trader"). This tracker is the loud-failure detector.
+
+    On `threshold` consecutive ticks where n_errored == n_ran > 0, it
+    touches a sentinel file and returns True so the caller can break the
+    loop and exit non-zero (firing notify-failure@%n). One successful
+    tick (n_errored < n_ran) resets the counter.
+
+    Idle ticks (n_ran == 0, i.e. halt_all set) carry no signal and don't
+    affect the counter — neither incrementing nor resetting it. This
+    lets the operator pause the book without triggering false alarms.
+    """
+
+    def __init__(self, threshold: int, sentinel_path: Path,
+                 log: logging.Logger):
+        self.threshold = threshold
+        self.sentinel_path = sentinel_path
+        self.log = log
+        self.consecutive_ticks = 0
+
+    def record_tick(self, n_ran: int, n_errored: int) -> bool:
+        """Account for one tick's outcomes. Returns True iff the threshold
+        is now (or was already) breached — caller should exit non-zero."""
+        if n_ran == 0:
+            # halt_all or no strategies — no signal either way.
+            return False
+        if n_errored == n_ran:
+            self.consecutive_ticks += 1
+            self.log.warning(
+                "Heartbeat: all %d running strategies errored this tick "
+                "(consecutive: %d/%d)",
+                n_ran, self.consecutive_ticks, self.threshold,
+            )
+            if self.consecutive_ticks >= self.threshold:
+                try:
+                    self.sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.sentinel_path.touch()
+                except Exception as e:
+                    self.log.exception(
+                        "Failed to touch heartbeat sentinel %s: %s",
+                        self.sentinel_path, e,
+                    )
+                self.log.critical(
+                    "SILENT-FAIL HEARTBEAT BREACHED: every strategy has "
+                    "errored on every operation for %d consecutive ticks "
+                    "(threshold %d). Touched %s and will exit non-zero so "
+                    "notify-failure alerts. Likely causes: token expired, "
+                    "kite API outage, network isolation. The sentinel "
+                    "file is informational only (not checked at startup) "
+                    "— investigate the root cause from the journal before "
+                    "the next session runs.",
+                    self.consecutive_ticks, self.threshold,
+                    self.sentinel_path,
+                )
+                return True
+            return False
+        # At least one strategy succeeded this tick — reset.
+        if self.consecutive_ticks > 0:
+            self.log.info(
+                "Heartbeat recovered: at least one strategy succeeded "
+                "(was %d/%d consecutive all-errored ticks)",
+                self.consecutive_ticks, self.threshold,
+            )
+        self.consecutive_ticks = 0
+        return False
 
 
 def check_daily_loss_limit(strategies, limit_inr: float,
@@ -1053,14 +1170,21 @@ def main():
         log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
                     "circuit breaker for runaway losses this session")
     install_signal_handlers(log)
+    heartbeat = HeartbeatTracker(
+        threshold=SILENT_FAIL_THRESHOLD,
+        sentinel_path=silent_fail_flag_path(args.system),
+        log=log,
+    )
+    silent_fail = False
     try:
         while datetime.now() < session_end_ts:
             halt_state.refresh(log)
+            n_errored = 0
             for s in strategies:
-                attempted = tick_one(s, log,
-                                     halt_all=halt_state.halt_all,
-                                     halt_new_entries=halt_state.halt_new)
-                if attempted:
+                outcome = tick_one(s, log,
+                                   halt_all=halt_state.halt_all,
+                                   halt_new_entries=halt_state.halt_new)
+                if outcome.attempted_execution:
                     # Persist immediately so a SIGKILL before the next
                     # strategy in this tick can't lose state mutations
                     # from the call we just made. write_state_file is
@@ -1074,6 +1198,12 @@ def main():
                     except Exception as e:
                         log.exception("Per-fill state persist failed: %s "
                                       "— continuing", e)
+                if outcome.errored:
+                    n_errored += 1
+            n_ran = 0 if halt_state.halt_all else len(strategies)
+            if heartbeat.record_tick(n_ran=n_ran, n_errored=n_errored):
+                silent_fail = True
+                break
             check_daily_loss_limit(strategies, args.max_daily_loss_inr, log)
             try:
                 write_state_file(strategies, args.system, log, archive=False)
@@ -1082,8 +1212,25 @@ def main():
             remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
 
-        log.info("Session-end window reached.")
-        end_of_session(strategies, today, args, log)
+        # Run end_of_session for both normal and silent-fail exits, but
+        # wrap it in the silent-fail case: an uncaught exception in
+        # teardown (e.g. write_state_file fsync fails on a dying disk,
+        # legs_expire_on hits the dead token that triggered the breach)
+        # would otherwise propagate past `return 1` and mask the
+        # heartbeat-specific exit code with a generic traceback. The
+        # sentinel + CRITICAL log have already fired by this point.
+        if silent_fail:
+            try:
+                end_of_session(strategies, today, args, log)
+            except Exception as e:
+                log.exception(
+                    "end_of_session failed during silent-fail teardown: "
+                    "%s — heartbeat alert still fires via sentinel + "
+                    "non-zero exit", e,
+                )
+        else:
+            log.info("Session-end window reached.")
+            end_of_session(strategies, today, args, log)
 
     except KeyboardInterrupt:
         # If a second SIGTERM arrives while end_of_session is writing the
@@ -1096,6 +1243,11 @@ def main():
         end_of_session(strategies, today, args, log)
         return 130
 
+    if silent_fail:
+        # Heartbeat fired — non-zero exit triggers notify-failure@%n
+        # (deploy/notify-failure@.service, wired via C8). The sentinel
+        # has been touched and CRITICAL has been logged; just return.
+        return 1
     log.info("Session complete. Exiting cleanly.")
     return 0
 
