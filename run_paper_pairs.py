@@ -33,6 +33,7 @@ import configparser
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -516,6 +517,22 @@ def tick_one(strategy, log: logging.Logger,
         log.exception("[%s] check_and_rehedge failed: %s", pair_label, e)
 
     return attempted_execution
+
+
+def install_signal_handlers(log: logging.Logger) -> None:
+    """Map SIGTERM to KeyboardInterrupt so `systemctl stop` (and any other
+    normal-flow process termination) runs `end_of_session` instead of
+    killing the runner without persisting the EOD sidecar.
+
+    `signal.default_int_handler` is the stdlib function bound to SIGINT by
+    default — it raises KeyboardInterrupt at the next interpreter check
+    point. Re-binding it to SIGTERM mirrors Ctrl+C behaviour exactly, so
+    the existing `except KeyboardInterrupt:` path in main() catches both
+    signals through the same teardown.
+    """
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    log.info("SIGTERM handler installed (treated as KeyboardInterrupt; "
+             "systemd stop will run end_of_session)")
 
 
 def check_daily_loss_limit(strategies, limit_inr: float,
@@ -1035,6 +1052,7 @@ def main():
     if args.max_daily_loss_inr <= 0:
         log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
                     "circuit breaker for runaway losses this session")
+    install_signal_handlers(log)
     try:
         while datetime.now() < session_end_ts:
             halt_state.refresh(log)
@@ -1068,6 +1086,12 @@ def main():
         end_of_session(strategies, today, args, log)
 
     except KeyboardInterrupt:
+        # If a second SIGTERM arrives while end_of_session is writing the
+        # state file / EOD sidecar, we don't want it to raise KI again
+        # mid-write. Reset SIGTERM to the default action (terminate) so
+        # an impatient operator's second `systemctl stop` kills cleanly
+        # *after* this teardown completes, rather than interrupting it.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         log.info("Interrupted — persisting state and exiting.")
         end_of_session(strategies, today, args, log)
         return 130

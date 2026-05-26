@@ -1,5 +1,7 @@
 """Tests for run_paper_pairs runner lifecycle: per-tick `tick_one` return
-contract (H1 — drives per-attempt state persist).
+contract (H1 — drives per-attempt state persist) and SIGTERM signal
+handler installation (H2 — turns systemd stop into a clean
+end_of_session).
 
 `tick_one` returns True when `execute_proposals` was called (scan or
 rehedge produced proposals). It does NOT guarantee that broker-side fills
@@ -9,20 +11,23 @@ Persisting in those "attempted but no-op" cases is harmless and the
 safer side to err on.
 
 State-file persistence semantics (atomicity, durability, fsync ordering)
-live in test_run_paper_pairs_state.py.
+live in test_run_paper_pairs_state.py; this file is just about *when* the
+runner triggers a persist and *how* it tears down on signals.
 """
 from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from run_paper_pairs import tick_one
+from run_paper_pairs import install_signal_handlers, tick_one
 
 
 @pytest.fixture
@@ -94,3 +99,39 @@ class TestTickOneReturnsFilled:
         assert tick_one(s, log, halt_new_entries=True) is True
         s.scan_and_propose.assert_not_called()
         s.check_and_rehedge.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────
+# H2 — SIGTERM handler installation
+# ──────────────────────────────────────────────────────────
+
+class TestInstallSignalHandlers:
+    @pytest.fixture(autouse=True)
+    def _restore_sigterm(self):
+        """Signal handlers are process-global — save and restore around
+        each test so we don't poison other tests in the session."""
+        original = signal.getsignal(signal.SIGTERM)
+        yield
+        signal.signal(signal.SIGTERM, original)
+
+    def test_sigterm_routes_to_default_int_handler(self, log):
+        """SIGTERM must be bound to the same handler that Python uses for
+        SIGINT (Ctrl+C) — raising KeyboardInterrupt at the next interpreter
+        check point. The existing main() `except KeyboardInterrupt:`
+        catches both signals through one teardown path."""
+        install_signal_handlers(log)
+        assert signal.getsignal(signal.SIGTERM) is signal.default_int_handler
+
+    def test_sigterm_actually_raises_keyboardinterrupt(self, log):
+        """End-to-end: after install, sending SIGTERM to this process
+        raises KeyboardInterrupt rather than terminating us. This is the
+        contract the runner relies on — verify it works on this kernel."""
+        install_signal_handlers(log)
+        with pytest.raises(KeyboardInterrupt):
+            os.kill(os.getpid(), signal.SIGTERM)
+            # time.sleep is a documented signal check-point: a pending
+            # signal interrupts it and the handler's exception propagates
+            # out. Don't use a busy `for _ in range(N): pass` here — that
+            # relies on per-bytecode signal checks that PEP 659's adaptive
+            # interpreter may collapse under optimisation.
+            time.sleep(0.05)
