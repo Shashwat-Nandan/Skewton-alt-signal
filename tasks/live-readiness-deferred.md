@@ -54,7 +54,7 @@ audit (strategy / broker / risk / ops) that were **not** fixed in the cutover
 push. Each is tagged with severity, blast-radius, and an explicit go-live
 blocker call.
 
-Closed Criticals (committed this session, for reference):
+Closed Criticals (committed during cutover, for reference):
 ```
 58af67a runners: fail loud if holidays.csv is stale or partial         (C7)
 907fc4b pair_trading: flag-file kill switch (HALT_ALL, ...)            (C5)
@@ -67,7 +67,15 @@ f028329 pair_trading: exit on held contract, fail-loud on phantom legs (C10, H11
 f82451e pair_trading: --mode live with triple-lock safety gate         (C6)
 ```
 
-The Highs and Mediums below remain. Severity uses the audit rubric:
+Closed Highs (2026-05-26 "what happens when the runner dies" worklist):
+```
+1c9ee63 pair_trading: fsync state file + parent dir for power-loss durability  (H4)
+9a1191f pair_trading: per-attempt state persist inside tick_one                (H1)
+55fa2d3 pair_trading: SIGTERM handler → end_of_session via KeyboardInterrupt   (H2)
+1acc96f pair_trading: silent-fail heartbeat — exit non-zero on N errored ticks (H3)
+```
+
+The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 - **High**: will lose money or block trading under a common failure mode
 - **Medium**: degrades reliability or observability; unlikely to lose money directly
 - **Low**: nice-to-have
@@ -75,34 +83,6 @@ The Highs and Mediums below remain. Severity uses the audit rubric:
 ---
 
 ## Highs
-
-### H1 — Mid-session state persistence
-**Go-live blocker:** No (but raise to Yes if first-week live runs more than 5 days without addressing)
-**Source:** strategy audit
-**Risk:** State only written at session end (`end_of_session`). A mid-session crash loses today's entries from local state while the broker still holds them. C3 (reconciliation) catches the mismatch on next-session restart, but the operator has to recover.
-**Fix sketch:** call `write_state_file` after every successful `execute_proposals` (within `tick_one`, post-fill).
-**Effort:** ~30 min.
-
-### H2 — SIGTERM not handled
-**Go-live blocker:** No
-**Source:** strategy audit
-**Risk:** Only `KeyboardInterrupt` triggers `end_of_session`. systemd's normal stop is SIGTERM, which kills the runner without persisting the EOD sidecar or running `force-flatten-on-exit`.
-**Fix sketch:** install a `signal.signal(SIGTERM, ...)` handler that raises KeyboardInterrupt (or use `try: ... finally:`).
-**Effort:** ~15 min.
-
-### H3 — Heartbeat / silent-fail detection
-**Go-live blocker:** No (mitigated by C8 alerting per-unit-failure, but not for "loop alive yet all-strategies-erroring")
-**Source:** ops + strategy audits
-**Risk:** `tick_one` swallows per-strategy errors. A bad token mid-session → every quote fails → no entries fire → unit exits 0 SUCCESS at 15:25. Silent dead trader.
-**Fix sketch:** runner counts consecutive ticks where every strategy raised. After N (e.g. 3), touch a sentinel file + emit alert via notify-failure.
-**Effort:** ~1 hr.
-
-### H4 — fsync on state-file write
-**Go-live blocker:** No (file system is journaled; risk is power-loss only)
-**Source:** ops audit
-**Risk:** `os.replace` is rename-atomic but not durable across power loss. ext4 with `relatime` journals metadata but not data ordering with rename.
-**Fix sketch:** `os.open(tmp, O_WRONLY)` → `os.fsync(fd)` → close → `os.replace` → `os.open(parent_dir)` → `os.fsync` → close.
-**Effort:** ~15 min.
 
 ### H5 — Same-tick re-entry / no cooldown after stop
 **Go-live blocker:** No
