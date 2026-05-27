@@ -231,7 +231,16 @@ def end_of_session(hedger, today: date, args, log: logging.Logger):
 
     Order matters — flatten before EOD report so the report reflects the
     post-flatten reality; persist after report so any state mutations the
-    report makes are captured."""
+    report makes are captured.
+
+    H18: legs_expire_on now retries kite.instruments('NFO') 3× and raises
+    on persistent failure rather than silently returning False. We always
+    write the EOD report + state + IV history first (so tomorrow's runner
+    isn't blind) then re-raise so the runner exits non-zero and
+    notify-failure@ alerts the operator to manually flatten before cash
+    settlement.
+    """
+    expiry_check_failure: Optional[Exception] = None
     if _has_open_position(hedger):
         if args.force_flatten_on_exit:
             force_flatten(hedger, log, reason="OPS_FORCE (--force-flatten-on-exit)")
@@ -241,7 +250,8 @@ def end_of_session(hedger, today: date, args, log: logging.Logger):
                     force_flatten(hedger, log,
                                   reason="EXPIRY (leg contract expires today)")
             except Exception as e:
-                log.exception("Expiry check failed: %s — leaving position", e)
+                log.exception("Expiry check failed after retries: %s", e)
+                expiry_check_failure = e
 
     try:
         report = hedger.generate_eod_report()
@@ -255,6 +265,18 @@ def end_of_session(hedger, today: date, args, log: logging.Logger):
         log.exception("IV history save failed: %s", e)
 
     write_state_file(hedger, log)
+
+    if expiry_check_failure is not None:
+        log.critical(
+            "EXPIRY CHECK FAILED for taleb-karpathy session. EOD report + "
+            "state + IV history have been written; runner will now exit "
+            "non-zero so notify-failure@ alerts. OPERATOR ACTION: manually "
+            "verify whether any option/futures leg's contract expires "
+            "today and square off BEFORE cash settlement.",
+        )
+        raise RuntimeError(
+            "Expiry-day check failed; refusing to silently proceed (H18)."
+        ) from expiry_check_failure
 
 
 def main():

@@ -1646,16 +1646,74 @@ class TestLegsExpireOn:
         assert h.legs_expire_on(date(2026, 5, 28)) is True
         assert h.legs_expire_on(date(2026, 5, 19)) is False
 
-    def test_false_on_instruments_lookup_failure(self):
-        """Flaky API hiccup must not force an unintended flatten."""
+    def test_raises_after_retries_on_instruments_failure(self):
+        """H18: when a futures hedge is held and instruments('NFO') keeps
+        failing, legs_expire_on must raise rather than silently return
+        False — silent False on real expiry day means carrying a contract
+        into cash settlement. Three attempts with 1s/2s backoff between.
+        time.sleep is patched out so the test stays fast."""
         from datetime import date
+        import strategies.taleb_karpathy as tk_mod
+        import pytest
+
         h = self._mock_hedger()
         h.state.futures_hedge_delta = -75.0
         h.state.futures_lots = -1
+        call_count = {"n": 0}
+
         def _raise(*a, **k):
+            call_count["n"] += 1
             raise RuntimeError("network down")
         h.kite.instruments = _raise
-        assert h.legs_expire_on(date(2026, 5, 19)) is False
+
+        sleeps: list[float] = []
+        orig_sleep = tk_mod.time.sleep
+        tk_mod.time.sleep = lambda secs: sleeps.append(secs)
+        try:
+            with pytest.raises(RuntimeError, match="3 consecutive times"):
+                h.legs_expire_on(date(2026, 5, 19))
+        finally:
+            tk_mod.time.sleep = orig_sleep
+
+        assert call_count["n"] == 3, f"expected 3 attempts, got {call_count['n']}"
+        assert sleeps == [1.0, 2.0], f"unexpected backoff schedule: {sleeps}"
+
+    def test_raises_on_empty_instruments_dump(self):
+        """H18: kite.instruments('NFO') succeeding but returning [] is
+        treated the same as a fetch failure for the futures-hedge path —
+        cannot verify whether the hedge contract expires today."""
+        from datetime import date
+        import pytest
+
+        h = self._mock_hedger()
+        h.state.futures_hedge_delta = -75.0
+        h.state.futures_lots = -1
+        h.kite.instruments = lambda seg: []
+        with pytest.raises(RuntimeError, match="empty list"):
+            h.legs_expire_on(date(2026, 5, 19))
+
+    def test_no_retry_when_no_futures_hedge(self):
+        """If only option legs are held (no futures hedge), the futures
+        instruments path is never touched — a dead kite API doesn't
+        block expiry detection on the option side."""
+        from datetime import date
+
+        h = self._mock_hedger()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY2651923700CE", instrument_token=1,
+                strike=23700, expiry="2026-05-19", option_type="CE",
+                lot_size=75, quantity=1, entry_price=80, current_price=80, iv=0.2,
+            ),
+        ]
+        h.state.futures_hedge_delta = 0.0
+        h.state.futures_lots = 0
+
+        def _explode(*a, **k):
+            raise AssertionError("kite.instruments() must not be called "
+                                 "when only option legs are held")
+        h.kite.instruments = _explode
+        assert h.legs_expire_on(date(2026, 5, 19)) is True
 
 
 class TestRealizedThetaAccounting:

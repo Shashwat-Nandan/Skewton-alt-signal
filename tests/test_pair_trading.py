@@ -999,15 +999,47 @@ class TestLegsExpireOn:
         ]
         assert s.legs_expire_on(d(2026, 5, 20)) is False
 
-    def test_false_on_instruments_lookup_failure(self):
-        """If the instruments call fails, return False rather than raise —
-        a flaky API hiccup must not force-flatten a position."""
+    def test_raises_after_retries_on_instruments_failure(self):
+        """H18: when held legs are present and instruments('NFO') keeps
+        failing, legs_expire_on must raise rather than silently return
+        False — silent False on real expiry day means carrying a contract
+        into cash settlement. The retry path tries 3× with backoff before
+        giving up. We monkey-patch time.sleep to skip the waits."""
         from datetime import date as d
+        import strategies.pair_trading as pt_mod
+
         s = self._strategy_with_legs("AAA26MAYFUT")
+        s._nfo_instruments_cache = None  # force fetch
+        call_count = {"n": 0}
+
         def _raise(*a, **k):
+            call_count["n"] += 1
             raise RuntimeError("network down")
         s.kite.instruments = _raise
-        assert s.legs_expire_on(d(2026, 5, 28)) is False
+
+        sleeps: list[float] = []
+        orig_sleep = pt_mod.time.sleep
+        pt_mod.time.sleep = lambda secs: sleeps.append(secs)
+        try:
+            with pytest.raises(RuntimeError, match="3 consecutive times"):
+                s.legs_expire_on(d(2026, 5, 28))
+        finally:
+            pt_mod.time.sleep = orig_sleep
+
+        assert call_count["n"] == 3, f"expected 3 attempts, got {call_count['n']}"
+        # 1s then 2s backoffs between attempts; no sleep after the final attempt.
+        assert sleeps == [1.0, 2.0], f"unexpected backoff schedule: {sleeps}"
+
+    def test_raises_on_empty_instruments_dump(self):
+        """H18: kite.instruments('NFO') succeeding but returning [] is
+        treated the same as a fetch failure — we cannot verify whether
+        held legs expire today, so refuse to silently return False."""
+        from datetime import date as d
+        s = self._strategy_with_legs("AAA26MAYFUT")
+        s._nfo_instruments_cache = None
+        s.kite.instruments = lambda seg: []
+        with pytest.raises(RuntimeError, match="empty list"):
+            s.legs_expire_on(d(2026, 5, 28))
 
 
 # ──────────────────────────────────────────────────────────

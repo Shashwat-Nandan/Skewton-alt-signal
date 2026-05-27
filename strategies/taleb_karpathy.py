@@ -1013,8 +1013,13 @@ class TalebKarpathyStrategy(BaseStrategy):
         """True if any held leg's contract has its last trading day on `today`.
         Covers both option legs (each carries its own ISO expiry string) and
         the futures hedge (looked up against the NFO instruments dump).
-        Returns False on instruments-fetch failure — a flaky API hiccup must
-        not trigger an unintended force-flatten."""
+
+        H18: kite.instruments('NFO') is retried up to 3× with exponential
+        backoff; persistent failure raises rather than silently returning
+        False. Silent False on expiry day means carrying a contract into
+        cash settlement — fail loud and let the runner exit non-zero so
+        notify-failure@ alerts the operator to manually flatten.
+        """
         today_iso = today.isoformat()
         for p in self.state.positions:
             if not p.expiry:
@@ -1027,12 +1032,14 @@ class TalebKarpathyStrategy(BaseStrategy):
         # Futures hedge: only one contract at a time, identified by the cached
         # tradingsymbol. Look up its expiry from the instruments dump.
         if abs(self.state.futures_hedge_delta) > 0 or self.state.futures_lots != 0:
-            try:
-                fut_symbol = self._get_futures_symbol()
-                instruments = self.kite.instruments("NFO")
-            except Exception as e:
-                logger.warning("instruments('NFO') for expiry check failed: %s", e)
-                return False
+            fut_symbol = self._get_futures_symbol()
+            instruments = self._fetch_nfo_instruments_with_retry()
+            if not instruments:
+                raise RuntimeError(
+                    "instruments('NFO') returned an empty list — cannot "
+                    "verify whether the futures hedge expires today. "
+                    "Refusing to silently return False."
+                )
             for row in instruments:
                 if row.get("tradingsymbol") != fut_symbol:
                     continue
@@ -1048,6 +1055,38 @@ class TalebKarpathyStrategy(BaseStrategy):
                     return True
                 break
         return False
+
+    def _fetch_nfo_instruments_with_retry(
+        self, *, max_retries: int = 3, base_backoff_s: float = 1.0,
+    ) -> List[dict]:
+        """H18: retry kite.instruments('NFO') with exponential backoff;
+        raise the last exception on persistent failure. Used by
+        legs_expire_on at session end — a hiccup that leaves us unable
+        to detect expiry day is louder than a hiccup that just delays
+        startup."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                result = self.kite.instruments("NFO") or []
+                if attempt > 0:
+                    logger.info(
+                        "instruments('NFO') succeeded on retry #%d", attempt,
+                    )
+                return result
+            except Exception as e:
+                last_exc = e
+                if attempt + 1 < max_retries:
+                    wait = base_backoff_s * (2 ** attempt)
+                    logger.warning(
+                        "instruments('NFO') failed (attempt %d/%d): %s — "
+                        "retrying in %.1fs",
+                        attempt + 1, max_retries, e, wait,
+                    )
+                    time.sleep(wait)
+        raise RuntimeError(
+            f"instruments('NFO') failed {max_retries} consecutive times; "
+            f"last error: {last_exc!r}"
+        )
 
     # ══════════════════════════════════════════════════════════
     # INTERNAL METHODS

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import fcntl
 import json
 import logging
 import os
@@ -119,6 +120,21 @@ QUALITY_MAX_PVALUE = 0.025
 # many pairs in the book. Prevents one stock's idiosyncratic move from
 # driving multiple positions' P&L in the same direction.
 LEG_CONCENTRATION_CAP = 2
+
+# --max-csv-age-days defaults. Paper/signals can tolerate a slightly stale
+# weekly screen because nothing real moves; live cannot — 6-day-old hedge
+# ratios are an implicit directional exposure on each leg (H10).
+DEFAULT_CSV_AGE_LIVE = 1.0
+DEFAULT_CSV_AGE_PAPER = 7.0
+
+
+def resolve_max_csv_age_days(mode: str,
+                              value: Optional[float]) -> float:
+    """H10: explicit operator value wins; otherwise live tolerates only
+    fresh hedge ratios and paper/signals keep the legacy 7-day window."""
+    if value is not None:
+        return float(value)
+    return DEFAULT_CSV_AGE_LIVE if mode == "live" else DEFAULT_CSV_AGE_PAPER
 
 # Silent-fail heartbeat. If every strategy has at least one operation
 # (scan or rehedge) raise for this many consecutive ticks, the runner
@@ -728,10 +744,44 @@ def flatten_one(strategy, log: logging.Logger, reason: str = "EOD_CLOSE"):
 # expiry-day force-flatten below.
 
 STATE_FILE_TEMPLATE = "pair_paper_state_{system}.json"
+LOCK_FILE_TEMPLATE = ".pair_paper_{system}.lock"
 
 
 def state_file_path(system: str) -> Path:
     return DATA_CACHE / STATE_FILE_TEMPLATE.format(system=system)
+
+
+def acquire_runner_lock(system: str, log: logging.Logger) -> int:
+    """H9: refuse to start if another runner already holds the lock for
+    this --system tag. Two processes sharing a state file would clobber
+    each other's writes; even with the H1 per-attempt persist, the loser's
+    last-write-wins behaviour silently drops state mutations.
+
+    Opens data_cache/.pair_paper_<system>.lock and acquires
+    fcntl.flock(LOCK_EX | LOCK_NB). Returns the open FD — the caller
+    must keep the reference alive for the process lifetime so the OS
+    holds the lock until the process exits (kernel releases on close,
+    which includes crash/SIGKILL).
+
+    Raises RuntimeError if the lock is already held by another process
+    (BlockingIOError from non-blocking flock)."""
+    DATA_CACHE.mkdir(parents=True, exist_ok=True)
+    path = DATA_CACHE / LOCK_FILE_TEMPLATE.format(system=system)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RuntimeError(
+            f"Another pair-paper runner is already holding the lock for "
+            f"--system={system} (lock file: {path}). Refusing to start a "
+            f"second runner — concurrent writes to the state file would "
+            f"silently lose mutations. If the previous runner died "
+            f"abnormally, `rm {path}` after confirming no process is "
+            f"actually running."
+        )
+    log.info("Runner lock acquired: %s (pid %d)", path, os.getpid())
+    return fd
 
 
 def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
@@ -1069,11 +1119,14 @@ def main():
                              "tool can split P&L by system. Defaults to "
                              "'baseline' which preserves the original "
                              "filenames.")
-    parser.add_argument("--max-csv-age-days", type=float, default=7.0,
+    parser.add_argument("--max-csv-age-days", type=float, default=None,
                         help="Refuse to load candidates CSV older than this "
                              "many days. Safety net for a failed weekly screen "
                              "leaving stale hedge ratios in production. 0 to "
-                             "disable (default: 7).")
+                             "disable. When unset, defaults to 1 day in "
+                             "--mode live (H10: stale β's are a directional "
+                             "exposure we won't accept on real money) and "
+                             "7 days in paper/signals.")
     parser.add_argument("--force-flatten-on-exit", action="store_true",
                         help="Flatten every open position at session end "
                              "before persisting state. Operations safety "
@@ -1111,6 +1164,17 @@ def main():
     today = datetime.now().date()
     log = setup_logging(today, args.system)
 
+    # H10: resolve --max-csv-age-days from mode when the operator didn't
+    # pass it explicitly. Live tolerates only fresh hedge ratios; paper
+    # keeps the legacy 7-day window.
+    explicit_override = args.max_csv_age_days is not None
+    args.max_csv_age_days = resolve_max_csv_age_days(
+        args.mode, args.max_csv_age_days,
+    )
+    if not explicit_override:
+        log.info("--max-csv-age-days unset → defaulting to %.1f day(s) for "
+                 "--mode %s", args.max_csv_age_days, args.mode)
+
     # Live-mode safety gate. Three independent locks so a refactor or
     # typo can't push real money into the market:
     #   (1) --mode live CLI flag (default paper)
@@ -1146,6 +1210,11 @@ def main():
     if not ok and not args.force:
         log.info("No-op: %s. Exiting.", reason)
         return 0
+
+    # H9: refuse to start a second runner with the same --system tag.
+    # Assigned to a local that lives for main()'s scope so the FD stays
+    # open (lock released on process exit, including SIGKILL).
+    _runner_lock_fd = acquire_runner_lock(args.system, log)  # noqa: F841
 
     log.info("=" * 60)
     log.info("PAIR-TRADING %s SESSION — %s [system=%s]",
@@ -1330,7 +1399,16 @@ def end_of_session(strategies, today: date, args, log: logging.Logger):
 
     Order matters — flatten must run before persist so the state file reflects
     the post-flatten reality, and persist must run before sidecar so the
-    sidecar's session_realized_delta is a snapshot of the same moment."""
+    sidecar's session_realized_delta is a snapshot of the same moment.
+
+    H18: legs_expire_on now raises on persistent kite.instruments('NFO')
+    failure rather than silently returning False. We collect any
+    unverifiable pairs, ALWAYS persist state + sidecar first (so the
+    next runner doesn't start blind), then re-raise. The non-zero exit
+    fires notify-failure@ so the operator can manually flatten before
+    cash settlement.
+    """
+    unverified_expiry: List[str] = []
     for s in strategies:
         pair_label = f"{s.symbol_a}/{s.symbol_b}"
         if s.state.position == "FLAT":
@@ -1345,10 +1423,25 @@ def end_of_session(strategies, today: date, args, log: logging.Logger):
                          pair_label)
                 flatten_one(s, log, reason="EXPIRY")
         except Exception as e:
-            log.exception("[%s] expiry check failed: %s — leaving position",
+            log.exception("[%s] expiry check failed after retries: %s",
                           pair_label, e)
+            unverified_expiry.append(pair_label)
     write_state_file(strategies, args.system, log)
     write_eod_sidecar(strategies, today, log, args.system)
+    if unverified_expiry:
+        log.critical(
+            "EXPIRY CHECK FAILED for %d open pair(s): %s. State and EOD "
+            "sidecar have been written; runner will now exit non-zero so "
+            "notify-failure@ alerts. OPERATOR ACTION: manually verify "
+            "whether any leg's futures contract expires today and square "
+            "off BEFORE cash settlement — a contract carried into "
+            "settlement is the worst possible outcome.",
+            len(unverified_expiry), ", ".join(unverified_expiry),
+        )
+        raise RuntimeError(
+            f"Expiry-day check failed for {len(unverified_expiry)} pair(s); "
+            "refusing to silently proceed (H18)."
+        )
 
 
 if __name__ == "__main__":

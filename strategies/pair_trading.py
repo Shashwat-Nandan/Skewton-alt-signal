@@ -527,29 +527,80 @@ class PairTradingStrategy(BaseStrategy):
                     pass
         return out
 
-    def _get_nfo_instruments(self) -> List[dict]:
+    def _get_nfo_instruments(self, *, retry: bool = False,
+                              max_retries: int = 3,
+                              base_backoff_s: float = 1.0) -> List[dict]:
         """H19: return the injected NFO dump if the runner pre-fetched one,
         otherwise fall back to a lazy kite.instruments('NFO') call that
-        also fills the cache so subsequent ticks reuse it. Returns [] on
-        fetch failure so callers can short-circuit safely."""
+        also fills the cache so subsequent ticks reuse it.
+
+        retry=False (default): returns [] on fetch failure so callers in
+            hot paths (_resolve_futures) can short-circuit safely without
+            paying retry latency on transient failures.
+
+        retry=True (H18): retries up to `max_retries` times with
+            exponential backoff (base_backoff_s × 2**attempt). If every
+            attempt fails, raises the last exception so the caller can
+            decide whether to abort. Used by legs_expire_on at session
+            end where silent-False would mean holding into cash settlement.
+        """
         if self._nfo_instruments_cache is not None:
             return self._nfo_instruments_cache
-        try:
-            self._nfo_instruments_cache = self.kite.instruments("NFO") or []
-        except Exception as e:
-            logger.warning("instruments('NFO') failed: %s", e)
-            return []
-        return self._nfo_instruments_cache
+        if not retry:
+            try:
+                self._nfo_instruments_cache = self.kite.instruments("NFO") or []
+            except Exception as e:
+                logger.warning("instruments('NFO') failed: %s", e)
+                return []
+            return self._nfo_instruments_cache
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                result = self.kite.instruments("NFO") or []
+                self._nfo_instruments_cache = result
+                if attempt > 0:
+                    logger.info(
+                        "instruments('NFO') succeeded on retry #%d", attempt,
+                    )
+                return result
+            except Exception as e:
+                last_exc = e
+                if attempt + 1 < max_retries:
+                    wait = base_backoff_s * (2 ** attempt)
+                    logger.warning(
+                        "instruments('NFO') failed (attempt %d/%d): %s — "
+                        "retrying in %.1fs",
+                        attempt + 1, max_retries, e, wait,
+                    )
+                    time.sleep(wait)
+        raise RuntimeError(
+            f"instruments('NFO') failed {max_retries} consecutive times; "
+            f"last error: {last_exc!r}"
+        )
 
     def legs_expire_on(self, today: date) -> bool:
         """True if any open leg's futures contract has its last trading day
         on `today`. The paper runner uses this to force-flatten before
-        contract expiry rather than holding a contract into settlement."""
+        contract expiry rather than holding a contract into settlement.
+
+        H18: when this is asked AND there are open legs, the NFO fetch
+        retries up to 3× with backoff and raises on persistent failure
+        rather than silently returning False. A silent False on expiry
+        day means carrying a contract into cash settlement — the worst
+        possible outcome — so we'd rather the runner exit non-zero and
+        alert the operator than silently proceed.
+        """
         if not self.state.legs:
             return False
-        instruments = self._get_nfo_instruments()
+        instruments = self._get_nfo_instruments(retry=True)
         if not instruments:
-            return False
+            # H18: empty list with no exception is the "broker returned
+            # nothing" edge — treat as failure to surface (don't carry).
+            raise RuntimeError(
+                "instruments('NFO') returned an empty list — cannot verify "
+                "whether held legs expire today. Refusing to silently "
+                "return False."
+            )
         expiry_by_ts: Dict[str, date] = {}
         for row in instruments:
             ts = row.get("tradingsymbol")

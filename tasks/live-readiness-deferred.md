@@ -80,6 +80,12 @@ Closed Highs (2026-05-26 "kite-API hygiene + same-tick re-entry" worklist):
 d192814 pair_trading: H5 stop cooldown + H14 kite throttle + H19 NFO cache (single bundled commit)
 ```
 
+Closed Highs (2026-05-27 "defensive runner-startup + expiry-day guard" worklist):
+```
+<PENDING> pair_trading + taleb_karpathy: H9 runner lockfile + H10 live CSV age default + H18 NFO retry/abort
+        (H18 applies to both legs_expire_on implementations per Rule 7 — same policy, same shape)
+```
+
 The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 - **High**: will lose money or block trading under a common failure mode
 - **Medium**: degrades reliability or observability; unlikely to lose money directly
@@ -110,20 +116,6 @@ The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 **Fix sketch:** specific `except TokenException` branch calling `auth.get_kite()` to refresh, retry once. Log CRITICAL + alert on second failure.
 **Effort:** ~1 hr.
 
-### H9 — Lockfile around state-file write
-**Go-live blocker:** No (single runner per system tag during cutover week per pre-flight)
-**Source:** risk audit
-**Risk:** Two concurrent runners with the same `--system` would clobber each other's state writes.
-**Fix sketch:** `fcntl.flock(LOCK_EX | LOCK_NB)` on `data_cache/.pair_paper_<system>.lock` at startup. Refuse to start if held.
-**Effort:** ~30 min.
-
-### H10 — `--max-csv-age-days` default 7 too lenient
-**Go-live blocker:** No (mitigated by adding `--max-csv-age-days 1` to live ExecStart)
-**Source:** risk audit
-**Risk:** 6-day-old hedge ratios → implicit directional exposure on the stale legs.
-**Fix sketch:** default to 1 day for live mode (or require operator to pass explicitly). For paper, keep 7.
-**Effort:** ~10 min (config flag default).
-
 ### H12 — `--lots-per-leg` no hard cap
 **Go-live blocker:** No (pre-flight calls for `--lots-per-leg 1`)
 **Source:** risk audit
@@ -151,13 +143,6 @@ The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 **Risk:** baseline + persistent runners both running live could 2× per-symbol concentration (`LEG_CONCENTRATION_CAP=2` is intra-runner only).
 **Fix sketch:** shared state file or cross-runner lock; for now, disable one timer during cutover (documented in pre-flight).
 **Effort:** ~2 hr.
-
-### H18 — `legs_expire_on` retry on API failure
-**Go-live blocker:** No (silent-False is intentional defensive choice; the worst case requires the API to fail specifically on expiry day at session end)
-**Source:** strategy audit
-**Risk:** On expiry day, `kite.instruments("NFO")` failure → return False → position carried into cash settlement.
-**Fix sketch:** retry 3× with backoff; if still failing, abort runner rather than silently proceed.
-**Effort:** ~30 min.
 
 ---
 

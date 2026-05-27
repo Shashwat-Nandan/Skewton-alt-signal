@@ -25,11 +25,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import run_paper_pairs
 from run_paper_pairs import (
-    load_prior_state,
-    write_state_file,
-    restore_matching_strategies,
+    acquire_runner_lock,
     build_orphan_strategies,
+    end_of_session,
+    load_prior_state,
+    resolve_max_csv_age_days,
+    restore_matching_strategies,
     state_file_path,
+    write_state_file,
+    DEFAULT_CSV_AGE_LIVE,
+    DEFAULT_CSV_AGE_PAPER,
 )
 
 
@@ -375,3 +380,191 @@ class TestBuildOrphanStrategies:
             )
         assert orphans == []
         MockStrat.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────
+# H9 — runner lockfile
+# ──────────────────────────────────────────────────────────
+
+
+class TestRunnerLock:
+    """H9: refuse to start a second runner with the same --system tag.
+    Two runners sharing a state file would silently clobber each other's
+    writes. fcntl.flock(LOCK_EX | LOCK_NB) on a per-system lock file
+    enforces this at startup."""
+
+    def test_first_runner_acquires_lock(self, isolated_data_cache, log):
+        fd = acquire_runner_lock("baseline", log)
+        try:
+            assert isinstance(fd, int) and fd >= 0
+            lock_path = isolated_data_cache / ".pair_paper_baseline.lock"
+            assert lock_path.exists()
+        finally:
+            os.close(fd)
+
+    def test_second_runner_is_refused(self, isolated_data_cache, log):
+        """Acquire the lock from a *child process* so the kernel sees it
+        held by a different pid — flock's process-scoped semantics make
+        same-process re-acquisition succeed, which would mask the bug."""
+        import subprocess
+
+        lock_path = isolated_data_cache / ".pair_paper_baseline.lock"
+        # Child holds the lock indefinitely until we kill it. We need
+        # the lock acquired BEFORE we return, so use a stdout sync.
+        child_script = (
+            "import fcntl, os, sys, time\n"
+            f"fd = os.open({str(lock_path)!r}, os.O_CREAT | os.O_RDWR, 0o644)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
+            "time.sleep(60)\n"
+        )
+        proc = subprocess.Popen(
+            ["python3", "-c", child_script],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            # Wait for the child to confirm it has the lock.
+            handshake = proc.stdout.readline().strip()
+            assert handshake == "LOCKED", f"child failed: {handshake!r}"
+            with pytest.raises(RuntimeError, match="already holding the lock"):
+                acquire_runner_lock("baseline", log)
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_distinct_system_tags_dont_collide(self, isolated_data_cache, log):
+        """baseline and persistent runners must coexist — they own
+        independent state files and so independent locks."""
+        fd1 = acquire_runner_lock("baseline", log)
+        fd2 = acquire_runner_lock("persistent", log)
+        try:
+            assert fd1 != fd2
+        finally:
+            os.close(fd1)
+            os.close(fd2)
+
+
+# ──────────────────────────────────────────────────────────
+# H10 — --max-csv-age-days mode-based default
+# ──────────────────────────────────────────────────────────
+
+
+class TestMaxCsvAgeDefault:
+    """H10: a stale weekly screen leaves 6-day-old hedge ratios in play.
+    Paper can tolerate that; live cannot — the stale β becomes an
+    implicit directional exposure on each leg. Live default is 1 day."""
+
+    def test_explicit_value_wins_in_every_mode(self):
+        for mode in ("paper", "live", "signals"):
+            assert resolve_max_csv_age_days(mode, 0.5) == 0.5
+            assert resolve_max_csv_age_days(mode, 14.0) == 14.0
+            # 0 disables the check entirely.
+            assert resolve_max_csv_age_days(mode, 0.0) == 0.0
+
+    def test_live_defaults_to_one_day(self):
+        assert resolve_max_csv_age_days("live", None) == DEFAULT_CSV_AGE_LIVE
+        assert DEFAULT_CSV_AGE_LIVE == 1.0
+
+    def test_paper_keeps_legacy_seven_days(self):
+        assert resolve_max_csv_age_days("paper", None) == DEFAULT_CSV_AGE_PAPER
+        assert DEFAULT_CSV_AGE_PAPER == 7.0
+
+    def test_signals_mode_uses_paper_default(self):
+        """signals is dry-run — same tolerance as paper."""
+        assert resolve_max_csv_age_days("signals", None) == DEFAULT_CSV_AGE_PAPER
+
+
+# ──────────────────────────────────────────────────────────
+# H18 — end_of_session aborts on persistent legs_expire_on failure
+# ──────────────────────────────────────────────────────────
+
+
+class TestEndOfSessionH18:
+    """H18: legs_expire_on now raises on persistent kite.instruments('NFO')
+    failure. The runner must persist state + sidecar first (so tomorrow's
+    runner isn't blind), then exit non-zero so notify-failure@ alerts."""
+
+    def _make_strategy_mock(self, sa: str, sb: str,
+                              position: str = "LONG_SPREAD"):
+        s = MagicMock()
+        s.symbol_a, s.symbol_b = sa, sb
+        s.state = MagicMock()
+        s.state.position = position
+        s.state.legs = [MagicMock()] if position != "FLAT" else []
+        # serialize_state used by write_state_file
+        s.serialize_state.return_value = {
+            "pair": [sa, sb], "hedge_ratio": 1.0,
+            "state": {"position": position},
+        }
+        s.generate_eod_report.return_value = {"pair": (sa, sb)}
+        return s
+
+    def test_raises_after_persisting_state_and_sidecar(
+        self, isolated_data_cache, log,
+    ):
+        """When legs_expire_on raises persistently for an open pair, the
+        runner must still write the state file and EOD sidecar before
+        re-raising — otherwise tomorrow's runner has no state to restore."""
+        from datetime import date
+        s = self._make_strategy_mock("A", "B")
+        s.legs_expire_on.side_effect = RuntimeError(
+            "instruments('NFO') failed 3 consecutive times"
+        )
+
+        args = MagicMock()
+        args.force_flatten_on_exit = False
+        args.system = "baseline"
+
+        today = date(2026, 5, 28)
+        with pytest.raises(RuntimeError, match="H18"):
+            end_of_session([s], today, args, log)
+
+        # State file and EOD sidecar must exist despite the raise.
+        state_path = isolated_data_cache / "pair_paper_state_baseline.json"
+        assert state_path.exists(), "state file not written before re-raise"
+        sidecar = isolated_data_cache / f"pair_paper_eod_{today.isoformat()}.json"
+        assert sidecar.exists(), "EOD sidecar not written before re-raise"
+
+    def test_proceeds_when_expiry_check_succeeds(
+        self, isolated_data_cache, log,
+    ):
+        """Happy path: legs_expire_on returns False for everyone → no raise,
+        sidecar + state written as usual."""
+        from datetime import date
+        s = self._make_strategy_mock("A", "B")
+        s.legs_expire_on.return_value = False
+
+        args = MagicMock()
+        args.force_flatten_on_exit = False
+        args.system = "baseline"
+
+        today = date(2026, 5, 21)  # non-expiry day
+        end_of_session([s], today, args, log)
+        assert (isolated_data_cache / "pair_paper_state_baseline.json").exists()
+        assert (isolated_data_cache /
+                f"pair_paper_eod_{today.isoformat()}.json").exists()
+
+    def test_force_flatten_bypasses_expiry_check(
+        self, isolated_data_cache, log,
+    ):
+        """--force-flatten-on-exit should not invoke legs_expire_on at all,
+        so a dead kite API on a non-expiry shutdown doesn't accidentally
+        block the operations hatch."""
+        from datetime import date
+        s = self._make_strategy_mock("A", "B")
+        # If legs_expire_on is ever called we'd raise — assert it isn't.
+        s.legs_expire_on.side_effect = AssertionError(
+            "legs_expire_on must not run when --force-flatten-on-exit is set"
+        )
+        # flatten_one will call _observe_spread + execute_proposals on a
+        # MagicMock — those return MagicMocks and the flatten happens to
+        # not raise. The point of this test is just the assertion above.
+        s._observe_spread.return_value = (None, {})  # short-circuits
+
+        args = MagicMock()
+        args.force_flatten_on_exit = True
+        args.system = "baseline"
+
+        end_of_session([s], date(2026, 5, 21), args, log)
+        # legs_expire_on was not called (its side_effect never fired).
