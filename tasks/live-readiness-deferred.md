@@ -82,7 +82,7 @@ d192814 pair_trading: H5 stop cooldown + H14 kite throttle + H19 NFO cache (sing
 
 Closed Highs (2026-05-27 "defensive runner-startup + expiry-day guard" worklist):
 ```
-<PENDING> pair_trading + taleb_karpathy: H9 runner lockfile + H10 live CSV age default + H18 NFO retry/abort
+533c39d pair_trading + taleb_karpathy: H9 runner lockfile + H10 live CSV age default + H18 NFO retry/abort
         (H18 applies to both legs_expire_on implementations per Rule 7 — same policy, same shape)
 ```
 
