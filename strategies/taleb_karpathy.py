@@ -407,8 +407,15 @@ class TalebKarpathyStrategy(BaseStrategy):
         chain = self._get_options_chain()
         if chain.empty:
             return []
+        # Phase 3.2: chain now spans up to two expiries so the calendar
+        # builder can fire. IV percentile, skew percentile, and the
+        # legacy straddle path are single-expiry by construction, so
+        # they consume the primary slice. The full chain is forwarded
+        # only to `propose_for_structure` below (regime dispatch path),
+        # which is the path that may route to CALENDAR.
+        primary = self._primary_expiry_slice(chain)
 
-        iv_percentile = self._compute_iv_percentile(chain, spot)
+        iv_percentile = self._compute_iv_percentile(primary, spot)
         iv_min = self.tunable_params["entry_iv_percentile_min"]
         iv_max = self.tunable_params["entry_iv_percentile_max"]
         if not (iv_min <= iv_percentile <= iv_max):
@@ -421,7 +428,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         # remains in place for operators who want a hard block on rich
         # skew; the regime classifier instead ROUTES rich-skew regimes
         # to RISK_REVERSAL_LONG_PUT.
-        skew_pct = self._compute_skew_percentile(chain, spot)
+        skew_pct = self._compute_skew_percentile(primary, spot)
         skew_max = self.tunable_params.get("skew_pct_max", 100.0)
         regime_enabled = self.tunable_params.get(
             "enable_regime_dispatch", False,
@@ -490,8 +497,9 @@ class TalebKarpathyStrategy(BaseStrategy):
                 greeks_engine=self.greeks,
             )
         else:
+            # Legacy single-expiry straddle — pass primary slice only.
             proposals = self.proposer.propose_delta_neutral(
-                chain=chain, spot=spot,
+                chain=primary, spot=spot,
                 capital=self.immutable_params["total_capital"],
                 position_size_pct=self.tunable_params["position_size_pct"],
                 greeks_engine=self.greeks,
@@ -1142,6 +1150,25 @@ class TalebKarpathyStrategy(BaseStrategy):
             logger.warning("Cannot generate soft delta hedge: options chain unavailable")
             return []
 
+        # Phase 3.2: chain may span two expiries. Soft hedge MUST sit on
+        # the same expiry as the existing position(s) — otherwise we'd
+        # hedge the front-month greek surface with a back-month option
+        # whose theta/gamma profile is wrong and the hedge would
+        # introduce its own basis risk. If flat (shouldn't happen here,
+        # but defensive), pin to the primary slice.
+        if self.state.positions and self.state.positions[0].expiry:
+            position_expiry = self.state.positions[0].expiry
+            chain = chain[chain["expiry"] == position_expiry]
+            if chain.empty:
+                logger.warning(
+                    "Soft delta hedge: position expiry %s not in chain — "
+                    "cannot hedge with matching expiry option",
+                    position_expiry,
+                )
+                return []
+        else:
+            chain = self._primary_expiry_slice(chain)
+
         strike_interval = 50 if self.underlying == "NIFTY" else 100
         strike = round(spot / strike_interval) * strike_interval
         expiry = self.state.positions[0].expiry if self.state.positions else ""
@@ -1628,10 +1655,24 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     def _get_options_chain(self):
         """
-        Get options chain for the best available expiry.
-        Checks the 2 nearest expiries and picks the one with the most
-        strikes around the current spot (handles weekly expiries with
-        sparse OTM strikes).
+        Get options chain for the two nearest expiries.
+
+        Returns a DataFrame containing rows from up to the two nearest
+        expiries, with the "primary" expiry (best ATM coverage among
+        the two) rows ordered first. The primary expiry is also marked
+        in `chain.attrs["primary_expiry"]` so callers can recover it
+        explicitly via `_primary_expiry_slice(chain)`.
+
+        Why two expiries: the calendar builder
+        (`trade_proposer.propose_calendar_short_front`) requires a
+        chain spanning two expiries to construct front-vs-back legs.
+        Single-expiry callers (IV percentile, skew percentile, soft
+        delta hedge, legacy straddle proposer) must filter via
+        `_primary_expiry_slice` to preserve pre-Phase-3.2 semantics.
+
+        Primary selection is unchanged from the pre-Phase-3.2 logic
+        (pick the expiry with the most strikes within 3% of spot,
+        falling back to nearest if neither has an ATM CE/PE pair).
         """
         try:
             instruments = self.kite.instruments("NFO")
@@ -1652,30 +1693,41 @@ class TalebKarpathyStrategy(BaseStrategy):
                 # Without spot we can't pick the best ATM expiry. Caller
                 # treats empty chain as "skip this tick."
                 return pd.DataFrame()
-            best_chain = pd.DataFrame()
-            best_atm_count = -1
 
-            # Check up to 2 nearest expiries, pick the one with best ATM coverage
+            candidates = []
             for expiry in expiries[:2]:
-                chain = df[df["expiry"] == expiry]
-                strikes = chain["strike"].unique()
-                # Count strikes within 3% of spot (ATM zone)
+                slice_ = df[df["expiry"] == expiry]
+                strikes = slice_["strike"].unique()
+                if len(strikes) == 0:
+                    continue
                 atm_zone = [s for s in strikes if abs(s - spot) / spot < 0.03]
-                # Need both CE and PE at the ATM strike
-                atm_strike = min(strikes, key=lambda s: abs(s - spot)) if len(strikes) > 0 else 0
-                has_ce = not chain[(chain["strike"] == atm_strike) & (chain["instrument_type"] == "CE")].empty
-                has_pe = not chain[(chain["strike"] == atm_strike) & (chain["instrument_type"] == "PE")].empty
+                atm_strike = min(strikes, key=lambda s: abs(s - spot))
+                has_ce = not slice_[(slice_["strike"] == atm_strike) & (slice_["instrument_type"] == "CE")].empty
+                has_pe = not slice_[(slice_["strike"] == atm_strike) & (slice_["instrument_type"] == "PE")].empty
+                candidates.append({
+                    "expiry": expiry,
+                    "atm_count": len(atm_zone),
+                    "has_atm_pair": has_ce and has_pe,
+                    "slice": slice_,
+                })
 
-                if has_ce and has_pe and len(atm_zone) > best_atm_count:
-                    best_atm_count = len(atm_zone)
-                    best_chain = chain
+            if not candidates:
+                return pd.DataFrame()
 
-            # Fallback: if no expiry has ATM CE+PE, return nearest anyway
-            if best_chain.empty:
-                nearest_expiry = expiries[0]
-                return df[df["expiry"] == nearest_expiry]
+            valid = [c for c in candidates if c["has_atm_pair"]]
+            if valid:
+                primary = max(valid, key=lambda c: c["atm_count"])
+                primary_expiry = primary["expiry"]
+            else:
+                primary_expiry = expiries[0]
 
-            return best_chain
+            ordered = sorted(
+                candidates,
+                key=lambda c: (0 if c["expiry"] == primary_expiry else 1, c["expiry"]),
+            )
+            chain = pd.concat([c["slice"] for c in ordered], ignore_index=True)
+            chain.attrs["primary_expiry"] = primary_expiry
+            return chain
         except Exception as e:
             consecutive = getattr(self, "_consecutive_chain_failures", 0) + 1
             self._consecutive_chain_failures = consecutive
@@ -1685,6 +1737,25 @@ class TalebKarpathyStrategy(BaseStrategy):
                 consecutive, e,
             )
             return pd.DataFrame()
+
+    def _primary_expiry_slice(self, chain):
+        """Filter `chain` to its primary expiry rows.
+
+        Restores pre-Phase-3.2 single-expiry semantics for callers
+        that don't understand a multi-expiry chain (IV percentile,
+        skew percentile, soft delta hedge, legacy straddle proposer).
+        Reads `chain.attrs["primary_expiry"]` (set by
+        `_get_options_chain`); falls back to the first row's expiry
+        (matches the sort order written by `_get_options_chain`)
+        when the attribute has been stripped — pandas `.attrs` is
+        not preserved across all DataFrame operations.
+        """
+        if chain.empty:
+            return chain
+        primary_expiry = chain.attrs.get("primary_expiry")
+        if primary_expiry is None:
+            primary_expiry = chain.iloc[0]["expiry"]
+        return chain[chain["expiry"] == primary_expiry]
 
     def _compute_iv_percentile(self, chain, spot):
         """

@@ -252,6 +252,35 @@
   could speak?" If no, the constraint is leaking and needs an explicit
   bridge.
 
+## A memory note can be partially stale — verify the unblock path before promising "just one click" (2026-05-27)
+- Incident: investigating why the Taleb hedger keeps losing money,
+  the user asked "why have we not enabled phase 3 and above". I
+  cited the `project_taleb_profitability_uplift_2026_05_23` memory
+  which said "All the plumbing is in place; just `systemctl start
+  taleb-autoresearch.service`". The user said "kick off autoresearch
+  and patch the chain fetcher" — assuming the patch was a single
+  scoped action. On exploration, three additional gates were
+  discovered:
+  (a) `_get_options_chain` returned one expiry — calendar builder
+      always returned `[]`.
+  (b) `tick_capture.py` only subscribed to the front weekly — every
+      captured tape session was single-expiry.
+  (c) `deploy/run_weekly_autoresearch.sh` passed `--data $CSV` which
+      bypassed `run_autoresearch.py:198`'s captured-tape replay
+      path entirely.
+- Rule: memory notes are point-in-time observations. When a memory
+  asserts a code path is wired, verify the actual call chain end to
+  end (chain fetcher → proposer → wrapper → entry script) before
+  pitching it as "ready to ship". The `<system-reminder>` on every
+  memory read says this literally — treat it as load-bearing, not
+  boilerplate.
+- Application: before recommending a documented "ready to ship"
+  action, grep for the actual callers of each named component and
+  read at least the function signatures. Cheap to do; the cost of
+  promising a one-step unblock and then discovering three steps in
+  the middle of the user's session is much higher than a 60-second
+  audit at the start.
+
 ## A silent-identity fallback hides leg-lookup bugs in tests
 - Incident: a smoke test of the new cross-session persistence kept
   re-appending exit legs to `state.legs` instead of removing them, so

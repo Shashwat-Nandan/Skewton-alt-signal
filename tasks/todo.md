@@ -1,3 +1,118 @@
+# Phase 3+ unblock — chain fetcher + autoresearch tape replay (2026-05-27)
+
+## Problem
+Live taleb-hedger is bleeding ~₹10k/day (max_daily_loss_pct ceiling) running
+the legacy single-expiry ATM-straddle path. Phase 3+ regime dispatch was
+landed 2026-05-23 but stays gated because:
+1. `_get_options_chain` returns one expiry → calendar builder returns []
+2. `run_weekly_autoresearch.sh` passes `--data CSV` which **bypasses** the
+   captured-tape replay path in `run_autoresearch.py:198` — so the metric
+   the uplift was designed for (gamma_theta_ratio on tape) has never
+   actually been measured.
+
+## Plan
+- [ ] `strategies/taleb_karpathy.py:1629` — extend `_get_options_chain`
+      to return rows from the two nearest expiries (sorted ascending).
+      Mark the "primary" expiry (best-ATM-coverage) via a method that
+      filters down.
+- [ ] Add `_primary_expiry_slice(chain)` helper. Update
+      `_compute_iv_percentile` (1689), `_compute_skew_percentile` (1732),
+      and the soft-delta-hedge path (1140) to filter via the helper so
+      their single-expiry semantics are preserved.
+- [ ] Calendar builder (`trade_proposer.py:303`) is already correct —
+      it sorts unique expiries and picks `expiries[0]` front,
+      `expiries[1]` back. No edit needed.
+- [ ] `deploy/run_weekly_autoresearch.sh` — drop `--data "$DATA_CSV"`
+      argument so `run_autoresearch.py:198` takes the
+      `list_captured_sessions` path. Keep the daily-bar fetch as a
+      pre-flight (still useful for fresh CSV in case tape is empty).
+- [ ] Add tests: two-expiry chain fixture, IV-pct unchanged, skew-pct
+      unchanged, calendar builder fires when chain has 2 expiries.
+- [ ] Run `pytest tests/test_taleb_karpathy.py tests/test_trade_proposer.py`
+      and any new tests. Verify per Rule 4 / Rule 12.
+- [ ] `systemctl start taleb-autoresearch.service`. Tail
+      `journalctl -u taleb-autoresearch.service -f` to confirm the
+      log line "No --data flag; using captured-tape replay path"
+      appears (not the CSV fallback). Verify
+      `candidate_params_YYYY-MM-DD.json` written and
+      `best_params.json` is restored (script restores prior).
+
+## Out of scope
+- Flipping `enable_regime_dispatch=true` in config.ini — that's the
+  promotion step AFTER autoresearch produces a candidate. Manual
+  review of `candidate_params_*.json` per the wrapper's `[3/3]`
+  instruction.
+- Two-expiry per-leg T accounting in `_compute_portfolio_greeks` —
+  Phase 3.3 docs say "per-leg T makes the multi-expiry portfolio
+  greeks workable"; chain fetcher upgrade is the gate, but a
+  follow-up audit of multi-expiry greeks is owed.
+- The 9-rehedge-in-13-minutes incident on 2026-05-26. Root cause
+  could be tight rehedge_delta_threshold OR a stale-quote bug in
+  rehedge path — needs separate investigation (rule 1: no silent
+  assumption that "tighter band → cheaper to fix").
+
+## Acceptance
+- New tests pass.
+- Existing taleb test suite still 141/141 (no regressions).
+- `taleb-autoresearch.service` completes, writes a non-trivial
+  results.tsv tail (not all rows showing 0 trades), and produces
+  `candidate_params_2026-05-27.json` with at least one parameter
+  combination where `gamma_theta_ratio > 1.0` on tape replay. If
+  no candidate clears that bar, fail loud (Rule 12): document
+  that the captured tape regime to date does not exercise Phase 3+
+  edge, do NOT silently declare "uplift validated".
+
+## Review (2026-05-27)
+- `strategies/taleb_karpathy.py:1629` rewritten — returns up to two
+  nearest expiries; primary (best ATM coverage) sorted first;
+  `chain.attrs["primary_expiry"]` marker preserved.
+- New helper `_primary_expiry_slice(chain)` preserves pre-Phase-3.2
+  single-expiry semantics. Callers updated:
+  `scan_and_propose` IV/skew/legacy-straddle path uses primary;
+  regime-dispatch path uses full chain; soft-delta hedge filters
+  to active position's expiry.
+- 9 new tests in `tests/test_taleb_karpathy.py::TestTwoExpiryChain`
+  and 2 in `tests/test_trade_proposer.py::TestCalendarShortFront`.
+  All 121 Taleb-adjacent tests pass.
+- `tick_capture.py:97-98` rewritten to subscribe to the two nearest
+  expiries (front + back), not just `weekly_expiry`. Necessary
+  because front-only tape couldn't exercise the calendar regime
+  under replay. Discovered mid-flight when grepping tape sessions —
+  the memory note didn't flag this as a separate gate.
+- `deploy/run_weekly_autoresearch.sh` — dropped `--data $DATA_CSV`
+  arg so `run_autoresearch.py:198` takes the captured-tape replay
+  path (Phase 2.3). The CSV-based path was bypassing the metric the
+  uplift was designed for. Fetch step made non-fatal (tape replay
+  is independent of CSV freshness).
+- Autoresearch kicked off via `systemctl start --no-block
+  taleb-autoresearch.service`. Log confirms "Replaying 3 captured
+  sessions: ['2026-05-25', '2026-05-26', '2026-05-27']" — Phase 2.3
+  path engaged successfully. Existing tape is single-expiry so this
+  run measures the legacy straddle path's `gamma_theta_ratio`
+  baseline; calendar regime will start firing once 1-2 weeks of
+  multi-expiry tape accumulates after the `tick_capture.py` patch.
+
+## Honest caveats — what this session did NOT do
+- Did not promote any candidate params or flip
+  `enable_regime_dispatch=true`. That is the operator's manual
+  promotion step after reviewing the candidate_params file the
+  autoresearch run writes.
+- Did not investigate the 9-rehedge-in-13-minutes incident on
+  2026-05-26 (₹14,279 cost / 93% of that day's gross loss). Tight
+  rehedge_delta_threshold OR a stale-quote bug in the rehedge
+  path — needs separate root-cause work. The chain fetcher patch
+  does NOT address this.
+- Did not audit `_compute_portfolio_greeks` for multi-expiry per-leg
+  T accounting — claimed in original framework as "wired" but
+  callers should verify before running the calendar regime in
+  paper. Phase 3.3 hook at strategies/taleb_karpathy.py:746-753
+  builds per-leg T but the consumers in greeks_engine were not
+  re-audited in this session.
+- Did not stop the live taleb-hedger or tighten max_daily_loss_pct.
+  Per-user decision to keep running for tape capture continuity.
+
+---
+
 # equity-swing entry-fill correction — next-day open via PENDING queue (2026-05-25)
 
 ## Problem

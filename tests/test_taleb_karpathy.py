@@ -811,6 +811,11 @@ class TestPreEntryVegaGate:
         # Non-empty chain
         import pandas as pd
         hedger._get_options_chain = MagicMock(return_value=pd.DataFrame({"x": [1]}))
+        # Phase 3.2: scan_and_propose now slices chain to primary expiry.
+        # These tests stub the chain with sentinel data, so bypass the
+        # slice (identity passthrough) — they don't exercise multi-expiry
+        # behaviour and the sentinel has no "expiry" column.
+        hedger._primary_expiry_slice = lambda c: c
         hedger._compute_iv_percentile = MagicMock(return_value=50.0)
         hedger._apply_risk_filters = lambda props, spot: props
         hedger._proposals_to_contracts = MagicMock(return_value=[MagicMock()])
@@ -1022,6 +1027,11 @@ class TestMCSizingSubLotGate:
         hedger._get_spot_price = MagicMock(return_value=22000.0)
         import pandas as pd
         hedger._get_options_chain = MagicMock(return_value=pd.DataFrame({"x": [1]}))
+        # Phase 3.2: scan_and_propose now slices chain to primary expiry.
+        # These tests stub the chain with sentinel data, so bypass the
+        # slice (identity passthrough) — they don't exercise multi-expiry
+        # behaviour and the sentinel has no "expiry" column.
+        hedger._primary_expiry_slice = lambda c: c
         hedger._compute_iv_percentile = MagicMock(return_value=50.0)
         hedger._apply_risk_filters = lambda props, spot: props
         hedger._proposals_to_contracts = MagicMock(return_value=[MagicMock()])
@@ -1304,6 +1314,11 @@ class TestRVIVGate:
         hedger._get_spot_price = MagicMock(return_value=22000.0)
         import pandas as pd
         hedger._get_options_chain = MagicMock(return_value=pd.DataFrame({"x": [1]}))
+        # Phase 3.2: scan_and_propose now slices chain to primary expiry.
+        # These tests stub the chain with sentinel data, so bypass the
+        # slice (identity passthrough) — they don't exercise multi-expiry
+        # behaviour and the sentinel has no "expiry" column.
+        hedger._primary_expiry_slice = lambda c: c
         # We control IV via _atm_iv_history directly; stub percentile to mid.
         hedger._compute_iv_percentile = MagicMock(return_value=50.0)
         hedger._apply_risk_filters = lambda props, spot: props
@@ -2451,3 +2466,134 @@ class TestLayeredStructures:
             quantity=1, entry_price=320, current_price=320, iv=0.15,
         ))
         assert h._count_active_structures() == 2
+
+
+class TestTwoExpiryChain:
+    """Phase 3.2 unblock: `_get_options_chain` returns rows from up to
+    two expiries so `propose_calendar_short_front` can fire. Primary
+    expiry (best ATM coverage) rows are first and marked in attrs.
+    Single-expiry callers filter via `_primary_expiry_slice`."""
+
+    def _make_instruments(self, *, dense_expiry, sparse_expiry, spot=22000):
+        """Build a fake NFO instrument dump.
+        `dense_expiry` has 9 strikes ±4% of spot (best ATM coverage);
+        `sparse_expiry` has 3 strikes ±2% (less coverage).
+        Both have ATM CE+PE pairs so `has_atm_pair` is True for both.
+        """
+        rows = []
+        dense_strikes = [spot - 4*100, spot - 3*100, spot - 2*100, spot - 100,
+                         spot, spot + 100, spot + 2*100, spot + 3*100, spot + 4*100]
+        for s in dense_strikes:
+            for ot in ("CE", "PE"):
+                rows.append({
+                    "name": "NIFTY", "tradingsymbol": f"NIFTY_{dense_expiry}_{int(s)}{ot}",
+                    "instrument_token": hash((dense_expiry, s, ot)) % 100000,
+                    "strike": float(s), "expiry": dense_expiry,
+                    "instrument_type": ot, "lot_size": 25,
+                })
+        sparse_strikes = [spot - 100, spot, spot + 100]
+        for s in sparse_strikes:
+            for ot in ("CE", "PE"):
+                rows.append({
+                    "name": "NIFTY", "tradingsymbol": f"NIFTY_{sparse_expiry}_{int(s)}{ot}",
+                    "instrument_token": hash((sparse_expiry, s, ot)) % 100000,
+                    "strike": float(s), "expiry": sparse_expiry,
+                    "instrument_type": ot, "lot_size": 25,
+                })
+        return rows
+
+    def _make_hedger(self, instruments, spot=22000):
+        kite = MagicMock()
+        kite.instruments.return_value = instruments
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = kite
+        h.underlying = "NIFTY"
+        h._get_spot_price = MagicMock(return_value=spot)
+        h._consecutive_chain_failures = 0
+        return h
+
+    def test_returns_union_of_two_expiries_with_primary_first(self):
+        # Sparse expiry is the NEAREST (front), dense is the next.
+        # Primary should be the dense one (best ATM coverage), and its
+        # rows should come first in the returned DataFrame.
+        instruments = self._make_instruments(
+            dense_expiry="2026-05-29", sparse_expiry="2026-05-22",
+        )
+        h = self._make_hedger(instruments)
+        chain = h._get_options_chain()
+        assert not chain.empty
+        expiries_seen = chain["expiry"].unique().tolist()
+        assert "2026-05-22" in expiries_seen and "2026-05-29" in expiries_seen, (
+            f"chain must span both expiries; got {expiries_seen}"
+        )
+        # Primary = dense (best ATM coverage)
+        assert chain.attrs.get("primary_expiry") == "2026-05-29"
+        # Primary rows ordered first
+        assert chain.iloc[0]["expiry"] == "2026-05-29"
+
+    def test_primary_expiry_slice_returns_only_primary(self):
+        instruments = self._make_instruments(
+            dense_expiry="2026-05-29", sparse_expiry="2026-05-22",
+        )
+        h = self._make_hedger(instruments)
+        chain = h._get_options_chain()
+        primary = h._primary_expiry_slice(chain)
+        assert primary["expiry"].unique().tolist() == ["2026-05-29"]
+        # Dense expiry has 9 strikes × 2 types = 18 rows
+        assert len(primary) == 18
+
+    def test_primary_slice_falls_back_when_attrs_stripped(self):
+        # pandas does not preserve `.attrs` through all DataFrame ops;
+        # the helper must fall back to first-row expiry.
+        instruments = self._make_instruments(
+            dense_expiry="2026-05-29", sparse_expiry="2026-05-22",
+        )
+        h = self._make_hedger(instruments)
+        chain = h._get_options_chain()
+        chain_stripped = chain.copy()
+        chain_stripped.attrs = {}  # simulate operation that drops attrs
+        primary = h._primary_expiry_slice(chain_stripped)
+        # First row is primary (dense_expiry) by sort order
+        assert primary["expiry"].unique().tolist() == ["2026-05-29"]
+
+    def test_returns_single_expiry_when_only_one_available(self):
+        # Backward compat: if instruments dump has only one expiry,
+        # chain should still be non-empty and primary points at it.
+        instruments = self._make_instruments(
+            dense_expiry="2026-05-29", sparse_expiry="2026-05-29",
+        )
+        # De-dup tradingsymbol so we don't have duplicate rows in the chain
+        seen = set()
+        dedup = []
+        for r in instruments:
+            key = (r["expiry"], r["strike"], r["instrument_type"])
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(r)
+        h = self._make_hedger(dedup)
+        chain = h._get_options_chain()
+        assert chain["expiry"].unique().tolist() == ["2026-05-29"]
+        assert chain.attrs.get("primary_expiry") == "2026-05-29"
+
+    def test_empty_when_no_spot(self):
+        instruments = self._make_instruments(
+            dense_expiry="2026-05-29", sparse_expiry="2026-05-22",
+        )
+        h = self._make_hedger(instruments, spot=0)
+        h._get_spot_price = MagicMock(return_value=0)
+        assert h._get_options_chain().empty
+
+    def test_empty_when_kite_fails(self):
+        instruments = self._make_instruments(
+            dense_expiry="2026-05-29", sparse_expiry="2026-05-22",
+        )
+        h = self._make_hedger(instruments)
+        h.kite.instruments.side_effect = RuntimeError("boom")
+        assert h._get_options_chain().empty
+        assert h._consecutive_chain_failures == 1
+
+    def test_primary_slice_on_empty_returns_empty(self):
+        import pandas as pd
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        assert h._primary_expiry_slice(pd.DataFrame()).empty

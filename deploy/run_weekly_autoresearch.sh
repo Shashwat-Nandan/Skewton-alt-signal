@@ -28,15 +28,14 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo "Underlying:    $UNDERLYING"
   echo
 
-  echo "[1/3] Fetching last $DAYS days of $UNDERLYING data via Kite..."
-  "$PY" fetch_historical_data.py --days "$DAYS" --underlying "$UNDERLYING"
-
-  DATA_CSV="$(ls -t data_cache/${UNDERLYING}_*.csv 2>/dev/null | head -1 || true)"
-  if [[ -z "$DATA_CSV" ]]; then
-    echo "ERROR: no data_cache/${UNDERLYING}_*.csv produced — aborting." >&2
-    exit 1
-  fi
-  echo "    Using: $DATA_CSV"
+  echo "[1/3] Fetching last $DAYS days of $UNDERLYING daily bars via Kite..."
+  echo "    (kept as a freshness pre-flight; the autoresearch loop now"
+  echo "     prefers captured tape — see Phase 2.3 of the 2026-05-23 uplift)."
+  # Non-fatal: tape replay does not need this CSV. If Kite auth has
+  # expired or the API rate-limits, the autoresearch step below still
+  # runs against captured tape.
+  "$PY" fetch_historical_data.py --days "$DAYS" --underlying "$UNDERLYING" || \
+      echo "    WARN: fetch failed; autoresearch will still run on tape."
   echo
 
   # Preserve any existing best_params.json so this run cannot overwrite it.
@@ -44,9 +43,13 @@ PY="$PROJECT_DIR/.venv/bin/python"
     cp -p best_params.json "best_params.preautoresearch.$TODAY.json"
   fi
 
-  echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, hold-out split)..."
+  # 2026-05-27: drop --data so run_autoresearch.py:198 takes the
+  # captured-tape replay path. The CSV-based path bypassed Phase 2.3
+  # and replayed daily bars (12 ticks/day), which can't exercise the
+  # gamma_theta_ratio metric the uplift was designed for. Tape sessions
+  # live in data_cache/ticks/ticks-*.jsonl.
+  echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, captured-tape replay)..."
   "$PY" run_autoresearch.py \
-      --data "$DATA_CSV" \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
       --metric sharpe_ratio \

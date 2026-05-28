@@ -4,7 +4,9 @@ tick_capture.py — Append-only KiteTicker capture for trigger-fair-value resear
 Subscribes via KiteTicker WebSocket to, for each requested underlying:
   - Index spot (NIFTY 50 / NIFTY BANK)
   - Earliest-expiry futures
-  - Current-week options, ±5 strikes × {CE, PE} around live spot
+  - Two nearest expiries, ±5 strikes × {CE, PE} around live spot
+    (front for the straddle path, back so the calendar builder can
+    fire under tape replay — see Phase 3.2 of the 2026-05-23 uplift)
 
 Default is NIFTY only. Pass --underlyings NIFTY,BANKNIFTY to also capture
 BANKNIFTY (~24 extra tokens; 4.3× finer hedge granularity for the gamma
@@ -57,7 +59,11 @@ def setup_logging(today):
 def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
     """Return (subscribe_tokens, token_to_symbol_map) for one underlying.
     Picks index spot, the earliest-expiry future, and ±5 strikes × {CE, PE}
-    of the current-week options around live spot at the moment of resolution.
+    of the **two nearest expiries** around live spot at the moment of
+    resolution. Capturing two expiries is required for the calendar
+    builder to fire under tape replay (Phase 3.2 of the 2026-05-23
+    profitability uplift) — front-only tape can only exercise the
+    legacy straddle path.
 
     `nfo_cache` is the NFO instrument list — pass it in when resolving multiple
     underlyings so we don't re-fetch the (large) master per underlying."""
@@ -94,8 +100,11 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
             and i["expiry"] >= today]
     if not opts:
         raise RuntimeError(f"No {underlying} options contracts found in NFO master")
-    weekly_expiry = min(i["expiry"] for i in opts)
-    weekly_opts = [o for o in opts if o["expiry"] == weekly_expiry]
+    # Two nearest expiries (front = weekly, back = next available — usually
+    # the monthly). If only one expiry is listed, fall back to single-expiry
+    # capture rather than aborting; calendar regime will degrade gracefully.
+    expiries_sorted = sorted({i["expiry"] for i in opts})
+    selected_expiries = expiries_sorted[:2]
 
     spot_key = f"NSE:{spot_symbol}"
     spot_ltp = kite.quote([spot_key])[spot_key]["last_price"]
@@ -103,8 +112,9 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
     strike_set = {atm + strike_step * k
                   for k in range(-STRIKES_EACH_SIDE, STRIKES_EACH_SIDE + 1)}
     selected = sorted(
-        (o for o in weekly_opts if o["strike"] in strike_set),
-        key=lambda o: (o["strike"], o["instrument_type"]),
+        (o for o in opts
+         if o["expiry"] in selected_expiries and o["strike"] in strike_set),
+        key=lambda o: (o["expiry"], o["strike"], o["instrument_type"]),
     )
 
     token_to_symbol = {spot_token: spot_symbol,
@@ -116,9 +126,9 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
 
     log.info(
         "[%s] Resolved %d instruments: spot=%s, fut=%s (exp %s), %d options "
-        "exp=%s ATM=%d strikes=%s",
+        "expiries=%s ATM=%d strikes=%s",
         underlying, len(tokens), spot_symbol, fut["tradingsymbol"], fut["expiry"],
-        len(selected), weekly_expiry, atm,
+        len(selected), selected_expiries, atm,
         sorted({o["strike"] for o in selected}),
     )
     return tokens, token_to_symbol
