@@ -41,9 +41,19 @@ from trade_proposer import TradeProposal
 from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
 
 try:  # kiteconnect is the live broker; tests run without it installed
-    from kiteconnect.exceptions import TokenException as _TokenException
+    from kiteconnect.exceptions import (
+        TokenException as _TokenException,
+        NetworkException as _NetworkException,
+        OrderException as _OrderException,
+    )
 except Exception:  # pragma: no cover
     class _TokenException(Exception):  # type: ignore[no-redef]
+        pass
+
+    class _NetworkException(Exception):  # type: ignore[no-redef]
+        pass
+
+    class _OrderException(Exception):  # type: ignore[no-redef]
         pass
 
 logger = logging.getLogger(__name__)
@@ -252,6 +262,12 @@ class PairTradingStrategy(BaseStrategy):
         # mean-reversion meaningfully. STOP is intentionally not
         # debounced — runaway moves should exit on first signal.
         self.exit_debounce_ticks = max(1, int(cfg.get("exit_debounce_ticks", 2)))
+        # M-B2: paper-mode one-way slippage in basis points. Pre-fix,
+        # paper filled at exact LTP; live crosses the bid/ask. Default
+        # 5bp ≈ typical NIFTY-50 STF half-spread (1-1.5bp top-of-book
+        # plus some intraday widening). Set to 0 to disable. Live
+        # ignores this — real fills cross the real spread.
+        self.paper_slippage_bps = float(cfg.get("paper_slippage_bps", 5.0))
         # Cost-hurdle: refuse entries whose expected ₹ move from current z back
         # to the exit band is below `min_edge_multiplier × round_trip_cost`.
         # 2026-05-13 paper session ate ~₹39k in friction across 28 round-trips
@@ -328,6 +344,14 @@ class PairTradingStrategy(BaseStrategy):
         # the full session and reloading per tick would re-parse the file
         # ~360 times.
         self._holidays_cache: Optional[set] = None
+        # M-B5: consecutive-failure backoff for place_order. After
+        # `place_order_fail_threshold` consecutive non-COMPLETE returns,
+        # _live_execute short-circuits to FAILED for `skip_ticks_left`
+        # ticks (doubling per re-trigger up to a cap) so a known-broken
+        # account doesn't burn 360 retries × 6h. Reset on any COMPLETE.
+        self._place_order_fail_streak = 0
+        self._place_order_skip_ticks_left = 0
+        self._place_order_skip_window = 5  # next breach skips 5 ticks
         # Session-start P&L snapshot — re-captured if/when restore_state runs.
         # Lets generate_eod_report() emit per-session delta fields even when
         # state is carried across sessions by the runner.
@@ -478,6 +502,12 @@ class PairTradingStrategy(BaseStrategy):
             result = (self._paper_execute(prop) if self.is_paper_mode
                       else self._live_execute(prop))
             results.append(result)
+            # M-B5: track consecutive place_order failures in live mode so
+            # a known-broken account doesn't burn ~360 retries × 6h. Only
+            # arm/clear on the live path; paper mode shouldn't gate live
+            # exposure.
+            if not self.is_paper_mode:
+                self._track_place_order_outcome(result)
             if result.get("status") != "COMPLETE":
                 logger.warning(
                     "Order not COMPLETE for %s: status=%s error=%s",
@@ -899,6 +929,30 @@ class PairTradingStrategy(BaseStrategy):
         fut_b = self._resolve_futures(self.symbol_b)
         if not (fut_a and fut_b):
             return []
+
+        # M-B3: refuse new entries when either leg's expiry == today. The
+        # `_exp_date(r) >= today` filter in _resolve_futures returns the
+        # contract settling at 15:30 on expiry day, so a 14:00 entry on
+        # that contract is a same-day exit by construction (and loses
+        # the round-trip cost). Exits on existing held positions are
+        # unaffected — they target the leg's stored tradingsymbol, not
+        # today's front-month.
+        today = self._clock().date()
+        for fut in (fut_a, fut_b):
+            exp = fut.get("expiry")
+            try:
+                exp_date = (date.fromisoformat(exp) if isinstance(exp, str)
+                            else exp.date() if hasattr(exp, "date") else exp)
+            except (ValueError, AttributeError):
+                exp_date = None
+            if exp_date == today:
+                logger.warning(
+                    "%s/%s: refusing new entry — %s expires today (%s); "
+                    "would settle at 15:30 IST.",
+                    self.symbol_a, self.symbol_b,
+                    fut.get("tradingsymbol"), exp_date,
+                )
+                return []
 
         # Refuse if 1 lot of EITHER leg busts the cap — we can't size below
         # 1 lot, so the cap can't be honoured under any anchoring.
@@ -1477,16 +1531,38 @@ class PairTradingStrategy(BaseStrategy):
     # ══════════════════════════════════════════════════════════
 
     def _paper_execute(self, prop: TradeProposal) -> Dict:
+        # M-B1: apply the same validate_order gate as the live path so a
+        # NaN/garbage proposal doesn't "fill" in paper while it would
+        # reject in live. Paper-vs-live divergence here historically
+        # hid mis-priced quotes that only surfaced at cutover.
+        try:
+            validate_order(prop)
+        except OrderValidationError as e:
+            logger.error("[PAPER] Order rejected pre-submit: %s — %s", e, prop)
+            return {"order_id": None, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": f"validation: {e}", "mode": "paper"}
+        # M-B2: model spread crossing as a one-sided fill-price slip.
+        # Pre-fix, paper filled at exact LTP; live crosses the bid/ask
+        # so day-1 live P&L diverged from paper by the real spread × qty
+        # per round-trip. Apply `paper_slippage_bps / 1e4` one-way on the
+        # unfavourable side (buyer pays LTP × (1 + slip), seller hits
+        # LTP × (1 − slip)). Set paper_slippage_bps=0 in config to
+        # disable for tests that need exact fills.
+        slip = self.paper_slippage_bps / 1e4
+        fill_price = (prop.price * (1.0 + slip)
+                      if prop.transaction_type == "BUY"
+                      else prop.price * (1.0 - slip))
         logger.info(
-            "[PAPER] %s %d lots %s @ %.2f — %s",
+            "[PAPER] %s %d lots %s @ %.2f (LTP %.2f, slip %.1fbp) — %s",
             prop.transaction_type, prop.quantity, prop.tradingsymbol,
-            prop.price, prop.rationale,
+            fill_price, prop.price, self.paper_slippage_bps, prop.rationale,
         )
         return {
             "order_id": f"PAPER-{int(time.time() * 1000)}",
             "status": "COMPLETE",
             "filled_lots": prop.quantity,
-            "average_price": prop.price,
+            "average_price": fill_price,
             "mode": "paper",
         }
 
@@ -1498,6 +1574,21 @@ class PairTradingStrategy(BaseStrategy):
         # MARKET guarantees a fill (or a clear reject), the slippage is
         # already baked into the cost model, and we poll order_history to
         # confirm before booking any state change.
+        # M-B5: consecutive-failure backoff. Skip subsequent place_order
+        # attempts during the current cooldown window so a known-broken
+        # account doesn't burn ~360 retries over a 6h session.
+        if self._place_order_skip_ticks_left > 0:
+            self._place_order_skip_ticks_left -= 1
+            logger.warning(
+                "%s/%s: place_order backoff in effect (%d ticks remaining)",
+                self.symbol_a, self.symbol_b,
+                self._place_order_skip_ticks_left,
+            )
+            result = {"order_id": None, "status": "FAILED",
+                      "filled_lots": 0, "average_price": 0.0,
+                      "error": "place_order backoff (M-B5)",
+                      "mode": "live"}
+            return result
         try:
             validate_order(prop)
         except OrderValidationError as e:
@@ -1543,6 +1634,34 @@ class PairTradingStrategy(BaseStrategy):
                         "filled_lots": 0, "average_price": 0.0,
                         "error": f"place_order post-refresh: {e2}",
                         "mode": "live"}
+        except _NetworkException as e:
+            # M-B4: transient kite/network blip. Retry once with a brief
+            # delay; if the second attempt also fails, give up for this
+            # tick (C2 reversal handles any already-filled sibling).
+            logger.warning("place_order NetworkException for %s: %s — retrying once",
+                           prop.tradingsymbol, e)
+            time.sleep(1.0)
+            try:
+                order_id = _do_place()
+            except Exception as e2:
+                logger.error(
+                    "place_order NetworkException retry failed for %s: %s",
+                    prop.tradingsymbol, e2,
+                )
+                return {"order_id": None, "status": "FAILED",
+                        "filled_lots": 0, "average_price": 0.0,
+                        "error": f"place_order net-retry: {e2}",
+                        "mode": "live"}
+        except _OrderException as e:
+            # M-B4: broker-side reject (margin, validation, exchange
+            # error). Do not retry — the underlying cause is unlikely to
+            # clear within seconds and a blind retry can compound an
+            # invalid-order issue. Log and return FAILED.
+            logger.error("place_order OrderException for %s: %s",
+                         prop.tradingsymbol, e)
+            return {"order_id": None, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": f"place_order rejected: {e}", "mode": "live"}
         except Exception as e:
             logger.exception("place_order failed for %s: %s",
                              prop.tradingsymbol, e)
@@ -1627,6 +1746,40 @@ class PairTradingStrategy(BaseStrategy):
                 "filled_lots": 0, "average_price": 0.0,
                 "error": f"non-terminal after {timeout_s}s: status={final_status}",
                 "mode": "live"}
+
+    def _track_place_order_outcome(self, result: Dict) -> None:
+        # M-B5: streak-based backoff. Threshold = 3 consecutive failures
+        # arms a skip window starting at 5 ticks and doubling on each
+        # subsequent re-arm (cap 60 ticks ≈ 1h at 60s tick cadence).
+        # The "backoff" FAILED return from _live_execute decrements
+        # skip_ticks_left BEFORE returning, so a re-arm there doesn't
+        # double-count.
+        threshold = 3
+        cap = 60
+        if result.get("status") == "COMPLETE":
+            if self._place_order_fail_streak:
+                logger.info("%s/%s: place_order recovered — clearing streak",
+                            self.symbol_a, self.symbol_b)
+            self._place_order_fail_streak = 0
+            self._place_order_skip_window = 5
+            return
+        # Don't compound the streak while the cooldown is already running
+        # — that would cancel the skip window's purpose (allow time to
+        # heal). The cooldown FAILED return is already counted by its own
+        # decrement in _live_execute.
+        if self._place_order_skip_ticks_left > 0:
+            return
+        self._place_order_fail_streak += 1
+        if self._place_order_fail_streak >= threshold:
+            self._place_order_skip_ticks_left = self._place_order_skip_window
+            logger.warning(
+                "%s/%s: %d consecutive place_order failures — backing off "
+                "for %d ticks (M-B5)",
+                self.symbol_a, self.symbol_b, self._place_order_fail_streak,
+                self._place_order_skip_window,
+            )
+            self._place_order_skip_window = min(self._place_order_skip_window * 2, cap)
+            self._place_order_fail_streak = 0
 
     def _emergency_reverse_partial(self, prop: TradeProposal,
                                     filled_shares: int,

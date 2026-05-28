@@ -82,6 +82,13 @@ def _make_strategy(
     # M-S3: debounce defaults to 1 so existing single-tick exit tests
     # remain valid. Dedicated debounce tests opt in by setting >1.
     s.exit_debounce_ticks = 1
+    # M-B5: backoff counters start clean (no skip in effect).
+    s._place_order_fail_streak = 0
+    s._place_order_skip_ticks_left = 0
+    s._place_order_skip_window = 5
+    # M-B2: tests that assert exact fill prices default to 0bp slip;
+    # dedicated slippage tests opt in by setting paper_slippage_bps.
+    s.paper_slippage_bps = 0.0
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
     s._cached_futures = {
@@ -689,6 +696,179 @@ class TestStrategyMediums:
         s._set_position_from_legs()
         assert s.state.realized_at_entry == 1000.0
         assert s.state.tx_costs_at_entry == 200.0
+
+
+class TestBrokerMediums:
+    """M-B1..M-B5 — paper validate, paper slippage, expiry-day refusal,
+    kite-exception specificity, place_order backoff."""
+
+    def _live_strategy(self):
+        s = _make_strategy(mode="live")
+        s.kite.VARIETY_REGULAR = "regular"
+        s.kite.TRANSACTION_TYPE_BUY = "BUY"
+        s.kite.TRANSACTION_TYPE_SELL = "SELL"
+        s.kite.PRODUCT_NRML = "NRML"
+        s.kite.ORDER_TYPE_MARKET = "MARKET"
+        s.kite.VALIDITY_DAY = "DAY"
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000_000.0}},
+        })
+        return s
+
+    def _prop(self, qty=1, txn="BUY", price=1000.0,
+              tradingsymbol="AAA26APRFUT", expiry="2026-04-28"):
+        return TradeProposal(
+            tradingsymbol=tradingsymbol, instrument_token=111, strike=0,
+            expiry=expiry, option_type="FUT", lot_size=100,
+            quantity=qty, price=price, transaction_type=txn,
+            iv=0, bid_ask_spread_pct=0.0, margin_required=20000,
+            rationale="entry",
+        )
+
+    # M-B1: paper applies validate_order
+    def test_paper_rejects_nan_price(self):
+        s = _make_strategy(mode="paper")
+        prop = self._prop(price=float("nan"))
+        result = s._paper_execute(prop)
+        assert result["status"] == "FAILED"
+        assert "validation" in result["error"]
+
+    # M-B2: paper slip is applied per direction
+    def test_paper_buy_pays_above_ltp_with_slip(self):
+        s = _make_strategy(mode="paper")
+        s.paper_slippage_bps = 10.0  # 10bp = 0.10%
+        result = s._paper_execute(self._prop(txn="BUY", price=1000.0))
+        # 1000 * (1 + 0.001) = 1001.0
+        assert abs(result["average_price"] - 1001.0) < 1e-6
+
+    def test_paper_sell_hits_below_ltp_with_slip(self):
+        s = _make_strategy(mode="paper")
+        s.paper_slippage_bps = 10.0
+        result = s._paper_execute(self._prop(txn="SELL", price=2000.0))
+        # 2000 * (1 - 0.001) = 1998.0
+        assert abs(result["average_price"] - 1998.0) < 1e-6
+
+    def test_paper_zero_slip_matches_ltp(self):
+        s = _make_strategy(mode="paper")
+        s.paper_slippage_bps = 0.0
+        result = s._paper_execute(self._prop(price=1234.5))
+        assert result["average_price"] == 1234.5
+
+    # M-B3: expiry-day refuse
+    def test_refuses_entry_when_expiry_is_today(self):
+        from datetime import datetime as dt
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, exit_z=0.5,
+                           max_leg_notional=2_000_000.0, lots_per_leg=1)
+        # Pin clock to 2026-04-28
+        s._clock = lambda: dt(2026, 4, 28, 14, 0)
+        # Both legs' cached expiry = today
+        s._cached_futures = {
+            "AAA": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
+                    "expiry": "2026-04-28", "instrument_token": 111},
+            "BBB": {"tradingsymbol": "BBB26APRFUT", "lot_size": 200,
+                    "expiry": "2026-04-28", "instrument_token": 222},
+        }
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 2010.0}}
+        )
+        proposals = s.scan_and_propose()
+        assert proposals == []
+
+    def test_allows_entry_when_expiry_is_not_today(self):
+        from datetime import datetime as dt
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, exit_z=0.5,
+                           max_leg_notional=2_000_000.0, lots_per_leg=1,
+                           min_edge_multiplier=0.0)
+        s._clock = lambda: dt(2026, 4, 21, 14, 0)
+        # Expiry next week
+        s._cached_futures = {
+            "AAA": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
+                    "expiry": "2026-04-28", "instrument_token": 111},
+            "BBB": {"tradingsymbol": "BBB26APRFUT", "lot_size": 200,
+                    "expiry": "2026-04-28", "instrument_token": 222},
+        }
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 2010.0}}
+        )
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+
+    # M-B4: distinguish exception classes
+    def test_network_exception_retries_once(self):
+        from strategies.pair_trading import _NetworkException
+        s = self._live_strategy()
+        calls = {"n": 0}
+
+        def fake_place(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _NetworkException("transient")
+            return "ORD-RETRY"
+
+        s.kite.place_order = fake_place
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals([self._prop()])
+        assert calls["n"] == 2  # original + retry
+        assert len(s.state.legs) == 1
+
+    def test_order_exception_does_not_retry(self):
+        from strategies.pair_trading import _OrderException
+        s = self._live_strategy()
+        calls = {"n": 0}
+
+        def fake_place(*a, **kw):
+            calls["n"] += 1
+            raise _OrderException("margin shortfall")
+
+        s.kite.place_order = fake_place
+        s.execute_proposals([self._prop()])
+        # Broker-side reject: no retry, single call
+        assert calls["n"] == 1
+        assert s.state.legs == []
+
+    # M-B5: place_order backoff
+    def test_consecutive_failures_arm_backoff(self):
+        s = self._live_strategy()
+        # Force 3 consecutive non-COMPLETE results
+        s.kite.place_order = MagicMock(side_effect=RuntimeError("broken"))
+        for _ in range(3):
+            s.execute_proposals([self._prop()])
+        assert s._place_order_skip_ticks_left == 5
+        # 4th call: backoff short-circuits BEFORE place_order is hit
+        call_count_before = s.kite.place_order.call_count
+        s.execute_proposals([self._prop()])
+        assert s.kite.place_order.call_count == call_count_before
+
+    def test_backoff_clears_on_complete(self):
+        s = self._live_strategy()
+        # Two failures, then success
+        seq = [
+            RuntimeError("broken"),
+            RuntimeError("broken"),
+            "ORD-OK",
+        ]
+
+        def fake_place(*a, **kw):
+            v = seq.pop(0)
+            if isinstance(v, Exception):
+                raise v
+            return v
+
+        s.kite.place_order = fake_place
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        for _ in range(3):
+            s.execute_proposals([self._prop()])
+        # COMPLETE on the 3rd attempt clears the streak (it was only 2)
+        assert s._place_order_fail_streak == 0
+        assert s._place_order_skip_ticks_left == 0
 
 
 class TestBookNotionalCap:
