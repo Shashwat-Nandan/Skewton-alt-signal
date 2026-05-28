@@ -233,6 +233,17 @@ class TradeProposer:
                 }
         return best
 
+    # NSE SPAN+ELM for a naked short NIFTY option is typically 12-15% of
+    # underlying notional (= strike × lot_size × qty). The old
+    # `margin_required = price × lot × qty` formula was right for longs
+    # (cash outlay = premium) but wrong for shorts: it treated premium
+    # as posted margin when in reality SPAN is far larger than premium
+    # for OTM shorts. 0.15 is the conservative end of the SPAN+ELM band,
+    # erring toward the 30% portfolio cap rejecting rather than admitting
+    # an over-leveraged book. Compare strategies/pair_trading.py and
+    # strategies/arbitrage.py which use 0.20 for FUT notional.
+    _SHORT_OPTION_MARGIN_PCT = 0.15
+
     def _build_proposal(
         self, row, price, iv, quantity, transaction_type, rationale,
         quote=None,
@@ -241,10 +252,20 @@ class TradeProposer:
         Shared by every builder so the boilerplate doesn't repeat."""
         lot_size = int(row["lot_size"])
         spread = self._compute_spread(quote) if quote else 0.0
+        strike = float(row["strike"])
+        if transaction_type == "BUY":
+            margin_required = price * lot_size * quantity
+        else:
+            # Short option: SPAN+ELM ≈ 15% of strike-notional. Use max with
+            # 2× premium as a floor for deep-ITM shorts where premium can
+            # exceed the notional-percentage estimate.
+            notional_margin = strike * lot_size * quantity * self._SHORT_OPTION_MARGIN_PCT
+            premium_floor = 2.0 * price * lot_size * quantity
+            margin_required = max(notional_margin, premium_floor)
         return TradeProposal(
             tradingsymbol=row["tradingsymbol"],
             instrument_token=int(row["instrument_token"]),
-            strike=float(row["strike"]),
+            strike=strike,
             expiry=str(row["expiry"]),
             option_type=row["instrument_type"],
             lot_size=lot_size,
@@ -253,7 +274,7 @@ class TradeProposer:
             transaction_type=transaction_type,
             iv=iv,
             bid_ask_spread_pct=spread,
-            margin_required=price * lot_size * quantity,
+            margin_required=margin_required,
             rationale=rationale,
         )
 
@@ -426,16 +447,26 @@ class TradeProposer:
             return []
 
         lot_size = int(atm_short["row"]["lot_size"])
-        # Cost = 2 × OTM_long_price - 1 × ATM_short_price (per lot pair).
-        # For a true backspread the OTM longs are paid for by the ATM
-        # short; this is a net credit if the trade is structured well.
-        # We size against capital so worst-case max loss (the area
-        # between strikes minus credit received) stays bounded.
-        per_unit_cost = max(
-            2 * otm_long["price"] - atm_short["price"], 1.0,
-        ) * lot_size
+        # Size against max-loss-at-expiry, which occurs when the underlying
+        # pins at the OTM strike: the ATM short is ITM by (OTM - ATM) and
+        # the OTM longs expire worthless. Entry net credit (+) or debit (−)
+        # offsets that. Max loss per (1×ATM short, 2×OTM long) unit:
+        #     max_loss = (OTM_strike − ATM_strike) − (ATM_price − 2·OTM_price)
+        # The old "per_unit_cost = max(2·OTM − ATM, 1.0)" sizing was
+        # meaningless for a properly-built (net-credit) backspread —
+        # it clamped to 1.0 and blew max_lots to hundreds of lots.
+        strike_width = float(otm_long["row"]["strike"]) - float(atm_short["row"]["strike"])
+        net_credit = atm_short["price"] - 2 * otm_long["price"]
+        max_loss_per_unit = (strike_width - net_credit) * lot_size
+        if max_loss_per_unit <= 0:
+            logger.warning(
+                "Backspread: non-positive max loss (width=%.0f credit=%.2f) — "
+                "structure is free money or pricing is off; skipping",
+                strike_width, net_credit,
+            )
+            return []
         risk_capital = capital * position_size_pct / 100.0
-        max_lots = max(int(risk_capital / per_unit_cost), 1)
+        max_lots = max(int(risk_capital / max_loss_per_unit), 1)
 
         return [
             self._build_proposal(
