@@ -86,6 +86,17 @@ Closed Highs (2026-05-27 "defensive runner-startup + expiry-day guard" worklist)
         (H18 applies to both legs_expire_on implementations per Rule 7 — same policy, same shape)
 ```
 
+Closed Highs (2026-05-28 "remaining Highs sweep"):
+```
+H6  pair_trading: max_holding_days counts NSE trading days (skips weekends + holidays.csv)
+H7  pair_trading: refuse ANY partial fill (incl. lot-boundary), not just sub-lot
+H8  pair_trading: TokenException-specific catch + one-shot kite_refresh on place_order/quote/margins
+H12 run_paper_pairs: --lots-per-leg >5 requires --ack-large-size; >2× notional clamp logs WARNING
+H13 pair_trading + runner: cross-runner total-book notional cap (--max-book-notional-inr)
+H15 pair_trading: kite.margins() pre-check before live entry batches
+H17 run_paper_pairs: LEG_CONCENTRATION_CAP seeded from sibling pair-runner state files
+```
+
 The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 - **High**: will lose money or block trading under a common failure mode
 - **Medium**: degrades reliability or observability; unlikely to lose money directly
@@ -95,54 +106,9 @@ The remaining Highs and Mediums below are open. Severity uses the audit rubric:
 
 ## Highs
 
-### H6 — `max_holding_days` is calendar days, not trading days
-**Go-live blocker:** No (cosmetic vs backtest; doesn't lose money)
-**Source:** strategy audit
-**Risk:** Weekend/holiday gaps compress effective hold. Backtests over weekdays diverge from live by 1-3 days per held position.
-**Fix sketch:** count weekday transitions excluding `holidays.csv` between `entry_time` and `now`.
-**Effort:** ~30 min.
-
-### H7 — Partial-fill handling
-**Go-live blocker:** No (current code marks partial as FAILED, then triggers reversal of the other leg — safe but loses the entry opportunity)
-**Source:** broker + strategy audits
-**Risk:** Real partial fills on liquid NIFTY-50 STFs are uncommon for 1-2 lot MARKET orders, but possible. C1 fix refuses partial fills (treats as FAILED). The full fix is to handle partial fills gracefully: book the partial, reissue or accept residual.
-**Fix sketch:** track `filled_lots` from each `_apply_fill` separately from `prop.quantity`; if partial, log + either re-issue residual or accept partial position.
-**Effort:** ~2 hr including tests.
-
-### H8 — TokenException catch + mid-session re-auth
-**Go-live blocker:** No (mitigated: token expires ~06:00 IST, session runs 09:15-15:25, so within-session expiry only if process started yesterday)
-**Source:** broker audit
-**Risk:** `except Exception` in `_live_execute`/`_get_last_price` swallows `kiteconnect.exceptions.TokenException`. Token expiry mid-session → silent no-trade.
-**Fix sketch:** specific `except TokenException` branch calling `auth.get_kite()` to refresh, retry once. Log CRITICAL + alert on second failure.
-**Effort:** ~1 hr.
-
-### H12 — `--lots-per-leg` no hard cap
-**Go-live blocker:** No (pre-flight calls for `--lots-per-leg 1`)
-**Source:** risk audit
-**Risk:** Operator typo: `--lots-per-leg 100`. Notional cap clamps silently → trade is smaller than intended. Or if notional cap doesn't bite (low-price legs), real ₹50M deployed.
-**Fix sketch:** `--lots-per-leg` >5 requires `--ack-large-size`. When notional clamps lots down by >2×, log WARNING.
-**Effort:** ~30 min.
-
-### H13 — No total-book exposure cap across runners + orphans
-**Go-live blocker:** No (mitigated by `--top 1` cutover-week sizing)
-**Source:** risk audit
-**Risk:** Orphan count accumulates over weeks; total deployed notional grows monotonically until pairs naturally exit.
-**Fix sketch:** track `Σ open_notional` across all active strategies; refuse new entries when above `--max-book-notional-inr`.
-**Effort:** ~45 min.
-
-### H15 — `kite.margins()` pre-check
-**Go-live blocker:** No (mitigated by C2 entry-batch reversal — but reactive, not preventive)
-**Source:** risk audit
-**Risk:** Multi-leg entry where leg-B rejects on margin: C2 reverses leg-A, but the round-trip cost (~₹3k) is loss.
-**Fix sketch:** before placing leg-A, call `kite.margins()["equity"]["available"]["live_balance"]` and compare against estimated SPAN. Skip pair if insufficient.
-**Effort:** ~45 min.
-
-### H17 — Cross-runner concentration cap
-**Go-live blocker:** No (pre-flight: only one runner live)
-**Source:** risk audit
-**Risk:** baseline + persistent runners both running live could 2× per-symbol concentration (`LEG_CONCENTRATION_CAP=2` is intra-runner only).
-**Fix sketch:** shared state file or cross-runner lock; for now, disable one timer during cutover (documented in pre-flight).
-**Effort:** ~2 hr.
+All open Highs (H6, H7, H8, H12, H13, H15, H17) were closed in the
+2026-05-28 sweep — see the "Closed Highs" block above for the per-item
+commit/landing notes.
 
 ---
 

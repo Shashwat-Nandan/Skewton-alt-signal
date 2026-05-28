@@ -121,6 +121,40 @@ QUALITY_MAX_PVALUE = 0.025
 # driving multiple positions' P&L in the same direction.
 LEG_CONCENTRATION_CAP = 2
 
+
+def load_cross_runner_leg_counts(own_state_path: Optional[Path],
+                                  data_cache: Path = DATA_CACHE
+                                  ) -> dict[str, int]:
+    # H17: read sibling pair-runner state files and count each symbol's
+    # appearances across pairs that currently hold an open position. The
+    # caller's own state file is excluded so the per-runner selection walk
+    # doesn't double-count its own held pairs (which are already preserved
+    # via restore_matching_strategies + orphans).
+    counts: dict[str, int] = {}
+    if not data_cache.exists():
+        return counts
+    own = own_state_path.resolve() if own_state_path else None
+    for jp in data_cache.glob("pair_paper_state_*.json"):
+        try:
+            if own and jp.resolve() == own:
+                continue
+        except OSError:
+            continue
+        try:
+            import json as _json
+            blob = _json.loads(jp.read_text())
+        except Exception:
+            continue
+        for pair in blob.get("pairs", []) or []:
+            state = pair.get("state") or {}
+            if not state.get("legs"):
+                continue
+            sym_pair = pair.get("pair") or []
+            for sym in sym_pair[:2]:
+                if sym:
+                    counts[sym] = counts.get(sym, 0) + 1
+    return counts
+
 # --max-csv-age-days defaults. Paper/signals can tolerate a slightly stale
 # weekly screen because nothing real moves; live cannot — 6-day-old hedge
 # ratios are an implicit directional exposure on each leg (H10).
@@ -240,6 +274,7 @@ def classify_pair_candidates(
     *,
     exclude_symbols: set[str] | None = None,
     max_hedge_ratio: float | None = None,
+    seed_leg_count: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """Annotate every candidate row with its disposition under the four-pass
     runner logic (see `select_pairs` docstring for the passes themselves).
@@ -347,7 +382,10 @@ def classify_pair_candidates(
     )
 
     admitted_count = 0
-    leg_count: dict[str, int] = {}
+    # H17: seed with cross-runner counts so two runners (baseline + persistent)
+    # can't each independently admit the same symbol up to the per-runner cap
+    # and end up with 2× per-symbol exposure overall.
+    leg_count: dict[str, int] = dict(seed_leg_count or {})
     for idx in walk_order:
         if admitted_count >= top:
             out.loc[idx, "skip_reason"] = "cutoff"
@@ -371,7 +409,9 @@ def classify_pair_candidates(
 
 def select_pairs(top: int, log: logging.Logger,
                  candidates_path: Path = CANDIDATES_PATH,
-                 max_age_days: float = 7.0) -> pd.DataFrame:
+                 max_age_days: float = 7.0,
+                 *,
+                 seed_leg_count: dict[str, int] | None = None) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
       1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
@@ -410,7 +450,10 @@ def select_pairs(top: int, log: logging.Logger,
         log.info("Candidates CSV age: %.1fd (mtime %s)",
                  age_days, mtime.strftime("%Y-%m-%d %H:%M"))
 
-    annotated = classify_pair_candidates(pd.read_csv(candidates_path), top, log)
+    annotated = classify_pair_candidates(
+        pd.read_csv(candidates_path), top, log,
+        seed_leg_count=seed_leg_count,
+    )
     picks = (
         annotated[annotated["processing_rank"].notna()]
         .sort_values("processing_rank")
@@ -432,6 +475,9 @@ def select_pairs(top: int, log: logging.Logger,
 def build_strategies(
     pairs: pd.DataFrame, args, kite, config_path: str, log: logging.Logger,
     *, nfo_instruments: Optional[List[dict]] = None,
+    kite_refresh=None,
+    book_notional_fn=None,
+    max_book_notional: float = 0.0,
 ):
     from strategies.pair_trading import PairTradingStrategy
 
@@ -447,7 +493,11 @@ def build_strategies(
                 symbol_b=b,
                 hedge_ratio=beta,
                 nfo_instruments=nfo_instruments,
+                kite_refresh=kite_refresh,
+                book_notional_fn=book_notional_fn,
             )
+            if max_book_notional > 0:
+                s.max_book_notional = max_book_notional
         except Exception as e:
             log.exception("Could not init %s/%s: %s — skipping", a, b, e)
             continue
@@ -917,6 +967,9 @@ def build_orphan_strategies(
     prior_state: Dict[str, Dict], matched_keys: set,
     args, kite, config_path: str, log: logging.Logger,
     *, nfo_instruments: Optional[List[dict]] = None,
+    kite_refresh=None,
+    book_notional_fn=None,
+    max_book_notional: float = 0.0,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -942,7 +995,11 @@ def build_orphan_strategies(
                 kite=kite, config_path=config_path, mode=args.mode,
                 symbol_a=sa, symbol_b=sb, hedge_ratio=saved_beta,
                 nfo_instruments=nfo_instruments,
+                kite_refresh=kite_refresh,
+                book_notional_fn=book_notional_fn,
             )
+            if max_book_notional > 0:
+                s.max_book_notional = max_book_notional
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z
@@ -1081,6 +1138,12 @@ def main():
     parser.add_argument("--lookback", type=int, default=60, dest="lookback_days")
     parser.add_argument("--max-hold", type=int, default=7, dest="max_holding_days")
     parser.add_argument("--lots-per-leg", type=int, default=1)
+    parser.add_argument("--ack-large-size", action="store_true",
+                        help="H12: explicit acknowledgement required when "
+                             "--lots-per-leg > 5. Pre-flight tip: cutover-week "
+                             "sizing is --lots-per-leg 1; this flag exists so a "
+                             "typo (e.g. --lots-per-leg 100) cannot silently "
+                             "deploy a 100× larger book.")
     parser.add_argument("--kite-rate-per-sec", type=float, default=8.0,
                         dest="kite_rate_per_sec",
                         help="Token-bucket refill rate (req/s) for the kite "
@@ -1108,6 +1171,12 @@ def main():
                              "are unaffected. 0 disables (default: 60).")
     parser.add_argument("--max-leg-notional", type=float, default=1_000_000,
                         help="Per-leg ₹ cap (required for paper mode)")
+    parser.add_argument("--max-book-notional-inr", type=float, default=0.0,
+                        dest="max_book_notional_inr",
+                        help="H13: total Σ open_notional ceiling across all "
+                             "paper/live runners' state files in data_cache/. "
+                             "Refuses new entries when current book is at or "
+                             "above this cap. 0 disables (default).")
     parser.add_argument("--force", action="store_true",
                         help="Run even on weekends/holidays (testing only)")
     parser.add_argument("--candidates", type=str, default=str(CANDIDATES_PATH),
@@ -1157,6 +1226,17 @@ def main():
                              "Doubles as a typo-tripwire so a refactor "
                              "can't accidentally flip the runner to live.")
     args = parser.parse_args()
+
+    # H12: hard cap on --lots-per-leg to catch operator typos before they
+    # deploy real notional. Pre-flight (deploy/VPS_DEPLOYMENT.md §7.9)
+    # calls for --lots-per-leg 1; anything >5 must be explicitly
+    # acknowledged with --ack-large-size.
+    if args.lots_per_leg > 5 and not args.ack_large_size:
+        parser.error(
+            f"--lots-per-leg={args.lots_per_leg} exceeds the soft cap of 5. "
+            "Pass --ack-large-size to acknowledge intentional large sizing, "
+            "or reduce --lots-per-leg. (H12 typo-tripwire.)"
+        )
 
     load_dotenv(HERE / ".env")
     os.chdir(HERE)
@@ -1222,9 +1302,22 @@ def main():
     log.info("Candidates: %s", args.candidates)
     log.info("=" * 60)
 
+    # H17: count active legs across other paper-state files so the
+    # leg-concentration cap applies across runners (baseline + persistent),
+    # not just within this runner. Excludes own state file because that
+    # runner's own held pairs are restored via restore_matching_strategies
+    # and orphans — counting them twice would block legitimate re-entries.
+    own_state = state_file_path(args.system)
+    cross_runner_counts = load_cross_runner_leg_counts(own_state)
+    if cross_runner_counts:
+        log.info(
+            "Cross-runner leg counts (H17 seed): %s",
+            ", ".join(f"{s}={n}" for s, n in sorted(cross_runner_counts.items())),
+        )
     pairs = select_pairs(args.top, log,
                           candidates_path=Path(args.candidates),
-                          max_age_days=args.max_csv_age_days)
+                          max_age_days=args.max_csv_age_days,
+                          seed_leg_count=cross_runner_counts)
     log.info("Selected %d pair(s):", len(pairs))
     for _, row in pairs.iterrows():
         log.info("  %s/%s  β=%.4f  z=%.2f  half-life=%.1fd  p=%.4f",
@@ -1273,9 +1366,26 @@ def main():
         )
         nfo_instruments = None
 
+    # H8: closure for mid-session token refresh. Calls auth.get_kite() to
+    # re-authenticate (re-uses cached refresh path if available, else full
+    # TOTP login), then re-wraps with the same throttler so the strategies
+    # don't bypass H14 after a refresh.
+    def _refresh_kite():
+        fresh = auth.get_kite()
+        return throttle_kite(fresh, kite_limiter)
+
+    # H13: closure that scans data_cache/ for all paper-state JSONs and sums
+    # open-leg notional across every runner. Each strategy calls this before
+    # generating entry proposals.
+    from strategies.pair_trading import _aggregate_book_notional
+    book_notional_fn = _aggregate_book_notional if args.max_book_notional_inr > 0 else None
+
     strategies = build_strategies(
         pairs, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
+        kite_refresh=_refresh_kite,
+        book_notional_fn=book_notional_fn,
+        max_book_notional=args.max_book_notional_inr,
     )
 
     # Restore prior-session state (no-op if no state file exists yet).
@@ -1284,6 +1394,9 @@ def main():
     orphans = build_orphan_strategies(
         prior_state, matched_keys, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
+        kite_refresh=_refresh_kite,
+        book_notional_fn=book_notional_fn,
+        max_book_notional=args.max_book_notional_inr,
     )
     strategies = strategies + orphans
 

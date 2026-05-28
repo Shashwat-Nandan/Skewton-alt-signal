@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,12 @@ import pandas as pd
 from trade_proposer import TradeProposal
 
 from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
+
+try:  # kiteconnect is the live broker; tests run without it installed
+    from kiteconnect.exceptions import TokenException as _TokenException
+except Exception:  # pragma: no cover
+    class _TokenException(Exception):  # type: ignore[no-redef]
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,75 @@ PAIR_CANDIDATES_PATH = Path("data_cache/pair_candidates.csv")
 # filter `_top_screener_pair` applies before picking row 0.
 HEDGE_RATIO_MIN = 0.1
 HEDGE_RATIO_MAX = 10.0
+
+HOLIDAYS_PATH = Path(__file__).resolve().parent.parent / "holidays.csv"
+
+
+def _load_holidays(path: Path = HOLIDAYS_PATH) -> set:
+    if not path.exists():
+        return set()
+    days = set()
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        token = line.split(",", 1)[0].strip()
+        try:
+            days.add(date.fromisoformat(token))
+        except ValueError:
+            continue
+    return days
+
+
+def _aggregate_book_notional(data_cache: Optional[Path] = None) -> float:
+    # H13: read all paper/live state JSONs in data_cache/ and sum |entry_px *
+    # qty * lot_size| across every open leg, regardless of which runner owns
+    # it. The pair-runner shape (pairs[].state.legs[]) and the taleb-runner
+    # shape (positions[].legs[]) are both covered. Best-effort: a malformed
+    # file is skipped (logged at debug), and tick concurrency means the read
+    # is eventually consistent — fine for an approximate ceiling, not for
+    # margin accounting.
+    import json
+    cache = data_cache or (Path(__file__).resolve().parent.parent / "data_cache")
+    if not cache.exists():
+        return 0.0
+    total = 0.0
+    for jp in cache.glob("*paper_state*.json"):
+        try:
+            blob = json.loads(jp.read_text())
+        except Exception as e:
+            logger.debug("book-notional: skipping %s: %s", jp.name, e)
+            continue
+        for pair in blob.get("pairs", []) or []:
+            for leg in (pair.get("state") or {}).get("legs", []) or []:
+                px = abs(float(leg.get("entry_price") or 0))
+                qty = abs(int(leg.get("quantity") or 0))
+                lot = abs(int(leg.get("lot_size") or 0))
+                total += px * qty * lot
+        for pos in blob.get("positions", []) or []:
+            for leg in pos.get("legs", []) or []:
+                px = abs(float(leg.get("entry_price") or 0))
+                qty = abs(int(leg.get("quantity") or leg.get("lots") or 0))
+                lot = abs(int(leg.get("lot_size") or 0))
+                total += px * qty * lot
+    return total
+
+
+def _trading_days_between(start: date, end: date, holidays: set) -> int:
+    # H6: count NSE trading days in (start, end] — weekends and
+    # holidays.csv excluded. Matches the run_paper_pairs gating.
+    if end <= start:
+        return 0
+    count = 0
+    d = start
+    one = pd.Timedelta(days=1)
+    while True:
+        d = (pd.Timestamp(d) + one).date()
+        if d > end:
+            break
+        if d.weekday() < 5 and d not in holidays:
+            count += 1
+    return count
 
 
 @dataclass
@@ -99,6 +174,8 @@ class PairTradingStrategy(BaseStrategy):
         symbol_b: Optional[str] = None,
         hedge_ratio: Optional[float] = None,
         nfo_instruments: Optional[List[dict]] = None,
+        kite_refresh: Optional[Callable[[], object]] = None,
+        book_notional_fn: Optional[Callable[[], float]] = None,
     ):
         super().__init__(kite, config_path=config_path, mode=mode)
 
@@ -217,7 +294,24 @@ class PairTradingStrategy(BaseStrategy):
         # × 360 ticks/day on expiry day don't each re-fetch. None = no cache
         # injected; _get_nfo_instruments() lazy-fills from kite on first use.
         self._nfo_instruments_cache: Optional[List[dict]] = nfo_instruments
+        # H8: callback that returns a fresh, fully-wrapped kite client (post
+        # throttle/retry wrappers). On TokenException mid-session, the
+        # live-path call sites use this to refresh the token once before
+        # giving up. None → no refresh (calls fail loud, same as pre-H8).
+        self._kite_refresh = kite_refresh
+        # H13: callback returning the current Σ open_notional across ALL
+        # paper/live runners' state files. None → cross-runner exposure
+        # cap disabled. self.max_book_notional is the cap; if 0/unset the
+        # check short-circuits even when the callback is wired.
+        self._book_notional_fn = book_notional_fn
+        mbn = cfg.get("max_book_notional_inr", "").strip()
+        self.max_book_notional: Optional[float] = float(mbn) if mbn else None
         self._clock = datetime.now
+        # H6: holidays.csv loaded once per session for the trading-day
+        # time-stop. Cached on the instance because the strategy lives for
+        # the full session and reloading per tick would re-parse the file
+        # ~360 times.
+        self._holidays_cache: Optional[set] = None
         # Session-start P&L snapshot — re-captured if/when restore_state runs.
         # Lets generate_eod_report() emit per-session delta fields even when
         # state is carried across sessions by the runner.
@@ -255,6 +349,25 @@ class PairTradingStrategy(BaseStrategy):
         # would re-enter on.
         if self._is_in_stop_cooldown():
             return []
+        # H13: cross-runner total-book exposure cap. Orphans accumulate and
+        # baseline+persistent runners co-exist; without this, total deployed
+        # notional drifts monotonically until natural exits. Disabled when
+        # max_book_notional is unset or callback not wired.
+        if self.max_book_notional and self._book_notional_fn is not None:
+            try:
+                book = float(self._book_notional_fn())
+            except Exception as e:
+                logger.warning(
+                    "book_notional callback failed (%s) — skipping cross-runner "
+                    "cap check this tick", e,
+                )
+                book = 0.0
+            if book >= self.max_book_notional:
+                logger.warning(
+                    "%s/%s: book notional ₹%.0f >= cap ₹%.0f — refusing entry",
+                    self.symbol_a, self.symbol_b, book, self.max_book_notional,
+                )
+                return []
         spread, prices = self._observe_spread()
         if spread is None:
             return []
@@ -288,9 +401,15 @@ class PairTradingStrategy(BaseStrategy):
         # Update marks for unrealized P&L reporting
         self._update_unrealized(prices)
 
-        # Time-based exit (positions shouldn't drift forever)
+        # Time-based exit (positions shouldn't drift forever).
+        # H6: count NSE trading days, not calendar days. Weekend/holiday
+        # gaps used to silently compress the effective hold by 1-3 days
+        # vs the backtest, which steps date-by-date through trading days.
         if self.state.entry_time:
-            held_days = (self._clock() - self.state.entry_time).total_seconds() / 86400.0
+            held_days = _trading_days_between(
+                self.state.entry_time.date(), self._clock().date(),
+                self._holidays(),
+            )
             if held_days >= self.max_holding_days:
                 return self._build_exit_proposals(reason="MAX_HOLD", z=z or 0.0, prices=prices)
 
@@ -314,6 +433,17 @@ class PairTradingStrategy(BaseStrategy):
         results = []
         is_entry_batch = (self.state.position == "FLAT")
         filled_entry_props: List[Tuple[TradeProposal, Dict]] = []
+
+        # H15: kite.margins() pre-check on live entry batches. If the
+        # broker reports insufficient available balance, refuse the batch
+        # entirely — without this, leg B rejects on margin AFTER leg A has
+        # filled, and C2 reversal eats the ~₹3k round-trip cost. Skipped
+        # for paper, for exits (we already own the position), and when
+        # the margins() call itself fails (transient kite hiccup — let
+        # the order through and rely on C2 reversal if it rejects).
+        if is_entry_batch and not self.is_paper_mode and proposals:
+            if not self._margin_precheck_ok(proposals):
+                return []
 
         # COMPLETE is the whitelist (not !FAILED) — PENDING/REJECTED/
         # CANCELLED returned by _live_execute all share the property that
@@ -733,6 +863,20 @@ class PairTradingStrategy(BaseStrategy):
             max_natural = max(notional_a, notional_b)
             if max_natural > self.max_leg_notional:
                 scale = self.max_leg_notional / max_natural
+                # H12: surface aggressive notional-cap clamps. If the cap
+                # forces a >2× downscale, the operator's --lots-per-leg
+                # config is bigger than the cap can support — flag it so
+                # they tighten either knob deliberately rather than learn
+                # via a much-smaller-than-expected fill.
+                if scale < 0.5:
+                    logger.warning(
+                        "%s/%s: notional cap clamped lots from (%d, %d) "
+                        "by %.1fx (scale=%.3f). Either --lots-per-leg is "
+                        "too large for --max-leg-notional, or β is so "
+                        "skewed that the smaller side is forced to 1 lot.",
+                        self.symbol_a, self.symbol_b, qty_a, qty_b,
+                        1.0 / scale, scale,
+                    )
                 qty_a = max(int(round(qty_a * scale)), 1)
                 qty_b = max(int(round(qty_b * scale)), 1)
 
@@ -1067,12 +1211,99 @@ class PairTradingStrategy(BaseStrategy):
         return info
 
     def _get_last_price(self, tradingsymbol: str) -> Optional[float]:
+        key = f"NFO:{tradingsymbol}"
         try:
-            quote = self.kite.quote([f"NFO:{tradingsymbol}"])
-            return float(quote[f"NFO:{tradingsymbol}"]["last_price"])
+            quote = self.kite.quote([key])
+            return float(quote[key]["last_price"])
+        except _TokenException as e:
+            # H8: token expired mid-session. Refresh once and retry.
+            if not self._try_refresh_kite("quote", tradingsymbol, e):
+                return None
+            try:
+                quote = self.kite.quote([key])
+                return float(quote[key]["last_price"])
+            except Exception as e2:
+                logger.critical(
+                    "quote failed for %s even after token refresh: %s",
+                    tradingsymbol, e2,
+                )
+                return None
         except Exception as e:
             logger.warning("quote failed for %s: %s", tradingsymbol, e)
             return None
+
+    def _margin_precheck_ok(self, proposals: List[TradeProposal]) -> bool:
+        # H15: returns True if the entry batch should proceed, False if
+        # kite.margins() reports insufficient available balance.
+        # Transient margins() failure → True (let order flow; C2 reversal
+        # handles any post-fact margin reject).
+        try:
+            margins = self.kite.margins()
+        except _TokenException as e:
+            if not self._try_refresh_kite("margins", "entry_precheck", e):
+                logger.warning(
+                    "%s/%s: margins() raised TokenException with no refresh — "
+                    "proceeding without margin precheck", self.symbol_a, self.symbol_b,
+                )
+                return True
+            try:
+                margins = self.kite.margins()
+            except Exception as e2:
+                logger.warning(
+                    "%s/%s: margins() failed after token refresh (%s) — "
+                    "proceeding without margin precheck",
+                    self.symbol_a, self.symbol_b, e2,
+                )
+                return True
+        except Exception as e:
+            logger.warning(
+                "%s/%s: margins() failed (%s) — proceeding without margin precheck",
+                self.symbol_a, self.symbol_b, e,
+            )
+            return True
+
+        try:
+            available = float(margins["equity"]["available"]["live_balance"])
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(
+                "%s/%s: margins() shape unexpected (%s) — proceeding without "
+                "margin precheck", self.symbol_a, self.symbol_b, e,
+            )
+            return True
+
+        required = sum(float(p.margin_required or 0) for p in proposals)
+        if required > available:
+            logger.warning(
+                "%s/%s: insufficient margin — required ₹%.0f > available ₹%.0f. "
+                "Skipping entry batch (H15).",
+                self.symbol_a, self.symbol_b, required, available,
+            )
+            return False
+        return True
+
+    def _try_refresh_kite(self, op: str, ctx: str, err: Exception) -> bool:
+        # H8: refresh the kite client via the runner-supplied callback.
+        # Returns True if a fresh client is now bound, False if no callback
+        # was provided or the refresh itself failed (caller MUST handle
+        # the failure path — typically by returning a FAILED order or None).
+        if self._kite_refresh is None:
+            logger.error(
+                "TokenException during %s (%s) but no kite_refresh callback "
+                "is configured — cannot recover: %s", op, ctx, err,
+            )
+            return False
+        try:
+            self.kite = self._kite_refresh()
+            logger.warning(
+                "Token refreshed mid-session after %s on %s: %s", op, ctx, err,
+            )
+            return True
+        except Exception as e:
+            logger.critical(
+                "kite_refresh callback failed during %s (%s): original=%s "
+                "refresh_err=%s", op, ctx, err, e,
+            )
+            return False
 
     def _symbol_from_tradingsymbol(self, tradingsymbol: str) -> str:
         # Existing legs first: a rolled-leg's tradingsymbol may not match
@@ -1093,6 +1324,11 @@ class PairTradingStrategy(BaseStrategy):
             f"symbol. cache={[f['tradingsymbol'] for f in self._cached_futures.values()]} "
             f"state_legs={[l.tradingsymbol for l in self.state.legs]}"
         )
+
+    def _holidays(self) -> set:
+        if self._holidays_cache is None:
+            self._holidays_cache = _load_holidays()
+        return self._holidays_cache
 
     def _seed_spread_history(self) -> None:
         """
@@ -1184,8 +1420,8 @@ class PairTradingStrategy(BaseStrategy):
             return {"order_id": None, "status": "FAILED",
                     "filled_lots": 0, "average_price": 0.0,
                     "error": f"validation: {e}", "mode": "live"}
-        try:
-            order_id = self.kite.place_order(
+        def _do_place():
+            return self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR, exchange="NFO",
                 tradingsymbol=prop.tradingsymbol,
                 transaction_type=(
@@ -1198,6 +1434,30 @@ class PairTradingStrategy(BaseStrategy):
                 validity=self.kite.VALIDITY_DAY,
                 tag=self._order_tag(prop),
             )
+
+        try:
+            order_id = _do_place()
+        except _TokenException as e:
+            # H8: token expired mid-session. Refresh once and retry the
+            # place_order call exactly once. A second failure is CRITICAL
+            # and the order is reported FAILED — C2 reversal handles any
+            # already-filled sibling leg.
+            if not self._try_refresh_kite("place_order", prop.tradingsymbol, e):
+                return {"order_id": None, "status": "FAILED",
+                        "filled_lots": 0, "average_price": 0.0,
+                        "error": f"place_order: token-expired ({e})",
+                        "mode": "live"}
+            try:
+                order_id = _do_place()
+            except Exception as e2:
+                logger.critical(
+                    "place_order failed after token refresh for %s: %s",
+                    prop.tradingsymbol, e2,
+                )
+                return {"order_id": None, "status": "FAILED",
+                        "filled_lots": 0, "average_price": 0.0,
+                        "error": f"place_order post-refresh: {e2}",
+                        "mode": "live"}
         except Exception as e:
             logger.exception("place_order failed for %s: %s",
                              prop.tradingsymbol, e)
@@ -1235,19 +1495,32 @@ class PairTradingStrategy(BaseStrategy):
 
         requested_shares = abs(prop.quantity) * prop.lot_size
         if final_status == "COMPLETE":
-            filled_lots = filled_qty // prop.lot_size
-            if filled_lots * prop.lot_size != filled_qty or filled_qty == 0:
-                # Partial-fill at lot boundary or zero — refuse to book a
-                # phantom position. Operator can re-issue manually.
+            # H7: refuse ANY partial fill (filled_qty != requested_shares),
+            # not just sub-lot ones. A lot-boundary partial (e.g. 1 of 2
+            # lots) would otherwise silently book a half-size leg, breaking
+            # the pair's hedge ratio.
+            #
+            # Returning FAILED keeps the leg out of state.legs and out of
+            # filled_entry_props, which means C2 (which only reverses
+            # COMPLETE siblings) will NOT touch the broker-side partial.
+            # We therefore reverse the partial inline — a same-symbol
+            # opposite-side MARKET order for filled_qty shares — so the
+            # batch ends flat on both the strategy and the broker. If the
+            # inline reversal fails, log CRITICAL: an operator MUST square
+            # this manually before the next session.
+            if filled_qty != requested_shares:
                 logger.error(
                     "Partial fill not handled: order %s filled %d of %d "
                     "shares (lot %d) — treating as FAILED",
                     order_id, filled_qty, requested_shares, prop.lot_size,
                 )
+                if filled_qty > 0:
+                    self._emergency_reverse_partial(prop, filled_qty, order_id)
                 return {"order_id": order_id, "status": "FAILED",
                         "filled_lots": 0, "average_price": 0.0,
                         "error": f"partial-fill {filled_qty}/{requested_shares}",
                         "mode": "live"}
+            filled_lots = filled_qty // prop.lot_size
             return {"order_id": order_id, "status": "COMPLETE",
                     "filled_lots": filled_lots, "average_price": avg_price,
                     "mode": "live"}
@@ -1269,6 +1542,43 @@ class PairTradingStrategy(BaseStrategy):
                 "filled_lots": 0, "average_price": 0.0,
                 "error": f"non-terminal after {timeout_s}s: status={final_status}",
                 "mode": "live"}
+
+    def _emergency_reverse_partial(self, prop: TradeProposal,
+                                    filled_shares: int,
+                                    original_order_id: str) -> None:
+        # H7 follow-up: place an opposite-side MARKET order for the partial
+        # quantity sitting on the broker after we treated the original
+        # order as FAILED. Best-effort: if this raises, we cannot recover
+        # automatically — log CRITICAL so notify-failure@ alerts surface
+        # the orphan and the operator squares it manually before reopen.
+        reverse_side = (
+            self.kite.TRANSACTION_TYPE_SELL if prop.transaction_type == "BUY"
+            else self.kite.TRANSACTION_TYPE_BUY
+        )
+        try:
+            reverse_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR, exchange="NFO",
+                tradingsymbol=prop.tradingsymbol,
+                transaction_type=reverse_side,
+                quantity=filled_shares,
+                product=self.kite.PRODUCT_NRML,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                validity=self.kite.VALIDITY_DAY,
+                tag=self._order_tag(prop),
+            )
+            logger.warning(
+                "H7 partial-fill recovery: placed reversing %s order %s for "
+                "%d shares of %s (original order %s)",
+                reverse_side, reverse_id, filled_shares, prop.tradingsymbol,
+                original_order_id,
+            )
+        except Exception as e:
+            logger.critical(
+                "H7 PARTIAL ORPHAN: failed to reverse %d shares of %s after "
+                "partial fill on order %s. MANUAL SQUARE-OFF REQUIRED before "
+                "next session. err=%s",
+                filled_shares, prop.tradingsymbol, original_order_id, e,
+            )
 
     def _order_tag(self, prop: TradeProposal) -> str:
         # Kite tag limit is 20 chars. Short symbol prefixes so the broker

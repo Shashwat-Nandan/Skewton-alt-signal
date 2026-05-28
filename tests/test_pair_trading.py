@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -71,6 +71,14 @@ def _make_strategy(
     # _resolve_futures or legs_expire_on lookups mock kite.instruments
     # directly so the lazy-fetch path still works.
     s._nfo_instruments_cache = None
+    # H6: trading-day time-stop reads holidays.csv via _holidays(). Default
+    # to an empty set so tests don't depend on the on-disk file's contents.
+    s._holidays_cache = set()
+    # H8/H13: optional callbacks default to None so tests don't trip on
+    # missing attrs (constructor bypassed by __new__).
+    s._kite_refresh = None
+    s._book_notional_fn = None
+    s.max_book_notional = None
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
     s._cached_futures = {
@@ -445,6 +453,39 @@ class TestExit:
         assert len(proposals) == 2
         assert any("MAX_HOLD" in p.rationale for p in proposals)
 
+    def test_max_hold_uses_trading_days_skipping_weekend(self):
+        # H6: Fri close → Mon close is 1 trading day, not 3 calendar days.
+        # max_holding_days=2 must NOT trigger on Monday after a Friday entry.
+        from datetime import datetime as dt
+        s = _make_strategy()
+        s.max_holding_days = 2
+        s._holidays_cache = set()  # no holidays in the test window
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        # Friday 2026-05-22 entry, "now" pinned to Monday 2026-05-25 close.
+        s.state.entry_time = dt(2026, 5, 22, 15, 30)
+        s._clock = lambda: dt(2026, 5, 25, 15, 30)
+        self._set_quote(s, price_a=1000.0, price_b=1999.5)
+        proposals = s.check_and_rehedge()
+        # 1 trading day held (Monday) < max_holding_days=2 → no MAX_HOLD
+        assert not any("MAX_HOLD" in p.rationale for p in proposals)
+
+    def test_max_hold_trading_days_excludes_holidays(self):
+        # H6: a configured holiday between entry and now must not count.
+        from datetime import datetime as dt
+        s = _make_strategy()
+        s.max_holding_days = 3
+        # Mark Tue 2026-05-26 as a holiday → held = Wed + Thu = 2 trading days.
+        s._holidays_cache = {date(2026, 5, 26)}
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        s.state.entry_time = dt(2026, 5, 25, 15, 30)  # Monday
+        s._clock = lambda: dt(2026, 5, 28, 15, 30)  # Thursday
+        self._set_quote(s, price_a=1000.0, price_b=1999.5)
+        proposals = s.check_and_rehedge()
+        # 2 trading days < 3 → no MAX_HOLD
+        assert not any("MAX_HOLD" in p.rationale for p in proposals)
+
     def test_deep_entry_not_stopped_inside_widened_band(self):
         # 2026-05-15 RELIANCE/CIPLA regression: a position opened at z=-3.8
         # (just inside max_entry_z=5.0) used to fire EXIT_STOP on the next
@@ -483,6 +524,97 @@ class TestExit:
 # ──────────────────────────────────────────────────────────
 # H5 — post-STOP cooldown
 # ──────────────────────────────────────────────────────────
+
+class TestBookNotionalCap:
+    """H13: total Σ open_notional ceiling across all runners. Refuses new
+    entries when current book is already at or above cap."""
+
+    def _seed_priced_quotes(self, s, price_a=1000.0, price_b=2010.0):
+        def fake_quote(symbols):
+            sym = symbols[0]
+            if "AAA" in sym:
+                return {sym: {"last_price": price_a}}
+            return {sym: {"last_price": price_b}}
+        s.kite.quote = fake_quote
+
+    def test_no_cap_allows_entry(self):
+        # Cap unset → callback never called; entry proceeds.
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=2_000_000.0,
+                           lots_per_leg=1, entry_z=2.0)
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        self._seed_priced_quotes(s)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+
+    def test_book_at_cap_refuses_new_entry(self):
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=2_000_000.0,
+                           lots_per_leg=1, entry_z=2.0)
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        s.max_book_notional = 1_000_000.0
+        s._book_notional_fn = lambda: 1_100_000.0  # above cap
+        self._seed_priced_quotes(s)
+        proposals = s.scan_and_propose()
+        assert proposals == []
+
+    def test_book_below_cap_allows_entry(self):
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=2_000_000.0,
+                           lots_per_leg=1, entry_z=2.0)
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        s.max_book_notional = 5_000_000.0
+        s._book_notional_fn = lambda: 1_000_000.0  # well below cap
+        self._seed_priced_quotes(s)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+
+    def test_callback_exception_does_not_block_entry(self):
+        # H13: a flaky callback (e.g. IO error reading sibling state file)
+        # must NOT silently halt trading. Fall through with book=0.0 and
+        # log the failure. The cap still applies if cap=0 implies "I know
+        # there is at least this much" — but the conservative call here is
+        # to keep entries flowing so a transient bug doesn't freeze the
+        # strategy. Symmetric with H5/H7 fail-loud-but-don't-deadlock.
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=2_000_000.0,
+                           lots_per_leg=1, entry_z=2.0)
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        s.max_book_notional = 1_000_000.0
+        s._book_notional_fn = lambda: (_ for _ in ()).throw(IOError("boom"))
+        self._seed_priced_quotes(s)
+        proposals = s.scan_and_propose()
+        assert len(proposals) == 2
+
+    def test_aggregate_helper_reads_pair_state(self, tmp_path):
+        # H13: the cross-runner aggregator reads both pair- and taleb-shape
+        # paper-state files in data_cache/.
+        import json
+        from strategies.pair_trading import _aggregate_book_notional
+        (tmp_path / "pair_paper_state_baseline.json").write_text(json.dumps({
+            "pairs": [{
+                "state": {"legs": [
+                    {"entry_price": 1000.0, "quantity": 2, "lot_size": 100},
+                    {"entry_price": 2000.0, "quantity": -1, "lot_size": 200},
+                ]},
+            }],
+        }))
+        (tmp_path / "taleb_paper_state.json").write_text(json.dumps({
+            "positions": [{
+                "legs": [
+                    {"entry_price": 50.0, "quantity": 4, "lot_size": 50},
+                ],
+            }],
+        }))
+        total = _aggregate_book_notional(tmp_path)
+        # 1000*2*100 + 2000*1*200 + 50*4*50 = 200k + 400k + 10k = 610_000
+        assert total == 610_000.0
+
+    def test_aggregate_helper_handles_malformed_file(self, tmp_path):
+        from strategies.pair_trading import _aggregate_book_notional
+        (tmp_path / "pair_paper_state_bad.json").write_text("not json{")
+        (tmp_path / "pair_paper_state_ok.json").write_text(
+            '{"pairs":[{"state":{"legs":[]}}]}'
+        )
+        # Should not raise; bad file is skipped.
+        assert _aggregate_book_notional(tmp_path) == 0.0
+
 
 class TestStopCooldown:
     """A pair that stops out at z=4.2 must not re-enter on the very next
@@ -812,6 +944,29 @@ class TestNotionalCap:
         assert a.quantity * a.lot_size * a.price <= 500_000
         assert b.quantity * b.lot_size * b.price <= 500_000
 
+    def test_clamp_above_2x_emits_warning(self, caplog):
+        # H12: when the notional cap forces a >2× downscale, log a WARNING
+        # so the operator notices a too-large --lots-per-leg vs cap.
+        # lots_per_leg=20, β=0.5 → qty_a=20, qty_b=5. Natural notionals:
+        # A=20*100*1000=2,000k, B=5*200*2010=2,010k → max=2,010k.
+        # Cap 500k → scale ≈ 0.249 (>4× downscale) → warning expected.
+        import logging
+        caplog.set_level(logging.WARNING, logger="strategies.pair_trading")
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=500_000.0, lots_per_leg=20)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        s.scan_and_propose()
+        assert any("notional cap clamped lots" in r.message for r in caplog.records)
+
+    def test_clamp_below_2x_no_warning(self, caplog):
+        # H12: a mild clamp (<2×) is routine high-β rebalancing — no warning.
+        import logging
+        caplog.set_level(logging.WARNING, logger="strategies.pair_trading")
+        # lots_per_leg=10, cap 800k. Natural max ≈ 1000k → scale=0.8 (<2× ↓).
+        s = _make_strategy(hedge_ratio=0.5, max_leg_notional=800_000.0, lots_per_leg=10)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        s.scan_and_propose()
+        assert not any("notional cap clamped lots" in r.message for r in caplog.records)
+
 
 class TestEODReport:
     def test_eod_report_keys(self):
@@ -1132,6 +1287,11 @@ class TestLiveExecuteConfirmation:
         s.kite.PRODUCT_NRML = "NRML"
         s.kite.ORDER_TYPE_MARKET = "MARKET"
         s.kite.VALIDITY_DAY = "DAY"
+        # H15: tests for execution semantics aren't margin-precheck tests,
+        # so default to a permissive margin response.
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000_000.0}},
+        })
         return s
 
     def _prop(self, qty=1, txn="BUY"):
@@ -1182,6 +1342,239 @@ class TestLiveExecuteConfirmation:
         s.execute_proposals([self._prop(qty=2)])
         assert s.state.legs == []
 
+    def test_partial_fill_at_full_lot_is_failed(self):
+        # H7: requested 2 lots (200 shares), got 100 (1 full lot) → FAILED.
+        # Pre-fix this booked a 1-lot leg, breaking the pair hedge ratio.
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(return_value="ORD-4")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals([self._prop(qty=2)])
+        assert s.state.legs == []
+
+    def test_zero_fill_marked_complete_is_failed(self):
+        # H7: COMPLETE status with filled_quantity=0 (paranoid broker quirk)
+        # must still be refused — no leg booked. Zero fill → no broker
+        # position to reverse, so place_order called exactly once.
+        s = self._live_strategy()
+        s.kite.place_order = MagicMock(return_value="ORD-5")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 0, "average_price": 0.0},
+        ])
+        s.execute_proposals([self._prop(qty=1)])
+        assert s.state.legs == []
+        assert s.kite.place_order.call_count == 1
+
+    def test_partial_fill_triggers_emergency_reversal(self):
+        # H7 follow-up: when broker gives a partial (50 of 200 shares for a
+        # 2-lot req on lot=100), we return FAILED AND place an opposite-
+        # side reversing MARKET order for the 50 shares so the broker ends
+        # flat too. C2 reversal won't see this leg (it's FAILED), so
+        # without the inline reverse the partial would be orphaned.
+        s = self._live_strategy()
+        place_calls = []
+
+        def fake_place(*a, **kw):
+            place_calls.append(kw)
+            return f"ORD-{len(place_calls)}"
+
+        s.kite.place_order = fake_place
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 50, "average_price": 1000.0},
+        ])
+        s.execute_proposals([self._prop(qty=2)])
+        assert s.state.legs == []
+        # Two place_order calls: the original (BUY 200) + reverse (SELL 50)
+        assert len(place_calls) == 2
+        assert place_calls[1]["transaction_type"] == "SELL"
+        assert place_calls[1]["quantity"] == 50
+        assert place_calls[1]["tradingsymbol"] == "AAA26APRFUT"
+
+    def test_partial_fill_reverse_failure_logs_critical(self, caplog):
+        # H7 follow-up: if the reversing order itself raises, log CRITICAL
+        # with "PARTIAL ORPHAN" so notify-failure@ surfaces the leak.
+        import logging
+        caplog.set_level(logging.CRITICAL, logger="strategies.pair_trading")
+        s = self._live_strategy()
+        call_counter = {"n": 0}
+
+        def fake_place(*a, **kw):
+            call_counter["n"] += 1
+            if call_counter["n"] == 1:
+                return "ORD-1"
+            raise RuntimeError("broker down")
+
+        s.kite.place_order = fake_place
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 50, "average_price": 1000.0},
+        ])
+        s.execute_proposals([self._prop(qty=2)])
+        assert any("PARTIAL ORPHAN" in r.message for r in caplog.records)
+
+
+class TestTokenRefresh:
+    """H8: TokenException on place_order or quote triggers exactly one
+    refresh-and-retry. Without a kite_refresh callback, the call fails
+    loud. Second failure after refresh is CRITICAL and treated as FAILED."""
+
+    def _live_strategy(self, kite_refresh=None):
+        s = _make_strategy(mode="live")
+        s.kite.VARIETY_REGULAR = "regular"
+        s.kite.TRANSACTION_TYPE_BUY = "BUY"
+        s.kite.TRANSACTION_TYPE_SELL = "SELL"
+        s.kite.PRODUCT_NRML = "NRML"
+        s.kite.ORDER_TYPE_MARKET = "MARKET"
+        s.kite.VALIDITY_DAY = "DAY"
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000_000.0}},
+        })
+        s._kite_refresh = kite_refresh
+        return s
+
+    def _prop(self):
+        return TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
+            rationale="entry",
+        )
+
+    def test_place_order_token_exception_refreshes_and_retries(self):
+        from strategies.pair_trading import _TokenException
+        # First call raises TokenException; the refreshed kite client's
+        # place_order succeeds.
+        s = self._live_strategy()
+        fresh = MagicMock()
+        fresh.VARIETY_REGULAR = "regular"
+        fresh.TRANSACTION_TYPE_BUY = "BUY"
+        fresh.TRANSACTION_TYPE_SELL = "SELL"
+        fresh.PRODUCT_NRML = "NRML"
+        fresh.ORDER_TYPE_MARKET = "MARKET"
+        fresh.VALIDITY_DAY = "DAY"
+        fresh.place_order = MagicMock(return_value="ORD-RETRY")
+        fresh.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s._kite_refresh = MagicMock(return_value=fresh)
+        s.kite.place_order = MagicMock(side_effect=_TokenException("expired"))
+        s.execute_proposals([self._prop()])
+        assert s._kite_refresh.call_count == 1
+        # Leg booked from the retry fill
+        assert len(s.state.legs) == 1
+
+    def test_place_order_token_exception_without_callback_is_failed(self):
+        from strategies.pair_trading import _TokenException
+        s = self._live_strategy(kite_refresh=None)
+        s.kite.place_order = MagicMock(side_effect=_TokenException("expired"))
+        s.execute_proposals([self._prop()])
+        assert s.state.legs == []
+        assert s.state.position == "FLAT"
+
+    def test_place_order_second_failure_after_refresh_is_failed(self):
+        from strategies.pair_trading import _TokenException
+        s = self._live_strategy()
+        fresh = MagicMock()
+        fresh.VARIETY_REGULAR = "regular"
+        fresh.TRANSACTION_TYPE_BUY = "BUY"
+        fresh.TRANSACTION_TYPE_SELL = "SELL"
+        fresh.PRODUCT_NRML = "NRML"
+        fresh.ORDER_TYPE_MARKET = "MARKET"
+        fresh.VALIDITY_DAY = "DAY"
+        fresh.place_order = MagicMock(side_effect=RuntimeError("still broken"))
+        s._kite_refresh = MagicMock(return_value=fresh)
+        s.kite.place_order = MagicMock(side_effect=_TokenException("expired"))
+        s.execute_proposals([self._prop()])
+        assert s.state.legs == []
+
+    def test_quote_token_exception_refreshes_and_retries(self):
+        from strategies.pair_trading import _TokenException
+        s = self._live_strategy()
+        fresh = MagicMock()
+        fresh.quote = MagicMock(return_value={
+            "NFO:AAA26APRFUT": {"last_price": 1234.5},
+        })
+        s._kite_refresh = MagicMock(return_value=fresh)
+        s.kite.quote = MagicMock(side_effect=_TokenException("expired"))
+        px = s._get_last_price("AAA26APRFUT")
+        assert px == 1234.5
+        assert s._kite_refresh.call_count == 1
+
+
+class TestMarginPrecheck:
+    """H15: live entry batches call kite.margins() first and skip the
+    batch when available_balance < Σ margin_required. Paper, signals,
+    and exits bypass the check."""
+
+    def _live_strategy(self):
+        s = _make_strategy(mode="live")
+        s.kite.VARIETY_REGULAR = "regular"
+        s.kite.TRANSACTION_TYPE_BUY = "BUY"
+        s.kite.TRANSACTION_TYPE_SELL = "SELL"
+        s.kite.PRODUCT_NRML = "NRML"
+        s.kite.ORDER_TYPE_MARKET = "MARKET"
+        s.kite.VALIDITY_DAY = "DAY"
+        return s
+
+    def _props(self, margin_a=20000, margin_b=30000):
+        from trade_proposer import TradeProposal
+        a = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=margin_a,
+            rationale="entry A",
+        )
+        b = TradeProposal(
+            tradingsymbol="BBB26APRFUT", instrument_token=222, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=2000.0, transaction_type="SELL",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=margin_b,
+            rationale="entry B",
+        )
+        return [a, b]
+
+    def test_insufficient_margin_skips_entry(self):
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000.0}},
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props(margin_a=20_000, margin_b=30_000))
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
+    def test_sufficient_margin_proceeds(self):
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 1_000_000.0}},
+        })
+        s.kite.place_order = MagicMock(return_value="ORD-OK")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals(self._props())
+        assert s.kite.place_order.call_count == 2
+
+    def test_margins_failure_lets_order_through(self):
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(side_effect=RuntimeError("net down"))
+        s.kite.place_order = MagicMock(return_value="ORD-OK")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals(self._props())
+        # margins() flake must not block trading — broker reject + C2 handles it
+        assert s.kite.place_order.call_count == 2
+
+    def test_paper_mode_skips_precheck(self):
+        # Paper has no broker — margins() not called.
+        s = _make_strategy(mode="paper")
+        s.kite.margins = MagicMock()
+        s.execute_proposals(self._props())
+        s.kite.margins.assert_not_called()
+
 
 class TestEntryBatchAtomicity:
     """C2: if one leg of a two-leg entry fails, the other must be reversed.
@@ -1189,6 +1582,9 @@ class TestEntryBatchAtomicity:
 
     def _live_strategy(self):
         s = _make_strategy(mode="live")
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000_000.0}},
+        })
         s.kite.VARIETY_REGULAR = "regular"
         s.kite.TRANSACTION_TYPE_BUY = "BUY"
         s.kite.TRANSACTION_TYPE_SELL = "SELL"
