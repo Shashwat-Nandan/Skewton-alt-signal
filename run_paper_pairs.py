@@ -523,8 +523,12 @@ def select_pairs(top: int, log: logging.Logger,
         # underlying screen data is stale; last_data_date is written by
         # screen_pairs.py and reflects the actual data window's end.
         # Fall back to mtime if the column is missing (legacy CSVs).
-        if "last_data_date" in df_raw.columns and not df_raw["last_data_date"].dropna().empty:
-            data_dates = pd.to_datetime(df_raw["last_data_date"], errors="coerce").dropna()
+        data_dates = (
+            pd.to_datetime(df_raw["last_data_date"], errors="coerce").dropna()
+            if "last_data_date" in df_raw.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        if not data_dates.empty:
             last_data = data_dates.max()
             age_days = (pd.Timestamp(datetime.now()).normalize()
                         - last_data.normalize()).days
@@ -1631,7 +1635,7 @@ def main():
                 )
         else:
             log.info("Session-end window reached.")
-            end_of_session(strategies, today, args, log)
+            end_of_session(strategies, today, args, log, holidays=holidays)
 
     except KeyboardInterrupt:
         # If a second SIGTERM arrives while end_of_session is writing the
@@ -1641,7 +1645,7 @@ def main():
         # *after* this teardown completes, rather than interrupting it.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         log.info("Interrupted — persisting state and exiting.")
-        end_of_session(strategies, today, args, log)
+        end_of_session(strategies, today, args, log, holidays=holidays)
         return 130
 
     if silent_fail:

@@ -845,6 +845,38 @@ class TestBrokerMediums:
         s.execute_proposals([self._prop()])
         assert s.kite.place_order.call_count == call_count_before
 
+    def test_backoff_burns_one_tick_per_execute_call_not_per_leg(self):
+        # Bug guard (review-found 2026-05-28): the cooldown decrement was
+        # inside _live_execute, so a 2-leg pair entry consumed 2 skip-ticks
+        # per tick. Decrement is now in execute_proposals — once per call
+        # regardless of leg count.
+        s = self._live_strategy()
+        # Pre-arm cooldown to 5 ticks
+        s._place_order_skip_ticks_left = 5
+        s._place_order_fail_streak = 0
+        # Two-leg batch in a single call
+        a = self._prop()
+        b = self._prop()
+        b.tradingsymbol = "BBB26APRFUT"
+        s.execute_proposals([a, b])
+        # One call → one tick burned, not two
+        assert s._place_order_skip_ticks_left == 4
+
+    def test_backoff_last_tick_does_not_immediately_rearm(self):
+        # Bug guard: when skip_ticks decremented from 1 → 0 inside the
+        # tick, the resulting FAILED outcome used to increment fail_streak
+        # → potentially rearm the cooldown on the very next FAILED tick.
+        # Now the streak is cleared when the cooldown ends.
+        s = self._live_strategy()
+        s._place_order_skip_ticks_left = 1
+        s._place_order_fail_streak = 0
+        s.kite.place_order = MagicMock(side_effect=RuntimeError("broker still flaky"))
+        # This call: decrement 1 → 0, fail_streak cleared. The FAILED
+        # outcome from the actual place_order then increments to 1 (not 3).
+        s.execute_proposals([self._prop()])
+        assert s._place_order_skip_ticks_left == 0
+        assert s._place_order_fail_streak == 1  # NOT >= threshold
+
     def test_backoff_clears_on_complete(self):
         s = self._live_strategy()
         # Two failures, then success

@@ -490,6 +490,18 @@ class PairTradingStrategy(BaseStrategy):
         # for paper, for exits (we already own the position), and when
         # the margins() call itself fails (transient kite hiccup — let
         # the order through and rely on C2 reversal if it rejects).
+        # M-B5: tick-level cooldown decrement. Fires ONCE per call to
+        # execute_proposals (≈ once per pair per tick), regardless of how
+        # many legs the batch contains. Runs BEFORE margin precheck so a
+        # cooldown'd pair doesn't burn a margins() call (kite is the
+        # thing most likely to be broken). If the decrement clears the
+        # cooldown to 0, also clear the fail_streak so the very next
+        # FAILED outcome doesn't immediately re-arm the cooldown.
+        if not self.is_paper_mode and self._place_order_skip_ticks_left > 0:
+            self._place_order_skip_ticks_left -= 1
+            if self._place_order_skip_ticks_left == 0:
+                self._place_order_fail_streak = 0
+
         if is_entry_batch and not self.is_paper_mode and proposals:
             if not self._margin_precheck_ok(proposals):
                 return []
@@ -936,14 +948,19 @@ class PairTradingStrategy(BaseStrategy):
         # that contract is a same-day exit by construction (and loses
         # the round-trip cost). Exits on existing held positions are
         # unaffected — they target the leg's stored tradingsymbol, not
-        # today's front-month.
+        # today's front-month. Parses expiry the same way _resolve_futures
+        # does (exp[:10] slice tolerates "YYYY-MM-DDTHH:MM:SS" forms).
         today = self._clock().date()
         for fut in (fut_a, fut_b):
             exp = fut.get("expiry")
             try:
-                exp_date = (date.fromisoformat(exp) if isinstance(exp, str)
-                            else exp.date() if hasattr(exp, "date") else exp)
-            except (ValueError, AttributeError):
+                if isinstance(exp, str):
+                    exp_date = datetime.strptime(exp[:10], "%Y-%m-%d").date()
+                elif hasattr(exp, "date"):
+                    exp_date = exp.date()
+                else:
+                    exp_date = exp  # assume already a date
+            except (ValueError, AttributeError, TypeError):
                 exp_date = None
             if exp_date == today:
                 logger.warning(
@@ -1574,21 +1591,20 @@ class PairTradingStrategy(BaseStrategy):
         # MARKET guarantees a fill (or a clear reject), the slippage is
         # already baked into the cost model, and we poll order_history to
         # confirm before booking any state change.
-        # M-B5: consecutive-failure backoff. Skip subsequent place_order
-        # attempts during the current cooldown window so a known-broken
-        # account doesn't burn ~360 retries over a 6h session.
+        # M-B5: consecutive-failure backoff. Check (don't decrement) the
+        # tick-counter here so a multi-leg batch in one tick only counts
+        # as ONE tick of cooldown. The decrement happens in
+        # execute_proposals, before the per-prop loop.
         if self._place_order_skip_ticks_left > 0:
-            self._place_order_skip_ticks_left -= 1
             logger.warning(
                 "%s/%s: place_order backoff in effect (%d ticks remaining)",
                 self.symbol_a, self.symbol_b,
                 self._place_order_skip_ticks_left,
             )
-            result = {"order_id": None, "status": "FAILED",
-                      "filled_lots": 0, "average_price": 0.0,
-                      "error": "place_order backoff (M-B5)",
-                      "mode": "live"}
-            return result
+            return {"order_id": None, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": "place_order backoff (M-B5)",
+                    "mode": "live"}
         try:
             validate_order(prop)
         except OrderValidationError as e:
