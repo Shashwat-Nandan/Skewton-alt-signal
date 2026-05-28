@@ -20,7 +20,13 @@ Equity-swing API.
        fetches have run yet) so the frontend can render a "no data"
        state distinct from "no flows".
 
-All four are read-only — the strategy itself writes via the cron path.
+  GET  /api/equity/pending-entries?status=PENDING|FILLED|SKIPPED_GAP|SKIPPED_STALE|SKIPPED_OPEN
+       (EQ-FU-1) Reads the ``equity_pending_entries`` queue. After
+       close-scan a signal lives here until tomorrow's 18:30 fill;
+       /positions is empty until the fill lands so without this the
+       interim state is invisible to the operator.
+
+All five are read-only — the strategy itself writes via the cron path.
 """
 from __future__ import annotations
 
@@ -115,6 +121,48 @@ class FiiDiiResponse(BaseModel):
     rows: List[FiiDiiRow]
 
 
+class EquityPendingEntryRow(BaseModel):
+    id: int
+    signal_dt: str
+    symbol: str
+    side: str
+    signal_close: float
+    sl_distance: float
+    target_distance: float
+    atr: float
+    qty: int
+    rationale: Optional[str] = None
+    status: str
+    created_at: str
+    resolved_at: Optional[str] = None
+    resolution_note: Optional[str] = None
+
+
+class EquityPendingEntriesResponse(BaseModel):
+    pending: List[EquityPendingEntryRow]
+
+
+_PENDING_STATUSES = {
+    "PENDING", "FILLED", "SKIPPED_GAP", "SKIPPED_STALE", "SKIPPED_OPEN",
+}
+
+
+def _normalise_pending_status(raw: Optional[str]) -> str:
+    # EQ-FU-1: default PENDING — that's the operator's "what's queued for
+    # tomorrow's open" view. Resolved statuses are still queryable for
+    # post-mortem ("why did MARICO not fill on 2026-05-26?").
+    if raw is None:
+        return "PENDING"
+    s = raw.strip().upper()
+    if s in _PENDING_STATUSES:
+        return s
+    raise HTTPException(
+        status_code=400,
+        detail=(f"status must be one of {sorted(_PENDING_STATUSES)}, "
+                f"got {raw!r}"),
+    )
+
+
 def _normalise_status(raw: Optional[str]) -> Optional[str]:
     if raw is None:
         return None
@@ -202,6 +250,35 @@ def list_scans(
         except Exception as e:
             logger.warning("skip malformed equity scan row id=%s: %s", r.get("id"), e)
     return EquityScansResponse(scans=out)
+
+
+@router.get("/pending-entries", response_model=EquityPendingEntriesResponse)
+def list_pending_entries(
+    status: Optional[str] = Query(
+        None,
+        description=(
+            "PENDING | FILLED | SKIPPED_GAP | SKIPPED_STALE | SKIPPED_OPEN. "
+            "Defaults to PENDING."
+        ),
+    ),
+    limit: int = Query(500, ge=1, le=2000),
+) -> EquityPendingEntriesResponse:
+    """EQ-FU-1: surface today's close-scan signals queued for tomorrow's
+    18:30 fill. Without this, /equity/positions is empty for the
+    overnight window and the dashboard has no signal of pending work."""
+    rows = db.list_equity_pending_entries(
+        status=_normalise_pending_status(status), limit=limit,
+    )
+    out: List[EquityPendingEntryRow] = []
+    for r in rows:
+        try:
+            out.append(EquityPendingEntryRow(
+                **{k: r.get(k) for k in EquityPendingEntryRow.model_fields}
+            ))
+        except Exception as e:
+            logger.warning("skip malformed pending row id=%s: %s",
+                           r.get("id"), e)
+    return EquityPendingEntriesResponse(pending=out)
 
 
 @router.get("/fii-dii", response_model=FiiDiiResponse)

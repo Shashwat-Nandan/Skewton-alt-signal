@@ -1,5 +1,6 @@
 import type {
   AuthStatus,
+  EquityPendingEntriesResponse,
   EquityPositionsResponse,
   EquityScansResponse,
   EquitySignalsResponse,
@@ -112,6 +113,11 @@ export const api = {
   equityFiiDii: (days?: number) => {
     const qs = days != null ? `?days=${days}` : "";
     return http<FiiDiiResponse>(`/equity/fii-dii${qs}`);
+  },
+  // EQ-FU-1
+  equityPendingEntries: (status?: string) => {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+    return http<EquityPendingEntriesResponse>(`/equity/pending-entries${qs}`);
   },
 
   positions: () => http<PositionsResponse>("/positions"),

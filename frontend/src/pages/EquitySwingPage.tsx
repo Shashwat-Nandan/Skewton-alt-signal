@@ -20,7 +20,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn, formatINR, formatNum } from "@/lib/utils";
-import type { EquityPosition } from "@/lib/types";
+import type { EquityPendingEntry, EquityPosition } from "@/lib/types";
 
 const POLL_MS = 60_000;
 
@@ -304,6 +304,13 @@ export function EquitySwingPage() {
     retry: false,
   });
 
+  // EQ-FU-1: today's close-scan signals queued for tomorrow's 18:30 fill.
+  const pendingEntries = useQuery({
+    queryKey: ["equity", "pending-entries", "PENDING"],
+    queryFn: () => api.equityPendingEntries("PENDING"),
+    refetchInterval: POLL_MS,
+  });
+
   const allPositions = positions.data?.positions ?? [];
   const openPositions = useMemo(
     () => allPositions.filter((p) => p.status === "OPEN"),
@@ -461,6 +468,12 @@ export function EquitySwingPage() {
                 ? ` (${signals.data.signals.length})`
                 : ""}
             </TabsTrigger>
+            <TabsTrigger value="pending">
+              Pending fills
+              {pendingEntries.data?.pending.length
+                ? ` (${pendingEntries.data.pending.length})`
+                : ""}
+            </TabsTrigger>
             <TabsTrigger value="scans">Scans</TabsTrigger>
           </TabsList>
           <TabsContent value="open">
@@ -545,6 +558,80 @@ export function EquitySwingPage() {
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">
                             {s.rationale ?? "—"}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+          <TabsContent value="pending">
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">
+                  Pending fills
+                </CardTitle>
+                <p className="text-xs text-muted-foreground">
+                  EQ-FU-1: close-scan signals queued for tomorrow's 18:30
+                  fill. Each row will be filled at next-day open with SL /
+                  target re-anchored to the actual gap, OR skipped if the
+                  gap exceeds 1.5×ATR (SKIPPED_GAP) or the signal ages
+                  past 5 days (SKIPPED_STALE).
+                </p>
+              </CardHeader>
+              <CardContent>
+                {pendingEntries.isLoading ? (
+                  <Skeleton className="h-20" />
+                ) : !pendingEntries.data?.pending.length ? (
+                  <p className="text-sm text-muted-foreground">
+                    No signals queued for the next-day open.
+                  </p>
+                ) : (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Signal date</TableHead>
+                        <TableHead>Symbol</TableHead>
+                        <TableHead>Side</TableHead>
+                        <TableHead className="text-right">Qty</TableHead>
+                        <TableHead className="text-right">Signal close</TableHead>
+                        <TableHead className="text-right">SL dist</TableHead>
+                        <TableHead className="text-right">Tgt dist</TableHead>
+                        <TableHead className="text-right">ATR</TableHead>
+                        <TableHead>Rationale</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {pendingEntries.data.pending.map((p: EquityPendingEntry) => (
+                        <TableRow key={p.id}>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {formatDate(p.signal_dt)}
+                          </TableCell>
+                          <TableCell className="font-medium">
+                            {p.symbol}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="default">{p.side}</Badge>
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {p.qty}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatNum(p.signal_close, 2)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatNum(p.sl_distance, 2)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatNum(p.target_distance, 2)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatNum(p.atr, 2)}
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {p.rationale ?? "—"}
                           </TableCell>
                         </TableRow>
                       ))}

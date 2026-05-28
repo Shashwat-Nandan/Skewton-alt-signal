@@ -58,6 +58,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from strategies._eq_data import load_equity_panel, load_universe
 from strategies.varsity_equity_swing import (
     EquityPosition,
+    PENDING_GAP_ATR_THRESHOLD,
+    PENDING_MAX_AGE_DAYS,
     VarsityEquitySwingStrategy,
 )
 
@@ -114,6 +116,12 @@ class EquityBacktester:
         self.trade_log: List[TradeRecord] = []
         self.equity_curve: List[Tuple[pd.Timestamp, float]] = []
         self.daily_returns: List[float] = []
+        # EQ-FU-2 instrumentation — counts gap-skip and stale-skip drops
+        # for the summary. autoresearch consumers can read these to spot
+        # parameter sweeps where the would-be trade count is artificially
+        # inflated by the live-vs-backtest filter gap.
+        self.n_skipped_gap: int = 0
+        self.n_skipped_stale: int = 0
 
     def _trading_dates(self) -> List[pd.Timestamp]:
         return sorted(self.panel["date"].unique().tolist())
@@ -131,24 +139,43 @@ class EquityBacktester:
             raise RuntimeError("empty panel — cannot backtest")
         capital = self.strategy.params["total_capital"]
         cash = capital
-        # queued = proposals from yesterday's close, executed at today's open
-        queued: List = []
+        # EQ-FU-2: queue carries (proposal, signal_dt) tuples so the
+        # max-age filter (PENDING_MAX_AGE_DAYS) is computable. signal_dt
+        # is the date of the close-scan that emitted the proposal.
+        queued: List[Tuple] = []
 
         for i, dt in enumerate(dates):
             self.strategy.set_current_date(dt)
 
-            # 1) Execute queued opens at today's open
-            for proposal in queued:
+            # 1) Execute queued opens at today's open. EQ-FU-2 applies the
+            # SAME gap-skip + max-age filters as live's _fill_pending_entries,
+            # so autoresearch sweeps optimise against the trade count that
+            # live will actually deliver.
+            for proposal, signal_dt in queued:
                 open_px = self._open_price(proposal.tradingsymbol, dt)
                 if open_px is None or open_px <= 0:
+                    self.n_skipped_stale += 1
                     continue
+                age_days = (dt - signal_dt).days
+                if age_days > PENDING_MAX_AGE_DAYS:
+                    # Stale: live would mark SKIPPED_STALE. In a clean
+                    # daily-step backtest this branch never fires (age==1)
+                    # unless the panel skips days; kept for Rule 7 parity.
+                    self.n_skipped_stale += 1
+                    continue
+                snap = proposal.greeks_snapshot or {}
+                atr_v = float(snap.get("atr", 0.0))
+                signal_close = float(snap.get("entry", 0.0))
+                if atr_v > 0 and signal_close > 0:
+                    gap_atr = abs(open_px - signal_close) / atr_v
+                    if gap_atr > PENDING_GAP_ATR_THRESHOLD:
+                        self.n_skipped_gap += 1
+                        continue
                 # cost on entry
                 notional = open_px * proposal.quantity
                 entry_cost = notional * self.cost_pct / 200.0  # half RT on entry
                 cash -= notional + entry_cost
-                snap = proposal.greeks_snapshot or {}
                 # rebuild SL/target around the actual fill (not yesterday's close)
-                atr_v = float(snap.get("atr", 0.0))
                 k_sl = self.strategy.params["atr_stop_multiplier"]
                 rr = self.strategy.params["risk_reward"]
                 sl = open_px - k_sl * atr_v
@@ -195,9 +222,11 @@ class EquityBacktester:
                     holding_days=holding, R_multiple=rmult,
                 ))
 
-            # 3) Scan at close for tomorrow's entries
+            # 3) Scan at close for tomorrow's entries. EQ-FU-2: tag each
+            # proposal with today's date so the next-day filler can apply
+            # the same max-age filter live uses.
             proposals = self.strategy.scan_and_propose()
-            queued = list(proposals)
+            queued = [(p, dt) for p in proposals]
 
             # 4) Mark equity curve at today's close
             mtm = sum(self._mtm_value(p, dt) for p in self.strategy.positions.values())
@@ -228,6 +257,8 @@ class EquityBacktester:
                 "total_trades": 0,
                 "score": ZERO_TRADE_PENALTY,
                 "note": "no trades fired — see lessons.md flat-fitness rule",
+                "n_skipped_gap": self.n_skipped_gap,
+                "n_skipped_stale": self.n_skipped_stale,
             }
         wins = [t for t in self.trade_log if t.net_pnl > 0]
         losses = [t for t in self.trade_log if t.net_pnl <= 0]
@@ -274,6 +305,13 @@ class EquityBacktester:
             "ending_equity": round(self.equity_curve[-1][1], 2) if self.equity_curve else None,
             "n_dates": len(self.equity_curve),
             "score": float(sharpe),
+            # EQ-FU-2: visibility into how many signals the live filter
+            # would have dropped. autoresearch dashboards can plot the
+            # filter-rate so a parameter sweep that yields high backtest
+            # PnL but high gap-skip rate is flagged as "live will fire
+            # fewer trades than the screen suggests".
+            "n_skipped_gap": self.n_skipped_gap,
+            "n_skipped_stale": self.n_skipped_stale,
         }
 
     def per_symbol_breakdown(self) -> pd.DataFrame:

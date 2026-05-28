@@ -147,8 +147,13 @@ def _load_open_positions_into_strategy(strategy, log: logging.Logger) -> int:
     return n
 
 
-_PENDING_MAX_AGE_DAYS = 5            # calendar days — drops zombie signals after long downtime
-_PENDING_GAP_ATR_THRESHOLD = 1.5     # |open − signal_close| / atr above this = skip
+# EQ-FU-2: constants moved to strategies/varsity_equity_swing.py so the
+# backtester shares the same filter (autoresearch trade-count would
+# otherwise overshoot live by the count of would-be-gap-skipped signals).
+from strategies.varsity_equity_swing import (
+    PENDING_GAP_ATR_THRESHOLD as _PENDING_GAP_ATR_THRESHOLD,
+    PENDING_MAX_AGE_DAYS as _PENDING_MAX_AGE_DAYS,
+)
 
 
 def _scalar_open_from_panel(f: pd.DataFrame, today_ts: pd.Timestamp) -> float:

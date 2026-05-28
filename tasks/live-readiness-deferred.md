@@ -5,23 +5,12 @@
 Surfaced during the 5-angle code review of the PENDING-queue change; not
 blocking the commit but worth doing before the next iteration.
 
-### EQ-FU-1 (High) — Missing `/equity/pending-entries` API + dashboard tile
-After the close-scan, today's signals live in `equity_pending_entries` until
-tomorrow's 18:30 fill. Operator dashboard surfaces nothing in the interim:
-`/equity/positions` is empty (no fills yet), `/equity/signals` is JSONL-only
-(written in signals mode, not paper), `/equity/scans` shows only aggregate
-counts. Add `GET /equity/pending-entries?status=PENDING` and a frontend
-tile. Violates CLAUDE.md Rule 12 (fail loud / surface state) once the
-system runs in production paper mode.
-
-### EQ-FU-2 (High) — Backtest doesn't apply gap-skip / max-age filters
-`backtest_varsity_equity.py` fills every signal at next-day open with no
-filter; live `_fill_pending_entries` enforces `gap > 1.5×ATR → SKIPPED_GAP`
-and `age > 5d → SKIPPED_STALE`. Autoresearch sweeps optimise params against
-a higher trade count than live will deliver — high-gap days are exactly
-the asymmetric tails that drive most of the PnL variance. Reconcile by
-porting the gap filter into the backtester (or factor the constants into a
-shared module). Per CLAUDE.md Rule 7 (don't average two patterns; pick one).
+Closed Highs (2026-05-28 equity-swing follow-ups sweep):
+```
+EQ-FU-1  /equity/pending-entries API + dashboard tile (Rule 12 fail-loud)
+EQ-FU-2  backtest applies the gap-skip + max-age filters live enforces
+         (constants factored into strategies.varsity_equity_swing per Rule 7)
+```
 
 ### EQ-FU-3 (Medium) — Atomicity gap under autocommit
 `_fill_pending_entries` inserts the equity_positions row and updates the

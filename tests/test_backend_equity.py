@@ -238,3 +238,64 @@ class TestFiiDii:
         assert last["fii_net_5d"] == pytest.approx(-1200.0 + 300.0 + 500.0 + 700.0)
         # Last day's fii_net_5d is +300; boost flag must agree
         assert last["fii_boost"] == 1
+
+
+class TestPendingEntries:
+    """EQ-FU-1: /equity/pending-entries surface for the close-scan queue."""
+
+    def _seed_pending(self, symbol, status="PENDING", **over):
+        kwargs = dict(
+            signal_dt="2026-05-25",
+            symbol=symbol,
+            side="LONG",
+            signal_close=1000.0,
+            sl_distance=50.0,
+            target_distance=100.0,
+            atr=20.0,
+            qty=10,
+            rationale="trend_up ADX=24",
+        )
+        kwargs.update(over)
+        pid = db.insert_equity_pending_entry(**kwargs)
+        if status != "PENDING":
+            db.update_equity_pending_entry_status(pid, status, note="test")
+        return pid
+
+    def test_empty(self, client):
+        r = client.get("/api/equity/pending-entries")
+        assert r.status_code == 200
+        assert r.json() == {"pending": []}
+
+    def test_default_returns_pending_only(self, client):
+        self._seed_pending("INFY", status="PENDING")
+        self._seed_pending("RELIANCE", status="FILLED")
+        self._seed_pending("HDFC", status="SKIPPED_GAP")
+        r = client.get("/api/equity/pending-entries")
+        assert r.status_code == 200
+        body = r.json()
+        assert [p["symbol"] for p in body["pending"]] == ["INFY"]
+
+    def test_explicit_status_filter(self, client):
+        self._seed_pending("INFY", status="PENDING")
+        self._seed_pending("RELIANCE", status="FILLED")
+        self._seed_pending("HDFC", status="SKIPPED_GAP")
+        r = client.get("/api/equity/pending-entries?status=FILLED")
+        assert r.status_code == 200
+        body = r.json()
+        assert [p["symbol"] for p in body["pending"]] == ["RELIANCE"]
+
+    def test_unknown_status_rejected(self, client):
+        r = client.get("/api/equity/pending-entries?status=BOGUS")
+        assert r.status_code == 400
+        assert "PENDING" in r.json()["detail"]
+
+    def test_response_carries_fill_distances(self, client):
+        self._seed_pending("INFY", sl_distance=42.5, target_distance=85.0,
+                            atr=17.0, qty=20)
+        r = client.get("/api/equity/pending-entries")
+        body = r.json()
+        row = body["pending"][0]
+        assert row["sl_distance"] == pytest.approx(42.5)
+        assert row["target_distance"] == pytest.approx(85.0)
+        assert row["atr"] == pytest.approx(17.0)
+        assert row["qty"] == 20

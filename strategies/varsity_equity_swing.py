@@ -115,6 +115,20 @@ class EquityPosition:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Next-day fill filters (shared by live runner + backtester per Rule 7)
+# ──────────────────────────────────────────────────────────────────────────────
+# A signal whose next-session open gaps too far from the signal-close is
+# a different setup than the one screened — skip it rather than fill at
+# the gap and let the SL fire on the first tick.
+PENDING_GAP_ATR_THRESHOLD = 1.5
+# Max calendar days a PENDING row may sit before it's treated as stale.
+# Catches operator downtime / long-weekend zombies. Backtest applies the
+# same filter so autoresearch sweeps optimise against the live trade
+# count, not an inflated one (EQ-FU-2).
+PENDING_MAX_AGE_DAYS = 5
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Strategy
 # ──────────────────────────────────────────────────────────────────────────────
 

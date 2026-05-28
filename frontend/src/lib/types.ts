@@ -273,6 +273,35 @@ export type FiiDiiResponse = {
   rows: FiiDiiRow[];
 };
 
+// EQ-FU-1: equity_pending_entries surface
+export type EquityPendingStatus =
+  | "PENDING"
+  | "FILLED"
+  | "SKIPPED_GAP"
+  | "SKIPPED_STALE"
+  | "SKIPPED_OPEN";
+
+export type EquityPendingEntry = {
+  id: number;
+  signal_dt: string;
+  symbol: string;
+  side: string;
+  signal_close: number;
+  sl_distance: number;
+  target_distance: number;
+  atr: number;
+  qty: number;
+  rationale: string | null;
+  status: EquityPendingStatus;
+  created_at: string;
+  resolved_at: string | null;
+  resolution_note: string | null;
+};
+
+export type EquityPendingEntriesResponse = {
+  pending: EquityPendingEntry[];
+};
+
 // ── Live position tracker ──
 
 export type PositionMode = "paper" | "live";

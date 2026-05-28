@@ -49,6 +49,7 @@ ROUTES=(
     "/api/equity/signals|401"
     "/api/equity/scans|401"
     "/api/equity/fii-dii|401"
+    "/api/equity/pending-entries|401"
 )
 
 wait_ready() {
