@@ -103,7 +103,32 @@ f733a91 pair_trading: close remaining 7 Highs (H6/H7/H8/H12/H13/H15/H17)
             so baseline + persistent runners can't 2× per-symbol concentration
 ```
 
-The remaining Highs and Mediums below are open. Severity uses the audit rubric:
+Closed Mediums (2026-05-28 "Mediums sweep — Strategy / Broker / Risk / Ops",
+one commit per source per Rule 7):
+```
+796e742 pair_trading: strategy-source Mediums (M-S1/M-S2/M-S3/M-S4)
+        M-S1 restore_state warns on >0.5σ entry_z drift vs today's seeded distribution
+        M-S2 select_pairs prefers CSV last_data_date column over file mtime
+        M-S3 MEAN_REVERT exit debounced (N consecutive in-band ticks; STOP not debounced)
+        M-S4 closed_trades rows record per-trade realized PnL / costs (delta, not cumulative)
+9bc2972 pair_trading: broker-source Mediums (M-B1..M-B5)
+        M-B1 _paper_execute applies validate_order (was silently filling NaN proposals)
+        M-B2 _paper_execute applies one-way slippage (paper_slippage_bps default 5)
+        M-B3 refuses new entries when either leg's expiry == today
+        M-B4 distinguishes TokenException / NetworkException / OrderException
+        M-B5 consecutive-failure backoff on place_order (skip-window doubles per re-arm)
+19cc25a pair_trading: risk-source Mediums (M-R1/M-R2)
+        M-R1 end_of_session warns on ≥3-day break with open book + force-flatten off
+        M-R2 reconcile cross-checks state entry_price vs broker average_price (warn-only)
+8ae9ebc pair_trading: ops-source Mediums (M-O1..M-O5)
+        M-O1 load_holidays raises with file:line context on malformed date
+        M-O2 assert_disk_space_ok pre-flight refuses to start when <500MB / <5% free
+        M-O3 run_weekly_pair_screen.sh tees stdout to journald + log file
+        M-O4 assert_timezone_ist refuses to start outside IST / +0530
+        M-O5 pair-paper{,-persistent}.service Type=simple + Restart=on-failure
+```
+
+The remaining Lows below are open. Severity uses the audit rubric:
 - **High**: will lose money or block trading under a common failure mode
 - **Medium**: degrades reliability or observability; unlikely to lose money directly
 - **Low**: nice-to-have
@@ -120,31 +145,9 @@ commit/landing notes.
 
 ## Mediums
 
-(grouped by source; each ~15-30 min to fix)
-
-**Strategy:**
-- M-S1 — `restore_matching_strategies` doesn't warn on materially different reseeded std (could subtly shift stop-z math).
-- M-S2 — `select_pairs` checks CSV mtime, not `last_data_date` column — stale data with fresh mtime passes through.
-- M-S3 — `check_and_rehedge` exit at `|z| <= exit_z` could fire on a single noisy tick; consider debouncing.
-- M-S4 — `_record_close` stores cumulative not per-trade P&L — fragile audit shape.
-
-**Broker:**
-- M-B1 — Paper mode doesn't call `validate_order` — NaN-priced proposals "fill" in paper, reject in live.
-- M-B2 — Slippage modelled in cost only; paper fill price is exact LTP. Day-1 live P&L diverges by real spread.
-- M-B3 — Front-month resolution: `_exp_date(r) >= today` returns near-month on expiry day. New entries placed at 14:00 expiry-day → settle at 15:30. Refuse new entries when leg's expiry == today.
-- M-B4 — Broad `except Exception` swallows distinct Kite exception classes (TokenException, NetworkException, OrderException). Catch each specifically.
-- M-B5 — No backoff on consecutive `place_order` failures. With 6h × 60s ticks, 360 retries against a known-broken account.
-
-**Risk:**
-- M-R1 — Force-flatten-on-exit default False; no warning before extended breaks (long weekends). Add look-ahead check.
-- M-R2 — Restore_state trusts saved entry_price unconditionally; if state schema changes silently or operator copies wrong state, stop-z math fires against wrong baselines. Add cross-check vs `kite.positions()` average_price within 0.5%.
-
-**Ops:**
-- M-O1 — Holiday loader: typo in CSV → load aborts uncaught. Add `python -m holidays_lint` to redeploy.sh.
-- M-O2 — Disk-space monitoring: no alert when `data_cache/` or `logs/` cross threshold.
-- M-O3 — `screen-pairs.service` writes its log file directly, not via journald — `journalctl -u screen-pairs` only shows tail.
-- M-O4 — Timezone: `datetime.now()` is naïve, relies on systemd `TZ=Asia/Kolkata`. Add startup assertion that `time.tzname[0] == 'IST'`.
-- M-O5 — Restart policy missing on `Type=oneshot` runners. Segfault mid-session → no restart until tomorrow's timer.
+All open Mediums (M-S1..M-S4, M-B1..M-B5, M-R1, M-R2, M-O1..M-O5) were
+closed in the 2026-05-28 sweep — see the "Closed Mediums" block above
+for the per-item commit/landing notes.
 
 ---
 
