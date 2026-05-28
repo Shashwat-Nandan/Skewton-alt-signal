@@ -1066,18 +1066,27 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
             f"{e!r}. Refusing to start — broker state is unknown."
         )
 
-    # Index NFO positions by tradingsymbol → signed shares (Kite's
-    # `quantity` is already signed: positive long, negative short).
+    # Index NFO positions by tradingsymbol → (signed shares, avg price).
+    # Kite's `quantity` is already signed: positive long, negative short.
+    # `average_price` is the broker's truth for the leg's cost basis.
     broker_qty: Dict[str, int] = {}
+    broker_avg_price: Dict[str, float] = {}
     for pos in broker_positions:
         if pos.get("exchange") != "NFO":
             continue
         ts = pos.get("tradingsymbol", "")
         qty = int(pos.get("quantity", 0))
-        if ts:
-            broker_qty[ts] = broker_qty.get(ts, 0) + qty
+        if not ts:
+            continue
+        broker_qty[ts] = broker_qty.get(ts, 0) + qty
+        # If the same tradingsymbol appears twice, last write wins —
+        # acceptable because Kite collapses to a single net row per
+        # tradingsymbol in the "net" bucket.
+        if pos.get("average_price") not in (None, 0, 0.0):
+            broker_avg_price[ts] = float(pos.get("average_price"))
 
     mismatches: List[str] = []
+    price_warnings: List[str] = []
     expected_tradingsymbols: set = set()
     for s in live_strategies:
         if s.state.position == "FLAT":
@@ -1092,6 +1101,24 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
                     f"state expects {expected_shares} shares, broker has "
                     f"{actual_shares}"
                 )
+                continue
+            # M-R2: cross-check entry_price against broker's average_price.
+            # State-schema corruption or wrong-state-file-copied would
+            # otherwise leave stop-z math calibrated to a baseline the
+            # broker doesn't agree with. 0.5% tolerance covers normal
+            # rounding + intra-trade adds without flagging routine drift.
+            broker_px = broker_avg_price.get(leg.tradingsymbol)
+            if broker_px is None or broker_px == 0:
+                continue  # broker didn't report price — skip silently
+            tol = max(0.005 * broker_px, 0.5)  # 0.5% or ₹0.50 floor
+            if abs(leg.entry_price - broker_px) > tol:
+                price_warnings.append(
+                    f"{s.symbol_a}/{s.symbol_b} {leg.tradingsymbol}: "
+                    f"state entry_price ₹{leg.entry_price:.2f} vs broker "
+                    f"average_price ₹{broker_px:.2f} (diff "
+                    f"₹{abs(leg.entry_price - broker_px):.2f}, tol "
+                    f"₹{tol:.2f})"
+                )
 
     # Broker positions we don't know about — flag (don't refuse). Could be
     # manual orders or another runner's positions on the same account.
@@ -1102,6 +1129,17 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
             "Broker has %d NFO position(s) not tracked by this runner — "
             "this runner will NOT manage them: %s",
             len(unknown), unknown,
+        )
+
+    if price_warnings:
+        # M-R2: entry_price drift is non-fatal — broker agrees on shares
+        # so trading can proceed, but stop-z math is calibrated to a
+        # different baseline. Operator should audit state vs broker.
+        log.warning(
+            "M-R2: entry_price mismatch on %d leg(s) — broker shares "
+            "match but cost basis drifted. Stop-z math may fire against "
+            "an unintended baseline:\n  %s",
+            len(price_warnings), "\n  ".join(price_warnings),
         )
 
     if mismatches:
@@ -1498,7 +1536,7 @@ def main():
         # sentinel + CRITICAL log have already fired by this point.
         if silent_fail:
             try:
-                end_of_session(strategies, today, args, log)
+                end_of_session(strategies, today, args, log, holidays=holidays)
             except Exception as e:
                 log.exception(
                     "end_of_session failed during silent-fail teardown: "
@@ -1529,7 +1567,22 @@ def main():
     return 0
 
 
-def end_of_session(strategies, today: date, args, log: logging.Logger):
+def _calendar_days_until_next_trading_day(today: date, holidays: set) -> int:
+    # M-R1: how many calendar days until the next NSE-trading day (today
+    # excluded). Used to detect long-weekend / Diwali-week gaps so the
+    # session-end summary can warn the operator that the open book will
+    # sit unmonitored across the break.
+    from datetime import timedelta
+    d = today
+    for step in range(1, 11):  # cap at 10 days, way past any real break
+        d = d + timedelta(days=1)
+        if d.weekday() < 5 and d not in holidays:
+            return step
+    return 10  # fallback — refuses to spin forever
+
+
+def end_of_session(strategies, today: date, args, log: logging.Logger,
+                    *, holidays: Optional[set[date]] = None):
     """At session end: (1) force-flatten any leg whose contract expires today;
     (2) honour --force-flatten-on-exit if set; (3) persist state for the
     next session; (4) write the EOD sidecar for the verifier/dashboard.
@@ -1545,6 +1598,25 @@ def end_of_session(strategies, today: date, args, log: logging.Logger):
     fires notify-failure@ so the operator can manually flatten before
     cash settlement.
     """
+    # M-R1: long-break warning. If the next trading day is 3+ calendar
+    # days away (long weekend, Diwali week, etc.) AND any pair holds an
+    # open book AND --force-flatten-on-exit is NOT set, emit a WARNING.
+    # Static check; the operator decides whether to override on the
+    # next run.
+    if holidays is not None and not args.force_flatten_on_exit:
+        gap_days = _calendar_days_until_next_trading_day(today, holidays)
+        open_pairs = [f"{s.symbol_a}/{s.symbol_b}" for s in strategies
+                      if s.state.position != "FLAT"]
+        if gap_days >= 3 and open_pairs:
+            log.warning(
+                "M-R1: next trading day is %d calendar days away and %d "
+                "pair(s) hold open positions: %s. --force-flatten-on-exit "
+                "is OFF; the book will sit unmonitored across the break. "
+                "Consider re-running with --force-flatten-on-exit or "
+                "manually squaring off before close.",
+                gap_days, len(open_pairs), ", ".join(open_pairs),
+            )
+
     unverified_expiry: List[str] = []
     for s in strategies:
         pair_label = f"{s.symbol_a}/{s.symbol_b}"
