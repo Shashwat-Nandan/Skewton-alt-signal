@@ -21,6 +21,11 @@ mkdir -p "$LOG_DIR"
 
 PY="$PROJECT_DIR/.venv/bin/python"
 
+# M-O3: tee to stdout (→ journald via StandardOutput=journal in the
+# .service file) AND to the daily log file. Previously the block was
+# `>> "$LOG_FILE" 2>&1` which left `journalctl -u screen-pairs` with
+# only the trailing-tail mirror; the full step-by-step output is now
+# in journald for log-aggregation tooling AND on disk for `grep`.
 {
   echo "============================================================"
   echo "WEEKLY PAIR SCREEN — $TODAY"
@@ -50,7 +55,4 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo
   echo "Done."
   echo "============================================================"
-} >> "$LOG_FILE" 2>&1
-
-# Mirror the tail to journald.
-tail -n 30 "$LOG_FILE"
+} 2>&1 | tee -a "$LOG_FILE"

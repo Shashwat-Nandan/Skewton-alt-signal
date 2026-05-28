@@ -4,9 +4,14 @@ Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
 OnFailure=notify-failure@%n.service
+# M-O5: StartLimit* live in [Unit], not [Service]. See pair-paper.service.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
-Type=oneshot
+# M-O5: Type=simple (was oneshot) so Restart=on-failure can engage on
+# mid-session crashes. Mirrors pair-paper.service.
+Type=simple
 # --- EDIT THESE THREE FOR YOUR VPS ---
 User=root
 WorkingDirectory=/opt/taleb-karpathy-kite
@@ -26,6 +31,8 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run
     --system persistent
 # ------------------------------------
 
+Restart=on-failure
+RestartSec=30
 TimeoutStartSec=0
 StandardOutput=journal
 StandardError=journal

@@ -4,9 +4,17 @@ Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
 OnFailure=notify-failure@%n.service
+# M-O5: StartLimit* live in [Unit], not [Service]. Cap a crashloop at 5
+# restarts within 10 minutes — past that systemd gives up and
+# notify-failure@ alerts rather than burning CPU forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
-Type=oneshot
+# M-O5: Type=simple (not oneshot) so Restart=on-failure kicks in for
+# mid-session crashes. Oneshot blocks Restart=, leaving a segfault at
+# 11:00 IST unrecovered until the next day's timer at 09:15 IST.
+Type=simple
 # --- EDIT THESE THREE FOR YOUR VPS ---
 User=root
 WorkingDirectory=/opt/taleb-karpathy-kite
@@ -18,7 +26,13 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 12 --max-leg-notional 1000000
 # ------------------------------------
 
-# Oneshot session — exits cleanly at 15:25 IST. Timer fires again tomorrow.
+# M-O5: auto-restart on segfault / non-zero exit. Successful exit (clean
+# 15:25 IST teardown) returns 0 and does NOT trigger restart, so the
+# timer pattern still works. StartLimit caps a crashloop at 5 restarts
+# within 10 minutes — past that systemd gives up so notify-failure@
+# alerts rather than burning a CPU forever.
+Restart=on-failure
+RestartSec=30
 TimeoutStartSec=0
 StandardOutput=journal
 StandardError=journal

@@ -187,15 +187,28 @@ def silent_fail_flag_path(system: str) -> Path:
 
 
 def load_holidays(path: Path) -> set[date]:
+    # M-O1: lint each non-comment line and raise a precise error that
+    # names the offending line number + content. Pre-fix, a typo like
+    # "2026-13-05" raised a bare ValueError on date.fromisoformat with
+    # no file context, abort-the-runner-with-no-clue style.
     if not path.exists():
         return set()
     days: set[date] = set()
-    for raw in path.read_text().splitlines():
+    for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         token = line.split(",", 1)[0].strip()
-        days.add(date.fromisoformat(token))
+        if token.lower() in ("date", "holiday_date"):
+            # tolerate a CSV header row
+            continue
+        try:
+            days.add(date.fromisoformat(token))
+        except ValueError as e:
+            raise ValueError(
+                f"{path}:{lineno}: malformed holiday date {token!r} "
+                f"({e}). Expected YYYY-MM-DD."
+            )
     return days
 
 
@@ -205,6 +218,73 @@ def is_trading_day(d: date, holidays: set[date]) -> tuple[bool, str]:
     if d in holidays:
         return False, f"{d} is an NSE holiday"
     return True, ""
+
+
+def assert_timezone_ist(log: logging.Logger) -> None:
+    # M-O4: datetime.now() is naive and inherits the process timezone
+    # from systemd's TZ=Asia/Kolkata. A misconfigured deploy without
+    # that env var would silently quote UTC times everywhere — wrong
+    # market-open / close boundaries, wrong entry_time, wrong holiday
+    # gating. Assert the process really is on IST before the runner
+    # touches anything market-time-dependent.
+    import time as _time
+    tznames = _time.tzname
+    is_dst = _time.daylight and _time.localtime().tm_isdst > 0
+    current = tznames[1] if is_dst else tznames[0]
+    # IST is the canonical name; some glibc builds report "+0530" when
+    # the zone file isn't installed. Both are equivalent in offset.
+    expected = ("IST", "+0530")
+    if current not in expected:
+        raise RuntimeError(
+            f"M-O4: process timezone is {current!r} (tzname={tznames!r}, "
+            f"is_dst={is_dst}). Expected IST. The systemd unit must set "
+            f"`Environment=TZ=Asia/Kolkata` (or `TZ=Asia/Kolkata` on the "
+            f"shell). Refusing to start — wrong-TZ runs misquote market "
+            f"hours and holiday boundaries silently."
+        )
+    log.info("Timezone check passed: tzname=%s, dst=%s", current, is_dst)
+
+
+def assert_disk_space_ok(paths: List[Path], log: logging.Logger,
+                          min_free_mb: int = 500,
+                          min_free_pct: float = 5.0) -> None:
+    # M-O2: refuse to start if the partition hosting any critical
+    # directory (data_cache/, logs/) has less than min_free_mb MB free
+    # OR less than min_free_pct % of its capacity. State snapshots,
+    # rolling logs, and bhavcopy cache all live there; running out
+    # mid-session would corrupt the state-file write (no atomic rename
+    # if the destination partition is full) and silently drop log lines.
+    import shutil
+    breaches: List[str] = []
+    seen_mountpoints: set = set()
+    for p in paths:
+        try:
+            usage = shutil.disk_usage(p if p.exists() else p.parent)
+        except FileNotFoundError:
+            continue  # caller's responsibility — don't pretend to know
+        # Deduplicate by mountpoint so we don't double-report logs/ +
+        # data_cache/ when they live on the same volume.
+        mp = (usage.total, usage.free)
+        if mp in seen_mountpoints:
+            continue
+        seen_mountpoints.add(mp)
+        free_mb = usage.free / (1024 * 1024)
+        free_pct = 100.0 * usage.free / usage.total if usage.total else 0
+        if free_mb < min_free_mb or free_pct < min_free_pct:
+            breaches.append(
+                f"{p}: free={free_mb:.0f}MB ({free_pct:.1f}%) — "
+                f"below threshold (min {min_free_mb}MB / {min_free_pct}%)"
+            )
+        else:
+            log.info("Disk OK at %s: %.0fMB free (%.1f%%)",
+                     p, free_mb, free_pct)
+    if breaches:
+        raise RuntimeError(
+            "M-O2: disk-space pre-flight failed:\n  " +
+            "\n  ".join(breaches) +
+            "\nFree space and retry. State writes / log rolls would "
+            "otherwise corrupt or truncate silently."
+        )
 
 
 HOLIDAY_HORIZON_DAYS = 30
@@ -1345,6 +1425,12 @@ def main():
         log.critical("LIVE TRADING SESSION — REAL MONEY [system=%s]",
                      args.system)
         log.critical("=" * 60)
+
+    # M-O4 / M-O2: pre-flight gates before any market-time-dependent or
+    # disk-touching work. Both fail loud — operator must fix TZ or free
+    # disk before the next run.
+    assert_timezone_ist(log)
+    assert_disk_space_ok([DATA_CACHE, HERE / "logs"], log)
 
     holidays = load_holidays(HOLIDAYS_PATH)
     assert_holiday_data_fresh(holidays, today, log)
