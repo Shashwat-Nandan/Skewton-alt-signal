@@ -436,22 +436,46 @@ def select_pairs(top: int, log: logging.Logger,
             f"{candidates_path} not found — run screen_pairs.py first."
         )
 
+    df_raw = pd.read_csv(candidates_path)
     if max_age_days > 0:
-        mtime = datetime.fromtimestamp(candidates_path.stat().st_mtime)
-        age_days = (datetime.now() - mtime).total_seconds() / 86400.0
-        if age_days > max_age_days:
-            raise RuntimeError(
-                f"{candidates_path} is {age_days:.1f}d old (mtime "
-                f"{mtime:%Y-%m-%d %H:%M}), exceeds max_age_days={max_age_days}. "
-                "The weekly screen has not run recently — refusing to trade on "
-                "stale hedge ratios. Run screen_pairs.py to refresh, or pass "
-                "--max-csv-age-days 0 to bypass (not recommended in paper/live)."
+        # M-S2: prefer the `last_data_date` column over filesystem mtime.
+        # mtime can be fresh (cp/touch by an unrelated process) while the
+        # underlying screen data is stale; last_data_date is written by
+        # screen_pairs.py and reflects the actual data window's end.
+        # Fall back to mtime if the column is missing (legacy CSVs).
+        if "last_data_date" in df_raw.columns and not df_raw["last_data_date"].dropna().empty:
+            data_dates = pd.to_datetime(df_raw["last_data_date"], errors="coerce").dropna()
+            last_data = data_dates.max()
+            age_days = (pd.Timestamp(datetime.now()).normalize()
+                        - last_data.normalize()).days
+            if age_days > max_age_days:
+                raise RuntimeError(
+                    f"{candidates_path}: last_data_date={last_data.date()} is "
+                    f"{age_days}d old, exceeds max_age_days={max_age_days}. "
+                    "Re-run screen_pairs.py to refresh, or pass "
+                    "--max-csv-age-days 0 to bypass (not recommended in paper/live)."
+                )
+            log.info("Candidates last_data_date: %s (%dd old)",
+                     last_data.date(), age_days)
+        else:
+            mtime = datetime.fromtimestamp(candidates_path.stat().st_mtime)
+            age_days_f = (datetime.now() - mtime).total_seconds() / 86400.0
+            if age_days_f > max_age_days:
+                raise RuntimeError(
+                    f"{candidates_path} is {age_days_f:.1f}d old (mtime "
+                    f"{mtime:%Y-%m-%d %H:%M}), exceeds max_age_days={max_age_days}. "
+                    "The weekly screen has not run recently — refusing to trade on "
+                    "stale hedge ratios. Run screen_pairs.py to refresh, or pass "
+                    "--max-csv-age-days 0 to bypass (not recommended in paper/live)."
+                )
+            log.warning(
+                "Candidates CSV missing last_data_date column — using mtime "
+                "(%.1fd). Re-screen to populate the column (M-S2 fallback).",
+                age_days_f,
             )
-        log.info("Candidates CSV age: %.1fd (mtime %s)",
-                 age_days, mtime.strftime("%Y-%m-%d %H:%M"))
 
     annotated = classify_pair_candidates(
-        pd.read_csv(candidates_path), top, log,
+        df_raw, top, log,
         seed_leg_count=seed_leg_count,
     )
     picks = (

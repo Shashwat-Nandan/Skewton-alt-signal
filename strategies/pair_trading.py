@@ -159,6 +159,16 @@ class PairState:
     # diagnostics but allow immediate re-entry.
     last_exit_time: Optional[datetime] = None
     last_exit_reason: Optional[str] = None
+    # M-S3: consecutive-tick count for the mean-revert exit debounce.
+    # Single noisy tick at |z| <= exit_z used to fire MEAN_REVERT
+    # immediately. Counter increments per qualifying tick, fires the
+    # exit when it reaches exit_debounce_ticks, resets otherwise.
+    mean_revert_streak: int = 0
+    # M-S4: cumulative realized/tx-cost figures at the moment this open
+    # position was entered. Used at _record_close to write per-trade P&L
+    # rows (delta = current - baseline) instead of running totals.
+    realized_at_entry: float = 0.0
+    tx_costs_at_entry: float = 0.0
 
 
 class PairTradingStrategy(BaseStrategy):
@@ -236,6 +246,12 @@ class PairTradingStrategy(BaseStrategy):
         self.safety_buffer = float(cfg.get("safety_buffer", 0.75))
         self.lookback_days = int(cfg.get("lookback_days", 60))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
+        # M-S3: minimum consecutive ticks inside |z| <= exit_z before
+        # firing a MEAN_REVERT exit. Default 2 (~60s at 30s tick cadence)
+        # catches a single-tick noise spike without delaying genuine
+        # mean-reversion meaningfully. STOP is intentionally not
+        # debounced — runaway moves should exit on first signal.
+        self.exit_debounce_ticks = max(1, int(cfg.get("exit_debounce_ticks", 2)))
         # Cost-hurdle: refuse entries whose expected ₹ move from current z back
         # to the exit band is below `min_edge_multiplier × round_trip_cost`.
         # 2026-05-13 paper session ate ~₹39k in friction across 28 round-trips
@@ -417,7 +433,16 @@ class PairTradingStrategy(BaseStrategy):
             return []
 
         if abs(z) <= self.exit_z:
-            return self._build_exit_proposals(reason="MEAN_REVERT", z=z, prices=prices)
+            # M-S3: debounce — require N consecutive ticks inside the
+            # exit band before firing. A single noisy tick at |z| <=
+            # exit_z used to exit prematurely on spreads that immediately
+            # bounce back.
+            self.state.mean_revert_streak += 1
+            if self.state.mean_revert_streak >= self.exit_debounce_ticks:
+                return self._build_exit_proposals(reason="MEAN_REVERT", z=z, prices=prices)
+            return []
+        # Reset the streak whenever |z| moves back outside the exit band.
+        self.state.mean_revert_streak = 0
         # Per-trade effective stop (widened by safety_buffer for deep entries)
         # falls back to the global stop_z if state somehow missed initialisation.
         stop = self.state.effective_stop_z or self.stop_z
@@ -489,6 +514,10 @@ class PairTradingStrategy(BaseStrategy):
             self.state.entry_spread = 0.0
             self.state.effective_stop_z = 0.0
             self.state.unrealized_pnl = 0.0
+            # M-S3: reset the debounce counter so the NEXT position starts
+            # fresh; otherwise a closing trade's counter could leak into a
+            # new entry's first ticks.
+            self.state.mean_revert_streak = 0
             # H5: promote the reason stashed by _build_exit_proposals onto
             # state so scan_and_propose can enforce the cooldown across
             # ticks (and sessions, via state serialization).
@@ -565,6 +594,9 @@ class PairTradingStrategy(BaseStrategy):
                 "realized_pnl": self.state.realized_pnl,
                 "unrealized_pnl": self.state.unrealized_pnl,
                 "total_transaction_costs": self.state.total_transaction_costs,
+                "mean_revert_streak": self.state.mean_revert_streak,
+                "realized_at_entry": self.state.realized_at_entry,
+                "tx_costs_at_entry": self.state.tx_costs_at_entry,
                 "closed_trades": [
                     self._serialise_closed_trade(t)
                     for t in self.state.closed_trades
@@ -629,8 +661,48 @@ class PairTradingStrategy(BaseStrategy):
             datetime.fromisoformat(last_exit_time) if last_exit_time else None
         )
         self.state.last_exit_reason = state_blob.get("last_exit_reason")
+        # M-S3: backwards-compat — older state files don't carry the streak.
+        self.state.mean_revert_streak = int(state_blob.get("mean_revert_streak") or 0)
+        # M-S4: backwards-compat — older state files don't carry per-trade
+        # baselines. Default to current cumulative figures so a restored
+        # mid-trade position records a 0-PnL trade at close rather than
+        # double-counting (a one-shot loss the first time after the upgrade).
+        self.state.realized_at_entry = float(
+            state_blob.get("realized_at_entry", self.state.realized_pnl)
+        )
+        self.state.tx_costs_at_entry = float(
+            state_blob.get("tx_costs_at_entry", self.state.total_transaction_costs)
+        )
         # Re-baseline session deltas against the restored cumulative figures.
         self._capture_session_baseline()
+        # M-S1: warn if the reseeded spread distribution has drifted enough
+        # that the restored entry_z is materially different from what
+        # today's window would compute for the same entry_spread. The
+        # state's effective_stop_z is anchored to the OLD distribution; a
+        # large drift means stop-z math fires against an unintended band.
+        if self.state.position != "FLAT":
+            self._warn_on_std_drift()
+
+    def _warn_on_std_drift(self) -> None:
+        stats = self._rolling_window_stats()
+        if stats is None:
+            return
+        mean, std = stats
+        recomputed_z = (self.state.entry_spread - mean) / std
+        # Threshold 0.5σ: anything tighter triggers on routine daily drift;
+        # anything looser misses regime shifts the audit cares about.
+        drift = abs(recomputed_z - self.state.entry_z)
+        if drift > 0.5:
+            logger.warning(
+                "M-S1: spread distribution drifted since entry — "
+                "saved entry_z=%.3f, today's seed recomputes to %.3f "
+                "(drift=%.3f σ). effective_stop_z=%.3f is calibrated to "
+                "the OLD distribution; stop will fire %.3f σ earlier/"
+                "later than intended under today's seed.",
+                self.state.entry_z, recomputed_z, drift,
+                self.state.effective_stop_z,
+                drift,
+            )
 
     def _capture_session_baseline(self) -> None:
         self._session_start_realized = self.state.realized_pnl
@@ -1145,6 +1217,10 @@ class PairTradingStrategy(BaseStrategy):
         self.state.effective_stop_z = max(
             self.stop_z, abs(self.state.entry_z) + self.safety_buffer,
         )
+        # M-S4: snapshot the cumulative P&L / cost baselines so _record_close
+        # can write a per-trade delta row instead of a running total.
+        self.state.realized_at_entry = self.state.realized_pnl
+        self.state.tx_costs_at_entry = self.state.total_transaction_costs
 
     def _update_unrealized(self, prices: Dict[str, float]) -> None:
         unrealized = 0.0
@@ -1155,13 +1231,22 @@ class PairTradingStrategy(BaseStrategy):
         self.state.unrealized_pnl = unrealized
 
     def _record_close(self) -> None:
+        # M-S4: record per-trade P&L (delta from entry baseline) instead
+        # of the running cumulative total. The old shape made adjacent
+        # rows differ only by a few %, and per-trade audit required
+        # diff'ing — fragile when rows are reordered or filtered.
+        # `cumulative_realized_pnl` is preserved as a second column so
+        # readers that need the running total still have it.
+        trade_realized = self.state.realized_pnl - self.state.realized_at_entry
+        trade_costs = self.state.total_transaction_costs - self.state.tx_costs_at_entry
         self.state.closed_trades.append({
             "exit_time": self._clock(),
             "entry_time": self.state.entry_time,
             "entry_z": self.state.entry_z,
             "entry_spread": self.state.entry_spread,
-            "realized_pnl": self.state.realized_pnl,
-            "transaction_costs": self.state.total_transaction_costs,
+            "realized_pnl": trade_realized,
+            "transaction_costs": trade_costs,
+            "cumulative_realized_pnl": self.state.realized_pnl,
             "position": self.state.position,
         })
 

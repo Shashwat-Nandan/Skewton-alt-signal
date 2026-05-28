@@ -79,6 +79,9 @@ def _make_strategy(
     s._kite_refresh = None
     s._book_notional_fn = None
     s.max_book_notional = None
+    # M-S3: debounce defaults to 1 so existing single-tick exit tests
+    # remain valid. Dedicated debounce tests opt in by setting >1.
+    s.exit_debounce_ticks = 1
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
     s._cached_futures = {
@@ -524,6 +527,169 @@ class TestExit:
 # ──────────────────────────────────────────────────────────
 # H5 — post-STOP cooldown
 # ──────────────────────────────────────────────────────────
+
+class TestStrategyMediums:
+    """M-S1..M-S4 — restore-time std drift warning, exit debounce,
+    per-trade P&L recording."""
+
+    def _seed_priced_quotes(self, s, price_a=1000.0, price_b=2000.0):
+        def fake_quote(symbols):
+            sym = symbols[0]
+            if "AAA" in sym:
+                return {sym: {"last_price": price_a}}
+            return {sym: {"last_price": price_b}}
+        s.kite.quote = fake_quote
+
+    def _open_long_spread(self, s, entry_z=-2.5, price_a=1000.0, price_b=2000.0):
+        s.state.position = "LONG_SPREAD"
+        s.state.entry_time = s._clock()
+        s.state.entry_z = entry_z
+        s.state.entry_spread = entry_z * 1.0
+        s.state.effective_stop_z = max(s.stop_z, abs(entry_z) + s.safety_buffer)
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
+                    quantity=1, entry_price=price_a, current_price=price_a),
+            PairLeg(symbol="BBB", tradingsymbol="BBB26APRFUT", lot_size=200,
+                    quantity=-1, entry_price=price_b, current_price=price_b),
+        ]
+
+    # M-S1: std-drift warning on restore
+    def test_restore_warns_on_std_drift(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger="strategies.pair_trading")
+        s = _make_strategy(hedge_ratio=0.5)
+        # Today's seed has std = 1.0 (alternating ±1.0)
+        s._spread_history = [-1.0, 1.0] * 30
+        # Saved state: entry_z = -3.0 against an OLD distribution where
+        # std was much larger (so the SAME entry_spread implies a much
+        # less extreme z under today's tighter std).
+        blob = {
+            "pair": ["AAA", "BBB"],
+            "hedge_ratio": 0.5,
+            "state": {
+                "position": "LONG_SPREAD",
+                "entry_z": -3.0,
+                "entry_time": None,
+                "entry_spread": -1.5,  # under today's std=1 this is z=-1.5
+                "effective_stop_z": 4.5,
+                "legs": [
+                    {"symbol": "AAA", "tradingsymbol": "AAA26APRFUT",
+                     "lot_size": 100, "quantity": 1, "entry_price": 1000.0},
+                    {"symbol": "BBB", "tradingsymbol": "BBB26APRFUT",
+                     "lot_size": 200, "quantity": -1, "entry_price": 2000.0},
+                ],
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "total_transaction_costs": 0.0,
+            },
+        }
+        s.restore_state(blob)
+        assert any("M-S1" in r.message and "drifted" in r.message
+                   for r in caplog.records)
+
+    def test_restore_no_warn_when_drift_small(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger="strategies.pair_trading")
+        s = _make_strategy(hedge_ratio=0.5)
+        s._spread_history = [-1.0, 1.0] * 30
+        # entry_z=-2.5 and entry_spread=-2.5 → today recomputes to -2.5
+        # (mean=0, std=1) → 0 drift.
+        blob = {
+            "pair": ["AAA", "BBB"], "hedge_ratio": 0.5,
+            "state": {
+                "position": "LONG_SPREAD", "entry_z": -2.5,
+                "entry_time": None, "entry_spread": -2.5,
+                "effective_stop_z": 4.0,
+                "legs": [
+                    {"symbol": "AAA", "tradingsymbol": "AAA26APRFUT",
+                     "lot_size": 100, "quantity": 1, "entry_price": 1000.0},
+                    {"symbol": "BBB", "tradingsymbol": "BBB26APRFUT",
+                     "lot_size": 200, "quantity": -1, "entry_price": 2000.0},
+                ],
+                "realized_pnl": 0.0, "unrealized_pnl": 0.0,
+                "total_transaction_costs": 0.0,
+            },
+        }
+        s.restore_state(blob)
+        assert not any("M-S1" in r.message for r in caplog.records)
+
+    # M-S3: exit debounce
+    def test_exit_debounce_holds_first_tick(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
+        s.exit_debounce_ticks = 2
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        # spread = 1000 - 0.5*2000 = 0 → z=0, inside exit band
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2000.0)
+        proposals = s.check_and_rehedge()
+        # First in-band tick must NOT exit — streak only at 1
+        assert proposals == []
+        assert s.state.mean_revert_streak == 1
+
+    def test_exit_debounce_fires_on_second_tick(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
+        s.exit_debounce_ticks = 2
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2000.0)
+        s.check_and_rehedge()  # tick 1 — no exit
+        proposals = s.check_and_rehedge()  # tick 2 — exit
+        assert any("MEAN_REVERT" in p.rationale for p in proposals)
+
+    def test_exit_debounce_resets_on_out_of_band(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0)
+        s.exit_debounce_ticks = 2
+        s._spread_history = [-1.0, 1.0] * 30
+        self._open_long_spread(s)
+        # Tick 1: inside band — streak goes to 1, no exit.
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2000.0)
+        s.check_and_rehedge()
+        assert s.state.mean_revert_streak == 1
+        # Tick 2: bounce outside band — streak resets to 0.
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=1998.0)  # spread=1, z=1
+        s.check_and_rehedge()
+        assert s.state.mean_revert_streak == 0
+
+    # M-S4: per-trade P&L
+    def test_record_close_writes_per_trade_pnl(self):
+        s = _make_strategy(hedge_ratio=0.5)
+        # Simulate prior trade left realized=500 cumulative
+        s.state.realized_pnl = 500.0
+        s.state.total_transaction_costs = 100.0
+        s.state.realized_at_entry = 500.0
+        s.state.tx_costs_at_entry = 100.0
+        # Now this trade adds 300 realized, 50 costs
+        s.state.realized_pnl = 800.0
+        s.state.total_transaction_costs = 150.0
+        s.state.entry_time = s._clock()
+        s.state.entry_z = -2.5
+        s.state.entry_spread = -2.5
+        s.state.position = "LONG_SPREAD"
+        s._record_close()
+        row = s.state.closed_trades[-1]
+        # Per-trade delta, not cumulative
+        assert row["realized_pnl"] == 300.0
+        assert row["transaction_costs"] == 50.0
+        # Cumulative preserved as a separate column
+        assert row["cumulative_realized_pnl"] == 800.0
+
+    def test_entry_snapshots_pnl_baseline(self):
+        # _set_position_from_legs must capture realized/tx baselines so a
+        # later _record_close reports the right per-trade delta.
+        s = _make_strategy(hedge_ratio=0.5)
+        s._spread_history = [-1.0, 1.0] * 30
+        s.state.realized_pnl = 1000.0  # prior trades
+        s.state.total_transaction_costs = 200.0
+        s.state.legs = [
+            PairLeg(symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
+                    quantity=1, entry_price=1000.0),
+            PairLeg(symbol="BBB", tradingsymbol="BBB26APRFUT", lot_size=200,
+                    quantity=-1, entry_price=2000.0),
+        ]
+        s._set_position_from_legs()
+        assert s.state.realized_at_entry == 1000.0
+        assert s.state.tx_costs_at_entry == 200.0
+
 
 class TestBookNotionalCap:
     """H13: total Σ open_notional ceiling across all runners. Refuses new
