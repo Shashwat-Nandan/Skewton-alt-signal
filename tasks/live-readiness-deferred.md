@@ -86,15 +86,21 @@ Closed Highs (2026-05-27 "defensive runner-startup + expiry-day guard" worklist)
         (H18 applies to both legs_expire_on implementations per Rule 7 — same policy, same shape)
 ```
 
-Closed Highs (2026-05-28 "remaining Highs sweep"):
+Closed Highs (2026-05-28 "remaining Highs sweep" — single bundled commit):
 ```
-H6  pair_trading: max_holding_days counts NSE trading days (skips weekends + holidays.csv)
-H7  pair_trading: refuse ANY partial fill (incl. lot-boundary), not just sub-lot
-H8  pair_trading: TokenException-specific catch + one-shot kite_refresh on place_order/quote/margins
-H12 run_paper_pairs: --lots-per-leg >5 requires --ack-large-size; >2× notional clamp logs WARNING
-H13 pair_trading + runner: cross-runner total-book notional cap (--max-book-notional-inr)
-H15 pair_trading: kite.margins() pre-check before live entry batches
-H17 run_paper_pairs: LEG_CONCENTRATION_CAP seeded from sibling pair-runner state files
+f733a91 pair_trading: close remaining 7 Highs (H6/H7/H8/H12/H13/H15/H17)
+        H6  max_holding_days counts NSE trading days (skips weekends + holidays.csv)
+        H7  refuse ANY partial fill + inline reversal of broker-side partial
+            (the partial would otherwise orphan — C2 only acts on COMPLETE siblings)
+        H8  TokenException-specific catch + one-shot kite_refresh on
+            place_order / quote / margins (runner builds the refresh closure)
+        H12 --lots-per-leg >5 requires --ack-large-size; >2× notional clamp logs WARNING
+        H13 cross-runner total-book notional cap via --max-book-notional-inr
+            (_aggregate_book_notional reads every paper-state JSON in data_cache/)
+        H15 kite.margins() pre-check before live entry batches (paper / transient
+            failure both fall through — broker reject + C2 reversal as the safety net)
+        H17 LEG_CONCENTRATION_CAP seeded from sibling pair-runner state files
+            so baseline + persistent runners can't 2× per-symbol concentration
 ```
 
 The remaining Highs and Mediums below are open. Severity uses the audit rubric:
