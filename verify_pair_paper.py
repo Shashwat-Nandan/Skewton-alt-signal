@@ -38,6 +38,12 @@ sys.path.insert(0, str(HERE))
 LOG_DIR = HERE / "logs"
 DATA_CACHE = HERE / "data_cache"
 CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
+HOLIDAYS_PATH = HERE / "holidays.csv"
+
+# Shared source of truth with run_paper_pairs — see CLAUDE.md Rule 7. If the
+# runner no-op's on a weekend / NSE holiday it does not write a sidecar, and
+# the verifier must no-op on the same calendar to avoid spurious failures.
+from run_paper_pairs import is_trading_day, load_holidays  # noqa: E402
 
 
 def setup_logging(today: date, system: str = "baseline") -> logging.Logger:
@@ -280,10 +286,19 @@ def main():
                              "and suffixes the output filenames. Defaults to "
                              "'baseline' so the baseline pair-verify.service "
                              "wiring is byte-identical to today's.")
+    parser.add_argument("--force", action="store_true",
+                        help="Run the verifier even on weekends / NSE holidays. "
+                             "Mirrors --force in run_paper_pairs.py — only set "
+                             "for backfill / debugging on a known-bad sidecar.")
     args = parser.parse_args()
 
     today = date.fromisoformat(args.date) if args.date else datetime.now().date()
     log = setup_logging(today, args.system)
+
+    ok, reason = is_trading_day(today, load_holidays(HOLIDAYS_PATH))
+    if not ok and not args.force:
+        log.info("No-op: %s. Exiting.", reason)
+        return 0
 
     sidecar = load_eod_sidecar(today, args.system)
     if sidecar is None:
