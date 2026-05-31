@@ -645,6 +645,35 @@ def update_equity_pending_entry_status(
     )
 
 
+def fill_pending_entry(
+    pos_dict: Dict[str, Any],
+    opened_by_scan: str,
+    pending_id: int,
+    fill_px: float,
+) -> int:
+    """Atomically open a position and mark its source pending row FILLED.
+
+    The INSERT into equity_positions and the pending-row status flip share a
+    single transaction (EQ-FU-3). Previously they were two autocommit
+    statements; a crash between them left an OPEN position with a still-PENDING
+    source row. BEGIN IMMEDIATE takes the write lock up front. Returns the new
+    equity_positions row id.
+    """
+    conn = get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        pid = insert_equity_position(pos_dict, opened_by_scan)
+        update_equity_pending_entry_status(
+            pending_id, "FILLED",
+            note=f"position id={pid} @ ₹{fill_px:.2f}",
+        )
+        conn.commit()
+        return pid
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def list_equity_scans(limit: int = 50) -> List[Dict[str, Any]]:
     conn = get_conn()
     rows = conn.execute(

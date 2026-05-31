@@ -23,6 +23,10 @@ Mode selection:
 
 Live mode is intentionally absent here; the strategy raises if asked.
 
+Note: pending-entry fills (``equity_pending_entries``) only drain in
+``--mode paper``. A ``--mode signals`` dry-run leaves PENDING rows
+untouched; they age out to SKIPPED_STALE after the max-age window.
+
 Per-day logfile under ``logs/equity-YYYY-MM-DD.log``. Exits 0 on a
 clean run, 1 on errors that didn't bring the process down.
 """
@@ -176,7 +180,7 @@ def _scalar_open_from_panel(f: pd.DataFrame, today_ts: pd.Timestamp) -> float:
     return float(val)
 
 
-def _fill_pending_entries(strategy, today: date, log: logging.Logger) -> tuple[int, int, int, int]:
+def _fill_pending_entries(strategy, today: date, scan_kind: str, log: logging.Logger) -> tuple[int, int, int, int]:
     """Materialize PENDING entry rows into open positions at today's open.
 
     Re-anchors SL/target to the actual fill price using the signal's stored
@@ -291,22 +295,23 @@ def _fill_pending_entries(strategy, today: date, log: logging.Logger) -> tuple[i
             pos.last_mtm_dt = today_ts
             strategy.positions[sym] = pos
 
-            pid = db.insert_equity_position({
-                "symbol": pos.symbol, "side": pos.side,
-                "entry_dt": pos.entry_dt.isoformat(),
-                "entry_px": pos.entry_px, "qty": pos.qty,
-                "initial_sl": pos.initial_sl, "current_sl": pos.current_sl,
-                "target": pos.target, "atr_at_entry": pos.atr_at_entry,
-                "rationale": pos.rationale,
-                "last_mtm_dt": pos.last_mtm_dt.isoformat(),
-                "last_mtm_px": pos.last_mtm_px,
-                "high_watermark": pos.high_watermark,
-            }, opened_by_scan="close")
-            db_ids[sym] = pid
-            db.update_equity_pending_entry_status(
-                row["id"], "FILLED",
-                note=f"position id={pid} @ ₹{open_px:.2f}",
+            pid = db.fill_pending_entry(
+                {
+                    "symbol": pos.symbol, "side": pos.side,
+                    "entry_dt": pos.entry_dt.isoformat(),
+                    "entry_px": pos.entry_px, "qty": pos.qty,
+                    "initial_sl": pos.initial_sl, "current_sl": pos.current_sl,
+                    "target": pos.target, "atr_at_entry": pos.atr_at_entry,
+                    "rationale": pos.rationale,
+                    "last_mtm_dt": pos.last_mtm_dt.isoformat(),
+                    "last_mtm_px": pos.last_mtm_px,
+                    "high_watermark": pos.high_watermark,
+                },
+                opened_by_scan=scan_kind,
+                pending_id=row["id"],
+                fill_px=open_px,
             )
+            db_ids[sym] = pid
             log.info("[PENDING FILL] id=%d %s qty=%d @ ₹%.2f SL=₹%.2f TGT=₹%.2f "
                      "(signal %s close ₹%.2f, gap %.2f×ATR)",
                      pid, sym, pos.qty, open_px, sl, target,
@@ -556,7 +561,7 @@ def main() -> int:
     n_filled_today = 0
     if args.scan == "close" and args.mode == "paper":
         f_filled, f_skip_gap, f_skip_stale, f_skip_open = _fill_pending_entries(
-            strategy, today, log)
+            strategy, today, args.scan, log)
         n_filled_today = f_filled
         if f_filled or f_skip_gap or f_skip_stale or f_skip_open:
             log.info("Pending entries: %d filled, %d skipped (gap), "

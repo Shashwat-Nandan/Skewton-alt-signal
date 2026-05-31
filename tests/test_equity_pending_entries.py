@@ -211,8 +211,7 @@ class TestFill:
             features={"DIVISLAB": _make_feature_frame({fill_day: next_open})}
         )
 
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         assert (filled, skip_gap, skip_stale, skip_open) == (1, 0, 0, 0)
         # last_mtm_dt must be seeded to the bar date, not None — otherwise
         # _persist_proposals would later write wall-clock now() into a
@@ -261,8 +260,7 @@ class TestFill:
             features={"SUNPHARMA": _make_feature_frame({fill_day: big_gap_open})}
         )
 
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         assert (filled, skip_gap, skip_stale, skip_open) == (0, 1, 0, 0)
         assert "SUNPHARMA" not in strategy.positions
         assert db.list_equity_positions(status="OPEN") == []
@@ -289,7 +287,7 @@ class TestFill:
         strategy = _StubStrategy(
             features={"EDGE": _make_feature_frame({fill_day: 1000.0 + gap})}
         )
-        filled = _fill_pending_entries(strategy, fill_day, log)[0]
+        filled = _fill_pending_entries(strategy, fill_day, "close", log)[0]
         assert filled == 1
 
     def test_skips_when_signal_too_old(self, fresh_db, log):
@@ -309,8 +307,7 @@ class TestFill:
         strategy = _StubStrategy(
             features={"ZOMBIE": _make_feature_frame({fill_day: 500.0})}
         )
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         assert (filled, skip_gap, skip_stale, skip_open) == (0, 0, 1, 0)
         assert "ZOMBIE" not in strategy.positions
 
@@ -330,8 +327,7 @@ class TestFill:
         strategy = _StubStrategy(
             features={"DROPPED": _make_feature_frame({signal_day: 100.0})}
         )
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         assert (filled, skip_gap, skip_stale, skip_open) == (0, 0, 1, 0)
 
     def test_skips_when_symbol_already_open(self, fresh_db, log):
@@ -353,8 +349,7 @@ class TestFill:
         )
         # Pretend a position already exists in memory.
         strategy.positions["DUP"] = object()
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         assert (filled, skip_gap, skip_stale, skip_open) == (0, 0, 0, 1)
         # Status string MUST be SKIPPED_OPEN, not SKIPPED_STALE — pinning
         # the analytics contract.
@@ -395,8 +390,7 @@ class TestRobustness:
             features={"CORRUPT": _make_feature_frame({fill_day: 100.0}),
                       "GOOD": _make_feature_frame({fill_day: 101.0})},
         )
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         assert filled == 1, "well-formed row 2 must still fill despite row 1 error"
         assert skip_stale == 1, "row 1 marked stale via the per-row except handler"
         assert "GOOD" in strategy.positions
@@ -421,8 +415,7 @@ class TestRobustness:
         dup_df = pd.DataFrame({"open": [100.5, 100.7]}, index=idx)
         strategy = _StubStrategy(features={"DUPDATE": dup_df})
 
-        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(
-            strategy, fill_day, log)
+        filled, skip_gap, skip_stale, skip_open = _fill_pending_entries(strategy, fill_day, "close", log)
         # The duplicate is caught by the per-row except → SKIPPED_STALE.
         # Critical: the function returns rather than raising.
         assert (filled, skip_gap, skip_open) == (0, 0, 0)
@@ -453,6 +446,70 @@ class TestRobustness:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Atomicity: position INSERT + pending FILLED commit together (EQ-FU-3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAtomicFill:
+    def test_fill_rolls_back_position_when_pending_update_fails(
+            self, fresh_db, monkeypatch):
+        """``fill_pending_entry`` wraps the equity_positions INSERT and the
+        pending-row FILLED flip in one transaction. If the status update
+        fails between them, the INSERT must roll back — otherwise a crash
+        mid-fill leaves an OPEN position whose source row is still PENDING,
+        which the next run would re-read and double-fill. Simulate the crash
+        by making the status update raise, then assert neither write stuck."""
+        db.insert_equity_pending_entry(
+            signal_dt="2026-05-25", symbol="ATOM", side="LONG",
+            signal_close=100.0, sl_distance=5.0, target_distance=10.0,
+            atr=2.0, qty=10, rationale="",
+        )
+        pending_id = db.list_equity_pending_entries(status="PENDING")[0]["id"]
+
+        def boom(*_a, **_k):
+            raise RuntimeError("simulated crash between the two writes")
+        monkeypatch.setattr(db, "update_equity_pending_entry_status", boom)
+
+        pos_dict = {
+            "symbol": "ATOM", "side": "LONG",
+            "entry_dt": "2026-05-26T00:00:00",
+            "entry_px": 101.0, "qty": 10,
+            "initial_sl": 96.0, "target": 121.0,
+        }
+        with pytest.raises(RuntimeError):
+            db.fill_pending_entry(pos_dict, opened_by_scan="close",
+                                  pending_id=pending_id, fill_px=101.0)
+
+        # INSERT rolled back: no orphan OPEN position.
+        assert db.list_equity_positions(status="OPEN") == []
+        # Source row untouched: still PENDING, never silently FILLED.
+        assert len(db.list_equity_pending_entries(status="PENDING")) == 1
+        assert db.list_equity_pending_entries(status="FILLED") == []
+
+    def test_fill_commits_both_writes_on_success(self, fresh_db):
+        """Happy path through the atomic helper directly: one OPEN position,
+        source row FILLED, and the FILLED note carries the new position id."""
+        db.insert_equity_pending_entry(
+            signal_dt="2026-05-25", symbol="ATOM2", side="LONG",
+            signal_close=100.0, sl_distance=5.0, target_distance=10.0,
+            atr=2.0, qty=10, rationale="",
+        )
+        pending_id = db.list_equity_pending_entries(status="PENDING")[0]["id"]
+        pos_dict = {
+            "symbol": "ATOM2", "side": "LONG",
+            "entry_dt": "2026-05-26T00:00:00",
+            "entry_px": 101.0, "qty": 10,
+            "initial_sl": 96.0, "target": 121.0,
+        }
+        pid = db.fill_pending_entry(pos_dict, opened_by_scan="close",
+                                    pending_id=pending_id, fill_px=101.0)
+        opens = db.list_equity_positions(status="OPEN")
+        assert len(opens) == 1 and opens[0]["id"] == pid
+        filled = db.list_equity_pending_entries(status="FILLED")
+        assert len(filled) == 1
+        assert str(pid) in (filled[0]["resolution_note"] or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # End-to-end: queue today → fill tomorrow
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -478,7 +535,7 @@ class TestRoundTrip:
         strategy = _StubStrategy(
             features={"ABB": _make_feature_frame({day_n1: next_open})}
         )
-        filled = _fill_pending_entries(strategy, day_n1, log)[0]
+        filled = _fill_pending_entries(strategy, day_n1, "close", log)[0]
         assert filled == 1
         opens = db.list_equity_positions(status="OPEN")
         assert len(opens) == 1

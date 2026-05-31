@@ -12,25 +12,20 @@ EQ-FU-2  backtest applies the gap-skip + max-age filters live enforces
          (constants factored into strategies.varsity_equity_swing per Rule 7)
 ```
 
-### EQ-FU-3 (Medium) — Atomicity gap under autocommit
-`_fill_pending_entries` inserts the equity_positions row and updates the
-pending-status row as two separate autocommit statements. A process kill
-between them leaves OPEN position + still-PENDING row. Self-heals next run
-via the SKIPPED_OPEN branch (no double-position), but worth wrapping in
-`BEGIN IMMEDIATE / COMMIT` the next time we touch this code.
+Closed (2026-05-29 equity-swing follow-ups sweep):
+```
+EQ-FU-3  fill_pending_entry() helper — equity_positions INSERT + pending
+         FILLED flip share one BEGIN IMMEDIATE transaction (backend/db.py).
+         A crash between the two writes now rolls back the position INSERT
+         instead of leaving an OPEN position with a still-PENDING source row.
+         New tests: TestAtomicFill (rollback-on-failure + commit-on-success).
+EQ-FU-4  _fill_pending_entries takes scan_kind; opened_by_scan no longer
+         hardcoded "close" (call site passes args.scan).
+EQ-FU-5  runner-header docstring now states pending fills drain in
+         --mode paper only; --mode signals leaves PENDING rows to age out.
+```
 
-### EQ-FU-4 (Low) — `opened_by_scan='close'` hardcoded
-`_fill_pending_entries` hardcodes `opened_by_scan="close"`. Currently safe
-(call site is gated to close-scan), but if a future change wires the
-open-scan to pre-fill pendings from a Kite live quote, the audit column
-will lie. Parameterise as `scan_kind`.
-
-### EQ-FU-5 (Low) — Signals-mode never drains pending rows
-Pending fills are paper-only. An operator dry-run with `--mode signals`
-leaves PENDING rows untouched until they age to SKIPPED_STALE at day 6.
-Documented in todo.md but not in the runner header — add a note.
-
-### EQ-FU-6 (Low) — Same-day fill+exit lacks audit marker
+### EQ-FU-6 (Low) — Same-day fill+exit lacks audit marker (OPEN)
 A pending that fills at today's open and exits same-day via rehedge gets a
 bare SL_HIT / TARGET_HIT exit_reason. Worth a SAME_DAY marker (or
 resolution_note suffix) so backtest-vs-paper-vs-live consistency checks
