@@ -22,5 +22,9 @@ candidate_params_*.json
 # Historical market data cache (regenerable via fetch_historical_data.py)
 data_cache/
 
+# Reference docs / scratch (large, not source)
+Dynamic_Hedging-Taleb.pdf
+shot.png
+
 # OS
 .DS_Store
