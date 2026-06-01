@@ -48,11 +48,18 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # and replayed daily bars (12 ticks/day), which can't exercise the
   # gamma_theta_ratio metric the uplift was designed for. Tape sessions
   # live in data_cache/ticks/ticks-*.jsonl.
+  # 2026-06-01: optimize gamma_theta_ratio, not sharpe_ratio. Each cycle
+  # replays ONE captured session, which flushes ~1 daily P&L bucket — too few
+  # for an annualized Sharpe, so post the degenerate-Sharpe fix (#13)
+  # sharpe_ratio is a constant 0.0 across every experiment (flat fitness).
+  # gamma_theta_ratio (realized scalp / realized theta) is well-defined on a
+  # single session and is the Phase 2.4 metric the uplift was designed for —
+  # it matches config.ini's [autoresearch] default and the comment above.
   echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, captured-tape replay)..."
   "$PY" run_autoresearch.py \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
-      --metric sharpe_ratio \
+      --metric gamma_theta_ratio \
       --eval-cycles 3 \
       --window-days 5
 
