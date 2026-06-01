@@ -363,6 +363,7 @@ class HedgeResearchLoop:
         from backtest import (
             generate_synthetic_data, run_backtest,
             list_captured_sessions, load_captured_tape,
+            load_iv_skew_seed,
         )
 
         # Apply params to hedger so the backtest picks them up
@@ -390,6 +391,25 @@ class HedgeResearchLoop:
                 "this is structurally limited)."
             )
 
+        # Seed each backtest's IV/skew rolling history from the persisted
+        # live history so the IV-percentile and skew gates leave warmup.
+        # A tape replay fires a single entry scan per session; without a
+        # seed _compute_iv_percentile sees <30 obs and returns the neutral
+        # 50.0, pinning the IV-percentile / regime features and making those
+        # tunables inert (the flat-fitness bug). Built once — constant
+        # across experiments, so a shared seed cannot bias param ranking.
+        if not hasattr(self, "_iv_seed"):
+            drop = self.config.getint(
+                "autoresearch", "iv_seed_drop_recent", fallback=0,
+            )
+            self._iv_seed, self._skew_seed = load_iv_skew_seed(
+                underlying, drop_recent=drop,
+            )
+            logger.info(
+                "Backtest IV seed: %d ATM-IV + %d skew obs (drop_recent=%d)",
+                len(self._iv_seed), len(self._skew_seed), drop,
+            )
+
         cycle_metrics = []
 
         for cycle in range(self.eval_cycles):
@@ -410,6 +430,8 @@ class HedgeResearchLoop:
                     data, underlying=underlying,
                     config_path=getattr(self, "_config_path", "config.ini"),
                     tunable_params=params,
+                    seed_iv_history=self._iv_seed,
+                    seed_skew_history=self._skew_seed,
                 )
                 metrics = results["metrics"]
                 if metrics.get("total_trades", 0) == 0:

@@ -1937,7 +1937,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         cutoff = self._clock() - timedelta(days=window_days)
         samples = [(ts, s) for ts, s in self._spot_history if ts >= cutoff]
         # 5 in-window samples (≥4 returns) is the floor for the regime call.
-        # The post-loop `n < 5` check below is the final accuracy gate.
+        # The post-loop `n < 4` check below is the final accuracy gate.
         # Earlier this was 10, which assumed intraday-tick warmup; under
         # daily seeding the in-window sample count is naturally lower.
         if len(samples) < 5:
@@ -1953,7 +1953,13 @@ class TalebKarpathyStrategy(BaseStrategy):
             r = float(np.log(samples[i][1] / samples[i-1][1]))
             sumsq += r * r / dt_years
             n += 1
-        if n < 5:
+        # 4 returns is the floor (5 in-window samples). The earlier `n < 5`
+        # here was an off-by-one: it required 6 samples, contradicting the
+        # `len(samples) < 5` guard above and the documented 5-sample floor —
+        # so under daily EOD seeding the gate never produced an RV and the
+        # RV/IV regime feature was permanently None (autoresearch could not
+        # see rv_window_days / min_rv_iv_ratio). Same fn drives live.
+        if n < 4:
             return None
         return float(np.sqrt(sumsq / n))
 

@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
 from pathlib import Path
+import backtest
 from backtest import (
     generate_synthetic_data, MockKite, run_backtest,
     load_captured_tape, list_captured_sessions,
@@ -271,3 +272,97 @@ class TestCapturedTapeReplay:
             f"merge_asof forward-fill regression"
         )
 
+
+# ── Fix B (2026-05-31): IV/skew seeding so autoresearch tunables can bind ──
+# Diagnosis: a captured-tape replay fires one entry scan per session; without
+# a primed IV history _compute_iv_percentile sees <30 obs → neutral 50.0, so
+# the IV-percentile / regime tunables were inert in the weekly sweep.
+
+class TestLoadIVSkewSeed:
+    def test_truncation_drops_most_recent_k(self, tmp_path, monkeypatch):
+        """drop_recent must trim the TAIL (most-recent) of each series — the
+        coarse guard against a replay ranking against its own/future IV."""
+        import json
+        from pathlib import Path
+        d = tmp_path / "data_cache"
+        d.mkdir()
+        (d / "iv_history_NIFTY.json").write_text(json.dumps({
+            "atm_iv": [0.10, 0.20, 0.30, 0.40, 0.50],
+            "skew": [0.01, 0.02, 0.03],
+        }))
+        monkeypatch.chdir(tmp_path)
+        atm, skew = backtest.load_iv_skew_seed("NIFTY", drop_recent=2)
+        assert atm == [0.10, 0.20, 0.30]   # last two dropped
+        assert skew == [0.01]
+
+    def test_filters_out_of_range_values(self, tmp_path, monkeypatch):
+        """Same sanity bounds as the live loader: IV in (0.01,3.0),
+        skew in (-1.0,1.0). Garbage must not poison the seed."""
+        import json
+        d = tmp_path / "data_cache"; d.mkdir()
+        (d / "iv_history_NIFTY.json").write_text(json.dumps({
+            "atm_iv": [0.15, 99.0, 0.0, 0.25],
+            "skew": [0.05, 5.0, -0.05],
+        }))
+        monkeypatch.chdir(tmp_path)
+        atm, skew = backtest.load_iv_skew_seed("NIFTY")
+        assert atm == [0.15, 0.25]
+        assert skew == [0.05, -0.05]
+
+    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert backtest.load_iv_skew_seed("NIFTY") == ([], [])
+
+    def test_drop_recent_ge_len_returns_empty(self, tmp_path, monkeypatch):
+        import json
+        d = tmp_path / "data_cache"; d.mkdir()
+        (d / "iv_history_NIFTY.json").write_text(json.dumps(
+            {"atm_iv": [0.15, 0.25], "skew": [0.05]}))
+        monkeypatch.chdir(tmp_path)
+        assert backtest.load_iv_skew_seed("NIFTY", drop_recent=5) == ([], [])
+
+
+class TestRunBacktestSeeding:
+    """The seed must reach the hedger's rolling windows; default must wipe
+    BOTH (the prior code left _skew_history loaded from the live JSON — a
+    silent, asymmetric look-ahead leak)."""
+
+    def _spy_first_call_lengths(self, monkeypatch):
+        seen = {}
+        orig_iv = backtest.TalebKarpathyStrategy._compute_iv_percentile
+        orig_sk = backtest.TalebKarpathyStrategy._compute_skew_percentile
+
+        def spy_iv(self, chain, spot):
+            seen.setdefault("iv", len(self._atm_iv_history))  # before its own append
+            return orig_iv(self, chain, spot)
+
+        def spy_sk(self, chain, spot):
+            seen.setdefault("skew", len(self._skew_history))
+            return orig_sk(self, chain, spot)
+
+        monkeypatch.setattr(backtest.TalebKarpathyStrategy,
+                            "_compute_iv_percentile", spy_iv)
+        monkeypatch.setattr(backtest.TalebKarpathyStrategy,
+                            "_compute_skew_percentile", spy_sk)
+        return seen
+
+    def test_seed_primes_both_windows(self, monkeypatch):
+        seen = self._spy_first_call_lengths(monkeypatch)
+        data = generate_synthetic_data(days=2, ticks_per_day=12)
+        run_backtest(data, underlying="NIFTY",
+                     seed_iv_history=[0.15] * 40,
+                     seed_skew_history=[0.01] * 35)
+        # The single entry scan saw the full seeded prefix → can leave the
+        # 30-obs warmup, so the IV-percentile / regime tunables can bind.
+        assert seen["iv"] == 40
+        assert seen["skew"] == 35
+
+    def test_default_wipes_both_no_skew_leak(self, monkeypatch):
+        seen = self._spy_first_call_lengths(monkeypatch)
+        data = generate_synthetic_data(days=2, ticks_per_day=12)
+        # No seed: both windows must START empty even though __init__ loaded
+        # the live persisted history. Pre-fix, _skew_history started non-empty
+        # (leak); this pins the symmetry.
+        run_backtest(data, underlying="NIFTY")
+        assert seen["iv"] == 0
+        assert seen["skew"] == 0

@@ -20,7 +20,7 @@ import math
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -433,11 +433,54 @@ def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
     return sorted(p.stem.replace("ticks-", "") for p in ticks_dir.glob("ticks-*.jsonl"))
 
 
+def load_iv_skew_seed(
+    underlying: str = "NIFTY", drop_recent: int = 0,
+) -> Tuple[List[float], List[float]]:
+    """Load persisted ATM-IV / skew history to prime a backtest's rolling
+    windows so the IV-percentile and skew gates can leave warmup.
+
+    Reads ``data_cache/iv_history_{underlying}.json`` — the same file the
+    live hedger persists. A captured-tape replay fires only one entry scan
+    per session (the book is occupied after tick 1), so without a seed the
+    single ``_compute_iv_percentile`` call sees <30 observations and returns
+    the neutral 50.0, pinning the IV-percentile / regime features and making
+    those tunables inert in autoresearch.
+
+    ``drop_recent`` trims the most-recent K observations from each series — a
+    coarse guard against the replayed session ranking against its own (or a
+    future session's) IV, since the JSON carries no per-observation
+    timestamps. Returns ``(atm_iv, skew)``; ``([], [])`` if the file is
+    absent or unreadable.
+
+    NOTE (Rule 12): this is NOT look-ahead-clean — without timestamps we
+    cannot guarantee the seed predates the replayed session. It is adequate
+    for *relative* parameter ranking in a sweep, where the same seed is
+    shared across every experiment, NOT for absolute backtest-realism claims.
+    """
+    import json
+    path = Path("data_cache") / f"iv_history_{underlying}.json"
+    if not path.exists():
+        return [], []
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return [], []
+    # Same sanity filters as TalebKarpathyStrategy._load_iv_history.
+    atm = [float(x) for x in d.get("atm_iv", []) if 0.01 < float(x) < 3.0]
+    skew = [float(x) for x in d.get("skew", []) if -1.0 < float(x) < 1.0]
+    if drop_recent > 0:
+        atm = atm[:-drop_recent] if drop_recent < len(atm) else []
+        skew = skew[:-drop_recent] if drop_recent < len(skew) else []
+    return atm, skew
+
+
 def run_backtest(
     data: pd.DataFrame,
     underlying: str = "NIFTY",
     config_path: str = "config.ini",
     tunable_params: Optional[Dict] = None,
+    seed_iv_history: Optional[List[float]] = None,
+    seed_skew_history: Optional[List[float]] = None,
 ) -> Dict:
     """
     Run the full hedging engine over historical data.
@@ -455,10 +498,20 @@ def run_backtest(
 
     mock_kite = MockKite(data, underlying)
     hedger = TalebKarpathyStrategy(mock_kite, config_path=config_path, mode="paper")
-    # Backtests should not leak IV state between experiments; each run
-    # builds its own rolling history from the replay ticks.
+    # Backtests must not write to (or rank against) the live persisted IV
+    # file. _persist_iv_history=False also disables _save_iv_history, so the
+    # appends below stay in-process.
     hedger._persist_iv_history = False
-    hedger._atm_iv_history = []
+    # IV/skew rolling history. Default: wipe BOTH. The previous code wiped
+    # _atm_iv_history but left _skew_history loaded from the live JSON in
+    # __init__ — a silent, asymmetric look-ahead leak. When a seed is
+    # supplied (autoresearch, via load_iv_skew_seed), prime the windows so
+    # _compute_iv_percentile / _compute_skew_percentile can leave warmup
+    # (<30 obs → neutral 50.0) on the single entry scan a tape replay fires;
+    # otherwise the IV-percentile / regime tunables are inert. The seed is
+    # shared across all experiments in a sweep, so it cannot bias ranking.
+    hedger._atm_iv_history = list(seed_iv_history) if seed_iv_history else []
+    hedger._skew_history = list(seed_skew_history) if seed_skew_history else []
     hedger._cached_lot_size = int(data[data["option_type"].isin(["CE", "PE"])].iloc[0]["lot_size"])
 
     # Apply candidate tunable params if provided (autoresearch optimization)

@@ -1268,6 +1268,32 @@ class TestRealizedVolEstimator:
         # Only old samples in a 5-day window → too few in-window → None
         assert h._compute_realized_vol(window_days=5) is None
 
+    def test_five_in_window_samples_compute_rv(self):
+        # Regression for the n<5 off-by-one: the daily-EOD seeding path
+        # produces exactly 5 in-window samples (= 4 returns), which the
+        # docstring calls the floor. Before the fix `n < 5` rejected 4
+        # returns, so RV was permanently None on the seeded path and the
+        # RV/IV regime feature could never bind in backtest. This is the
+        # exact shape the autoresearch tape replay hits.
+        from datetime import datetime, timedelta
+        import numpy as np
+        h = self._make_hedger()
+        h._clock = lambda: datetime(2026, 4, 20, 15, 30)
+        # 10 total samples (clears the len<10 guard). With window_days=5 the
+        # cutoff is 2026-04-15 15:30: the 5 old samples (Apr 1–5) fall out,
+        # leaving exactly 5 in-window (Apr 16–20) → 4 returns.
+        old_t = datetime(2026, 4, 1)
+        for i in range(5):
+            h._spot_history.append((old_t + timedelta(days=i), 22000.0))
+        spot = 22000.0
+        win_t = datetime(2026, 4, 16)
+        for i in range(5):
+            h._spot_history.append((win_t + timedelta(days=i), spot))
+            spot *= 1.01
+        rv = h._compute_realized_vol(window_days=5)
+        # 4 daily returns of ln(1.01); 365-day annualization.
+        assert rv == pytest.approx(abs(np.log(1.01)) * np.sqrt(365), rel=1e-6)
+
 
 class TestRVIVGate:
     """scan_and_propose must reject entries when RV/IV ratio falls below the threshold."""
