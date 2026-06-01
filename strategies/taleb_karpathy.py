@@ -837,28 +837,60 @@ class TalebKarpathyStrategy(BaseStrategy):
         if self.state._current_day_pnl != 0 or self.state._current_trading_date is not None:
             daily_pnls.append(self.state._current_day_pnl)
 
-        # Sharpe ratio (annualized, assuming daily P/L entries)
+        # Sharpe / Sortino degenerate in TWO independent ways and both must be
+        # guarded, or the optimizer ranks on a noise spike:
+        #   (1) too few daily points — a 1-2 point series has no meaningful
+        #       dispersion. MIN_SHARPE_DAYS is the count floor.
+        #   (2) near-zero dispersion with a nonzero mean — a near-flat P&L
+        #       week (e.g. a calm-regime straddle) has std≈0 but mean≠0, so
+        #       mean/std explodes to ±1e8+ even with many points. A bare
+        #       `std > 0` check does NOT catch this; the original -569035
+        #       autoresearch baseline was this exact failure at 2 points.
+        # Guard (2) with a coefficient-of-variation floor: only compute the
+        # ratio when std exceeds a small fraction of |mean| (i.e. the series
+        # has real relative dispersion). Below that the Sharpe is undefined →
+        # neutral 0.0. NOTE: a single-session tape replay yields ~1 daily
+        # bucket, so sharpe_ratio is legitimately 0.0 there — net_pnl /
+        # gamma_theta_ratio are the right metrics for single-session data.
+        # ddof=1 (sample std): daily_pnls is a sample, not the population.
+        MIN_SHARPE_DAYS = 5
+        # std must be at least this fraction of |mean| to count as real
+        # dispersion (rejects the flat-week artifact); and at least a small
+        # absolute floor so a near-zero-mean flat series doesn't sneak past.
+        _MIN_REL_STD = 1e-3   # std/|mean| below this → treat as degenerate
+        # Absolute ₹ std floor: catches the near-zero-MEAN flat series the
+        # relative guard misses (tiny mean ⇒ tiny rel-threshold). Daily P&L on
+        # a ₹5L book has std in the hundreds+; a sub-₹1 daily std means the
+        # book isn't trading, so this never rejects a real signal.
+        _MIN_ABS_STD = 1.0
+
+        def _annualized(values: np.ndarray, denom_std: float) -> float:
+            """mean/std * sqrt(252), or 0.0 if dispersion is degenerate."""
+            mean_v = float(np.mean(values))
+            if denom_std <= _MIN_ABS_STD:
+                return 0.0
+            if denom_std < abs(mean_v) * _MIN_REL_STD:
+                return 0.0
+            return (mean_v / denom_std) * np.sqrt(252)
+
         sharpe_ratio = 0.0
-        if len(daily_pnls) >= 2:
+        if len(daily_pnls) >= MIN_SHARPE_DAYS:
             arr = np.array(daily_pnls)
-            mean_r = np.mean(arr)
-            std_r = np.std(arr)
-            if std_r > 0:
-                sharpe_ratio = (mean_r / std_r) * np.sqrt(252)
+            sharpe_ratio = _annualized(arr, float(np.std(arr, ddof=1)))
 
         # Calmar ratio
         calmar_ratio = 0.0
         if max_dd > 0:
             calmar_ratio = total_pnl / max_dd
 
-        # Sortino ratio
+        # Sortino ratio — same count floor + CV guard; denominator is the
+        # sample std of the downside days (needs >= 2 of them).
         sortino_ratio = 0.0
-        if len(daily_pnls) >= 2:
+        if len(daily_pnls) >= MIN_SHARPE_DAYS:
             arr = np.array(daily_pnls)
             downside = arr[arr < 0]
-            downside_std = np.std(downside) if len(downside) > 0 else 0
-            if downside_std > 0:
-                sortino_ratio = (np.mean(arr) / downside_std) * np.sqrt(252)
+            if len(downside) >= 2:
+                sortino_ratio = _annualized(arr, float(np.std(downside, ddof=1)))
 
         # Phase 2.4: gamma_theta_ratio is the Taleb-framework efficiency
         # metric. Numerator is realized gamma scalp P&L (Phase 1.1 fix);

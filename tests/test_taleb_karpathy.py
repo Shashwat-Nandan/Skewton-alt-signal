@@ -264,6 +264,74 @@ class TestResetAndMetrics:
         assert metrics["sharpe_ratio"] != 0  # Should compute with 5 data points
 
 
+class TestSharpeDegeneracyGuard:
+    """The Sharpe/Sortino metric must not explode on too-few daily points.
+
+    Pre-fix the `>= 2` gate + population std let two near-identical daily
+    buckets drive std→0, producing a Sharpe of ±hundreds-of-thousands. That
+    degenerate spike (the autoresearch baseline was -569035) made the sweep
+    rank on noise. These tests pin the min-observations guard and that a
+    genuine multi-day series annualizes with the sample (ddof=1) std."""
+
+    def _hedger(self, daily):
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.state = HedgeState()
+        hedger.state.daily_pnl_history = list(daily)
+        hedger.state._current_day_pnl = 0.0
+        hedger.state._current_trading_date = None
+        hedger.state.total_pnl = float(sum(daily))
+        hedger.state.max_drawdown = 0.0
+        hedger.immutable_params = {"total_capital": 500000}
+        return hedger
+
+    def test_two_near_identical_days_do_not_explode(self):
+        # The exact shape that produced -569035: two almost-equal buckets.
+        # Caught by the count floor (2 < 5 days).
+        m = self._hedger([5000.0, 5000.0001]).get_strategy_metrics()
+        assert m["sharpe_ratio"] == 0.0
+        assert m["sortino_ratio"] == 0.0
+
+    def test_many_near_identical_days_do_not_explode(self):
+        # THE case the count floor alone misses: 5+ near-flat buckets clear
+        # the day count, but std/|mean| ≈ 1e-8 ⇒ pre-CV-guard Sharpe was
+        # ~1.8e9. The coefficient-of-variation guard must return 0.0. A
+        # near-flat P&L week (calm-regime straddle) is entirely realistic.
+        m = self._hedger([5000.0, 5000.0, 5000.0, 5000.0, 5000.0001]).get_strategy_metrics()
+        assert m["sharpe_ratio"] == 0.0
+        assert m["sortino_ratio"] == 0.0
+        m6 = self._hedger([100.0, 100.0, 100.0, 100.0, 100.0, 100.0001]).get_strategy_metrics()
+        assert m6["sharpe_ratio"] == 0.0
+
+    def test_near_zero_mean_flat_series_does_not_explode(self):
+        # Tiny mean ⇒ tiny relative-std threshold, so the CV guard alone
+        # would let this through (~7.1). The absolute ₹ std floor catches it:
+        # a sub-₹1 daily std means the book isn't really trading.
+        m = self._hedger([0.0, 0.0, 0.0, 0.0, 0.0001]).get_strategy_metrics()
+        assert m["sharpe_ratio"] == 0.0
+
+    def test_below_min_days_returns_zero(self):
+        # 4 days is below the 5-day floor → undefined → neutral 0.0.
+        m = self._hedger([100.0, -50.0, 200.0, -30.0]).get_strategy_metrics()
+        assert m["sharpe_ratio"] == 0.0
+
+    def test_sample_std_annualization_is_correct(self):
+        # 5 clean daily points: Sharpe = mean/std(ddof=1) * sqrt(252).
+        import numpy as np
+        daily = [100.0, -50.0, 200.0, -30.0, 150.0]
+        m = self._hedger(daily).get_strategy_metrics()
+        arr = np.array(daily)
+        expected = (arr.mean() / arr.std(ddof=1)) * np.sqrt(252)
+        assert m["sharpe_ratio"] == pytest.approx(expected, rel=1e-9)
+
+    def test_single_session_replay_sharpe_is_zero_not_huge(self):
+        # A single-session tape replay flushes ~1 daily bucket. Sharpe must
+        # be the neutral 0.0 there (undefined), NOT a degenerate spike —
+        # net_pnl / gamma_theta_ratio are the right metrics for that data.
+        m = self._hedger([1234.0]).get_strategy_metrics()
+        assert m["sharpe_ratio"] == 0.0
+        assert m["sortino_ratio"] == 0.0
+
+
 class TestDailyPnLAggregation:
     """P2: Verify tick-level P/L gets aggregated into daily buckets."""
 
