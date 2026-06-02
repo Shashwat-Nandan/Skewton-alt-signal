@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..settings import REPO_ROOT
+from ..trading_calendar import collect_trading_days
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pair-paper-compare", tags=["pair-paper-compare"])
@@ -50,16 +51,6 @@ def _total_pnl(report: dict) -> float:
     return float(report.get("realized_pnl", 0.0)) + float(report.get("unrealized_pnl", 0.0))
 
 
-def _collect_trading_days(end: date, n_days: int) -> List[date]:
-    out: List[date] = []
-    cur = end
-    safety = n_days * 3 + 7
-    while len(out) < n_days and safety > 0:
-        if cur.weekday() < 5:
-            out.append(cur)
-        cur -= timedelta(days=1)
-        safety -= 1
-    return list(reversed(out))
 
 
 # ───────────────────────── response shape ─────────────────────────
@@ -116,7 +107,7 @@ def compare_systems(
     if len(sys_list) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 systems to compare")
 
-    day_list = _collect_trading_days(end_date, days)
+    day_list = collect_trading_days(end_date, days)
     if not day_list:
         raise HTTPException(status_code=500, detail="Failed to enumerate trading days")
 

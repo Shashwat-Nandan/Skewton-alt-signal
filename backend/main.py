@@ -19,6 +19,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import db
 from .dashboard_auth import require_session
 from .routers import (
+    arbitrage_paper,
     auth,
     dashboard_session,
     equity_swing,
@@ -95,6 +96,7 @@ def create_app() -> FastAPI:
     app.include_router(market_profile.router, prefix="/api", dependencies=gated)
     app.include_router(pair_candidates.router, prefix="/api", dependencies=gated)
     app.include_router(pair_paper_compare.router, prefix="/api", dependencies=gated)
+    app.include_router(arbitrage_paper.router, prefix="/api", dependencies=gated)
     app.include_router(positions.router, prefix="/api", dependencies=gated)
     app.include_router(equity_swing.router, prefix="/api", dependencies=gated)
 

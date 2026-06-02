@@ -181,6 +181,12 @@ class ArbitrageStrategy(BaseStrategy):
 
         # State
         self.state = ArbitrageState()
+        # Session-start P&L baselines. The paper runner snapshots these after
+        # restore_state() so its daily-loss circuit breaker measures *this
+        # session's* delta rather than the cumulative book P&L. Default 0.0 so
+        # a strategy used without the runner still has the attributes present.
+        self._session_start_realized: float = 0.0
+        self._session_start_unrealized: float = 0.0
         self._instrument_cache: Optional[List[dict]] = None
         # Authoritative tradingsymbol → underlying name map. Populated from
         # the instrument list every time we observe the universe; consulted
@@ -329,7 +335,152 @@ class ArbitrageStrategy(BaseStrategy):
             "n_closed_trades": len(self.state.closed_trades),
             "last_basis_snapshot": self.state.last_basis_snapshot[:20],
             "universe_size": len(self.universe),
+            # Session-delta fields. realized_pnl / unrealized_pnl above are
+            # CUMULATIVE across sessions (restored each morning), so the
+            # dashboard needs per-session deltas to plot daily P&L without
+            # double-counting. Mirrors pair_trading.generate_eod_report. The
+            # paper runner snapshots _session_start_* after restore_state().
+            "session_realized_delta": (
+                self.state.realized_pnl - self._session_start_realized
+            ),
+            "session_unrealized_delta": (
+                self.state.unrealized_pnl - self._session_start_unrealized
+            ),
         }
+
+    # ══════════════════════════════════════════════════════════
+    # CROSS-SESSION STATE PERSISTENCE
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _serialise_closed_trade(t: dict) -> dict:
+        """closed_trades rows carry datetime objects (entry_time/exit_time);
+        coerce them to ISO strings so json.dumps round-trips without the
+        runner's default=str masking a real shape error."""
+        out = dict(t)
+        for k in ("entry_time", "exit_time"):
+            v = out.get(k)
+            if isinstance(v, datetime):
+                out[k] = v.isoformat()
+        return out
+
+    @staticmethod
+    def _deserialise_closed_trade(t: dict) -> dict:
+        out = dict(t)
+        for k in ("entry_time", "exit_time"):
+            v = out.get(k)
+            if isinstance(v, str):
+                try:
+                    out[k] = datetime.fromisoformat(v)
+                except ValueError:
+                    # Leave a malformed timestamp as the raw string rather than
+                    # aborting the whole restore — closed_trades is a historical
+                    # ledger, not live position state. Matches pair_trading's
+                    # guarded deserialiser (the more-tested form, Rule 7).
+                    logger.warning("closed_trade %s has malformed %s=%r; "
+                                   "kept as string", out.get("symbol"), k, v)
+        return out
+
+    def _capture_session_baseline(self) -> None:
+        """Snapshot the current cumulative P&L as the session-start baseline so
+        generate_eod_report's session_*_delta fields measure THIS session only.
+
+        Called from restore_state (session start = the restore point) so ANY
+        caller — the runner, a test, the autoresearch sweep, a future
+        signals-only service — gets correct session deltas without having to
+        know to poke _session_start_* by hand. For a fresh book the __init__
+        defaults (0.0) already hold, since cumulative == this-session there."""
+        self._session_start_realized = self.state.realized_pnl
+        self._session_start_unrealized = self.state.unrealized_pnl
+
+    def serialize_state(self) -> Dict:
+        """Snapshot strategy state so the paper runner can persist open calendar
+        spreads across sessions. Counterpart of restore_state().
+
+        `last_basis_snapshot` and `pending_entry_diff` are intentionally NOT
+        serialised — the former is rebuilt from live quotes on the next scan,
+        the latter only lives between scan_and_propose and the same tick's
+        _apply_fill (it never spans a session boundary).
+        """
+        return {
+            "strategy": self.name,
+            "realized_pnl": self.state.realized_pnl,
+            "unrealized_pnl": self.state.unrealized_pnl,
+            "total_transaction_costs": self.state.total_transaction_costs,
+            "closed_trades": [
+                self._serialise_closed_trade(t) for t in self.state.closed_trades
+            ],
+            "open_calendars": [
+                {
+                    "symbol": t.symbol,
+                    "position": t.position,
+                    "entry_time": t.entry_time.isoformat(),
+                    "entry_carry_diff": t.entry_carry_diff,
+                    "baseline_realized": t._baseline_realized,
+                    "baseline_costs": t._baseline_costs,
+                    "legs": [
+                        {
+                            "symbol": l.symbol,
+                            "tradingsymbol": l.tradingsymbol,
+                            "expiry": l.expiry,
+                            "lot_size": l.lot_size,
+                            "quantity": l.quantity,
+                            "entry_price": l.entry_price,
+                            "current_price": l.current_price,
+                        }
+                        for l in t.legs
+                    ],
+                }
+                for t in self.state.open_calendars.values()
+            ],
+        }
+
+    def restore_state(self, blob: Dict) -> None:
+        """Inverse of serialize_state(). Fails loudly on shape mismatch — a
+        corrupted or partial state file must not silently degrade into a
+        fresh-start strategy that abandons real open spreads (Rule 12)."""
+        if blob.get("strategy") not in (None, self.name):
+            raise ValueError(
+                f"State strategy {blob.get('strategy')!r} does not match "
+                f"{self.name!r}"
+            )
+        self.state.realized_pnl = float(blob["realized_pnl"])
+        self.state.unrealized_pnl = float(blob["unrealized_pnl"])
+        self.state.total_transaction_costs = float(blob["total_transaction_costs"])
+        self.state.closed_trades = [
+            self._deserialise_closed_trade(t)
+            for t in blob.get("closed_trades", [])
+        ]
+        open_calendars: Dict[str, CalendarTrade] = {}
+        for tblob in blob.get("open_calendars", []):
+            trade = CalendarTrade(
+                symbol=tblob["symbol"],
+                position=tblob["position"],
+                entry_time=datetime.fromisoformat(tblob["entry_time"]),
+                entry_carry_diff=float(tblob["entry_carry_diff"]),
+                legs=[
+                    CalendarLeg(
+                        symbol=l["symbol"],
+                        tradingsymbol=l["tradingsymbol"],
+                        expiry=l["expiry"],
+                        lot_size=int(l["lot_size"]),
+                        quantity=int(l["quantity"]),
+                        entry_price=float(l["entry_price"]),
+                        current_price=float(l.get("current_price", l["entry_price"])),
+                    )
+                    for l in tblob.get("legs", [])
+                ],
+                _baseline_realized=float(tblob.get("baseline_realized", 0.0)),
+                _baseline_costs=float(tblob.get("baseline_costs", 0.0)),
+            )
+            open_calendars[trade.symbol] = trade
+        self.state.open_calendars = open_calendars
+        # Session start = this restore point, so session_*_delta measures only
+        # what happens after restore. Capturing it here (not in the runner)
+        # means every caller of generate_eod_report gets correct per-session
+        # deltas — without this, a restored book reports its entire cumulative
+        # P&L as a single day's gain.
+        self._capture_session_baseline()
 
     # ══════════════════════════════════════════════════════════
     # CARRY MATH
@@ -390,11 +541,22 @@ class ArbitrageStrategy(BaseStrategy):
     def _observe_universe(self) -> List[dict]:
         """Snapshot spot + near + next future for every symbol in the universe.
 
-        Memoized per `_clock()` tick: scan/check/EOD all call this within the
-        same bar and the result is identical. Without memoization the
-        backtester does ~3× the work per day across 200+ symbols.
+        Memoized per tick: scan/check/EOD all call this within the same bar and
+        the result is identical. Without memoization the backtester does ~3× the
+        work per day across 200+ symbols.
+
+        Cache key: prefer the runner-supplied `_obs_tick_id` when present. In
+        the live/paper runner `_clock` is `datetime.now`, so keying on
+        `_clock()` would give a microsecond-distinct value on every call and the
+        cache would NEVER hit — scan and rehedge would each re-pull the whole
+        universe (2× the Kite quote traffic per tick, against the 8 req/s
+        throttle). The runner bumps `_obs_tick_id` once per tick so both calls
+        share one fetch. The backtester leaves it unset and falls back to its
+        stepped `_clock()`, which is already stable within a bar.
         """
-        cache_key = self._clock()
+        cache_key = getattr(self, "_obs_tick_id", None)
+        if cache_key is None:
+            cache_key = self._clock()
         cached = getattr(self, "_obs_cache", None)
         if cached is not None and cached[0] == cache_key:
             return cached[1]
@@ -827,6 +989,30 @@ class ArbitrageStrategy(BaseStrategy):
                 "position": trade.position,
             })
             del self.state.open_calendars[symbol]
+
+        # Keep unrealized_pnl consistent with the legs that are still open.
+        # Without this, unrealized_pnl is only ever maintained inside
+        # _update_unrealized (called from check_and_rehedge) — which
+        # early-returns on an empty book — so closing the last spread would
+        # leave that spread's mark-to-market frozen into unrealized_pnl
+        # forever, poisoning the EOD report, the dashboard net/cumulative, the
+        # daily-loss circuit breaker, and the persisted+restored state. It also
+        # fixes the within-tick double-count: _update_unrealized runs BEFORE
+        # this fill is applied, so the just-closed trade would otherwise be
+        # counted in both realized and unrealized until the next tick.
+        self._recompute_unrealized_from_open_legs()
+
+    def _recompute_unrealized_from_open_legs(self) -> None:
+        """Recompute unrealized_pnl from the currently-open legs' last marks.
+
+        Uses each leg's stored current_price (the last quote-driven mark from
+        _update_unrealized), so it needs no fresh quotes and is safe to call
+        from _apply_fill. An empty book correctly yields 0.0."""
+        self.state.unrealized_pnl = sum(
+            (leg.current_price - leg.entry_price) * leg.quantity * leg.lot_size
+            for trade in self.state.open_calendars.values()
+            for leg in trade.legs
+        )
 
     def _update_unrealized(self, snapshots: Dict[str, dict]) -> None:
         unrealized = 0.0

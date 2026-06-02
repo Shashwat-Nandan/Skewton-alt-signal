@@ -199,6 +199,50 @@ export type PaperCompareResponse = {
   per_pair: PaperComparePerPair[];
 };
 
+// ── Arbitrage (calendar/term-structure spreads) ──
+
+export type ArbitrageDailyRow = {
+  date: string;
+  has_data: boolean;
+  /** This session's P&L delta (session realized + unrealized delta). */
+  day_pnl: number | null;
+  /** This session's realized delta alone. */
+  day_realized: number | null;
+  n_closed_trades: number | null;
+  n_open_calendars: number | null;
+  /** Cumulative book P&L as of this EOD (already cumulative — not re-summed). */
+  cumulative_net_pnl: number | null;
+};
+
+export type ArbitrageOpenCalendar = {
+  symbol: string;
+  position: string;
+  entry_carry_diff: number;
+  legs: Record<string, unknown>[];
+};
+
+export type ArbitrageSummary = {
+  system: string;
+  n_days_with_data: number;
+  latest_date: string | null;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  net_pnl: number;
+  transaction_costs: number;
+  n_closed_trades: number;
+  n_open_calendars: number;
+  universe_size: number | null;
+};
+
+export type ArbitrageResponse = {
+  start_date: string;
+  end_date: string;
+  system: string;
+  summary: ArbitrageSummary;
+  daily: ArbitrageDailyRow[];
+  open_calendars: ArbitrageOpenCalendar[];
+};
+
 // ── Equity Swing ──
 
 export type EquityPosition = {

@@ -1,4 +1,5 @@
 import type {
+  ArbitrageResponse,
   AuthStatus,
   EquityPendingEntriesResponse,
   EquityPositionsResponse,
@@ -96,6 +97,15 @@ export const api = {
     if (params.systems) q.set("systems", params.systems);
     const qs = q.toString();
     return http<PaperCompareResponse>(`/pair-paper-compare${qs ? `?${qs}` : ""}`);
+  },
+
+  arbitragePaper: (params: { days?: number; end?: string; system?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    if (params.end) q.set("end", params.end);
+    if (params.system) q.set("system", params.system);
+    const qs = q.toString();
+    return http<ArbitrageResponse>(`/arbitrage-paper${qs ? `?${qs}` : ""}`);
   },
 
   equityPositions: (status?: "open" | "closed") => {

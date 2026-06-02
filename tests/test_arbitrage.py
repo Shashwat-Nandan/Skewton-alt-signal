@@ -58,6 +58,8 @@ def _make_strategy(
     s.max_leg_notional = None
     s.total_capital = 500_000
     s.state = ArbitrageState()
+    s._session_start_realized = 0.0
+    s._session_start_unrealized = 0.0
     s._instrument_cache = None
     s._ts_to_name = {}
     s._clock = lambda: datetime(2026, 4, 17, 10, 30)
@@ -656,3 +658,251 @@ class TestRolledLegPricing:
         assert apr.price == 99.5
         # And we logged about it.
         assert any("not in current snapshot" in r.message for r in caplog.records)
+
+
+# ──────────────────────────────────────────────────────────
+# Cross-session state persistence (serialize ↔ restore)
+# ──────────────────────────────────────────────────────────
+
+class TestStatePersistence:
+    """A restart in the middle of a multi-day calendar spread must not abandon
+    the open position nor double-count its P&L. serialize_state() →
+    json round-trip → restore_state() must reproduce the book exactly — that's
+    the contract the paper runner relies on every tick and every morning."""
+
+    def _strategy_with_open_spread(self):
+        s = _make_strategy()
+        # An open SHORT_CALENDAR on AAA: short near (Apr), long next (May).
+        trade = CalendarTrade(
+            symbol="AAA",
+            position="SHORT_CALENDAR",
+            entry_time=datetime(2026, 4, 15, 10, 0),
+            entry_carry_diff=0.031,
+            legs=[
+                CalendarLeg(symbol="AAA", tradingsymbol="AAA26APRFUT",
+                            expiry="2026-04-30", lot_size=50, quantity=-1,
+                            entry_price=101.0, current_price=100.5),
+                CalendarLeg(symbol="AAA", tradingsymbol="AAA26MAYFUT",
+                            expiry="2026-05-28", lot_size=50, quantity=1,
+                            entry_price=102.0, current_price=102.4),
+            ],
+            _baseline_realized=-21.0,
+            _baseline_costs=21.0,
+        )
+        s.state.open_calendars = {"AAA": trade}
+        s.state.realized_pnl = -42.0
+        s.state.unrealized_pnl = 95.0
+        s.state.total_transaction_costs = 42.0
+        s.state.closed_trades = [{
+            "symbol": "BBB",
+            "exit_time": datetime(2026, 4, 14, 15, 20),
+            "entry_time": datetime(2026, 4, 10, 9, 30),
+            "entry_carry_diff": 0.025,
+            "realized_pnl": 310.0,
+            "transaction_costs": 42.0,
+            "position": "LONG_CALENDAR",
+        }]
+        # Transient fields that must NOT survive serialisation.
+        s.state.last_basis_snapshot = [{"symbol": "AAA", "basis_annual": 0.04}]
+        s.state.pending_entry_diff = {"CCC": 0.05}
+        return s
+
+    def test_roundtrip_preserves_open_spread_and_pnl(self):
+        import json
+
+        src = self._strategy_with_open_spread()
+        blob = json.loads(json.dumps(src.serialize_state(), default=str))
+
+        dst = _make_strategy()
+        dst.restore_state(blob)
+
+        # Scalar P&L preserved exactly.
+        assert dst.state.realized_pnl == -42.0
+        assert dst.state.unrealized_pnl == 95.0
+        assert dst.state.total_transaction_costs == 42.0
+
+        # Open spread fully reconstructed, including signed leg quantities and
+        # the per-trade baselines (without which closed_trades would record the
+        # running cumulative instead of the trade delta at close).
+        assert set(dst.state.open_calendars) == {"AAA"}
+        t = dst.state.open_calendars["AAA"]
+        assert t.position == "SHORT_CALENDAR"
+        assert t.entry_time == datetime(2026, 4, 15, 10, 0)
+        assert t.entry_carry_diff == pytest.approx(0.031)
+        assert t._baseline_realized == -21.0
+        assert t._baseline_costs == 21.0
+        assert [(l.tradingsymbol, l.quantity, l.entry_price) for l in t.legs] == [
+            ("AAA26APRFUT", -1, 101.0),
+            ("AAA26MAYFUT", 1, 102.0),
+        ]
+
+        # Closed-trade datetimes survive the round-trip as datetimes (not str).
+        assert len(dst.state.closed_trades) == 1
+        ct = dst.state.closed_trades[0]
+        assert ct["exit_time"] == datetime(2026, 4, 14, 15, 20)
+        assert ct["entry_time"] == datetime(2026, 4, 10, 9, 30)
+        assert ct["realized_pnl"] == 310.0
+
+    def test_transient_fields_not_persisted(self):
+        import json
+
+        src = self._strategy_with_open_spread()
+        blob = json.loads(json.dumps(src.serialize_state(), default=str))
+        assert "last_basis_snapshot" not in blob
+        assert "pending_entry_diff" not in blob
+
+        dst = _make_strategy()
+        dst.restore_state(blob)
+        # Restore must leave the transient fields at their fresh defaults, not
+        # carry stale values from the source session.
+        assert dst.state.last_basis_snapshot == []
+        assert dst.state.pending_entry_diff == {}
+
+    def test_restore_rejects_wrong_strategy_blob(self):
+        dst = _make_strategy()
+        with pytest.raises(ValueError):
+            dst.restore_state({
+                "strategy": "pair_trading",
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "total_transaction_costs": 0.0,
+            })
+
+
+# ──────────────────────────────────────────────────────────
+# unrealized_pnl stays consistent with the open book (no phantom MTM)
+# ──────────────────────────────────────────────────────────
+
+class TestUnrealizedConsistency:
+    """unrealized_pnl must reflect ONLY currently-open legs. The bug: it was
+    maintained only inside _update_unrealized (called from check_and_rehedge,
+    which early-returns on an empty book), so closing the last spread left a
+    phantom mark frozen into unrealized_pnl — poisoning the EOD report, the
+    dashboard net/cumulative, the daily-loss breaker, and the persisted state.
+    """
+
+    def _prop(self, ts, side, qty=1, price=100.0):
+        return TradeProposal(
+            tradingsymbol=ts, instrument_token=1, strike=0.0,
+            expiry="2026-04-28" if "APR" in ts else "2026-05-26",
+            option_type="FUT", lot_size=100, quantity=qty, price=price,
+            transaction_type=side, iv=0.0, bid_ask_spread_pct=0.0,
+            margin_required=0.0, rationale="test",
+        )
+
+    def test_closing_last_spread_zeroes_unrealized(self):
+        s = _make_strategy(mode="paper")
+        s._apply_fill(self._prop("AAA26APRFUT", "BUY", price=100.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "SELL", price=101.0))
+        # Simulate an intraday mark that moved unrealized away from zero, the
+        # way _update_unrealized would on a live tick. Use asymmetric marks so
+        # the long/short legs don't cancel to a coincidental zero.
+        trade = s.state.open_calendars["AAA"]
+        trade.legs[0].current_price = trade.legs[0].entry_price + 5.0
+        trade.legs[1].current_price = trade.legs[1].entry_price + 1.0
+        s._recompute_unrealized_from_open_legs()
+        assert s.state.unrealized_pnl != 0.0  # mark is live
+
+        # Close both legs → book is now empty.
+        s._apply_fill(self._prop("AAA26APRFUT", "SELL", price=106.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "BUY", price=95.0))
+        assert "AAA" not in s.state.open_calendars
+        # The phantom-MTM bug would leave unrealized at its last open value;
+        # the fix recomputes from the (now empty) open book → exactly 0.
+        assert s.state.unrealized_pnl == 0.0
+
+    def test_unrealized_reflects_only_remaining_open_spread(self):
+        s = _make_strategy(mode="paper")
+        for sym in ("AAA", "BBB"):
+            s._apply_fill(self._prop(f"{sym}26APRFUT", "BUY", price=100.0))
+            s._apply_fill(self._prop(f"{sym}26MAYFUT", "SELL", price=100.0))
+        # Mark BBB's legs to a known unrealized; AAA stays flat.
+        for leg in s.state.open_calendars["BBB"].legs:
+            leg.current_price = leg.entry_price + (2.0 if leg.quantity > 0 else -2.0)
+        s._recompute_unrealized_from_open_legs()
+        # Close AAA only.
+        s._apply_fill(self._prop("AAA26APRFUT", "SELL", price=100.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "BUY", price=100.0))
+        # unrealized must now equal BBB's mark alone: each leg +2 * 100 * 1lot,
+        # both legs same sign of contribution = +400 total.
+        expected = sum(
+            (l.current_price - l.entry_price) * l.quantity * l.lot_size
+            for l in s.state.open_calendars["BBB"].legs
+        )
+        assert s.state.unrealized_pnl == pytest.approx(expected)
+
+
+# ──────────────────────────────────────────────────────────
+# Per-tick observation cache works under the live runner's clock
+# ──────────────────────────────────────────────────────────
+
+class TestObserveCache:
+    def test_obs_tick_id_dedupes_within_tick(self):
+        s = _make_strategy()
+        calls = []
+        s._observe_universe_uncached = lambda: (calls.append(1) or [])
+        s._obs_tick_id = 1
+        s._observe_universe()
+        s._observe_universe()
+        assert len(calls) == 1  # one fetch shared across the tick
+        s._obs_tick_id = 2
+        s._observe_universe()
+        assert len(calls) == 2  # next tick re-fetches
+
+
+# ──────────────────────────────────────────────────────────
+# Session baseline is captured by restore_state (not the runner)
+# ──────────────────────────────────────────────────────────
+
+class TestSessionBaseline:
+    def test_restore_captures_baseline_so_session_delta_is_zero(self):
+        s = _make_strategy()
+        # A restored book that has already earned ₹5000 cumulative.
+        s.restore_state({
+            "strategy": "arbitrage",
+            "realized_pnl": 5000.0,
+            "unrealized_pnl": 300.0,
+            "total_transaction_costs": 120.0,
+        })
+        report = s.generate_eod_report()
+        # Cumulative is reported as-is...
+        assert report["realized_pnl"] == 5000.0
+        # ...but the session delta is ~0 right after restore — NOT 5000. Without
+        # restore_state capturing the baseline, any caller of generate_eod_report
+        # would report the whole restored book as a single day's P&L.
+        assert report["session_realized_delta"] == 0.0
+        assert report["session_unrealized_delta"] == 0.0
+
+    def test_capture_baseline_is_idempotent_to_current_pnl(self):
+        s = _make_strategy()
+        s.state.realized_pnl = 1000.0
+        s.state.unrealized_pnl = -50.0
+        s._capture_session_baseline()
+        assert s._session_start_realized == 1000.0
+        assert s._session_start_unrealized == -50.0
+
+
+# ──────────────────────────────────────────────────────────
+# EOD report leg contract (dashboard reads "qty")
+# ──────────────────────────────────────────────────────────
+
+class TestEodReportLegContract:
+    def _prop(self, ts, side):
+        return TradeProposal(
+            tradingsymbol=ts, instrument_token=1, strike=0.0,
+            expiry="2026-04-28" if "APR" in ts else "2026-05-26",
+            option_type="FUT", lot_size=100, quantity=1, price=100.0,
+            transaction_type=side, iv=0.0, bid_ask_spread_pct=0.0,
+            margin_required=0.0, rationale="test",
+        )
+
+    def test_open_calendar_legs_use_qty_key(self):
+        # The frontend ArbitragePage reads l["qty"]; pin that contract so a
+        # future rename to "quantity" can't silently render every leg as 0.
+        s = _make_strategy(mode="paper")
+        s._apply_fill(self._prop("AAA26APRFUT", "BUY"))
+        s._apply_fill(self._prop("AAA26MAYFUT", "SELL"))
+        report = s.generate_eod_report()
+        leg = report["open_calendars"][0]["legs"][0]
+        assert "qty" in leg
+        assert "tradingsymbol" in leg

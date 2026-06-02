@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink } from "react-router-dom";
-import { LogOut, Activity, BarChart3, Briefcase, GitBranch, TrendingUp } from "lucide-react";
+import { LogOut, Activity, BarChart3, Briefcase, GitBranch, Scale, TrendingUp } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -93,6 +93,19 @@ export function Header() {
               <TrendingUp className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Equity Swing</span>
               <span className="sm:hidden">Equity</span>
+            </NavLink>
+            <NavLink
+              to="/arbitrage"
+              className={({ isActive }) =>
+                cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-muted-foreground hover:text-foreground",
+                  isActive && "text-foreground font-medium",
+                )
+              }
+            >
+              <Scale className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Arbitrage</span>
+              <span className="sm:hidden">Arb</span>
             </NavLink>
           </nav>
         </div>

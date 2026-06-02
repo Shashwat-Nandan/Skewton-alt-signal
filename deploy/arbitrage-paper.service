@@ -1,0 +1,54 @@
+[Unit]
+Description=Arbitrage Paper Runner — calendar/term-structure spreads on STFs
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+# StartLimit* live in [Unit], not [Service]. Cap a crashloop at 5 restarts
+# within 10 minutes — past that systemd gives up and notify-failure@ alerts
+# rather than burning CPU forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# Type=simple (not oneshot) so Restart=on-failure kicks in for mid-session
+# crashes. Oneshot blocks Restart=, leaving a crash at 11:00 IST unrecovered
+# until the next day's timer.
+Type=simple
+# --- EDIT THESE FOR YOUR VPS ---
+User=root
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# Tunables live here so config changes don't require a rebuild. Override on the
+# VPS with `systemctl edit arbitrage-paper.service`. --max-leg-notional caps
+# per-leg ₹ deployment; calendar thresholds come from config.ini [arbitrage].
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_arbitrage.py --max-leg-notional 500000
+# -------------------------------
+
+# Auto-restart on crash / non-zero exit. A clean 15:25 IST teardown returns 0
+# and does NOT trigger restart, so the timer pattern still works. StartLimit
+# caps a crashloop at 5 restarts within 10 minutes.
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches pair-paper.service)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+# NOTE: do NOT set ProtectHome=true here. If WorkingDirectory is under /root or
+# /home, ProtectHome=true hides it from the unit's mount namespace and the unit
+# fails at status=200/CHDIR before ExecStart runs. See tasks/lessons.md
+# (2026-05-12 incident).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

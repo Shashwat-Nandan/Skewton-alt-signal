@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, UnauthorizedError } from "@/lib/api";
 import { Header } from "@/components/Header";
 import { Home } from "@/pages/Home";
+import { ArbitragePage } from "@/pages/ArbitragePage";
 import { DashboardLoginPage } from "@/pages/DashboardLoginPage";
 import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
@@ -61,6 +62,7 @@ export default function App() {
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />
           <Route path="/pair-candidates" element={<PairCandidatesPage />} />
+          <Route path="/arbitrage" element={<ArbitragePage />} />
           <Route path="/equity-swing" element={<EquitySwingPage />} />
         </Routes>
       </main>
