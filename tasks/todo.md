@@ -1,3 +1,32 @@
+# Repair pair walk-forward backtest harness (2026-06-02)
+
+`backtest_pairs_rule.py` / `backtest_pairs.py` had bit-rotted and were silently
+producing all-₹0 results. Found while trying to backtest the persistent system.
+
+Three rot layers fixed:
+- [x] `make_strategy` __new__ bootstrap had drifted from __init__ — missing 12
+      attrs (H5 cooldown, book-notional cap, place-order backoff, exit
+      debounce, session anchors). Every tick raised AttributeError, swallowed
+      per-tick → no trades. Set the full set from live __init__ defaults.
+- [x] Mock futures tradingsymbol `{sym}_BTFUT` — the underscore fails the
+      pre-submit `validate_order` regex (`[A-Z0-9&\-]`), so every entry order
+      was rejected. Switched to `-BTFUT` (hyphen is allowed).
+- [x] Harness couldn't mirror the PERSISTENT runner: added `--persistence-min`
+      (+ window/step) to swap in `screen_pairs_persistent`, and
+      `--quality-max-pvalue` to pass the runner's p-floor override.
+- [x] Regression test (tests/test_backtest_pairs_bootstrap.py): make_strategy
+      covers every __init__ attr; mock FUT symbols pass validate_order.
+
+First result (persistence-min 2, 5-window/screen-window 310, top-12, 19
+checkpoints): p≤0.05 = −₹204,692 vs p≤0.025 = −₹79,691 — the looser floor (PR
+#17) is −₹125k WORSE here. Added pairs split into winners (COALINDIA/ITC,
+ICICIBANK/JSWSTEEL) and losers (TATACONSUM/*, *BPCL, Adani); p-value at admit
+does not separate them. CAVEAT: numbers come from the just-repaired harness and
+a 5-window config (live screen uses 9); both arms net-negative. Re-run with the
+9-window config before trusting magnitude; consider revisiting PR #17.
+
+---
+
 # Pair persistent: looser p-value quality floor (2026-06-02)
 
 Goal: the persistent runner re-tests `p ≤ 0.025` on the latest single window,

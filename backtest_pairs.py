@@ -83,8 +83,8 @@ class MockKitePair:
     def quote(self, symbols: List[str]) -> Dict[str, dict]:
         out = {}
         for sym in symbols:
-            base = sym.split(":", 1)[-1]              # "NFO:RELIANCE_BTFUT" → "RELIANCE_BTFUT"
-            underlying = base[: -len("_BTFUT")] if base.endswith("_BTFUT") else base
+            base = sym.split(":", 1)[-1]              # "NFO:RELIANCE-BTFUT" → "RELIANCE-BTFUT"
+            underlying = base[: -len("-BTFUT")] if base.endswith("-BTFUT") else base
             if underlying in self.panel.columns:
                 px = float(self.panel.iloc[self._date_idx][underlying])
                 out[sym] = {
@@ -103,7 +103,7 @@ class MockKitePair:
         for sym in self.panel.columns:
             rows.append({
                 "name": sym,
-                "tradingsymbol": f"{sym}_BTFUT",
+                "tradingsymbol": f"{sym}-BTFUT",
                 "instrument_type": "FUT",
                 "lot_size": int(self.lot_sizes.get(sym, 1)),
                 "expiry": "2099-12-31",   # never rolls during a backtest
@@ -181,6 +181,36 @@ def make_strategy(
     s.max_holding_days = max_holding_days
     s.max_leg_notional = max_leg_notional
     s.total_capital = 500_000
+    # __init__ establishes these but this __new__ bootstrap bypasses it; the
+    # tick/entry/fill paths read them, so without them every tick raises
+    # AttributeError and the backtest silently zeroes out. (The list drifted as
+    # features landed — H5 cooldown, book-notional cap, place-order backoff,
+    # exit debounce — so set the full set, not just the one that throws first.)
+    #
+    # Most mirror the live __init__ defaults AND are inert at daily resolution:
+    # cooldown is in MINUTES so 60 ≪ one daily bar (1440 min); the place-order
+    # backoff never trips with the always-succeeding mock; the book cap stays
+    # disabled (None); slippage matches the live 5 bps default.
+    #
+    # exit_debounce_ticks is the EXCEPTION: live uses 2, but a "tick" is a
+    # daily bar here, so 2 would impose a 2-DAY mean-revert exit debounce where
+    # live has ~2 minutes (2×60s) — over-holding reverted spreads and biasing
+    # P&L. The debounce is an intraday-noise filter; a daily close is already
+    # settled, so use 1 (exit on first in-band bar) for a faithful daily replay.
+    s.stop_cooldown_minutes = 60
+    s.paper_slippage_bps = 5.0
+    s.exit_debounce_ticks = 1
+    s.max_book_notional = None
+    s._book_notional_fn = None
+    s._kite_refresh = None
+    s._nfo_instruments_cache = None
+    s._holidays_cache = None
+    s._pending_exit_reason = None
+    s._place_order_fail_streak = 0
+    s._place_order_skip_ticks_left = 0
+    s._place_order_skip_window = 5
+    s._session_start_realized = 0.0
+    s._session_start_unrealized = 0.0
     s.state = PairState()
     # Out-of-sample mode pre-loads the rolling-window history with
     # train-period spreads so z-scores are immediately computable on

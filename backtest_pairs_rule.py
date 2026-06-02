@@ -47,7 +47,9 @@ import pandas as pd
 # and don't reimplement screening.
 from backtest_pairs import backtest_one, load_lot_sizes
 from run_paper_pairs import classify_pair_candidates
-from screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
+from screen_pairs import (
+    NIFTY_50, load_front_month_panel, screen_pairs, screen_pairs_persistent,
+)
 
 logger = logging.getLogger("backtest_pairs_rule")
 
@@ -223,13 +225,25 @@ def run(args) -> int:
         if test.empty:
             continue
 
-        screened = screen_pairs(
-            train,
-            p_threshold=0.05,
-            min_correlation=0.5,
-            min_hedge_ratio=0.1,
-            max_hedge_ratio=10.0,
-        )
+        if args.persistence_min is not None:
+            screened = screen_pairs_persistent(
+                train,
+                min_persistence=args.persistence_min,
+                window_days=args.persistence_window_days,
+                step_days=args.persistence_step_days,
+                p_threshold=0.05,
+                min_correlation=0.5,
+                min_hedge_ratio=0.1,
+                max_hedge_ratio=10.0,
+            )
+        else:
+            screened = screen_pairs(
+                train,
+                p_threshold=0.05,
+                min_correlation=0.5,
+                min_hedge_ratio=0.1,
+                max_hedge_ratio=10.0,
+            )
         if screened.empty:
             logger.warning("Checkpoint %s: screen returned 0 pairs", ck.date())
             continue
@@ -238,6 +252,7 @@ def run(args) -> int:
             screened, top=args.top,
             exclude_symbols=args.exclude_symbols or None,
             max_hedge_ratio=args.max_hedge_ratio,
+            max_pvalue=args.quality_max_pvalue,
         )
         admitted = (
             annotated[annotated["processing_rank"].notna()]
@@ -398,6 +413,23 @@ def main():
     p.add_argument("--max-hedge-ratio", type=float, default=None,
                    help="Override the |β| upper bound (default uses "
                         "HEDGE_RATIO_MAX=10.0).")
+    p.add_argument("--persistence-min", type=int, default=None,
+                   help="Mirror the PERSISTENT runner: replace the single-"
+                        "window screen at each checkpoint with the rolling-"
+                        "window persistence screen, admitting only pairs that "
+                        "pass p<0.05 in ≥this-many windows AND the latest one. "
+                        "Use a large --screen-window so multiple windows fit "
+                        "(needs ≥ window_days + (N-1)*step_days history).")
+    p.add_argument("--persistence-window-days", type=int, default=130,
+                   help="Rolling-window length for --persistence-min (default "
+                        "130, matches the live screen).")
+    p.add_argument("--persistence-step-days", type=int, default=45,
+                   help="Step between rolling windows for --persistence-min "
+                        "(default 45, matches the live screen).")
+    p.add_argument("--quality-max-pvalue", type=float, default=None,
+                   help="Override the runner quality floor's p-value ceiling "
+                        "(default QUALITY_MAX_PVALUE=0.025). The persistent "
+                        "runner uses 0.05; pass it here to mirror that.")
     p.add_argument("--panel-start", type=str, default=None,
                    help="YYYY-MM-DD lower bound on the bhavcopy panel.")
     p.add_argument("--panel-end", type=str, default=None,
