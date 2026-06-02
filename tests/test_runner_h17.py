@@ -77,3 +77,69 @@ def test_classify_seeds_admit_when_below_cap():
     seed = {"AAA": 1}
     out = classify_pair_candidates(df, top=5, seed_leg_count=seed)
     assert (out["processing_rank"] == 1).sum() == 1
+
+
+def test_max_pvalue_override_admits_marginal_pair():
+    """Persistent quality-floor relaxation (2026-06-02): a pair whose
+    cointegration p sits between the default 0.025 ceiling and the persistent
+    0.05 ceiling is dropped as 'quality' by default but admitted when
+    max_pvalue=0.05 is passed. corr / half-life still gate normally."""
+    from run_paper_pairs import classify_pair_candidates
+    df = pd.DataFrame([
+        _candidate("COAL", "ITC", p=0.028, corr=0.89),   # p in the dead-band
+    ])
+    # Default ceiling (0.025): dropped on p-value.
+    default = classify_pair_candidates(df, top=5)
+    assert (default["skip_reason"] == "quality").sum() == 1
+    assert default["processing_rank"].isna().all()
+    # Persistent ceiling (0.05): admitted.
+    loosened = classify_pair_candidates(df, top=5, max_pvalue=0.05)
+    assert (loosened["processing_rank"] == 1).sum() == 1
+    assert (loosened["skip_reason"] == "").sum() == 1
+
+
+def test_max_pvalue_override_does_not_relax_corr_or_halflife():
+    """Loosening the p ceiling must NOT admit pairs failing the economic gates
+    (correlation, half-life) — those are system-agnostic. A weak-correlation
+    pair with a fine p-value stays dropped even at max_pvalue=0.05."""
+    from run_paper_pairs import classify_pair_candidates
+    df = pd.DataFrame([
+        _candidate("WEAK", "CORR", p=0.01, corr=0.54),   # great p, corr < 0.65
+        _candidate("SLOW", "REV", p=0.01, corr=0.90, hl=9.0),  # HL > 5d
+    ])
+    out = classify_pair_candidates(df, top=5, max_pvalue=0.05)
+    assert (out["skip_reason"] == "quality").sum() == 2
+    assert out["processing_rank"].isna().all()
+
+
+def test_max_pvalue_none_preserves_default_ceiling():
+    """max_pvalue=None (every existing caller) behaves exactly as before:
+    the module's QUALITY_MAX_PVALUE constant governs the floor."""
+    from run_paper_pairs import classify_pair_candidates, QUALITY_MAX_PVALUE
+    just_over = QUALITY_MAX_PVALUE + 0.001
+    just_under = QUALITY_MAX_PVALUE - 0.001
+    df = pd.DataFrame([
+        _candidate("OVER", "CEIL", p=just_over, corr=0.90),
+        _candidate("UNDR", "CEIL", p=just_under, corr=0.90),
+    ])
+    out = classify_pair_candidates(df, top=5)  # no override
+    over = out[out["symbol_a"] == "OVER"].iloc[0]
+    under = out[out["symbol_a"] == "UNDR"].iloc[0]
+    assert over["skip_reason"] == "quality"
+    assert under["skip_reason"] == ""
+
+
+@pytest.mark.parametrize("bad", ["0.5", "5", "0", "-0.01", "0.1"])
+def test_quality_max_pvalue_typo_tripwire_rejects(bad):
+    """--quality-max-pvalue outside (0, 0.05] must fail at parse-time (exit 2)
+    with a clear message, rather than silently trade on a wrong selection gate.
+    parser.error fires before any env/network work, so this is hermetic."""
+    import subprocess, sys, os
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    r = subprocess.run(
+        [sys.executable, "run_paper_pairs.py", "--system", "persistent",
+         "--quality-max-pvalue", bad, "--force"],
+        cwd=repo, capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 2, (r.returncode, r.stderr[-500:])
+    assert "quality-max-pvalue" in r.stderr and "(0, 0.05]" in r.stderr

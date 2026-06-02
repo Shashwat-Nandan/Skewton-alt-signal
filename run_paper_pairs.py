@@ -354,6 +354,7 @@ def classify_pair_candidates(
     *,
     exclude_symbols: set[str] | None = None,
     max_hedge_ratio: float | None = None,
+    max_pvalue: float | None = None,
     seed_leg_count: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """Annotate every candidate row with its disposition under the four-pass
@@ -373,6 +374,12 @@ def classify_pair_candidates(
       - `max_hedge_ratio`: override `HEDGE_RATIO_MAX` for the |β| upper
          bound. Used to tighten the tradeable hedge-ratio band beyond the
          strategy's defensive defaults.
+      - `max_pvalue`: override `QUALITY_MAX_PVALUE` for the cointegration
+         p-value ceiling. The persistent system passes 0.05 here: its CSV
+         already cleared the persistence screen's p<0.05 in ≥2 of N rolling
+         windows, so re-testing the latest single window at the tighter 0.025
+         is double-jeopardy. corr / half-life floors are unaffected — those
+         are economic-tradeability gates, system-agnostic.
 
     Row order is preserved so callers can render the original candidate
     sequence with annotations layered on. Used by both `select_pairs` (which
@@ -382,6 +389,7 @@ def classify_pair_candidates(
     from strategies.pair_trading import HEDGE_RATIO_MIN, HEDGE_RATIO_MAX
 
     beta_upper = max_hedge_ratio if max_hedge_ratio is not None else HEDGE_RATIO_MAX
+    pvalue_ceiling = max_pvalue if max_pvalue is not None else QUALITY_MAX_PVALUE
 
     out = df.copy()
     # Coerce numeric columns to float, mapping non-coercible values (e.g. a
@@ -430,13 +438,13 @@ def classify_pair_candidates(
         beta_mask
         & (out["correlation"] >= QUALITY_MIN_CORR)
         & (out["half_life_days"] <= QUALITY_MAX_HALFLIFE)
-        & (out["coint_pvalue"] <= QUALITY_MAX_PVALUE)
+        & (out["coint_pvalue"] <= pvalue_ceiling)
     )
     quality_dropped = beta_mask & ~quality_mask
     out.loc[quality_dropped, "skip_reason"] = "quality"
     if log is not None and quality_dropped.any():
         log.info("Quality floor (corr≥%.2f, HL≤%.1fd, p≤%.3f) dropped %d more",
-                 QUALITY_MIN_CORR, QUALITY_MAX_HALFLIFE, QUALITY_MAX_PVALUE,
+                 QUALITY_MIN_CORR, QUALITY_MAX_HALFLIFE, pvalue_ceiling,
                  int(quality_dropped.sum()))
 
     if not quality_mask.any():
@@ -491,13 +499,16 @@ def select_pairs(top: int, log: logging.Logger,
                  candidates_path: Path = CANDIDATES_PATH,
                  max_age_days: float = 7.0,
                  *,
+                 max_pvalue: float | None = None,
                  seed_leg_count: dict[str, int] | None = None) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
       1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
       2) Quality floor: corr ≥ QUALITY_MIN_CORR AND half_life ≤
-         QUALITY_MAX_HALFLIFE AND p ≤ QUALITY_MAX_PVALUE. Drops candidates
-         that are statistically cointegrated but economically untradeable.
+         QUALITY_MAX_HALFLIFE AND p ≤ QUALITY_MAX_PVALUE (the p ceiling is
+         overridable via `max_pvalue` — the persistent system passes 0.05).
+         Drops candidates that are statistically cointegrated but
+         economically untradeable.
       3) Composite select_score = mean of percentile ranks over (p, half-life,
          spread_vol, correlation). The screener's `rank_score` weights only
          p/half-life/vol — adding correlation here rewards spreads whose legs
@@ -560,6 +571,7 @@ def select_pairs(top: int, log: logging.Logger,
 
     annotated = classify_pair_candidates(
         df_raw, top, log,
+        max_pvalue=max_pvalue,
         seed_leg_count=seed_leg_count,
     )
     picks = (
@@ -1334,6 +1346,14 @@ def main():
                              "tool can split P&L by system. Defaults to "
                              "'baseline' which preserves the original "
                              "filenames.")
+    parser.add_argument("--quality-max-pvalue", type=float, default=None,
+                        help="Override the cointegration p-value ceiling in "
+                             "the quality floor (default QUALITY_MAX_PVALUE = "
+                             "0.025). The persistent system passes 0.05: its "
+                             "CSV already cleared the persistence screen's "
+                             "p<0.05 in ≥2 of N rolling windows, so re-testing "
+                             "the latest window at 0.025 is double-jeopardy. "
+                             "corr / half-life floors are unaffected.")
     parser.add_argument("--max-csv-age-days", type=float, default=None,
                         help="Refuse to load candidates CSV older than this "
                              "many days. Safety net for a failed weekly screen "
@@ -1382,6 +1402,22 @@ def main():
             f"--lots-per-leg={args.lots_per_leg} exceeds the soft cap of 5. "
             "Pass --ack-large-size to acknowledge intentional large sizing, "
             "or reduce --lots-per-leg. (H12 typo-tripwire.)"
+        )
+
+    # Typo-tripwire for --quality-max-pvalue. Must be in (0, 0.05]: 0 or
+    # negative rejects every pair (empty book); anything above 0.05 is
+    # meaningless — the screen only writes candidates with p < 0.05, so a
+    # higher ceiling can't admit more, and the value is almost certainly a
+    # fat-finger (0.5 / 5 for 0.05). Fail loud rather than trade on a
+    # silently-wrong selection gate.
+    if args.quality_max_pvalue is not None and not (
+        0 < args.quality_max_pvalue <= 0.05
+    ):
+        parser.error(
+            f"--quality-max-pvalue={args.quality_max_pvalue} is outside the "
+            "valid range (0, 0.05]. The screen gate is p<0.05, so a higher "
+            "ceiling has no effect; 0 or negative empties the book. Check for "
+            "a decimal-point typo (0.05, not 0.5/5)."
         )
 
     load_dotenv(HERE / ".env")
@@ -1466,9 +1502,13 @@ def main():
             "Cross-runner leg counts (H17 seed): %s",
             ", ".join(f"{s}={n}" for s, n in sorted(cross_runner_counts.items())),
         )
+    if args.quality_max_pvalue is not None:
+        log.info("Quality p-value ceiling overridden: %.3f (default %.3f)",
+                 args.quality_max_pvalue, QUALITY_MAX_PVALUE)
     pairs = select_pairs(args.top, log,
                           candidates_path=Path(args.candidates),
                           max_age_days=args.max_csv_age_days,
+                          max_pvalue=args.quality_max_pvalue,
                           seed_leg_count=cross_runner_counts)
     log.info("Selected %d pair(s):", len(pairs))
     for _, row in pairs.iterrows():

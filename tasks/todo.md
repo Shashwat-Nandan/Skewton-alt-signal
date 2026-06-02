@@ -1,3 +1,47 @@
+# Pair persistent: looser p-value quality floor (2026-06-02)
+
+Goal: the persistent runner re-tests `p ≤ 0.025` on the latest single window,
+even though its candidate CSV already cleared the persistence screen's own
+`p < 0.05` in ≥2 of 9 rolling windows — double-jeopardy that cut 3 of 8
+persistent candidates (COALINDIA-ITC, APOLLOHOSP-HCLTECH, M&M-HDFCLIFE) on
+2026-06-02. Relax ONLY the p-value floor for persistent to 0.05; keep
+corr≥0.65 and half-life≤5d (economic gates, system-agnostic).
+
+Approach (confirmed 2026-06-02): explicit CLI flag set in the service unit.
+Simulated impact: persistent 4 → 6 admitted (M&M-HDFCLIFE still caught by the
+leg-cap; DRREDDY-TECHM still cut on corr 0.54). Baseline untouched (0.025).
+
+Plan:
+- [x] `classify_pair_candidates`: add `max_pvalue` kwarg (None → QUALITY_MAX_PVALUE).
+- [x] `select_pairs`: thread `max_pvalue` through to classify.
+- [x] `main`: add `--quality-max-pvalue` (default None→0.025); pass + log effective value.
+- [x] `deploy/pair-paper-persistent.service`: add `--quality-max-pvalue 0.05`
+      + a "do NOT mirror to baseline" note (it's an intentional divergence).
+- [x] Tests: override admits the marginal pairs; corr/HL still gate; default unchanged.
+- [x] Verify: pair-runner/select/h17/candidate/lifecycle suites green (128+22).
+
+## Review (2026-06-02)
+
+Done. `run_paper_pairs.py`: `max_pvalue` keyword on classify_pair_candidates
+(mirrors the existing exclude_symbols/max_hedge_ratio override pattern),
+threaded through select_pairs, exposed as `--quality-max-pvalue` (default None
+→ QUALITY_MAX_PVALUE 0.025, so every existing caller — baseline runner,
+dashboard, backtest, sweep — is byte-for-byte unchanged). Persistent service
+unit passes 0.05.
+
+Verified on the live persistent CSV: 4 → 6 admitted (COALINDIA-ITC,
+APOLLOHOSP-HCLTECH added). M&M-HDFCLIFE still dropped — leg-cap (M&M already
+2×); DRREDDY-TECHM still dropped — corr 0.54 < 0.65. So loosening p only does
+NOT relax the economic gates.
+
+Dashboard (backend/routers/pair_candidates.py) serves only the baseline CSV →
+no persistent display path to update; left at default.
+
+Not deployed: operator must redeploy deploy/pair-paper-persistent.service and
+restart the unit on the host. Takes effect from the next persistent session.
+
+---
+
 # C2 — bound Taleb rehedge churn (2026-06-02)
 
 Goal: stop the rehedge cost bleed in `check_and_rehedge` (taleb_karpathy.py).
