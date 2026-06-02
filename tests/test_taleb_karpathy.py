@@ -4,6 +4,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 from strategies.taleb_karpathy import (
     TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
@@ -2525,15 +2526,15 @@ class TestLayeredStructures:
         h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
         h.state.portfolio_greeks = pf
         proposals = h.check_and_rehedge()
-        # The realized-scalp anchor isn't set in this minimal mock so
-        # gamma_scalp_pnl stays 0, but the band trigger AND log emit
-        # is what matters here. Easiest assertion: rehedge_count
-        # incremented, OR proposals non-empty.
-        # NOTE: round(15/75)=0 so proposals=[] even when band fires,
-        # per the 2026-05-07 lesson. Check rehedge_count.
-        assert h.state.rehedge_count == 1 or len(proposals) > 0, (
-            "Phase 5 T-0 tightening did not fire — band still too wide"
-        )
+        # round(15/75)=0 so the hard-hedge proposal list is empty even though
+        # the tightened band fired (per the 2026-05-07 lesson). The robust
+        # signal that the band fired is that the method proceeded past the
+        # band + cost gates to the hedge decision — hedge_decision is only
+        # reached when delta clears the band. rehedge_count is NOT a valid
+        # proxy: the 2026-06-02 C2 fix stops it incrementing on empty proposals
+        # (a 0-lot non-hedge must not count toward the session cap).
+        h.risk.hedge_decision.assert_called_once()
+        assert proposals == [], "0-lot drift should yield no proposal here"
 
     def test_count_active_structures_by_expiry(self):
         """Two legs sharing one expiry (a straddle) count as ONE
@@ -2691,3 +2692,174 @@ class TestTwoExpiryChain:
         import pandas as pd
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         assert h._primary_expiry_slice(pd.DataFrame()).empty
+
+
+class TestRehedgeChurnBounds:
+    """C2 (2026-06-02): bound rehedge frequency, count, and per-tick size so an
+    optimistic scalp estimate cannot churn the book into a cost bleed
+    (06-02: 53 rehedges / ₹19.5k cost vs ₹10.8k gross loss). The band trigger
+    and WW cost gate are forced to PASS in these tests — we are verifying the
+    three new bounds gate independently of the +EV decision, and that exits are
+    never throttled."""
+
+    CLOCK = datetime(2026, 4, 22, 11, 0, 0)
+
+    def _hedger(self, *, lots=2, cooldown=180.0, session_cap=20, lots_cap=20):
+        from types import SimpleNamespace
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.state = HedgeState()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26APR20000CE", instrument_token=1,
+                strike=20000, expiry="2026-04-30", option_type="CE",
+                lot_size=25, quantity=25, entry_price=100.0,
+                current_price=100.0, iv=0.2,
+            )
+        ]
+        h.state.entry_time = None  # not the entry bar → :601 guard passes
+        # Greeks chosen so the asymmetric band ≈ base_threshold (all γ equal),
+        # and |delta|/lot_size clears it → a rehedge is *wanted*.
+        h.state.portfolio_greeks = SimpleNamespace(
+            net_discrete_delta=float(lots) * 25.0,
+            net_shadow_gamma=1.0, net_gamma=1.0,
+            net_shadow_gamma_up=1.0, net_shadow_gamma_down=1.0,
+        )
+        h.tunable_params = {
+            "rehedge_delta_threshold": 0.6,
+            "cost_hurdle_factor": 1.5,
+            "gamma_scalp_band_pct": 1.5,
+            "t0_band_factor": 1.0,
+            "max_rehedge_lots_per_tick": lots_cap,
+            "rehedge_cooldown_seconds": cooldown,
+            "max_rehedges_per_session": session_cap,
+        }
+        h.underlying = "NIFTY"
+        h._clock = lambda: self.CLOCK
+        # Stub the surrounding machinery so the method reaches the gates.
+        h._get_spot_price = lambda: 20000.0
+        h._check_spot = lambda spot: True
+        h._record_spot_sample = lambda *a: None
+        h._update_positions_prices = lambda spot: None
+        h._update_portfolio_greeks = lambda: None
+        h._should_exit = lambda greeks, spot: False
+        h._get_lot_size = lambda: 25
+        h._estimate_gamma_scalp_pnl = lambda greeks, spot: 1e9  # cost gate passes
+        h._generate_close_all_proposals = lambda: ["CLOSE_SENTINEL"]
+        h._generate_hard_delta_proposals = lambda greeks, spot: [
+            TradeProposal(
+                tradingsymbol="NIFTY26APRFUT", instrument_token=0, strike=0,
+                expiry="", option_type="FUT", lot_size=25, quantity=lots,
+                price=20000.0, transaction_type="SELL", iv=0,
+                bid_ask_spread_pct=0.01, margin_required=20000.0 * 25 * lots * 0.10,
+                rationale="test hedge",
+            )
+        ]
+        h.risk = MagicMock()
+        h.risk.hedge_decision.return_value = SimpleNamespace(
+            use_soft_delta=False, rationale="hard"
+        )
+        return h
+
+    def test_single_inband_rehedge_emits_and_stamps_time(self):
+        """Baseline: with no prior rehedge and bounds permissive, an in-band
+        rehedge is emitted and the cooldown clock is stamped — proving the
+        bounds don't block legitimate hedging."""
+        h = self._hedger()
+        out = h.check_and_rehedge()
+        assert len(out) == 1 and out[0].option_type == "FUT"
+        assert h.state._last_rehedge_time == self.CLOCK
+
+    def test_cooldown_blocks_rapid_rehedge(self):
+        """A rehedge within rehedge_cooldown_seconds of the last is skipped —
+        this is the bound on sustained churn (the 06-02 mode)."""
+        h = self._hedger(cooldown=180.0)
+        h.state._last_rehedge_time = self.CLOCK - timedelta(seconds=60)
+        assert h.check_and_rehedge() == []
+
+    def test_cooldown_does_not_block_exit(self):
+        """Exits must NEVER be throttled — flattening on a stop/expiry is
+        unconditional even mid-cooldown."""
+        h = self._hedger(cooldown=180.0)
+        h.state._last_rehedge_time = self.CLOCK - timedelta(seconds=1)
+        h._should_exit = lambda greeks, spot: True
+        assert h.check_and_rehedge() == ["CLOSE_SENTINEL"]
+
+    def test_cooldown_disabled_when_zero(self):
+        """cooldown=0 disables the gate (legacy behaviour)."""
+        h = self._hedger(cooldown=0)
+        h.state._last_rehedge_time = self.CLOCK - timedelta(seconds=1)
+        assert len(h.check_and_rehedge()) == 1
+
+    def test_session_cap_blocks_after_limit(self):
+        """The (cap+1)th rehedge within one open→close trade is skipped,
+        bounding total per-trade churn regardless of cost-gate optimism."""
+        h = self._hedger(session_cap=20)
+        h.state._attribution_baseline = {"rehedges_at_entry": 0}
+        h.state.rehedge_count = 20  # already did 20 this trade
+        assert h.check_and_rehedge() == []
+
+    def test_session_cap_allows_below_limit(self):
+        h = self._hedger(session_cap=20)
+        h.state._attribution_baseline = {"rehedges_at_entry": 5}
+        h.state.rehedge_count = 10  # 5 this trade < 20
+        assert len(h.check_and_rehedge()) == 1
+
+    def test_lots_cap_clamps_oversized_hedge(self):
+        """A hedge larger than max_rehedge_lots_per_tick is clamped, and its
+        margin is scaled to match — bounds the 05-26 mode (few, huge hedges)."""
+        h = self._hedger(lots=50, lots_cap=20)
+        out = h.check_and_rehedge()
+        assert len(out) == 1
+        assert out[0].quantity == 20
+        # margin scaled from the original 50-lot figure to 20 lots
+        assert out[0].margin_required == pytest.approx(20000.0 * 25 * 50 * 0.10 * 20 / 50)
+
+    def test_lots_cap_leaves_small_hedge_untouched(self):
+        h = self._hedger(lots=2, lots_cap=20)
+        out = h.check_and_rehedge()
+        assert out[0].quantity == 2
+
+    def test_empty_proposal_does_not_count_as_rehedge(self):
+        """A sub-1-lot hard hedge that rounds to 0 lots returns [] — it must NOT
+        increment rehedge_count (the session-cap input), start the cooldown, or
+        re-anchor the gamma-scalp baseline. Otherwise phantom 0-lot ticks on a
+        T-0 tightened band could silently exhaust the per-trade cap."""
+        h = self._hedger()
+        h._generate_hard_delta_proposals = lambda greeks, spot: []  # rounds to 0
+        h.state.rehedge_count = 3
+        h.state._last_rehedge_spot = 19990.0
+        assert h.check_and_rehedge() == []
+        assert h.state.rehedge_count == 3            # unchanged
+        assert h.state._last_rehedge_time is None    # cooldown not started
+        assert h.state._last_rehedge_spot == 19990.0  # anchor not moved
+
+    def test_session_cap_survives_state_restore(self):
+        """The per-trade session cap reads _attribution_baseline. A trade held
+        across a session boundary must keep that baseline through serialize/
+        restore, or the cap silently goes unenforced for restored positions."""
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.state = HedgeState()
+        h.state._attribution_baseline = {
+            "entry_time": datetime(2026, 4, 22, 9, 20, 0),
+            "realized_pnl_at_entry": 0.0,
+            "gamma_scalp_at_entry": 0.0,
+            "costs_at_entry": 0.0,
+            "rehedges_at_entry": 7,
+            "entry_atm_iv": 0.2,
+            "n_legs": 2,
+        }
+        blob = h.serialize_state()
+
+        h2 = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h2.state = HedgeState()
+        h2.restore_state(blob)
+        assert h2.state._attribution_baseline is not None
+        assert h2.state._attribution_baseline["rehedges_at_entry"] == 7
+        assert h2.state._attribution_baseline["entry_time"] == datetime(2026, 4, 22, 9, 20, 0)
+
+        # Legacy blob without the key restores to None (no crash, no cap).
+        del blob["state"]["_attribution_baseline"]
+        h3 = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h3.state = HedgeState()
+        h3.restore_state(blob)
+        assert h3.state._attribution_baseline is None

@@ -186,6 +186,9 @@ class HedgeState:
     # rehedge. The realized scalp at rehedge is 0.5 × |γ| × (ΔS)² where
     # ΔS is the actual spot move since the anchor — not a static band.
     _last_rehedge_spot: Optional[float] = None
+    # C2: wall-clock of the last emitted rehedge, for the cooldown gate.
+    # Set when a rehedge is actually emitted, cleared when the book goes flat.
+    _last_rehedge_time: Optional[datetime] = None
 
 
 class TalebKarpathyStrategy(BaseStrategy):
@@ -273,6 +276,19 @@ class TalebKarpathyStrategy(BaseStrategy):
             # gate continues to filter sub-EV rehedges.
             "t0_band_factor": self.config.getfloat(
                 "strategy", "t0_band_factor", fallback=1.0,
+            ),
+            # C2: rehedge-churn bounds. The band trigger + WW cost gate decide
+            # whether a rehedge is +EV; these cap how often and how big it can
+            # be so an optimistic scalp estimate can't churn the book into a
+            # cost bleed. Each is disabled by setting it to 0.
+            "max_rehedge_lots_per_tick": self.config.getint(
+                "strategy", "max_rehedge_lots_per_tick", fallback=20,
+            ),
+            "rehedge_cooldown_seconds": self.config.getfloat(
+                "strategy", "rehedge_cooldown_seconds", fallback=180.0,
+            ),
+            "max_rehedges_per_session": self.config.getint(
+                "strategy", "max_rehedges_per_session", fallback=20,
             ),
         }
 
@@ -681,6 +697,37 @@ class TalebKarpathyStrategy(BaseStrategy):
             "up" if delta >= 0 else "down", g_up, g_down, g_avg,
         )
 
+        # ── C2: rehedge-churn bounds ──
+        # The band fired (a rehedge is *wanted*), but frequency/count caps
+        # bound the cost bleed regardless of whether the cost gate below
+        # passes. Both gate ONLY rehedges — exits/close-all returned above at
+        # _should_exit are never throttled. Disabled when set to 0.
+        now = self._clock()
+        session_cap = self.tunable_params.get("max_rehedges_per_session", 0)
+        if session_cap and self.state._attribution_baseline is not None:
+            rehedges_this_trade = (
+                self.state.rehedge_count
+                - self.state._attribution_baseline["rehedges_at_entry"]
+            )
+            if rehedges_this_trade >= session_cap:
+                logger.warning(
+                    "Skipping rehedge: session cap reached (%d/%d this trade). "
+                    "Delta %.1f left unhedged until exit or a new trade.",
+                    rehedges_this_trade, session_cap, delta,
+                )
+                return []
+
+        cooldown = self.tunable_params.get("rehedge_cooldown_seconds", 0)
+        if cooldown and self.state._last_rehedge_time is not None:
+            since = (now - self.state._last_rehedge_time).total_seconds()
+            if since < cooldown:
+                logger.info(
+                    "Skipping rehedge: cooldown active (%.0fs since last < %.0fs). "
+                    "Delta %.1f deferred to next eligible tick.",
+                    since, cooldown, delta,
+                )
+                return []
+
         # ── Whalley-Wilmott cost gate (Taleb Ch 16: balance gamma vs cost) ──
         # WW's optimal-band result gives required-move-to-rehedge ∝
         # (cost / γ)^(1/3). Translating to scalp/cost gives required
@@ -719,23 +766,48 @@ class TalebKarpathyStrategy(BaseStrategy):
         else:
             proposals = self._generate_hard_delta_proposals(greeks, spot)
 
-        # Realized gamma-scalp P/L: 0.5 × γ × (ΔS)² where ΔS is the actual
-        # spot move since the last anchor (entry or prior rehedge). The
-        # SIGN of γ matters: a long-gamma book scalps positive on any
-        # move; a short-gamma book LOSES money to realized vol — taking
-        # abs(γ) would silently invert that loss into a fictitious gain
-        # and bias the autoresearch metric toward the losing parameter
-        # set under Phase 3+ regimes that book short-gamma legs.
-        anchor_spot = self.state._last_rehedge_spot
-        if anchor_spot is not None and anchor_spot > 0:
-            dS = spot - anchor_spot
-            gamma_for_scalp = (
-                greeks.net_shadow_gamma if greeks.net_shadow_gamma != 0
-                else greeks.net_gamma
-            )
-            self.state.gamma_scalp_pnl += 0.5 * gamma_for_scalp * dS * dS
-        self.state._last_rehedge_spot = spot
-        self.state.rehedge_count += 1
+        # ── C2: per-tick lots cap ──
+        # Bound a single oversized hedge (the 05-26 mode: few rehedges, large
+        # lots). Clamp quantity and scale margin_required to match. In normal
+        # operation a hedge is round(delta/lot_size) ≈ 1-3 lots, so this only
+        # bites a runaway sizing. Disabled when set to 0.
+        lots_cap = self.tunable_params.get("max_rehedge_lots_per_tick", 0)
+        if lots_cap:
+            for prop in proposals:
+                if prop.quantity > lots_cap:
+                    logger.warning(
+                        "Clamping rehedge %s from %d to %d lots (max_rehedge_"
+                        "lots_per_tick); residual delta left for next tick.",
+                        prop.tradingsymbol, prop.quantity, lots_cap,
+                    )
+                    prop.margin_required *= lots_cap / prop.quantity
+                    prop.quantity = lots_cap
+
+        # Post-emission bookkeeping runs ONLY when a rehedge is actually
+        # emitted. An empty proposal list (e.g. a sub-1-lot hard hedge that
+        # rounds to 0, reachable when the band is tightened on T-0) is not a
+        # rehedge: it must not start the cooldown, count toward the session
+        # cap (rehedge_count), or re-anchor the gamma-scalp baseline.
+        if proposals:
+            self.state._last_rehedge_time = now
+
+            # Realized gamma-scalp P/L: 0.5 × γ × (ΔS)² where ΔS is the actual
+            # spot move since the last anchor (entry or prior rehedge). The
+            # SIGN of γ matters: a long-gamma book scalps positive on any
+            # move; a short-gamma book LOSES money to realized vol — taking
+            # abs(γ) would silently invert that loss into a fictitious gain
+            # and bias the autoresearch metric toward the losing parameter
+            # set under Phase 3+ regimes that book short-gamma legs.
+            anchor_spot = self.state._last_rehedge_spot
+            if anchor_spot is not None and anchor_spot > 0:
+                dS = spot - anchor_spot
+                gamma_for_scalp = (
+                    greeks.net_shadow_gamma if greeks.net_shadow_gamma != 0
+                    else greeks.net_gamma
+                )
+                self.state.gamma_scalp_pnl += 0.5 * gamma_for_scalp * dS * dS
+            self.state._last_rehedge_spot = spot
+            self.state.rehedge_count += 1
 
         return proposals
 
@@ -939,10 +1011,14 @@ class TalebKarpathyStrategy(BaseStrategy):
           - portfolio_greeks: recomputed every tick from positions+spot+T
           - bleed_history / stability_history / monte_carlo_report /
             last_hedge_decision: rolling diagnostic outputs, rebuilt next tick
-          - _attribution_baseline: re-anchored on next entry
         Skips runtime caches (_atm_iv_history / _spot_history) — IV history
         has its own persistence (_save_iv_history); spot history rebuilds
         in ~10 ticks.
+
+        Persists _attribution_baseline: a trade held across a session boundary
+        keeps its per-trade anchor, so (a) the C2 session rehedge cap stays
+        bound to the right baseline and (b) the closed-trade attribution emitted
+        on exit spans the real open→close window rather than being dropped.
         """
         def _iso(ts):
             if ts is None:
@@ -994,6 +1070,14 @@ class TalebKarpathyStrategy(BaseStrategy):
                 # so absence in an older blob is tolerated by restore.
                 "_last_theta_anchor_time": _iso(self.state._last_theta_anchor_time),
                 "_last_rehedge_spot": self.state._last_rehedge_spot,
+                "_last_rehedge_time": _iso(self.state._last_rehedge_time),
+                # Per-trade attribution anchor (entry_time is a datetime; the
+                # rest are floats/ints). Absent in older blobs → restored None.
+                "_attribution_baseline": (
+                    {**self.state._attribution_baseline,
+                     "entry_time": _iso(self.state._attribution_baseline["entry_time"])}
+                    if self.state._attribution_baseline is not None else None
+                ),
             },
         }
 
@@ -1048,6 +1132,16 @@ class TalebKarpathyStrategy(BaseStrategy):
         )
         lrs = s.get("_last_rehedge_spot")
         self.state._last_rehedge_spot = float(lrs) if lrs is not None else None
+        lrt = s.get("_last_rehedge_time")
+        self.state._last_rehedge_time = (
+            datetime.fromisoformat(lrt) if lrt else None
+        )
+        ab = s.get("_attribution_baseline")
+        if ab is not None:
+            ab = dict(ab)
+            ab_et = ab.get("entry_time")
+            ab["entry_time"] = datetime.fromisoformat(ab_et) if ab_et else None
+        self.state._attribution_baseline = ab
 
     def legs_expire_on(self, today: date) -> bool:
         """True if any held leg's contract has its last trading day on `today`.
@@ -1504,8 +1598,11 @@ class TalebKarpathyStrategy(BaseStrategy):
                 self.state._attribution_baseline = None
             self.state.entry_time = None  # Reset so next entry gets a fresh timestamp
             # Drop the rehedge-spot anchor; theta anchor is dropped in
-            # _update_portfolio_greeks() when it sees an empty book.
+            # _update_portfolio_greeks() when it sees an empty book. Also clear
+            # the cooldown clock so the next trade's first rehedge isn't blocked
+            # by the prior trade's spacing.
             self.state._last_rehedge_spot = None
+            self.state._last_rehedge_time = None
             self._record_pnl_snapshot()
 
         # Evaluate consecutive loss streak based on NET realized P/L of the batch
