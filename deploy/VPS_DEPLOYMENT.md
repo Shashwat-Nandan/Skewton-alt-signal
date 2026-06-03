@@ -17,6 +17,8 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `taleb-hedger.service`        | Oneshot, ~6 hours             | Runs `run_paper.py` — auths, sleeps to 09:15, ticks until 15:25, flattens, exits     |
 | `pair-paper.timer`            | Mon–Fri 09:11 IST + jitter    | Fires `pair-paper.service` (1-min offset from taleb-hedger to stagger TOTP logins)   |
 | `pair-paper.service`          | Oneshot, ~6 hours             | Runs `run_paper_pairs.py` — top-N cointegrated STF pairs, paper mode, EOD JSON sidecar |
+| `arbitrage-paper.timer`       | Mon–Fri 09:13 IST + jitter    | Fires `arbitrage-paper.service` (1-min offset after pair-paper to stagger TOTP logins) |
+| `arbitrage-paper.service`     | Type=simple, ~6 hours         | Runs `run_paper_arbitrage.py` — calendar/term-structure spreads, paper mode, EOD sidecar |
 | `pair-verify.timer`           | Mon–Fri 16:00 IST + jitter    | Fires `pair-verify.service`                                                          |
 | `pair-verify.service`         | Oneshot, ~5 min               | Runs `verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
 | `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
@@ -166,6 +168,23 @@ journalctl -t taleb-notify -n 5
 ```
 
 The journal line and (if configured) the external ping should fire within 10 seconds. **If the operator setup ever changes, re-run this smoke-test** — silent notifier failures are the worst-case scenario.
+
+### 3.2 Arbitrage paper runner
+
+The arbitrage calendar-spread paper runner ships its own pair of units (added after the original install list above):
+
+```bash
+sudo cp deploy/arbitrage-paper.service /etc/systemd/system/
+sudo cp deploy/arbitrage-paper.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now arbitrage-paper.timer
+```
+
+It mirrors `pair-paper`: the timer fires **Mon–Fri 09:13 IST** (staggered after the hedger/pair logins so the TOTP logins don't collide on the shared `.kite_session.json`), and the service runs `run_paper_arbitrage.py --max-leg-notional 500000` as a session-long loop that self-gates to the 09:15 open, then exits 0 at **15:25 IST** writing `data_cache/arbitrage_paper_eod_<date>.json` — the EOD sidecar the `/arbitrage` dashboard tab reads. Unlike the units above, `deploy/arbitrage-paper.service` already hardcodes `User=root`, so the only per-VPS edit is the path.
+
+**Host reconciliation note (2026-06-03).** On the current VPS this unit had been hand-installed as `Type=oneshot` with no `Restart=`, so a mid-session crash would stay dead until the next day's timer fire (only `notify-failure@` alerting). It was reconciled to match `deploy/arbitrage-paper.service` byte-for-byte except the path substitution (`/opt/taleb-karpathy-kite` → `/root/algo-trading/taleb-karpathy-kite`), restoring `Type=simple` + `Restart=on-failure` (`RestartSec=30`) + `StartLimitBurst=5`/`StartLimitIntervalSec=600`. A clean 15:25 IST teardown returns 0 and does **not** trip the restart, so the daily-timer pattern is unaffected. An interim `arbitrage-paper.service.d/restart.conf` drop-in — used to apply those directives before the full reconcile — was removed as redundant once the base unit matched. The pre-reconcile unit is backed up at `/root/arbitrage-paper.service.pre-reconcile.bak`.
+
+**Keep host units matching the template.** Per-host tweaks belong in the base unit (mirror generic ones back into `deploy/`) or a documented drop-in — don't let a hand-edit silently diverge from `deploy/arbitrage-paper.service`, or crash-recovery behaviour drifts unnoticed.
 
 ---
 
@@ -781,6 +800,8 @@ deploy/
 ├── VPS_DEPLOYMENT.md              # this guide
 ├── taleb-hedger.service           # daily paper trading oneshot
 ├── taleb-hedger.timer             # Mon–Fri 09:10 IST trigger
+├── arbitrage-paper.service        # daily calendar-spread paper runner
+├── arbitrage-paper.timer          # Mon–Fri 09:13 IST trigger
 ├── taleb-autoresearch.service     # weekly param sweep oneshot
 ├── taleb-autoresearch.timer       # Sat 10:00 IST trigger
 ├── run_weekly_autoresearch.sh     # wrapper: fetch → sweep → stage candidate
