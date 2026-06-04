@@ -25,6 +25,7 @@ data_cache/
 # Reference docs / scratch (large, not source)
 Dynamic_Hedging-Taleb.pdf
 shot.png
+claude_example.py
 
 # OS
 .DS_Store
