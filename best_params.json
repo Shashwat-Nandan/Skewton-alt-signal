@@ -9,12 +9,13 @@
     "entry_iv_percentile_max": 85.0,
     "max_entry_alpha": 143013.0,
     "mc_worst_path_loss_pct": 3.0,
+    "mc_min_mean_pnl": -10000.0,
     "cost_hurdle_factor": 2.5288,
     "min_rv_iv_ratio": 1.222,
     "rv_window_days": 6.5847,
     "skew_pct_max": 80.0,
     "enable_regime_dispatch": true,
-    "max_layered_structures": 2,
+    "max_layered_structures": 1,
     "t0_band_factor": 0.5
   },
   "best_metric": {

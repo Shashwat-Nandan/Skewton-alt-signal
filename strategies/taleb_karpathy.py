@@ -189,6 +189,13 @@ class HedgeState:
     # C2: wall-clock of the last emitted rehedge, for the cooldown gate.
     # Set when a rehedge is actually emitted, cleared when the book goes flat.
     _last_rehedge_time: Optional[datetime] = None
+    # Phase 4 layering: structure *types* currently on the book (e.g.
+    # ["straddle", "risk_reversal_long_put"]). scan_and_propose appends the
+    # entered structure on each open and consults this list to refuse layering
+    # a structure whose type is already held — the type-difference invariant
+    # the docstring promises but _count_active_structures (expiry-based) cannot
+    # enforce. Cleared when the book goes flat.
+    active_structure_types: List[str] = field(default_factory=list)
 
 
 class TalebKarpathyStrategy(BaseStrategy):
@@ -235,6 +242,14 @@ class TalebKarpathyStrategy(BaseStrategy):
             "max_entry_alpha": self.config.getfloat("strategy", "max_entry_alpha", fallback=25000),
             # ── New tunable: Monte Carlo worst-path sizing (Gap #19) ──
             "mc_worst_path_loss_pct": self.config.getfloat("strategy", "mc_worst_path_loss_pct", fallback=3.0),
+            # ── Gap #2 (2026-06-04): MC expected-value entry gate ──
+            # Reject entries whose Monte Carlo MEAN path P/L is below this
+            # floor (₹). Gates on EXPECTANCY, not win-rate: a long-gamma
+            # straddle is positive-skew (low win-rate, positive EV by
+            # design), so a pct_profitable floor would wrongly reject the
+            # convex trades the book exists to hold. Default 0.0 = refuse
+            # negative-expectancy entries. Set strongly negative to disable.
+            "mc_min_mean_pnl": self.config.getfloat("strategy", "mc_min_mean_pnl", fallback=0.0),
             # ── Cost-aware rehedge: min scalp/cost ratio to proceed (Taleb Ch 16) ──
             "cost_hurdle_factor": self.config.getfloat("strategy", "cost_hurdle_factor", fallback=1.5),
             # ── Realized-vs-implied vol regime gate ──
@@ -506,6 +521,20 @@ class TalebKarpathyStrategy(BaseStrategy):
             )
             if structure == Structure.NO_TRADE:
                 return []
+            # Type-difference layering gate. _count_active_structures counts
+            # unique expiries, so two same-expiry/same-type structures (e.g. a
+            # straddle layered on a straddle) slip past the max_layers count.
+            # Refuse to stack a structure whose type is already on the book —
+            # the invariant this method's docstring promises. Only applies when
+            # layering (positions held); a flat book has no active types.
+            if self.state.positions and structure.value in self.state.active_structure_types:
+                logger.info(
+                    "Layering blocked: structure '%s' already active (book holds "
+                    "%s) — refusing to stack the same structure type.",
+                    structure.value, self.state.active_structure_types,
+                )
+                return []
+            entered_structure = structure.value
             proposals = self.proposer.propose_for_structure(
                 structure=structure.value, chain=chain, spot=spot,
                 capital=self.immutable_params["total_capital"],
@@ -514,6 +543,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             )
         else:
             # Legacy single-expiry straddle — pass primary slice only.
+            entered_structure = "straddle"
             proposals = self.proposer.propose_delta_neutral(
                 chain=primary, spot=spot,
                 capital=self.immutable_params["total_capital"],
@@ -579,6 +609,25 @@ class TalebKarpathyStrategy(BaseStrategy):
                 seed=mc_seed,
             )
             self.state.monte_carlo_report = mc
+
+            # ── Gap #2 (2026-06-04): expected-value gate ──
+            # mc.mean_pnl is the entry's expectancy across simulated paths.
+            # Gate on EXPECTANCY, not win-rate: a long-gamma book is
+            # positive-skew (bleed small, win big), so a low pct_profitable
+            # is normal and healthy — only a NEGATIVE mean means we expect
+            # to pay more theta than the gamma scalp recovers. Rejecting
+            # here (not scaling) blocks the 2026-06-04 straddle add
+            # (mean -3,371, 14% profitable) while passing the earlier add
+            # (mean +23,614, 100% profitable).
+            mc_min_mean = self.tunable_params.get("mc_min_mean_pnl", 0.0)
+            if mc.mean_pnl < mc_min_mean:
+                logger.info(
+                    "MC mean P/L %.0f < floor %.0f (%.0f%% paths profitable) "
+                    "— negative-expectancy entry, skipping.",
+                    mc.mean_pnl, mc_min_mean, mc.pct_profitable,
+                )
+                return []
+
             max_loss_allowed = self.immutable_params["total_capital"] * self.tunable_params["mc_worst_path_loss_pct"] / 100
             if abs(mc.worst_path_pnl) > max_loss_allowed:
                 scale = max_loss_allowed / abs(mc.worst_path_pnl)
@@ -597,6 +646,11 @@ class TalebKarpathyStrategy(BaseStrategy):
                     p.quantity = int(p.quantity * scale)
 
         logger.info("Generated %d proposals after full Taleb analysis.", len(proposals))
+        # Record the structure type now that this entry is committed, so the
+        # next tick's type-difference gate sees it. Guarded on non-empty
+        # proposals: an empty list here means every leg was filtered out.
+        if proposals and entered_structure not in self.state.active_structure_types:
+            self.state.active_structure_types.append(entered_structure)
         return proposals
 
     def check_and_rehedge(self) -> List[TradeProposal]:
@@ -1071,6 +1125,9 @@ class TalebKarpathyStrategy(BaseStrategy):
                 "_last_theta_anchor_time": _iso(self.state._last_theta_anchor_time),
                 "_last_rehedge_spot": self.state._last_rehedge_spot,
                 "_last_rehedge_time": _iso(self.state._last_rehedge_time),
+                # Phase 4 layering: structure types held across the session
+                # boundary, so the type-difference gate stays enforced on resume.
+                "active_structure_types": list(self.state.active_structure_types),
                 # Per-trade attribution anchor (entry_time is a datetime; the
                 # rest are floats/ints). Absent in older blobs → restored None.
                 "_attribution_baseline": (
@@ -1136,6 +1193,8 @@ class TalebKarpathyStrategy(BaseStrategy):
         self.state._last_rehedge_time = (
             datetime.fromisoformat(lrt) if lrt else None
         )
+        # Optional — older blobs predate Phase 4 layering; default to empty.
+        self.state.active_structure_types = list(s.get("active_structure_types", []))
         ab = s.get("_attribution_baseline")
         if ab is not None:
             ab = dict(ab)
@@ -1349,21 +1408,22 @@ class TalebKarpathyStrategy(BaseStrategy):
         return 0.5 * gamma * dS ** 2
 
     def _count_active_structures(self) -> int:
-        """Phase 4: estimate how many distinct *structures* the book
-        holds, used by `scan_and_propose` to decide whether layering is
-        allowed under `max_layered_structures`.
+        """Phase 4: number of distinct *structures* layered on the book —
+        the unit `scan_and_propose` caps with `max_layered_structures`.
 
-        A "structure" here is a unique expiry — a straddle is one
-        expiry (both CE and PE same expiry), a calendar spans two
-        expiries (so counts as two), a risk reversal sits on one
-        expiry (one). This is coarse — it doesn't distinguish a
-        straddle from a strangle at the same expiry — but it's
-        sufficient to enforce "don't layer two of the same structure"
-        which is the load-bearing invariant for the existing
-        attribution / exit code.
+        Prefers `active_structure_types` (one entry per layered structure,
+        which is the correct unit: a calendar is ONE structure even though
+        it spans two expiries, and two same-expiry straddles are TWO
+        structures even though they share one expiry). Falls back to the
+        coarse unique-expiry count only when the type list is empty but
+        positions exist — i.e. a book restored from a pre-Phase-4 state
+        blob that predates the list — so a held book is never under-counted,
+        which would wrongly permit layering.
         """
         if not self.state.positions:
             return 0
+        if self.state.active_structure_types:
+            return len(self.state.active_structure_types)
         return len({p.expiry for p in self.state.positions if p.expiry})
 
     def _proposals_to_contracts(self, proposals):
@@ -1603,6 +1663,9 @@ class TalebKarpathyStrategy(BaseStrategy):
             # by the prior trade's spacing.
             self.state._last_rehedge_spot = None
             self.state._last_rehedge_time = None
+            # Flat book holds no structures — reset the layering type list so
+            # the next entry starts clean.
+            self.state.active_structure_types = []
             self._record_pnl_snapshot()
 
         # Evaluate consecutive loss streak based on NET realized P/L of the batch

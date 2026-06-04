@@ -12,6 +12,7 @@ from strategies.taleb_karpathy import (
 )
 from trade_proposer import TradeProposal
 from greeks_engine import OptionContract
+from regime_classifier import Structure
 
 
 class TestTransactionCosts:
@@ -950,7 +951,7 @@ class TestPreEntryVegaGate:
             return_value=MagicMock(is_stable=True, warnings=[]),
         )
         mock_hedger.risk.path_dependence_monte_carlo = MagicMock(
-            return_value=MagicMock(worst_path_pnl=-1000),
+            return_value=MagicMock(worst_path_pnl=-1000, mean_pnl=50000, pct_profitable=100.0),
         )
 
         result = mock_hedger.scan_and_propose()
@@ -1132,7 +1133,7 @@ class TestMCSizingSubLotGate:
         proposal = self._make_proposal(qty=1)
         mock_hedger.proposer.propose_delta_neutral = MagicMock(return_value=[proposal])
         mock_hedger.risk.path_dependence_monte_carlo = MagicMock(
-            return_value=MagicMock(worst_path_pnl=-15000),
+            return_value=MagicMock(worst_path_pnl=-15000, mean_pnl=50000, pct_profitable=100.0),
         )
 
         result = mock_hedger.scan_and_propose()
@@ -1145,7 +1146,7 @@ class TestMCSizingSubLotGate:
         proposal = self._make_proposal(qty=4)
         mock_hedger.proposer.propose_delta_neutral = MagicMock(return_value=[proposal])
         mock_hedger.risk.path_dependence_monte_carlo = MagicMock(
-            return_value=MagicMock(worst_path_pnl=-10000),
+            return_value=MagicMock(worst_path_pnl=-10000, mean_pnl=50000, pct_profitable=100.0),
         )
 
         result = mock_hedger.scan_and_propose()
@@ -1158,13 +1159,45 @@ class TestMCSizingSubLotGate:
         proposal = self._make_proposal(qty=1)
         mock_hedger.proposer.propose_delta_neutral = MagicMock(return_value=[proposal])
         mock_hedger.risk.path_dependence_monte_carlo = MagicMock(
-            return_value=MagicMock(worst_path_pnl=-3000),
+            return_value=MagicMock(worst_path_pnl=-3000, mean_pnl=50000, pct_profitable=100.0),
         )
 
         result = mock_hedger.scan_and_propose()
 
         assert len(result) == 1
         assert result[0].quantity == 1
+
+    def test_negative_expectancy_entry_rejected(self, mock_hedger):
+        """Gap #2: an entry whose MC MEAN path P/L is negative is rejected
+        outright, even when its worst path is within the loss cap.
+        Reproduces the 2026-06-04 straddle add (mean -3,371, 14% profitable)
+        that slipped through because only worst_path_pnl was gated."""
+        mock_hedger.tunable_params["mc_min_mean_pnl"] = 0.0
+        proposal = self._make_proposal(qty=1)
+        mock_hedger.proposer.propose_delta_neutral = MagicMock(return_value=[proposal])
+        mock_hedger.risk.path_dependence_monte_carlo = MagicMock(
+            return_value=MagicMock(worst_path_pnl=-3000, mean_pnl=-3371, pct_profitable=14.0),
+        )
+
+        result = mock_hedger.scan_and_propose()
+
+        assert result == []
+
+    def test_positive_expectancy_low_winrate_proceeds(self, mock_hedger):
+        """Gap #2: the gate keys on EXPECTANCY, not win-rate. A convex
+        long-gamma entry with a LOW pct_profitable but POSITIVE mean P/L
+        is exactly what the book exists to hold — it must proceed. Guards
+        against a naive pct_profitable floor that would be anti-Taleb."""
+        mock_hedger.tunable_params["mc_min_mean_pnl"] = 0.0
+        proposal = self._make_proposal(qty=1)
+        mock_hedger.proposer.propose_delta_neutral = MagicMock(return_value=[proposal])
+        mock_hedger.risk.path_dependence_monte_carlo = MagicMock(
+            return_value=MagicMock(worst_path_pnl=-3000, mean_pnl=12000, pct_profitable=18.0),
+        )
+
+        result = mock_hedger.scan_and_propose()
+
+        assert len(result) == 1
 
 
 class TestPerTradeAttribution:
@@ -1428,7 +1461,7 @@ class TestRVIVGate:
             return_value=MagicMock(is_stable=True, warnings=[]),
         )
         hedger.risk.path_dependence_monte_carlo = MagicMock(
-            return_value=MagicMock(worst_path_pnl=-100),
+            return_value=MagicMock(worst_path_pnl=-100, mean_pnl=50000, pct_profitable=100.0),
         )
         return hedger
 
@@ -2561,6 +2594,120 @@ class TestLayeredStructures:
             quantity=1, entry_price=320, current_price=320, iv=0.15,
         ))
         assert h._count_active_structures() == 2
+
+    def test_count_active_structures_uses_type_list(self):
+        """Gap #2: when active_structure_types is populated it is the
+        authoritative count, in the correct unit. Two same-expiry layered
+        structures count as TWO (the expiry fallback would wrongly say
+        one); a single calendar spanning two expiries counts as ONE (the
+        expiry fallback would wrongly say two)."""
+        h = self._make_hedger(max_layers=3, regime=True)
+        # One expiry on the book, but two structures were layered:
+        h.state.positions = [OptionContract(
+            tradingsymbol="A", instrument_token=1, strike=22000,
+            expiry="2027-04-03", option_type="CE", lot_size=25,
+            quantity=1, entry_price=300, current_price=300, iv=0.15,
+        )]
+        h.state.active_structure_types = ["straddle", "asymmetric_strangle"]
+        assert h._count_active_structures() == 2
+        # A single calendar spans two expiries but is ONE structure:
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="N", instrument_token=2, strike=22000,
+                expiry="2027-04-03", option_type="CE", lot_size=25,
+                quantity=-1, entry_price=300, current_price=300, iv=0.15,
+            ),
+            OptionContract(
+                tradingsymbol="F", instrument_token=3, strike=22000,
+                expiry="2027-05-08", option_type="CE", lot_size=25,
+                quantity=1, entry_price=320, current_price=320, iv=0.15,
+            ),
+        ]
+        h.state.active_structure_types = ["calendar_short_front"]
+        assert h._count_active_structures() == 1
+
+    def _stub_pipeline_to_classify(self, h):
+        """Stub everything scan_and_propose touches between the layering
+        branch and classify(), so a test can drive the type-difference gate
+        with _pre_trade_checks permissive."""
+        h._pre_trade_checks = MagicMock(return_value=True)
+        h._check_spot = MagicMock(return_value=True)
+        h._record_spot_sample = MagicMock()
+        chain = MagicMock(empty=False)
+        h._get_options_chain = MagicMock(return_value=chain)
+        h._primary_expiry_slice = MagicMock(return_value=chain)
+        h._compute_iv_percentile = MagicMock(return_value=50.0)
+        h._compute_skew_percentile = MagicMock(return_value=50.0)
+        h._compute_realized_vol = MagicMock(return_value=0.20)
+        h._atm_iv_history = [0.18] * 12
+        h._apply_risk_filters = lambda proposals, spot: proposals
+        h.immutable_params = {"total_capital": 1_000_000.0}
+        h.tunable_params.update({
+            "entry_iv_percentile_min": 0.0,
+            "entry_iv_percentile_max": 100.0,
+            "position_size_pct": 10.0,
+        })
+
+    def test_layering_blocks_same_structure_type(self):
+        """Type-difference gate: with capacity to layer (max_layers=2,
+        regime on, one expiry held) a SECOND structure of the SAME type is
+        refused — the invariant _count_active_structures (expiry-based)
+        cannot enforce. Reproduces the 2026-06-04 straddle-on-straddle add."""
+        h = self._make_hedger(max_layers=2, regime=True)
+        self._stub_pipeline_to_classify(h)
+        h.proposer.propose_for_structure = MagicMock(return_value=[])
+        h.state.positions.append(OptionContract(
+            tradingsymbol="NIFTY27APR22000CE", instrument_token=1,
+            strike=22000, expiry="2027-04-03", option_type="CE",
+            lot_size=25, quantity=1, entry_price=300,
+            current_price=300, iv=0.15,
+        ))
+        h.state.active_structure_types = ["straddle"]
+        with patch("strategies.taleb_karpathy.classify",
+                   return_value=Structure("straddle")):
+            result = h.scan_and_propose()
+        assert result == []
+        h.proposer.propose_for_structure.assert_not_called()
+
+    def test_layering_allows_different_structure_type(self):
+        """A structure whose type differs from everything on the book is
+        NOT blocked by the type gate — propose_for_structure is invoked.
+        (Returns [] downstream to keep the test focused on the gate.)"""
+        h = self._make_hedger(max_layers=2, regime=True)
+        self._stub_pipeline_to_classify(h)
+        h.proposer.propose_for_structure = MagicMock(return_value=[])
+        h.state.positions.append(OptionContract(
+            tradingsymbol="NIFTY27APR22000CE", instrument_token=1,
+            strike=22000, expiry="2027-04-03", option_type="CE",
+            lot_size=25, quantity=1, entry_price=300,
+            current_price=300, iv=0.15,
+        ))
+        h.state.active_structure_types = ["straddle"]
+        with patch("strategies.taleb_karpathy.classify",
+                   return_value=Structure("risk_reversal_long_put")):
+            h.scan_and_propose()
+        h.proposer.propose_for_structure.assert_called_once()
+
+    def test_active_structure_types_survive_serialize_restore(self):
+        """Overnight hold: the layering type list round-trips through
+        serialize/restore so the gate stays enforced on resume."""
+        h = self._make_hedger(max_layers=2, regime=True)
+        h.state.active_structure_types = ["straddle", "calendar_short_front"]
+        blob = h.serialize_state()
+        h2 = self._make_hedger(max_layers=2, regime=True)
+        h2.restore_state(blob)
+        assert h2.state.active_structure_types == [
+            "straddle", "calendar_short_front",
+        ]
+
+    def test_restore_tolerates_missing_active_structure_types(self):
+        """Older state blobs predate the field — restore defaults to []."""
+        h = self._make_hedger()
+        h.state.active_structure_types = ["straddle"]
+        blob = h.serialize_state()
+        del blob["state"]["active_structure_types"]
+        h.restore_state(blob)
+        assert h.state.active_structure_types == []
 
 
 class TestTwoExpiryChain:
