@@ -540,7 +540,7 @@ def main():
                         help="System tag — suffixes log/state/EOD filenames so "
                              "parallel runners don't clobber each other. "
                              "Defaults to 'baseline' (un-suffixed filenames).")
-    parser.add_argument("--max-leg-notional", type=float, default=500_000,
+    parser.add_argument("--max-leg-notional", type=float, default=1_000_000,
                         help="Per-leg ₹ cap (overrides config; required so a "
                              "1-lot RELIANCE leg can't deploy ₹50L silently)")
     parser.add_argument("--lots-per-leg", type=int, default=1,

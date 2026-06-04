@@ -24,7 +24,7 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # Tunables live here so config changes don't require a rebuild. Override on the
 # VPS with `systemctl edit arbitrage-paper.service`. --max-leg-notional caps
 # per-leg ₹ deployment; calendar thresholds come from config.ini [arbitrage].
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_arbitrage.py --max-leg-notional 500000
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_arbitrage.py --max-leg-notional 1000000
 # -------------------------------
 
 # Auto-restart on crash / non-zero exit. A clean 15:25 IST teardown returns 0
