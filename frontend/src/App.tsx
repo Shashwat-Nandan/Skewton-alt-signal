@@ -62,6 +62,10 @@ export default function App() {
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />
           <Route path="/pair-candidates" element={<PairCandidatesPage />} />
+          <Route
+            path="/pair-candidates/persistent"
+            element={<PairCandidatesPage variant="persistent" />}
+          />
           <Route path="/arbitrage" element={<ArbitragePage />} />
           <Route path="/equity-swing" element={<EquitySwingPage />} />
         </Routes>

@@ -150,6 +150,10 @@ export type PairCandidate = {
   processing_rank: number | null;
   /** Why the runner skipped this candidate ("beta"|"quality"|"leg_cap"|"cutoff"). */
   skip_reason: PairSkipReason | null;
+  /** Rolling windows the pair cleared cointegration in (persistent screen only; null for baseline). */
+  persistence_count: number | null;
+  /** Comma-separated window indices, e.g. "6,7,8" (persistent screen only; null for baseline). */
+  persistence_windows: string | null;
 };
 
 export type PairCandidatesResponse = {

@@ -19,6 +19,8 @@ import { cn, formatNum } from "@/lib/utils";
 import { PaperSystemCompare } from "@/components/PaperSystemCompare";
 import type { PairCandidate, PairSkipReason } from "@/lib/types";
 
+type PairVariant = "baseline" | "persistent";
+
 type SortKey =
   | "symbol_a"
   | "processing_rank"
@@ -28,11 +30,14 @@ type SortKey =
   | "half_life_days"
   | "correlation"
   | "spread_vol_pct"
-  | "hedge_ratio";
+  | "hedge_ratio"
+  | "persistence_count";
 
 type SortDir = "asc" | "desc";
 
-const COLUMNS: { key: SortKey; label: string; align?: "right" | "center"; help?: string }[] = [
+type Column = { key: SortKey; label: string; align?: "right" | "center"; help?: string };
+
+const BASE_COLUMNS: Column[] = [
   { key: "processing_rank", label: "Order", align: "center", help: "Admit order for the runner under the requested --top cutoff. Blank = skipped (hover for reason)." },
   { key: "symbol_a", label: "Pair" },
   { key: "latest_z_score", label: "Z-score", align: "right", help: "Latest spread vs panel mean/std" },
@@ -43,6 +48,20 @@ const COLUMNS: { key: SortKey; label: string; align?: "right" | "center"; help?:
   { key: "spread_vol_pct", label: "Vol %", align: "right", help: "Spread σ / avg leg price" },
   { key: "hedge_ratio", label: "β", align: "right", help: "OLS hedge ratio (long-leg β · short-leg)" },
 ];
+
+// Persistent screen surfaces how durable each cointegration is. Inserted right
+// after the Pair column so it reads as a headline trust signal.
+const PERSISTENCE_COLUMN: Column = {
+  key: "persistence_count",
+  label: "Windows",
+  align: "right",
+  help: "Rolling windows the pair cleared cointegration in (higher = more durable). Hover a value for the window indices.",
+};
+
+function columnsFor(variant: PairVariant): Column[] {
+  if (variant !== "persistent") return BASE_COLUMNS;
+  return [BASE_COLUMNS[0], BASE_COLUMNS[1], PERSISTENCE_COLUMN, ...BASE_COLUMNS.slice(2)];
+}
 
 const SKIP_REASON_LABEL: Record<PairSkipReason, string> = {
   beta: "|β| outside [0.1, 10] — untradeable hedge ratio",
@@ -79,13 +98,16 @@ function sortKeyValue(c: PairCandidate, key: SortKey): number | string | null {
     return c.latest_z_score == null ? null : Math.abs(c.latest_z_score);
   }
   if (key === "processing_rank") return c.processing_rank;
+  if (key === "persistence_count") return c.persistence_count;
   return c[key] as number | null;
 }
 
-export function PairCandidatesPage() {
+export function PairCandidatesPage({ variant = "baseline" }: { variant?: PairVariant }) {
+  const persistent = variant === "persistent";
+  const columns = columnsFor(variant);
   const { data, isLoading, error } = useQuery({
-    queryKey: ["pair-candidates"],
-    queryFn: () => api.pairCandidates(),
+    queryKey: ["pair-candidates", variant],
+    queryFn: () => (persistent ? api.pairCandidatesPersistent() : api.pairCandidates()),
     refetchInterval: 5 * 60 * 1000, // CSV updates daily; re-poll every 5 min is generous.
   });
 
@@ -136,13 +158,17 @@ export function PairCandidatesPage() {
   return (
     <div className="space-y-4">
       <div>
-        <h1 className="text-xl font-semibold">Pair candidates</h1>
+        <h1 className="text-xl font-semibold">
+          {persistent ? "Persistent pair candidates" : "Pair candidates"}
+        </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Cointegrated single-stock-futures pairs from the daily Engle-Granger screen.
+          {persistent
+            ? "Pairs that stayed cointegrated across multiple rolling windows (persistence screen, p≤0.05)."
+            : "Cointegrated single-stock-futures pairs from the daily Engle-Granger screen."}
         </p>
       </div>
 
-      <PaperSystemCompare />
+      {!persistent && <PaperSystemCompare />}
 
       <Card>
         <CardHeader className="flex flex-row flex-wrap items-end justify-between gap-3 pb-3">
@@ -194,7 +220,7 @@ export function PairCandidatesPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  {COLUMNS.map((col) => {
+                  {columns.map((col) => {
                     const active = col.key === sortKey;
                     const Arrow = sortDir === "asc" ? ArrowUp : ArrowDown;
                     return (
@@ -261,6 +287,23 @@ export function PairCandidatesPage() {
                           : "—"}
                       </div>
                     </TableCell>
+                    {persistent && (
+                      <TableCell className="text-right tabular-nums">
+                        {c.persistence_count == null ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          <span
+                            title={
+                              c.persistence_windows
+                                ? `Windows: ${c.persistence_windows}`
+                                : undefined
+                            }
+                          >
+                            {c.persistence_count}
+                          </span>
+                        )}
+                      </TableCell>
+                    )}
                     <TableCell className="text-right tabular-nums">
                       {c.latest_z_score == null ? (
                         <span className="text-muted-foreground">—</span>

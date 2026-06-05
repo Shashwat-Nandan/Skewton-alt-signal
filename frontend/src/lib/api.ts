@@ -90,6 +90,11 @@ export const api = {
     return http<PairCandidatesResponse>(`/pair-candidates${qs}`);
   },
 
+  pairCandidatesPersistent: (top?: number) => {
+    const qs = top != null ? `?top=${top}` : "";
+    return http<PairCandidatesResponse>(`/pair-candidates/persistent${qs}`);
+  },
+
   pairPaperCompare: (params: { days?: number; end?: string; systems?: string } = {}) => {
     const q = new URLSearchParams();
     if (params.days != null) q.set("days", String(params.days));

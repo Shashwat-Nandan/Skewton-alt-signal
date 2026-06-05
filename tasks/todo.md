@@ -1,3 +1,84 @@
+# Persistent pair candidates — daily-review frontend (2026-06-05)
+
+Close the gap flagged in the 2026-06-02 review below ("Dashboard serves only the
+baseline CSV → no persistent display path"). Mirror the baseline
+`/pair-candidates` page for `data_cache/pair_candidates_persistent.csv` so the
+persistence-screened pairs get the same daily-review surface.
+
+## Key facts established (from reading the code)
+- Baseline router `backend/routers/pair_candidates.py` → `/api/pair-candidates`,
+  reads `pair_candidates.csv`, replays `classify_pair_candidates(df, top)`.
+- Persistent CSV adds 2 cols: `persistence_count`, `persistence_windows`.
+- **Critical:** the persistent paper runner (`deploy/pair-paper-persistent.service`)
+  admits with `--quality-max-pvalue 0.05`, NOT baseline's 0.025. The persistent
+  endpoint MUST call `classify_pair_candidates(df, top, max_pvalue=0.05)` or the
+  dashboard's processing_rank / skip_reason won't match what the runner does.
+- dashboard-backend has no auto-deploy → a NEW route needs
+  `systemctl restart dashboard-backend.service` on the host to appear.
+
+## Plan
+### Backend (`backend/routers/pair_candidates.py`)
+- [ ] Add 2 optional fields to `PairCandidate`: `persistence_count: Optional[int]`,
+      `persistence_windows: Optional[str]` (default None → baseline unaffected).
+- [ ] Add `PERSISTENT_CSV_PATH`; factor the row→model build into a helper so the
+      two handlers share it.
+- [ ] `@router.get("/persistent")`: read persistent CSV,
+      `classify_pair_candidates(df, top=top, max_pvalue=0.05)`, fill the 2 extra
+      fields via getattr (legacy-safe).
+
+### Frontend
+- [ ] `types.ts`: add the 2 optional fields to `PairCandidate`.
+- [ ] `api.ts`: `pairCandidatesPersistent(top?)` → `/pair-candidates/persistent`.
+- [ ] `PairCandidatesPage.tsx`: add `variant?: "baseline" | "persistent"`
+      (default baseline = no behaviour change). Persistent: own title/copy,
+      persistence column(s), persistent query+api, hide `PaperSystemCompare`.
+- [ ] `App.tsx`: route `/pair-candidates/persistent`.
+- [ ] `Header.tsx`: nav link.
+
+## Verify
+- [ ] Backend test for `/persistent` (cols present; admit order honours p≤0.05).
+- [ ] `npm run build` (tsc) clean.
+
+## Review (2026-06-05)
+
+Done. Persistent pairs now have the same daily-review surface as baseline.
+
+Backend (`backend/routers/pair_candidates.py`):
+- `PairCandidate` gained 2 optional fields (`persistence_count`,
+  `persistence_windows`), default None → baseline rows + responses unchanged.
+- Extracted `_serve_candidates(csv_path, top, max_pvalue)` shared by both
+  routes (no logic duplicated). Added `_opt_str` helper + `PERSISTENT_CSV_PATH`.
+- New `GET /api/pair-candidates/persistent` passes `max_pvalue=0.05` to
+  `classify_pair_candidates` — mirrors deploy/pair-paper-persistent.service so
+  the dashboard's admit order / skip_reason match what the live runner trades.
+  Baseline route unchanged (max_pvalue=None → 0.025).
+
+Frontend:
+- `types.ts` + `api.ts`: 2 new optional fields; `pairCandidatesPersistent()`.
+- `PairCandidatesPage.tsx`: added `variant` prop (default "baseline" =
+  byte-for-byte same behaviour). Persistent variant: own title/copy, a
+  "Windows" column (persistence_count, windows in tooltip), persistent query,
+  PaperSystemCompare hidden (baseline-only).
+- `App.tsx`: route `/pair-candidates/persistent`. `Header.tsx`: "Persistent
+  Pairs" nav link (Layers icon); added `end` to the baseline link so it no
+  longer highlights on the sub-route.
+
+Verification:
+- `tests/test_pair_candidates.py`: 9 passed (4 new). The override test asserts
+  a p=0.0406 pair is ADMITTED on /persistent but SKIPPED 'quality' on baseline
+  — encodes WHY the 0.05 mirror matters (Rule 9).
+- Live smoke: /persistent admits 8 pairs at 0.05 vs 5 at 0.025 (override is
+  load-bearing — COALINDIA/ITC, APOLLOHOSP/HCLTECH, BAJFINANCE/COALINDIA).
+- `npm run build`: tsc + vite clean (exit 0).
+
+NOT done (operator, on the VPS — dashboard-backend has no auto-deploy):
+- `systemctl restart dashboard-backend.service` (new route 404s until then).
+- Rebuild + redeploy the frontend bundle for the new page/nav to appear.
+Both CSVs are already produced by the existing screen-pairs timer — no new
+data job needed.
+
+---
+
 # Repair pair walk-forward backtest harness (2026-06-02)
 
 `backtest_pairs_rule.py` / `backtest_pairs.py` had bit-rotted and were silently
