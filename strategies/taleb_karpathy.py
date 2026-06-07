@@ -292,6 +292,30 @@ class TalebKarpathyStrategy(BaseStrategy):
             "t0_band_factor": self.config.getfloat(
                 "strategy", "t0_band_factor", fallback=1.0,
             ),
+            # Phase 3.1 regime-classifier cutoffs. These are the thresholds the
+            # classifier ACTUALLY routes on when enable_regime_dispatch=True, so
+            # they must be tunable for the autoresearch loop to optimise the
+            # structure-routing it picks (regime_classifier.py promised this but
+            # the call site passed no Thresholds — the cutoffs were inert).
+            # Fallbacks mirror regime_classifier.Thresholds defaults exactly.
+            "regime_straddle_iv_pct_max": self.config.getfloat(
+                "strategy", "regime_straddle_iv_pct_max", fallback=60.0),
+            "regime_straddle_rv_iv_ratio_min": self.config.getfloat(
+                "strategy", "regime_straddle_rv_iv_ratio_min", fallback=1.0),
+            "regime_straddle_skew_pct_max": self.config.getfloat(
+                "strategy", "regime_straddle_skew_pct_max", fallback=70.0),
+            "regime_calendar_iv_pct_min": self.config.getfloat(
+                "strategy", "regime_calendar_iv_pct_min", fallback=70.0),
+            "regime_calendar_skew_pct_max": self.config.getfloat(
+                "strategy", "regime_calendar_skew_pct_max", fallback=60.0),
+            "regime_risk_reversal_skew_pct_min": self.config.getfloat(
+                "strategy", "regime_risk_reversal_skew_pct_min", fallback=80.0),
+            "regime_backspread_vvol_min": self.config.getfloat(
+                "strategy", "regime_backspread_vvol_min", fallback=0.15),
+            "regime_asymmetric_strangle_rv_iv_min": self.config.getfloat(
+                "strategy", "regime_asymmetric_strangle_rv_iv_min", fallback=1.30),
+            "regime_asymmetric_strangle_skew_pct_min": self.config.getfloat(
+                "strategy", "regime_asymmetric_strangle_skew_pct_min", fallback=70.0),
             # C2: rehedge-churn bounds. The band trigger + WW cost gate decide
             # whether a rehedge is +EV; these cap how often and how big it can
             # be so an optimistic scalp estimate can't churn the book into a
@@ -510,7 +534,19 @@ class TalebKarpathyStrategy(BaseStrategy):
                 skew_percentile=skew_pct,
                 vol_of_vol=vvol,
             )
-            structure = classify(features)
+            tp = self.tunable_params
+            thresholds = RegimeThresholds(
+                straddle_iv_pct_max=tp["regime_straddle_iv_pct_max"],
+                straddle_rv_iv_ratio_min=tp["regime_straddle_rv_iv_ratio_min"],
+                straddle_skew_pct_max=tp["regime_straddle_skew_pct_max"],
+                calendar_iv_pct_min=tp["regime_calendar_iv_pct_min"],
+                calendar_skew_pct_max=tp["regime_calendar_skew_pct_max"],
+                risk_reversal_skew_pct_min=tp["regime_risk_reversal_skew_pct_min"],
+                backspread_vvol_min=tp["regime_backspread_vvol_min"],
+                asymmetric_strangle_rv_iv_min=tp["regime_asymmetric_strangle_rv_iv_min"],
+                asymmetric_strangle_skew_pct_min=tp["regime_asymmetric_strangle_skew_pct_min"],
+            )
+            structure = classify(features, thresholds)
             logger.info(
                 "Regime classifier → %s (iv_pct=%.1f, rv_iv=%.2f, "
                 "skew_pct=%.1f, vvol=%s)",

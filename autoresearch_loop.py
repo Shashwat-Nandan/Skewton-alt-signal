@@ -69,22 +69,40 @@ class HedgeResearchLoop:
         "position_size_pct": (5.0, 25.0),
         "vega_limit": (1000.0, 8000.0),  # per-lot; scales with position size
         "max_holding_period_hours": (4.0, 168.0),  # 4 hours to 1 week
-        "entry_iv_percentile_min": (10.0, 50.0),
-        "entry_iv_percentile_max": (50.0, 95.0),
+        # Re-centred 2026-06-07: captured NIFTY tape sits at iv_pct 14-22, so
+        # the old max floor of 50 could never bind (data was always < floor) and
+        # min never needed to move off 10. Ranges now bracket that low-vol regime
+        # from both sides so the gate can actually flip an entry.
+        "entry_iv_percentile_min": (5.0, 30.0),
+        "entry_iv_percentile_max": (20.0, 90.0),
         "max_entry_alpha": (5000.0, 150000.0),
         "mc_worst_path_loss_pct": (1.0, 10.0),
         "cost_hurdle_factor": (1.0, 8.0),  # raised: cube-root scaling in
         # Phase 1.2 means hurdle=8 demands only 2× scalp/cost, not 8×
-        "min_rv_iv_ratio": (0.6, 1.5),
         "rv_window_days": (2.0, 15.0),
-        # Phase 1.3: put-skew percentile gate. 95 means "rarely block";
-        # 70 means "block in the top 30%". The autoresearch loop tunes
-        # how aggressively to defer entries when skew is rich.
-        "skew_pct_max": (70.0, 100.0),
+        # Dropped 2026-06-07: min_rv_iv_ratio and skew_pct_max are LEGACY-path
+        # hard gates, bypassed when enable_regime_dispatch=True (the live config)
+        # — see taleb_karpathy.py `not regime_enabled` guards. Sweeping them
+        # under regime dispatch wasted experiments on no-op params. They remain
+        # config-settable for the non-regime path; their regime-path equivalents
+        # are the regime_* thresholds below.
         # Phase 5: T-0 (expiry day) band tightening factor. 1.0 = disabled,
         # 0.33 = aggressive sticky-strike harvest. Tighter values produce
         # more rehedges on expiry day; the cost gate still filters sub-EV.
         "t0_band_factor": (0.33, 1.0),
+        # Phase 3.1 regime-classifier routing cutoffs. These are what the
+        # classifier actually decides on under regime dispatch; previously
+        # hardcoded (call site passed no Thresholds), so structure routing was
+        # untunable. Ranges span each cutoff's plausible NIFTY band.
+        "regime_straddle_iv_pct_max": (40.0, 80.0),
+        "regime_straddle_rv_iv_ratio_min": (0.6, 1.5),
+        "regime_straddle_skew_pct_max": (50.0, 90.0),
+        "regime_calendar_iv_pct_min": (50.0, 90.0),
+        "regime_calendar_skew_pct_max": (40.0, 80.0),
+        "regime_risk_reversal_skew_pct_min": (60.0, 95.0),
+        "regime_backspread_vvol_min": (0.05, 0.40),
+        "regime_asymmetric_strangle_rv_iv_min": (1.0, 2.5),
+        "regime_asymmetric_strangle_skew_pct_min": (50.0, 90.0),
     }
 
     def __init__(self, hedger, config_path: str = "config.ini"):
