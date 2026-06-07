@@ -583,6 +583,19 @@ which on a full-size book will very likely trip `HALT_DAILY_LOSS` on the first
 adverse tick and does **not** strictly bound a fast-move loss to ₹25k. All
 accepted by the operator on 2026-06-07; see `tasks/todo.md`.
 
+**⚠️ Path localization.** The `deploy/*.service` files use `/opt/taleb-karpathy-kite`
+as a template (see the `EDIT THESE … FOR YOUR VPS` marker). Localize
+`WorkingDirectory`, `EnvironmentFile`, `ExecStart`, and `ReadWritePaths` to your
+actual install root before installing — do NOT `cp` verbatim if your root differs.
+On the production host (`vmi1889781`, install root `/root/algo-trading/taleb-karpathy-kite`)
+the units were installed localized and **disarmed** on 2026-06-07: the live
+`.service`/`.timer` are present but `disabled`+`inactive`, `pair-paper.service`
+already carries `--max-daily-loss-inr 100000000`, and `pair-paper-persistent.service`
+already carries the `Conflicts=`. There the install (step 5) is done; resume at
+step 1 (arm `.env`) / step 6 (dry-run) / step 7 (manual start). Note that host's
+existing paper units are the older `Type=oneshot` generation; the live unit is
+`Type=simple` (M-O5) on purpose so a mid-session live crash auto-restarts.
+
 **The unit.** Live runs from `pair-paper-persistent-live.service` (not an edit of
 the paper unit). It reuses `--system persistent`, so it shares the persistent
 state file, EOD JSON, log, dashboard, and verifier with the paper unit — which
