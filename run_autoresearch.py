@@ -307,7 +307,12 @@ def main():
     print(f"  Best params:    best_params.json")
     print("=" * 60)
 
-    # Validation run on truly unseen data
+    # Validation run on truly unseen data. seed_iv/skew default to None (IV
+    # history wiped) and are only set for the captured-tape branch, which must
+    # prime the rolling windows the same way the fitness eval does — otherwise
+    # _compute_iv_percentile sees <30 obs, returns the neutral 50.0, and the
+    # validation is as degenerate as the metric it's checking.
+    val_seed_iv, val_seed_skew = None, None
     if args.validation_data:
         val_data = pd.read_csv(args.validation_data, parse_dates=["timestamp"])
         val_label = (f"separate validation set ({args.validation_data}, "
@@ -324,12 +329,38 @@ def main():
         val_data = historical_data
         val_label = "full dataset (WARNING: no true hold-out, insufficient data)"
     else:
-        np.random.seed(42)
-        val_data = generate_synthetic_data(days=10, ticks_per_day=12)
-        val_label = "synthetic (seed=42, 10 days)"
+        # No CSV: prefer a real captured-tape session over synthetic GBM. The
+        # fitness eval trains on the last `eval_cycles` sessions, so the most
+        # recent session OUTSIDE that window is a genuine hold-out. Falls back
+        # to synthetic only when there isn't enough tape for one.
+        from backtest import list_captured_sessions, load_captured_tape, load_iv_skew_seed
+        captured = list_captured_sessions(args.underlying)
+        if len(captured) > loop.eval_cycles:
+            val_date = captured[-(loop.eval_cycles + 1)]
+            val_data = load_captured_tape(val_date, args.underlying)
+            # Reuse the seed the fitness eval built (same drop_recent); compute
+            # it if the run never took the tape path. NOTE (Rule 12): the seed
+            # is NOT timestamp-filtered against val_date, so it can include
+            # post-val_date IV — adequate for a relative sanity check, not a
+            # look-ahead-clean absolute claim. Same caveat as load_iv_skew_seed.
+            val_seed_iv = getattr(loop, "_iv_seed", None)
+            val_seed_skew = getattr(loop, "_skew_seed", None)
+            if val_seed_iv is None:
+                drop = loop.config.getint("autoresearch", "iv_seed_drop_recent", fallback=0)
+                val_seed_iv, val_seed_skew = load_iv_skew_seed(args.underlying, drop_recent=drop)
+            val_label = (f"captured-tape hold-out ({val_date}, not in the "
+                         f"{loop.eval_cycles}-session fitness window)")
+        else:
+            np.random.seed(42)
+            val_data = generate_synthetic_data(days=10, ticks_per_day=12)
+            val_label = (f"synthetic (seed=42, 10 days) — only {len(captured)} "
+                         f"tape session(s), need >{loop.eval_cycles} for a hold-out")
 
     print(f"\n  Validation run ({val_label})...")
-    val_results = run_backtest(val_data, underlying=args.underlying, tunable_params=loop.best_params)
+    val_results = run_backtest(
+        val_data, underlying=args.underlying, tunable_params=loop.best_params,
+        seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
+    )
     vm = val_results["metrics"]
     print(f"    Net P/L:      {vm['net_pnl']:>12,.2f}")
     print(f"    Sharpe:       {vm['sharpe_ratio']:>12.4f}")
