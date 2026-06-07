@@ -1,5 +1,30 @@
 # Lessons
 
+## A heavier autoresearch config must be re-fit to its systemd TimeoutStartSec
+
+- 2026-06-06: `taleb-autoresearch.service` (Sat 10:00 IST timer) failed with
+  `result=timeout` — systemd SIGTERM'd it at exactly 2h (`TimeoutStartSec=2h`).
+  The journal looked empty because the wrapper (`run_weekly_autoresearch.sh`)
+  redirects all output to `logs/autoresearch-<date>.log` and only `tail`s to
+  journald at the END, which the kill pre-empted. The log file showed it reached
+  `[25/40]` experiments in ~118 min (~4.7 min each) → a full 40-exp sweep needs
+  ~3.1h.
+- Cause: the 2026-06-01 config change (`--metric gamma_theta_ratio
+  --eval-cycles 3 --window-days 5`) makes each experiment replay 3 captured tick
+  sessions, and those tapes are ~1.2 GB each (~3.6 GB parsed per experiment).
+  The prior week (2026-05-30) ran the lighter pre-06-01 config and finished
+  under 2h. 2026-06-06 was the first Saturday cron under the heavier config.
+- Impact was contained: no `candidate_params_<date>.json` that week, but
+  `best_params.json` was verified intact (byte-identical to the start-of-run
+  `.preautoresearch` backup) and nothing live/traded was touched.
+- Fix: bumped `TimeoutStartSec` 2h → 4h (fits ~3.1h with margin; no research
+  loss). Takeaway: **when you make an autoresearch eval heavier (more cycles,
+  bigger tape, more experiments), re-check it against the unit's
+  `TimeoutStartSec` — a oneshot that overruns is SIGTERM'd mid-sweep and
+  silently produces no candidate.** The deeper fix (deferred) is to parse each
+  ~1.2 GB tape once and reuse it across experiments instead of re-reading
+  ~144 GB/week.
+
 ## A new backend router needs THREE wiring updates, not two
 
 - 2026-05-17: Deployed the `/pair-paper-compare` router. Backend was
