@@ -511,13 +511,22 @@ class TestOptimizerRangeCoverage:
 
     def test_all_runtime_tunables_covered(self):
         from autoresearch_loop import HedgeResearchLoop
-        # These are the params actually used in runtime decision paths
+        # Params used in runtime decision paths that the optimizer must cover.
+        # Under regime dispatch (the live config) structure routing is decided by
+        # the regime_* classifier cutoffs, so those must be sweepable. The legacy
+        # hard gates min_rv_iv_ratio / skew_pct_max are bypassed under dispatch
+        # (their regime equivalents ARE the regime_* thresholds) and are
+        # intentionally config-only, not swept — so they are not required here.
         runtime_tunables = {
             "rehedge_delta_threshold", "gamma_scalp_band_pct",
             "position_size_pct", "vega_limit", "max_holding_period_hours",
             "entry_iv_percentile_min", "entry_iv_percentile_max",
-            "max_entry_alpha", "mc_worst_path_loss_pct",
-            "min_rv_iv_ratio", "rv_window_days",
+            "max_entry_alpha", "mc_worst_path_loss_pct", "rv_window_days",
+            "regime_straddle_iv_pct_max", "regime_straddle_rv_iv_ratio_min",
+            "regime_straddle_skew_pct_max", "regime_calendar_iv_pct_min",
+            "regime_calendar_skew_pct_max", "regime_risk_reversal_skew_pct_min",
+            "regime_backspread_vvol_min", "regime_asymmetric_strangle_rv_iv_min",
+            "regime_asymmetric_strangle_skew_pct_min",
         }
         optimizer_tunables = set(HedgeResearchLoop.TUNABLE_RANGES.keys())
         missing = runtime_tunables - optimizer_tunables

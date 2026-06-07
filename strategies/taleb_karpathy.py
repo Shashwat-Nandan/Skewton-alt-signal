@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 import pandas as pd
@@ -534,18 +534,15 @@ class TalebKarpathyStrategy(BaseStrategy):
                 skew_percentile=skew_pct,
                 vol_of_vol=vvol,
             )
+            # Build classifier thresholds from the regime_* tunables, falling
+            # back to RegimeThresholds defaults for any key a partial
+            # tunable_params omits (keeps callers that set a subset working).
             tp = self.tunable_params
-            thresholds = RegimeThresholds(
-                straddle_iv_pct_max=tp["regime_straddle_iv_pct_max"],
-                straddle_rv_iv_ratio_min=tp["regime_straddle_rv_iv_ratio_min"],
-                straddle_skew_pct_max=tp["regime_straddle_skew_pct_max"],
-                calendar_iv_pct_min=tp["regime_calendar_iv_pct_min"],
-                calendar_skew_pct_max=tp["regime_calendar_skew_pct_max"],
-                risk_reversal_skew_pct_min=tp["regime_risk_reversal_skew_pct_min"],
-                backspread_vvol_min=tp["regime_backspread_vvol_min"],
-                asymmetric_strangle_rv_iv_min=tp["regime_asymmetric_strangle_rv_iv_min"],
-                asymmetric_strangle_skew_pct_min=tp["regime_asymmetric_strangle_skew_pct_min"],
-            )
+            thresholds = RegimeThresholds(**{
+                f.name: tp[f"regime_{f.name}"]
+                for f in fields(RegimeThresholds)
+                if f"regime_{f.name}" in tp
+            })
             structure = classify(features, thresholds)
             logger.info(
                 "Regime classifier → %s (iv_pct=%.1f, rv_iv=%.2f, "

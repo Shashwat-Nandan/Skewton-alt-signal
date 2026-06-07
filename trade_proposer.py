@@ -197,16 +197,28 @@ class TradeProposer:
         sub = chain[chain["instrument_type"] == option_type]
         if sub.empty:
             return None
-        expiry_str = str(sub.iloc[0]["expiry"])
         clock = getattr(self, "_clock", None)
         ref = clock() if clock is not None else None
-        T = time_to_expiry(expiry_str, ref)
-        if T <= 0:
-            return None
+        # T is per-EXPIRY, not one value for the whole chain. The chain can span
+        # two expiries (primary + back month), and on an expiry day the primary's
+        # T is 0 (day-resolution time_to_expiry). The old code read T from the
+        # first row and returned None when T<=0, so every delta-based builder
+        # (backspread, risk reversal, asymmetric strangle) failed on expiry day.
+        # Now each row uses its own expiry's T and rows with T<=0 are skipped, so
+        # the picker falls through to the next live expiry instead of nulling the
+        # whole structure. (Also fixes back-month rows being priced with the
+        # front-month T.)
+        T_by_expiry = {}
 
         best = None
         best_dist = float("inf")
         for _, row in sub.iterrows():
+            expiry_str = str(row["expiry"])
+            if expiry_str not in T_by_expiry:
+                T_by_expiry[expiry_str] = time_to_expiry(expiry_str, ref)
+            T = T_by_expiry[expiry_str]
+            if T <= 0:
+                continue
             strike = float(row["strike"])
             symbol = row["tradingsymbol"]
             q = self._get_quote(symbol)
