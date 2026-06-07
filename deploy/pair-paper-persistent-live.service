@@ -1,0 +1,80 @@
+[Unit]
+Description=Pair-Trading LIVE Runner — persistence-screened pairs (REAL MONEY)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+# Mutual exclusion with the paper persistent unit: both reuse --system
+# persistent (same fcntl lock) and the same 09:12 slot. Conflicts= makes systemd
+# stop the paper unit when this one starts (and vice versa), so the live-vs-paper
+# choice can never be decided by a lock race if both timers are accidentally
+# enabled. Belt-and-suspenders with the runtime fcntl lock (H9).
+Conflicts=pair-paper-persistent.service
+# M-O5: StartLimit* live in [Unit], not [Service]. See pair-paper.service.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# M-O5: Type=simple so Restart=on-failure can engage on mid-session crashes.
+Type=simple
+# --- EDIT THESE THREE FOR YOUR VPS ---
+User=root
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# LIVE cutover of the persistence-screened pair runner (cutover 2026-06-08;
+# see deploy/VPS_DEPLOYMENT.md §7.10 and tasks/todo.md 2026-06-07). This unit
+# REPLACES pair-paper-persistent.service while live: it reuses --system
+# persistent (same state file, EOD JSON, log, dashboard + verifier wiring), so
+# the paper persistent timer MUST be disabled before this runs — two
+# --system persistent runners cannot coexist (H9 fcntl lock).
+#
+# Live-mode quad-lock (all four required, run_paper_pairs.main ~L1440):
+#   --mode live  +  ALLOW_LIVE_MODE=true (in .env)  +
+#   --i-understand-this-is-real-money  +  --max-daily-loss-inr > 0
+#
+# --max-csv-age-days 4 (NOT the live default of 1): pair_candidates_persistent.csv
+# is refreshed by screen-pairs.timer (Mon..Fri 19:00 IST), so on a Monday /
+# post-holiday morning it is ~2.6 days old. The 1-day live default would refuse
+# to start. 4 days covers a normal weekend; the tradeoff is trading on hedge
+# ratios up to ~weekend-stale.
+#
+# --quality-max-pvalue 0.05 is the INTENTIONAL persistent floor (see
+# pair-paper-persistent.service for the double-jeopardy rationale) — do NOT
+# mirror it to baseline.
+#
+# Sizing is full (--top 12 --max-leg-notional 1000000) and the daily-loss
+# breaker is ₹25,000 per the 2026-06-07 operator decision. NOTE: a ₹25k breaker
+# on a full-size book will very likely trip HALT_DAILY_LOSS on the first adverse
+# tick (entries stop, exits continue) and does not strictly bound a fast-move
+# loss to ₹25k. Accepted; recorded in tasks/todo.md.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py \
+    --top 12 --max-leg-notional 1000000 \
+    --candidates data_cache/pair_candidates_persistent.csv \
+    --system persistent \
+    --quality-max-pvalue 0.05 \
+    --max-csv-age-days 4 \
+    --mode live \
+    --i-understand-this-is-real-money \
+    --max-daily-loss-inr 25000
+# ------------------------------------
+
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+# Same ProtectHome caveat as pair-paper.service (see 2026-05-12 incident in tasks/lessons.md).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

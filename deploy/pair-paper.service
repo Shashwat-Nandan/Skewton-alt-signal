@@ -23,7 +23,14 @@ Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # --top, --max-leg-notional and tunables live here so config changes don't
 # require a rebuild. Override on the VPS by `systemctl edit pair-paper.service`.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 12 --max-leg-notional 1000000
+#
+# --max-daily-loss-inr 100000000 (effectively unreachable): the HALT_* flags in
+# data_cache/ are SHARED across runners. While the persistent runner trades live
+# (pair-paper-persistent-live.service), a paper-side daily-loss breach here would
+# otherwise touch data_cache/HALT_DAILY_LOSS and halt the LIVE runner's entries.
+# Pinning baseline paper's breaker out of reach keeps the shared circuit breaker
+# owned solely by the live runner. See tasks/todo.md (2026-06-07) §3.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 12 --max-leg-notional 1000000 --max-daily-loss-inr 100000000
 # ------------------------------------
 
 # M-O5: auto-restart on segfault / non-zero exit. Successful exit (clean

@@ -4,6 +4,11 @@ Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
 OnFailure=notify-failure@%n.service
+# Mutual exclusion with the live persistent unit (see
+# pair-paper-persistent-live.service): both reuse --system persistent and the
+# 09:12 slot. Conflicts= lets systemd guarantee only one is ever active rather
+# than relying on the runtime fcntl lock race.
+Conflicts=pair-paper-persistent-live.service
 # M-O5: StartLimit* live in [Unit], not [Service]. See pair-paper.service.
 StartLimitIntervalSec=600
 StartLimitBurst=5

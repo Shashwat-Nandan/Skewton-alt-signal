@@ -567,6 +567,120 @@ sudo systemctl restart pair-paper.service
 
 If positions are open on the broker, they'll persist regardless of the runner's mode. The paper runner will see them in `state.legs` only if state was preserved — otherwise square off manually on Kite first.
 
+### 7.10 Persistent runner → live, baseline stays paper
+
+§7.9 assumed the **baseline** runner goes live first. This section is the variant
+actually deployed (cutover 2026-06-08): the **persistent** (persistence-screened)
+runner goes live while **baseline stays paper**. Read §7.9 first — every gate,
+kill-switch, and reconciliation step there still applies. The differences are
+below.
+
+**Risk note (recorded, not hidden):** this is the first real-money deployment in
+the repo, the persistent strategy had ~2 weeks of paper history (below the
+8–12-week bar in §7.1), and its 2026-06-02 backtest was net-negative. Sizing is
+full (`--top 12 --max-leg-notional 1000000`) with a ₹25,000 daily breaker —
+which on a full-size book will very likely trip `HALT_DAILY_LOSS` on the first
+adverse tick and does **not** strictly bound a fast-move loss to ₹25k. All
+accepted by the operator on 2026-06-07; see `tasks/todo.md`.
+
+**The unit.** Live runs from `pair-paper-persistent-live.service` (not an edit of
+the paper unit). It reuses `--system persistent`, so it shares the persistent
+state file, EOD JSON, log, dashboard, and verifier with the paper unit — which
+means the two cannot run at once (H9 fcntl lock). Its ExecStart adds the live
+quad-lock plus two persistent-specific flags:
+
+```
+--mode live --i-understand-this-is-real-money --max-daily-loss-inr 25000 \
+--max-csv-age-days 4 --quality-max-pvalue 0.05
+```
+
+- `--max-csv-age-days 4` (not the live default of 1): `pair_candidates_persistent.csv`
+  is refreshed by `screen-pairs.timer` (Mon..Fri 19:00 IST), so a Monday /
+  post-holiday morning sees a ~2.6-day-old CSV. The 1-day default would refuse to
+  start. 4 covers a normal weekend; the cost is trading on up-to-weekend-stale
+  hedge ratios.
+- `--quality-max-pvalue 0.05` is the persistent floor (see
+  `pair-paper-persistent.service` for the double-jeopardy rationale).
+
+**Cutover steps (in order):**
+
+1. **Arm the env:** add `ALLOW_LIVE_MODE=true` (no quotes) to `.env`.
+2. **Clean-start state** so live reconciliation starts against an empty broker
+   book (the paper state holds imaginary positions reconciliation will reject):
+
+   ```bash
+   # Confirm Kite shows NO pair-* NFO/NRML positions first, then:
+   mkdir -p data_cache/state_backups
+   mv data_cache/pair_paper_state_persistent.json \
+      data_cache/state_backups/pair_paper_state_persistent.$(date +%Y%m%dT%H%M%S).json
+   ```
+3. **Stop the paper persistent runner** (the live unit takes over `--system persistent`):
+
+   ```bash
+   sudo systemctl disable --now pair-paper-persistent.timer
+   ```
+4. **Decouple the baseline breaker.** The `HALT_*` flags in `data_cache/` are
+   shared across runners. `pair-paper.service` now carries
+   `--max-daily-loss-inr 100000000` so a paper-side loss can't touch
+   `HALT_DAILY_LOSS` and halt the live runner. Re-deploy the baseline unit if it
+   isn't already on this version, then `systemctl daemon-reload`.
+5. **Install the live unit:**
+
+   ```bash
+   sudo cp deploy/pair-paper-persistent-live.{service,timer} /etc/systemd/system/
+   sudo systemctl daemon-reload
+   ```
+6. **Mandatory kill-switch dry-run** (per §7.9) on a paper session, if not done
+   recently.
+7. **Day-1 manual start** (do NOT enable the timer first). At ~09:12–09:14 IST:
+
+   ```bash
+   sudo systemctl start pair-paper-persistent-live.service
+   journalctl -fu pair-paper-persistent-live.service
+   ```
+
+   Confirm: `LIVE TRADING SESSION — REAL MONEY [system=persistent]` banner;
+   `Broker reconciliation OK` (0 positions); tick lines every ~60s; on any entry
+   a `place_order` line and **no** `[PAPER]` line. If anything looks wrong:
+   `touch data_cache/HALT_NEW_ENTRIES`, then `HALT_ALL`, then square off on Kite.
+8. **Enable the timer for subsequent days** only after a clean first session:
+
+   ```bash
+   sudo systemctl enable --now pair-paper-persistent-live.timer
+   ```
+
+**Rollback:**
+
+**⚠️ Do NOT just re-enable the paper timer.** After a live session,
+`pair_paper_state_persistent.json` holds REAL open legs. Paper mode does not run
+`reconcile_with_broker`, so a paper runner started on that state will *simulate*
+exits (`[PAPER] SELL …`), mark the legs closed, and report a flat book — while
+the real broker position stays open and unhedged (a false-flat). You must square
+off on the broker AND clean-start the state file before restoring paper.
+
+```bash
+# 1. Stop the live runner.
+sudo systemctl disable --now pair-paper-persistent-live.timer
+sudo systemctl stop pair-paper-persistent-live.service
+
+# 2. Square off any open pair-* legs on Kite (web UI or order API) and confirm
+#    Kite shows NO pair-* NFO/NRML positions.
+
+# 3. Clean-start the state file so the paper runner doesn't inherit real legs
+#    (same as the day-1 clean-start in step 2 above).
+mkdir -p data_cache/state_backups
+mv data_cache/pair_paper_state_persistent.json \
+   data_cache/state_backups/pair_paper_state_persistent.rollback.$(date +%Y%m%dT%H%M%S).json 2>/dev/null || true
+
+# 4. Restore paper.
+sudo systemctl enable --now pair-paper-persistent.timer
+
+# 5. Optionally unset ALLOW_LIVE_MODE in .env so a stray --mode live refuses.
+```
+
+If you skip step 2/3, the real positions persist on the broker regardless of the
+runner's mode — and the paper runner will hide them from the dashboard.
+
 ---
 
 ## 8. Troubleshooting

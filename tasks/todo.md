@@ -1,3 +1,116 @@
+# Persistent pair trading → LIVE cutover (2026-06-07)
+
+Promote the **persistent** pair runner from paper to **live (real money)** for
+the next trading session (Mon 2026-06-08), leaving the **baseline** runner in
+paper mode untouched. This is the FIRST real-money deployment in the repo.
+
+## Decisions locked (operator, 2026-06-07)
+- Go live **next session** (Mon 2026-06-08), no extended paper soak.
+- **Full sizing:** `--top 12 --max-leg-notional 1000000` (same as the paper unit).
+- **Daily-loss cap:** `--max-daily-loss-inr 25000`.
+- Reuse `--system persistent` (keeps dashboard + verifier wiring intact).
+
+## ⚠️ Risk flags raised and explicitly accepted (Rule 12 — recorded, not hidden)
+1. First real-money deployment in this repo.
+2. Persistent strategy has ~2 weeks paper history — **below** §7.1's own
+   8–12-week positive-PnL gating bar.
+3. The 2026-06-02 backtest showed the persistent config **net-negative**
+   (0.05 p-floor arm ~₹125k worse on a 5-window run).
+4. **Size/cap mismatch (accepted):** a ₹25k breaker on a full-size (~₹8–24M
+   gross) pair book is ~0.1–0.3% of book. It will very likely trip
+   `HALT_DAILY_LOSS` on the **first** adverse tick of day one (halting new
+   entries; exits continue), and in a fast move price can gap past ₹25k before
+   the periodic check fires — i.e. the realized loss is **not guaranteed** to be
+   bounded at exactly ₹25k. Operator chose "proceed exactly as chosen".
+
+## Load-bearing facts established (verified against host + code, not memory)
+- Nothing is live today: neither unit has `--mode live`. Both paper timers
+  active (baseline 09:11, persistent 09:12 IST).
+- Live gate is a quad-lock in `run_paper_pairs.main()` (~L1440-1463):
+  `--mode live` + `ALLOW_LIVE_MODE=true` (.env) +
+  `--i-understand-this-is-real-money` + `--max-daily-loss-inr > 0`.
+- Runner isolation is by `--system`: state `pair_paper_state_persistent.json`,
+  fcntl lock `.pair_paper_persistent.lock` (H9 — two `--system persistent`
+  runners cannot coexist), EOD `pair_paper_persistent_eod_*.json`, own log.
+- **CSV freshness gate (H10):** live defaults `--max-csv-age-days` to **1.0**
+  (`run_paper_pairs.py:161`). `pair_candidates_persistent.csv` is refreshed
+  by `screen-pairs.timer` (Mon..Fri 19:00 IST) — so Monday morning it is
+  ~2.6 days old → **a live runner with the default would REFUSE to start on
+  Mondays / post-holidays.** Live unit must set `--max-csv-age-days 4`.
+- **Shared kill-switches:** `HALT_*` flags live in `data_cache/` and halt BOTH
+  runners. The baseline paper unit currently has no `--max-daily-loss-inr`
+  (defaults to ₹50k), so a paper-side loss would touch `HALT_DAILY_LOSS` and
+  stop the LIVE runner's entries. Must decouple by raising baseline paper's cap.
+- Reconciliation (`reconcile_with_broker`) runs only in live mode and refuses to
+  start if held state legs don't match `kite.positions()`. The persistent paper
+  state holds imaginary positions → **must clean-start** before first live.
+- H17 leg-concentration seeds from sibling state files, so the live runner will
+  conservatively avoid symbols the baseline *paper* runner "holds". Safe (errs
+  toward less concentration); documented, not fixed.
+
+## Plan
+
+### A. Repo artifacts (Claude creates on approval; reviewed before install)
+- [ ] A1. New unit `deploy/pair-paper-persistent-live.service` — copy of
+      `pair-paper-persistent.service` with ExecStart:
+      `run_paper_pairs.py --top 12 --max-leg-notional 1000000
+       --candidates data_cache/pair_candidates_persistent.csv --system persistent
+       --quality-max-pvalue 0.05 --mode live --i-understand-this-is-real-money
+       --max-daily-loss-inr 25000 --max-csv-age-days 4`
+- [ ] A2. New timer `deploy/pair-paper-persistent-live.timer` (Mon..Fri 09:12
+      IST) — created but **left disabled for day 1** (manual start first).
+- [ ] A3. Edit `deploy/pair-paper.service` (baseline) to add
+      `--max-daily-loss-inr 100000000` so the paper runner never touches the
+      shared `HALT_DAILY_LOSS` and cannot halt the live runner.
+- [ ] A4. Add `deploy/VPS_DEPLOYMENT.md` §7.10 — persistent-live cutover
+      (inverse of §7.9, which assumed baseline-first).
+- [ ] A5. Commit on a branch + PR (repo convention).
+
+### B. Operator pre-flight (operator runs; Claude guides — Claude never reads/writes .env)
+- [ ] B1. Add `ALLOW_LIVE_MODE=true` to `/opt/taleb-karpathy-kite/.env`.
+- [ ] B2. Clean-start state: flatten/clear the persistent paper book so live
+      reconciliation starts against an empty broker. Archive
+      `data_cache/pair_paper_state_persistent.json` (+ backups) and confirm Kite
+      shows no `pair-*` NFO/NRML positions.
+- [ ] B3. `systemctl disable --now pair-paper-persistent.timer` (stop the paper
+      persistent runner — the live unit takes over `--system persistent`).
+- [ ] B4. Install new units (copy to unit dir) + `daemon-reload`. Edit/apply A3.
+- [ ] B5. Mandatory kill-switch dry run on a paper session: HALT_NEW_ENTRIES,
+      HALT_DAILY_LOSS, notify-failure smoke (per §7.9). If any misbehaves: STOP.
+- [ ] B6. Pre-flight checks: `holidays.csv` fresh; `pair_candidates_persistent.csv`
+      present + < ~3 days; alerting set (`HC_PING_URL_FAIL` or Telegram) and a
+      test alert received on phone; broker funded for full-size margin.
+
+### C. Day-1 go-live (Mon 2026-06-08, manual + supervised)
+- [ ] C1. ~09:12-09:14 IST manually `systemctl start
+      pair-paper-persistent-live.service` (do NOT wait for a timer first run).
+- [ ] C2. `journalctl -fu pair-paper-persistent-live.service` — confirm:
+      `LIVE TRADING SESSION — REAL MONEY [system=persistent]` banner;
+      `Broker reconciliation OK` (0 positions); tick lines; on any entry a
+      `place_order` line and NO `[PAPER]` line.
+- [ ] C3. At keyboard 09:10-10:00. Pre-decided abort criterion. If wrong:
+      `touch data_cache/HALT_NEW_ENTRIES` → if still wrong
+      `touch data_cache/HALT_ALL` → square off on Kite web UI.
+- [ ] C4. Once a clean session is observed, `systemctl enable --now
+      pair-paper-persistent-live.timer` for subsequent days.
+
+### D. Rollback (any time)
+- [ ] D1. `systemctl disable --now pair-paper-persistent-live.timer` + stop the
+      service; `systemctl enable --now pair-paper-persistent.timer` to restore
+      paper. Optionally unset `ALLOW_LIVE_MODE` in `.env` so a stray `--mode live`
+      refuses. Open broker positions persist regardless of mode — square off
+      manually on Kite if any remain.
+
+## Success criteria (Rule 4)
+- Manual start prints the LIVE banner (not "Refusing to start ...").
+- Reconciliation passes against an empty book; no `[PAPER]` lines appear.
+- Baseline runner unchanged: still `--mode paper`, own state file, own timer.
+- Dashboard `/pair-candidates/persistent` + `pair-verify-persistent` still read
+  the `--system persistent` artifacts the live runner now produces.
+- A kill-switch touch is observed halting entries within one tick.
+
+---
+
 # Persistent pair candidates — daily-review frontend (2026-06-05)
 
 Close the gap flagged in the 2026-06-02 review below ("Dashboard serves only the
