@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram alert — LIVE pair runner tripped HALT_DAILY_LOSS
+# Intentionally no OnFailure= — an alerting unit must not loop on its own failure.
+
+[Service]
+Type=oneshot
+# --- EDIT FOR YOUR VPS ---
+Environment=PROJECT_DIR=/opt/taleb-karpathy-kite
+EnvironmentFile=-/opt/taleb-karpathy-kite/.env
+ExecStart=/opt/taleb-karpathy-kite/deploy/pair-halt-alert.sh
+# -------------------------
+
+# Tight sandbox — reads env, reads journal, runs curl + logger.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+TimeoutStartSec=30

@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for data_cache/HALT_DAILY_LOSS and Telegram-alert the operator
+Documentation=man:systemd.path(5)
+
+[Path]
+# Fires pair-halt-alert.service when the live runner touches HALT_DAILY_LOSS.
+# The file persists until the operator rm's it, so this alerts ONCE per breach
+# episode (PathExists won't re-trigger until the file is removed and reappears).
+# --- HOST-LOCALIZE this path to your install root ---
+PathExists=/opt/taleb-karpathy-kite/data_cache/HALT_DAILY_LOSS
+Unit=pair-halt-alert.service
+
+[Install]
+WantedBy=paths.target

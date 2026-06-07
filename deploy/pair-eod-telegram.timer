@@ -1,0 +1,17 @@
+[Unit]
+Description=Fire pair-eod-telegram.service Mon–Fri at 15:35 IST (after session close)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 15:35 IST — the live runner flattens/teardown at ~15:25 and writes the EOD
+# sidecar by ~15:25; 15:35 leaves margin for the JSON to land.
+OnCalendar=Mon..Fri *-*-* 15:35:00 Asia/Kolkata
+
+# If the box was asleep at 15:35, still send the summary once on wake.
+Persistent=true
+RandomizedDelaySec=60
+
+Unit=pair-eod-telegram.service
+
+[Install]
+WantedBy=timers.target
