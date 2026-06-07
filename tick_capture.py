@@ -4,9 +4,12 @@ tick_capture.py — Append-only KiteTicker capture for trigger-fair-value resear
 Subscribes via KiteTicker WebSocket to, for each requested underlying:
   - Index spot (NIFTY 50 / NIFTY BANK)
   - Earliest-expiry futures
-  - Two nearest expiries, ±5 strikes × {CE, PE} around live spot
+  - Two nearest expiries, ±20 strikes × {CE, PE} around live spot
     (front for the straddle path, back so the calendar builder can
-    fire under tape replay — see Phase 3.2 of the 2026-05-23 uplift)
+    fire under tape replay — see Phase 3.2 of the 2026-05-23 uplift).
+    ±20 (was ±5) reaches the ~10Δ OTM wings the regime structures need
+    (backspread / risk reversal / asymmetric strangle); override with
+    --strikes-each-side.
 
 Default is NIFTY only. Pass --underlyings NIFTY,BANKNIFTY to also capture
 BANKNIFTY (~24 extra tokens; 4.3× finer hedge granularity for the gamma
@@ -40,7 +43,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 REPO = Path(__file__).parent
 LOG_DIR = REPO / "logs"
 TICKS_DIR = REPO / "data_cache" / "ticks"
-STRIKES_EACH_SIDE = 5
+STRIKES_EACH_SIDE = 20
 STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100}
 SPOT_DISPLAY_SYMBOLS = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
 
@@ -56,14 +59,16 @@ def setup_logging(today):
     return logging.getLogger("tick_capture")
 
 
-def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
+def resolve_instruments_for(kite, log, underlying, nfo_cache=None,
+                            strikes_each_side=STRIKES_EACH_SIDE):
     """Return (subscribe_tokens, token_to_symbol_map) for one underlying.
-    Picks index spot, the earliest-expiry future, and ±5 strikes × {CE, PE}
-    of the **two nearest expiries** around live spot at the moment of
-    resolution. Capturing two expiries is required for the calendar
+    Picks index spot, the earliest-expiry future, and ±`strikes_each_side`
+    strikes × {CE, PE} of the **two nearest expiries** around live spot at the
+    moment of resolution. Capturing two expiries is required for the calendar
     builder to fire under tape replay (Phase 3.2 of the 2026-05-23
     profitability uplift) — front-only tape can only exercise the
-    legacy straddle path.
+    legacy straddle path. The band must reach the ~10Δ OTM wings the regime
+    structures pick (backspread / risk reversal / asymmetric strangle).
 
     `nfo_cache` is the NFO instrument list — pass it in when resolving multiple
     underlyings so we don't re-fetch the (large) master per underlying."""
@@ -110,7 +115,7 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
     spot_ltp = kite.quote([spot_key])[spot_key]["last_price"]
     atm = round(spot_ltp / strike_step) * strike_step
     strike_set = {atm + strike_step * k
-                  for k in range(-STRIKES_EACH_SIDE, STRIKES_EACH_SIDE + 1)}
+                  for k in range(-strikes_each_side, strikes_each_side + 1)}
     selected = sorted(
         (o for o in opts
          if o["expiry"] in selected_expiries and o["strike"] in strike_set),
@@ -134,7 +139,7 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None):
     return tokens, token_to_symbol
 
 
-def resolve_instruments(kite, log, underlyings):
+def resolve_instruments(kite, log, underlyings, strikes_each_side=STRIKES_EACH_SIDE):
     """Resolve subscribe sets for every requested underlying and merge into
     one (tokens, token_to_symbol) pair. NFO master is fetched once and shared
     across underlyings. A failure on any underlying raises and aborts capture
@@ -143,7 +148,9 @@ def resolve_instruments(kite, log, underlyings):
     all_tokens: list[int] = []
     all_token_to_symbol: dict[int, str] = {}
     for u in underlyings:
-        tokens, sym_map = resolve_instruments_for(kite, log, u, nfo_cache=nfo_cache)
+        tokens, sym_map = resolve_instruments_for(
+            kite, log, u, nfo_cache=nfo_cache,
+            strikes_each_side=strikes_each_side)
         all_tokens.extend(tokens)
         all_token_to_symbol.update(sym_map)
     return all_tokens, all_token_to_symbol
@@ -214,11 +221,23 @@ def main():
         "--underlyings", type=str, default="NIFTY",
         help="Comma-separated underlyings to capture (default: NIFTY). "
              "Set to 'NIFTY,BANKNIFTY' to capture both. Each underlying adds "
-             "~24 tokens (1 spot + 1 fut + 22 options) — well under Kite's "
+             "1 spot + 1 fut + (2*strikes_each_side+1)*2*2 options (≈166 at the "
+             "±20 default) — well under Kite's "
              "3000-token cap. load_captured_tape() in backtest.py filters by "
              "underlying name, so mixed-underlying JSONLs replay cleanly.",
     )
+    parser.add_argument(
+        "--strikes-each-side", type=int, default=STRIKES_EACH_SIDE,
+        help=f"Strikes captured each side of ATM per expiry (default "
+             f"{STRIKES_EACH_SIDE}). Must reach the ~10Δ OTM wings the regime "
+             f"structures need; smaller bands shrink the tape (~linear) and "
+             f"speed autoresearch replay but starve backspread/risk-reversal/"
+             f"asymmetric-strangle.",
+    )
     args = parser.parse_args()
+    if args.strikes_each_side < 1:
+        print("--strikes-each-side must be >= 1", file=sys.stderr)
+        return 2
     underlyings = [u.strip().upper() for u in args.underlyings.split(",") if u.strip()]
     if not underlyings:
         print("--underlyings must list at least one symbol", file=sys.stderr)
@@ -243,8 +262,10 @@ def main():
     prof = kite.profile()
     _LOG.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
 
-    _LOG.info("Resolving instruments for: %s", ",".join(underlyings))
-    tokens, sym_map = resolve_instruments(kite, _LOG, underlyings)
+    _LOG.info("Resolving instruments for: %s (±%d strikes/side)",
+              ",".join(underlyings), args.strikes_each_side)
+    tokens, sym_map = resolve_instruments(
+        kite, _LOG, underlyings, strikes_each_side=args.strikes_each_side)
     _SUBSCRIBE_TOKENS = tokens
     _TOKEN_TO_SYMBOL = sym_map
 
@@ -259,6 +280,7 @@ def main():
 
     header = {
         "_session_start": datetime.now(IST).isoformat(),
+        "strikes_each_side": args.strikes_each_side,
         "instruments": [{"token": t, "tradingsymbol": _TOKEN_TO_SYMBOL[t]}
                         for t in tokens],
     }
