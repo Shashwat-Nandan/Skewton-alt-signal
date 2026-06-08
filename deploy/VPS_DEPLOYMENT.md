@@ -767,10 +767,18 @@ fire-drill once after any change to the live unit, its `StartLimit*`, or the
 4. **Verify it hard-stopped and BOTH handlers fired:**
 
    ```bash
-   systemctl show pair-paper-persistent-live.service -p ActiveState -p Result   # failed / start-limit-hit
-   journalctl -t taleb-notify --since "2 min ago" --no-pager                    # latch + failure log lines
-   ls -la data_cache/HALT_ALL                                                   # latch engaged (file now exists)
+   systemctl show pair-paper-persistent-live.service -p ActiveState -p Result   # ActiveState=failed (Result shows exit-code, see note)
+   journalctl -u pair-paper-persistent-live.service --since "2 min ago" --no-pager \
+     | grep -E 'Start request repeated too quickly|Triggering OnFailure='        # proof the limit tripped + handlers dispatched
+   journalctl -t taleb-notify --since "2 min ago" --no-pager                     # latch + failure log lines
+   ls -la data_cache/HALT_ALL                                                    # latch engaged (file now exists)
    ```
+
+   > **Note on `Result`:** systemd reports `Result=exit-code` (the underlying
+   > `/bin/false` exit), **not** `start-limit-hit`. The start-limit is what drove
+   > the unit to terminal `failed` and fired `OnFailure=` — confirmed by the
+   > `Start request repeated too quickly` and `Triggering OnFailure=` journal
+   > lines, not by the `Result` value.
 
    On your phone, confirm **two** Telegrams: the `notify-failure@` "ALERT … failed"
    page, and the "🛑 LIVE pair runner HARD-STOPPED …" latch message.
@@ -794,9 +802,11 @@ fire-drill once after any change to the live unit, its `StartLimit*`, or the
    ls data_cache/HALT_ALL       # MUST be absent again
    ```
 
-**Pass criteria:** `Result=start-limit-hit`; both Telegrams received; `HALT_ALL`
-was created by the drill (step 4) and removed by cleanup (step 6); `systemctl
-cat` shows the real python `ExecStart` with no drop-in remaining.
+**Pass criteria:** `ActiveState=failed` with `Start request repeated too quickly`
++ `Triggering OnFailure=` in the unit journal (the `Result=exit-code` value is
+expected — see the note above); both Telegrams received; `HALT_ALL` was created
+by the drill (step 4) and removed by cleanup (step 6); `systemctl cat` shows the
+real python `ExecStart` with no drop-in remaining.
 
 **If you abort midway,** the two things that MUST be true before the next live
 session are: (a) `systemctl cat …` shows the python `ExecStart` (not
