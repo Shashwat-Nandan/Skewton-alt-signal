@@ -17,6 +17,11 @@ ReadWritePaths=/opt/taleb-karpathy-kite/data_cache
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+# ProtectHome=read-only is safe here: this unit only READS its script + .env, and
+# the HALT_ALL write goes through ReadWritePaths (which overrides ProtectHome).
+# Matters most on a /root-localized host, where data_cache sits under a home dir —
+# unlike the live runner (WorkingDirectory under /root → must NOT set ProtectHome),
+# this oneshot sets no WorkingDirectory.
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
