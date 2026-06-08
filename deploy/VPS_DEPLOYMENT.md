@@ -694,6 +694,115 @@ sudo systemctl enable --now pair-paper-persistent.timer
 If you skip step 2/3, the real positions persist on the broker regardless of the
 runner's mode — and the paper runner will hide them from the dashboard.
 
+### 7.11 Crash-loop safety: what fires, and the out-of-hours fire-drill
+
+**What is wired** (live unit `pair-paper-persistent-live.service`):
+
+- `Restart=on-failure` + `StartLimitIntervalSec=3600`, `StartLimitBurst=5`. A
+  *single* crash auto-restarts and re-reconciles (`auto-restart` state — no
+  alert). Only a **sustained** loop (the 6th start within the hour, ~30–40 min
+  given the ~6-min screening per attempt) or a non-recoverable terminal exit
+  reaches systemd's terminal `failed` state.
+- Two `OnFailure=` handlers, which fire **only** on that terminal `failed`
+  state:
+  1. `notify-failure@%n.service` — Telegram page with the unit's last log lines
+     (the stack trace / `Refusing to start fresh` etc.).
+  2. `pair-live-halt-on-failure.service` — `touch`es `data_cache/HALT_ALL` and
+     Telegrams the recovery steps. The runner reads `HALT_ALL` every tick and
+     **freezes the book** (no entries, no exits), so the unattended next-day
+     09:12 timer can't blindly resume real-money trading on the crash-looped
+     state — it comes up, reconciles, then waits frozen for a conscious
+     `rm data_cache/HALT_ALL`.
+
+This is what made the 2026-06-08 silent 2-hour crash-loop impossible to repeat
+(the old `StartLimitIntervalSec=600` was too short for a ~6-min loop to ever
+trip `failed`, so neither handler fired).
+
+**Why drill it:** the chain can't be exercised during a live session. Run this
+fire-drill once after any change to the live unit, its `StartLimit*`, or the
+`pair-live-halt-on-failure` handler. It exercises the **real** installed unit's
+`OnFailure=` wiring without running the trading logic.
+
+> **⚠️ Run only when markets are CLOSED and no real positions are open.** The
+> drill sends **real** Telegram alerts (warn anyone else on the channel that it's
+> a drill) and touches the **real** `data_cache/HALT_ALL` — step 5 cleanup is
+> mandatory, or the next live session will freeze.
+
+1. **Preconditions.** Confirm the market is closed, the live session is not
+   running, and the latch is not already set:
+
+   ```bash
+   systemctl is-active pair-paper-persistent-live.service   # expect inactive/failed, NOT active
+   ls data_cache/HALT_ALL                                   # expect "No such file" (book not frozen)
+   ```
+
+2. **Neuter `ExecStart` and tighten the limit via a drop-in** so the loop trips
+   in seconds instead of running `--mode live` python:
+
+   ```bash
+   sudo mkdir -p /etc/systemd/system/pair-paper-persistent-live.service.d
+   sudo tee /etc/systemd/system/pair-paper-persistent-live.service.d/zz-firedrill.conf >/dev/null <<'EOF'
+   [Unit]
+   StartLimitIntervalSec=30
+   StartLimitBurst=2
+   [Service]
+   ExecStart=
+   ExecStart=/bin/false
+   RestartSec=1
+   EOF
+   sudo systemctl daemon-reload
+   ```
+
+   The empty `ExecStart=` clears the real command before the dummy replaces it;
+   `/bin/false` never authenticates or trades. `OnFailure=` lives in `[Unit]` and
+   is untouched, so the real handlers still fire.
+
+3. **Trigger the loop:**
+
+   ```bash
+   sudo systemctl start pair-paper-persistent-live.service || true
+   sleep 8
+   ```
+
+4. **Verify it hard-stopped and BOTH handlers fired:**
+
+   ```bash
+   systemctl show pair-paper-persistent-live.service -p ActiveState -p Result   # failed / start-limit-hit
+   journalctl -t taleb-notify --since "2 min ago" --no-pager                    # latch + failure log lines
+   ls -la data_cache/HALT_ALL                                                   # latch engaged (file now exists)
+   ```
+
+   On your phone, confirm **two** Telegrams: the `notify-failure@` "ALERT … failed"
+   page, and the "🛑 LIVE pair runner HARD-STOPPED …" latch message.
+
+5. **Clean up — mandatory, every line:**
+
+   ```bash
+   sudo rm /etc/systemd/system/pair-paper-persistent-live.service.d/zz-firedrill.conf
+   sudo rmdir /etc/systemd/system/pair-paper-persistent-live.service.d 2>/dev/null || true
+   sudo systemctl daemon-reload
+   sudo systemctl reset-failed pair-paper-persistent-live.service
+   rm -f data_cache/HALT_ALL    # UN-LATCH — else the next live session freezes
+   ```
+
+6. **Verify the real config is restored:**
+
+   ```bash
+   systemctl cat pair-paper-persistent-live.service | grep -E 'ExecStart|StartLimit'
+   #   want: ExecStart=…/run_paper_pairs.py (NOT /bin/false),
+   #         StartLimitIntervalSec=3600, StartLimitBurst=5, no firedrill drop-in
+   ls data_cache/HALT_ALL       # MUST be absent again
+   ```
+
+**Pass criteria:** `Result=start-limit-hit`; both Telegrams received; `HALT_ALL`
+was created by the drill (step 4) and removed by cleanup (step 6); `systemctl
+cat` shows the real python `ExecStart` with no drop-in remaining.
+
+**If you abort midway,** the two things that MUST be true before the next live
+session are: (a) `systemctl cat …` shows the python `ExecStart` (not
+`/bin/false`), and (b) `data_cache/HALT_ALL` is gone. Otherwise the next start
+will either fail outright or come up frozen.
+
 ---
 
 ## 8. Troubleshooting

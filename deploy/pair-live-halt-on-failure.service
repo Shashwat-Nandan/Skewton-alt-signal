@@ -1,0 +1,24 @@
+[Unit]
+Description=Latch HALT_ALL when the LIVE pair runner hard-stops (crash-loop / terminal failure)
+# Intentionally no OnFailure= — a latch/alert unit must not loop on its own failure.
+
+[Service]
+Type=oneshot
+# --- EDIT FOR YOUR VPS ---
+Environment=PROJECT_DIR=/opt/taleb-karpathy-kite
+EnvironmentFile=-/opt/taleb-karpathy-kite/.env
+ExecStart=/opt/taleb-karpathy-kite/deploy/pair-live-halt-on-failure.sh
+# -------------------------
+
+# Tight sandbox — reads env, queries systemd, runs curl + logger, and WRITES the
+# HALT_ALL flag. ProtectSystem=strict makes the FS read-only, so data_cache must
+# be re-exposed via ReadWritePaths or the touch fails on a read-only filesystem.
+ReadWritePaths=/opt/taleb-karpathy-kite/data_cache
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+TimeoutStartSec=30

@@ -3,7 +3,11 @@ Description=Pair-Trading LIVE Runner — persistence-screened pairs (REAL MONEY)
 Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
-OnFailure=notify-failure@%n.service
+# Two OnFailure handlers, both fire on the terminal `failed` state (a single
+# crash auto-restarts and never reaches here): notify-failure@ pages the generic
+# failure; pair-live-halt-on-failure latches HALT_ALL so the next start FREEZES
+# instead of blindly resuming real-money trading on the crash-looped state.
+OnFailure=notify-failure@%n.service pair-live-halt-on-failure.service
 # Mutual exclusion with the paper persistent unit: both reuse --system
 # persistent (same fcntl lock) and the same 09:12 slot. Conflicts= makes systemd
 # stop the paper unit when this one starts (and vice versa), so the live-vs-paper
@@ -11,7 +15,15 @@ OnFailure=notify-failure@%n.service
 # enabled. Belt-and-suspenders with the runtime fcntl lock (H9).
 Conflicts=pair-paper-persistent.service
 # M-O5: StartLimit* live in [Unit], not [Service]. See pair-paper.service.
-StartLimitIntervalSec=600
+# Interval widened 600->3600 (2026-06-08): a SLOW crash-loop — each iteration
+# spends ~6min on pair screening before dying — put fewer than 5 starts in any
+# 10min window, so Burst=5/600s never tripped 'failed', OnFailure=notify-failure@
+# never fired, and the live runner flapped SILENTLY for ~2h on cutover morning
+# (orphan-backup guard; see VPS_DEPLOYMENT §7.10). At 3600s the 6th crash within
+# the hour (~30-40min) trips 'failed': systemd stops the pointless flapping AND
+# the existing Telegram failure alert fires with the stack trace. Burst stays 5
+# so a genuinely transient single crash still auto-recovers.
+StartLimitIntervalSec=3600
 StartLimitBurst=5
 
 [Service]
