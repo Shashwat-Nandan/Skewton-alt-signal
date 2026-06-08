@@ -307,13 +307,19 @@ class TradeProposer:
             logger.warning("Risk reversal: could not find both 25Δ strikes")
             return []
 
-        # Size: budget the long-leg cost against capital × position_size_pct.
-        # The short call gives a credit; net debit is small. We size lots
-        # so the LONG-side notional respects the capital allocation, then
-        # mirror the short side at the same lot count.
+        # Size against the structure's MARGIN, which the short call dominates
+        # (SPAN ≈ 15% of its strike-notional). The long put is a cash premium
+        # that does NOT offset the call's upside risk, so sizing off the put
+        # price alone (the old behaviour) requested lots whose short-call margin
+        # dwarfed the capital allocation. Mirror both legs at the same lots.
         lot_size = int(put["row"]["lot_size"])
         risk_capital = capital * position_size_pct / 100.0
-        max_lots = max(int(risk_capital / (put["price"] * lot_size)), 1)
+        short_call_margin_per_lot = max(
+            float(call["row"]["strike"]) * lot_size * self._SHORT_OPTION_MARGIN_PCT,
+            2.0 * call["price"] * lot_size,
+        )
+        margin_per_lot = short_call_margin_per_lot + put["price"] * lot_size
+        max_lots = max(int(risk_capital / margin_per_lot), 1)
 
         proposals = [
             self._build_proposal(

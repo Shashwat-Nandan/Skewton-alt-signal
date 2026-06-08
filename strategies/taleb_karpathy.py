@@ -2267,28 +2267,92 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     def _apply_risk_filters(self, proposals, spot):
         """
-        All-or-nothing risk filter: if ANY leg fails liquidity or margin checks,
-        reject the entire structure. This prevents malformed partial positions
-        (e.g. keeping a short wing after its protective long is filtered out).
+        All-or-nothing risk filter: if ANY leg fails liquidity, or the
+        structure's margin exceeds the cap, reject the entire structure. This
+        prevents malformed partial positions (e.g. keeping a short wing after
+        its protective long is filtered out).
+
+        Margin is computed at the STRUCTURE level (see _structure_margin), so a
+        genuine hedge — the long leg of a vertical/backspread, or the offsetting
+        leg of a calendar — credits against its short instead of every leg
+        paying full naked margin. An uncovered short (e.g. the short call of a
+        risk reversal, whose long put does not cap upside) still costs full
+        naked margin, by design.
         """
         capital = self.immutable_params["total_capital"]
         max_margin_pct = self.immutable_params["max_position_margin_pct"]
         max_margin = capital * max_margin_pct / 100
 
-        cumulative_margin = 0.0
+        # Gate: liquidity (per leg, all-or-nothing).
         for prop in proposals:
-            # Gate: liquidity check
             if prop.bid_ask_spread_pct > self.immutable_params.get("liquidity_min_spread_pct", 1.0):
                 logger.info("Filtered %s: spread %.2f%% too wide — rejecting entire structure",
                             prop.tradingsymbol, prop.bid_ask_spread_pct)
                 return []
-            # Gate: margin check
-            cumulative_margin += prop.margin_required
-            if cumulative_margin > max_margin:
-                logger.info("Filtered %s: cumulative margin ₹%.0f exceeds %.0f%% of capital — rejecting entire structure",
-                            prop.tradingsymbol, cumulative_margin, max_margin_pct)
-                return []
+
+        # Gate: structure margin vs cap.
+        structure_margin = self._structure_margin(proposals)
+        if structure_margin > max_margin:
+            logger.info("Filtered structure: net margin ₹%.0f exceeds %.0f%% of capital "
+                        "(₹%.0f) — rejecting entire structure",
+                        structure_margin, max_margin_pct, max_margin)
+            return []
         return proposals
+
+    def _structure_margin(self, proposals):
+        """SPAN-style margin for a multi-leg options structure: the worst-case
+        loss the position can take, which credits genuine hedges instead of
+        summing naked per-leg margins. Never exceeds the gross per-leg sum.
+
+        Single-expiry: scan the expiry payoff at every strike plus the 0 and
+        far-OTM boundaries. A bounded worst case (defined-risk: verticals, ratio
+        backspreads, long straddles/strangles) is margined at that max loss. An
+        uncovered short call makes the upside unbounded — genuinely naked risk —
+        so we fall back to the gross per-leg sum.
+
+        Multi-expiry (calendars can't be expiry-scanned on one date): a long
+        calendar's max loss is its net debit, so a net-debit / net-long
+        structure is margined at the debit; anything else falls back to gross.
+        """
+        gross = sum(p.margin_required for p in proposals)
+        opt = [p for p in proposals if p.option_type in ("CE", "PE")]
+        if not opt or not any(p.transaction_type == "SELL" for p in opt):
+            return gross  # all-long (or no options): gross == premium outlay
+        # Non-option legs (e.g. a futures hedge) keep their own naked margin.
+        non_opt_margin = sum(p.margin_required for p in proposals
+                             if p.option_type not in ("CE", "PE"))
+
+        # Uncovered short call ⇒ unbounded upside loss ⇒ naked (gross). Short
+        # puts are bounded (max intrinsic = strike), so the scan handles them.
+        net_call_lots = sum((p.quantity if p.transaction_type == "BUY" else -p.quantity)
+                            for p in opt if p.option_type == "CE")
+        if net_call_lots < 0:
+            return gross
+
+        if len({str(p.expiry) for p in opt}) == 1:
+            strikes = sorted({float(p.strike) for p in opt})
+            test_pts = [0.0] + strikes + [max(strikes) * 3.0]
+
+            def _pnl_at(S):
+                total = 0.0
+                for p in opt:
+                    intrinsic = (max(S - float(p.strike), 0.0) if p.option_type == "CE"
+                                 else max(float(p.strike) - S, 0.0))
+                    contracts = p.lot_size * p.quantity
+                    total += ((intrinsic - p.price) if p.transaction_type == "BUY"
+                              else (p.price - intrinsic)) * contracts
+                return total
+
+            max_loss = max(-min(_pnl_at(S) for S in test_pts), 0.0)
+            return min(gross, max_loss + non_opt_margin)
+
+        # Multi-expiry: margin at net debit when the book is net long / net debit.
+        net_debit = -sum(((-p.price) if p.transaction_type == "BUY" else p.price)
+                         * p.lot_size * p.quantity for p in opt)
+        net_lots = sum((p.quantity if p.transaction_type == "BUY" else -p.quantity) for p in opt)
+        if net_debit > 0 and net_lots >= 0:
+            return min(gross, net_debit + non_opt_margin)
+        return gross
 
     def _generate_close_all_proposals(self):
         proposals = [TradeProposal(
