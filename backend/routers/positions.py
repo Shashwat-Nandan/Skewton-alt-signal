@@ -9,10 +9,13 @@ few seconds during market hours, and returns a unified view of:
 The endpoint is read-only — it does no order placement, no recomputation,
 no Kite calls. Polling cost is one ~6 KB JSON read per system.
 
-Live vs paper: every system here writes to a `*_paper_*` file, so the
-`mode` field is currently always "paper". When/if `settings.allow_live_mode`
-flips and a live runner lands, the new state file gets wired in here and
-the mode flips with it.
+Live vs paper: each runner writes its own `mode` ("live"/"paper", from its
+`--mode` flag) into the state file, and the badge renders that per-system
+value. This is deliberately NOT keyed off the global `allow_live_mode`
+setting — that flag is true whenever ANY system is live, so reading it here
+would mislabel the still-paper systems (baseline, Taleb) as real-money.
+A state file with no `mode` field falls back to "paper" (fail-safe: never
+render a paper book as live).
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ from typing import List, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ..settings import REPO_ROOT, get_settings
+from ..settings import REPO_ROOT
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/positions", tags=["positions"])
@@ -120,8 +123,13 @@ def _is_today(iso: Optional[str], today: date) -> bool:
         return False
 
 
-def _resolve_mode() -> str:
-    return "live" if get_settings().allow_live_mode else "paper"
+def _state_mode(payload: Optional[dict]) -> str:
+    """Per-system live/paper label authored by the runner into the state file
+    (`write_state_file`, driven by `--mode`). Falls back to "paper" when the
+    field is absent or unrecognised — a missing flag must never render a paper
+    book as real-money."""
+    mode = (payload or {}).get("mode")
+    return mode if mode in ("live", "paper") else "paper"
 
 
 # ─────────────────────────── per-system builders ───────────────────────────
@@ -131,7 +139,7 @@ def _build_taleb_block(today: date) -> SystemBlock:
     payload = _load_state(path)
     if not payload:
         return SystemBlock(
-            name="taleb", label="Taleb straddle", mode=_resolve_mode(),
+            name="taleb", label="Taleb straddle", mode=_state_mode(payload),
             state_file=path.name, available=False,
             summary=_empty_summary(), open_positions=[], closed_today=[],
         )
@@ -193,7 +201,7 @@ def _build_taleb_block(today: date) -> SystemBlock:
     unrealized = float(state.get("unrealized_pnl", 0.0))
     costs = float(state.get("total_transaction_costs", 0.0))
     return SystemBlock(
-        name="taleb", label="Taleb straddle", mode=_resolve_mode(),
+        name="taleb", label="Taleb straddle", mode=_state_mode(payload),
         state_file=path.name, updated_at=payload.get("saved_at"), available=True,
         summary=SystemSummary(
             realized_pnl=realized,
@@ -213,7 +221,7 @@ def _build_pair_block(name: str, label: str, filename: str, today: date) -> Syst
     payload = _load_state(path)
     if not payload:
         return SystemBlock(
-            name=name, label=label, mode=_resolve_mode(),
+            name=name, label=label, mode=_state_mode(payload),
             state_file=path.name, available=False,
             summary=_empty_summary(), open_positions=[], closed_today=[],
         )
@@ -277,7 +285,7 @@ def _build_pair_block(name: str, label: str, filename: str, today: date) -> Syst
             ))
 
     return SystemBlock(
-        name=name, label=label, mode=_resolve_mode(),
+        name=name, label=label, mode=_state_mode(payload),
         state_file=path.name, updated_at=payload.get("updated_at"), available=True,
         summary=SystemSummary(
             realized_pnl=realized_total,

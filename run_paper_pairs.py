@@ -982,7 +982,7 @@ def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
 
 
 def write_state_file(strategies, system: str, log: logging.Logger,
-                     archive: bool = True):
+                     archive: bool = True, mode: str = "paper"):
     """Atomically and durably persist current strategy state. Each strategy
     emits its own serialize_state() blob; runner adds a system/timestamp
     header.
@@ -1009,6 +1009,10 @@ def write_state_file(strategies, system: str, log: logging.Logger,
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
     payload = {
         "system": system,
+        # live/paper flag for read-only consumers (dashboard positions API).
+        # Single source of truth is the runner's --mode; the API renders this
+        # rather than a global setting so paper systems never read as live.
+        "mode": "live" if mode == "live" else "paper",
         "updated_at": datetime.now().isoformat(),
         "pairs": [],
     }
@@ -1639,7 +1643,7 @@ def main():
                     # here; that's harmless and the safer side to err on.
                     try:
                         write_state_file(strategies, args.system, log,
-                                         archive=False)
+                                         archive=False, mode=args.mode)
                     except Exception as e:
                         log.exception("Per-fill state persist failed: %s "
                                       "— continuing", e)
@@ -1651,7 +1655,8 @@ def main():
                 break
             check_daily_loss_limit(strategies, args.max_daily_loss_inr, log)
             try:
-                write_state_file(strategies, args.system, log, archive=False)
+                write_state_file(strategies, args.system, log, archive=False,
+                                 mode=args.mode)
             except Exception as e:
                 log.exception("Intraday state persist failed: %s — continuing", e)
             remaining = (session_end_ts - datetime.now()).total_seconds()
@@ -1765,7 +1770,7 @@ def end_of_session(strategies, today: date, args, log: logging.Logger,
             log.exception("[%s] expiry check failed after retries: %s",
                           pair_label, e)
             unverified_expiry.append(pair_label)
-    write_state_file(strategies, args.system, log)
+    write_state_file(strategies, args.system, log, mode=args.mode)
     write_eod_sidecar(strategies, today, log, args.system)
     if unverified_expiry:
         log.critical(
