@@ -28,7 +28,7 @@ def test_long_break_warning_fires_when_book_open(monkeypatch, caplog):
     caplog.set_level(logging.WARNING, logger="")
     s_open = _FakeStrategy("AAA", "BBB", position="LONG_SPREAD")
     s_flat = _FakeStrategy("CCC", "DDD", position="FLAT")
-    args = SimpleNamespace(force_flatten_on_exit=False, system="baseline")
+    args = SimpleNamespace(force_flatten_on_exit=False, system="baseline", mode="paper")
     monkeypatch.setattr(rpp, "write_state_file", lambda *a, **k: None)
     monkeypatch.setattr(rpp, "write_eod_sidecar", lambda *a, **k: None)
     # Friday 2026-05-29 → next trading day Mon 2026-06-01 (3 calendar days)
@@ -41,7 +41,7 @@ def test_long_break_warning_fires_when_book_open(monkeypatch, caplog):
 def test_no_warning_when_no_open_book(monkeypatch, caplog):
     import run_paper_pairs as rpp
     caplog.set_level(logging.WARNING, logger="")
-    args = SimpleNamespace(force_flatten_on_exit=False, system="baseline")
+    args = SimpleNamespace(force_flatten_on_exit=False, system="baseline", mode="paper")
     monkeypatch.setattr(rpp, "write_state_file", lambda *a, **k: None)
     monkeypatch.setattr(rpp, "write_eod_sidecar", lambda *a, **k: None)
     rpp.end_of_session([_FakeStrategy("CCC", "DDD")], date(2026, 5, 29), args,
@@ -52,7 +52,7 @@ def test_no_warning_when_no_open_book(monkeypatch, caplog):
 def test_no_warning_when_force_flatten_set(monkeypatch, caplog):
     import run_paper_pairs as rpp
     caplog.set_level(logging.WARNING, logger="")
-    args = SimpleNamespace(force_flatten_on_exit=True, system="baseline")
+    args = SimpleNamespace(force_flatten_on_exit=True, system="baseline", mode="paper")
     monkeypatch.setattr(rpp, "write_state_file", lambda *a, **k: None)
     monkeypatch.setattr(rpp, "write_eod_sidecar", lambda *a, **k: None)
     monkeypatch.setattr(rpp, "flatten_one", lambda *a, **k: None)
