@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backend.main import create_app
 from backend import db, run_manager as rm
+from backend.settings import get_settings
 
 
 @pytest.fixture
@@ -52,6 +53,25 @@ def unauthed_client(tmp_path):
     db.reset_for_tests(None)
 
 
+@pytest.fixture
+def live_mode_client(tmp_path, monkeypatch):
+    """`client` but with live mode ARMED (ALLOW_LIVE_MODE=true), to cover the
+    inverse of the default signals+paper build. The env override + cache_clear
+    make the running app's get_settings() return allow_live_mode=True; the cache
+    is cleared again on teardown so later tests see the conftest default."""
+    monkeypatch.setenv("ALLOW_LIVE_MODE", "true")
+    get_settings.cache_clear()
+    rm._manager = None
+    db.reset_for_tests(tmp_path / "test.db")
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.post("/api/session/login", json={"password": "test-password"})
+        assert r.status_code == 204, r.text
+        yield c
+    db.reset_for_tests(None)
+    get_settings.cache_clear()
+
+
 # ──────────────────────────────────────────────────────────
 # Meta + strategies
 # ──────────────────────────────────────────────────────────
@@ -63,6 +83,14 @@ class TestMeta:
         body = r.json()
         assert body["version"] == "0.1.0"
         assert body["live_mode_enabled"] is False
+
+    def test_root_live_mode_enabled_when_flag_set(self, live_mode_client):
+        # Inverse of test_root: with ALLOW_LIVE_MODE armed the meta endpoint
+        # must report it, so the flag is actually covered rather than only ever
+        # asserted false.
+        r = live_mode_client.get("/")
+        assert r.status_code == 200
+        assert r.json()["live_mode_enabled"] is True
 
     def test_strategies_list(self, client):
         r = client.get("/api/strategies")
@@ -155,6 +183,18 @@ class TestRuns:
         })
         assert r.status_code == 403
         assert "Live mode is disabled" in r.json()["detail"]
+
+    def test_create_run_live_passes_gate_when_flag_set(self, live_mode_client):
+        # Inverse of test_create_run_live_rejected: with ALLOW_LIVE_MODE armed,
+        # the live request clears the 403 gate and proceeds to the auth boundary
+        # (401 here, since Kite is unauthenticated) — proving the gate is keyed
+        # to the flag, not always-on.
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
+            r = live_mode_client.post("/api/runs", json={
+                "strategy": "pair_trading", "mode": "live", "params": {},
+            })
+        assert r.status_code == 401
+        assert "Live mode is disabled" not in r.text
 
     def test_create_run_unauthenticated(self, client):
         with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):

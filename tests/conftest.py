@@ -21,6 +21,12 @@ os.environ["DASHBOARD_SESSION_SECRET"] = (
 # httpx refuses to replay it on the next test request and the session
 # silently disappears between requests.
 os.environ["DASHBOARD_URL"] = "http://testserver"
+# Live mode is OFF by default for tests (the dashboard is signals+paper only,
+# CRITICAL Q1). Pin it here so the suite stays deterministic even when the host
+# .env has ALLOW_LIVE_MODE=true armed for a live runner — an env var overrides
+# the .env file, so tests never read the ambient value. Tests that exercise the
+# armed path flip this explicitly (see the live_mode_client fixture).
+os.environ["ALLOW_LIVE_MODE"] = "false"
 
 # Clear the cache so the first get_settings() in the test process sees the
 # env vars above, not whatever Pydantic baked at import time elsewhere.
