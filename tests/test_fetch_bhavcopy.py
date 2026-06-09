@@ -46,8 +46,27 @@ def isolated_raw_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def today():
-    """Today's wall-clock date (the only date the fallback fires for)."""
+    """Today's wall-clock date. MUST stay real-now: _download_bhavcopy only
+    fires the Kite fallback when `date == datetime.now().date()` (the fallback
+    is a today-only path), so a pinned past date would silently skip it. Fixture
+    contract dates are therefore expressed relative to this (see `expiries`)."""
     return datetime.now().replace(hour=19, minute=0, second=0, microsecond=0)
+
+
+@pytest.fixture
+def expiries(today):
+    """Front / mid / far expiry ISO strings, relative to `today`.
+
+    _build_today_stfs_via_kite keeps only `expiry >= today`, so fixture data
+    must use real-future dates — hardcoded calendar dates made these tests a
+    time bomb (issue #41): once the clock passed them, every contract read as
+    expired and was dropped, yielding None / empty CSVs."""
+    from datetime import timedelta
+    return (
+        (today + timedelta(days=14)).strftime("%Y-%m-%d"),
+        (today + timedelta(days=44)).strftime("%Y-%m-%d"),
+        (today + timedelta(days=74)).strftime("%Y-%m-%d"),
+    )
 
 
 def _mk_kite(instruments_list, candle_close_by_token):
@@ -81,15 +100,16 @@ def _instruments_for(symbols_with_expiry):
 
 class TestBuildTodayStfsViaKite:
 
-    def test_returns_csv_with_required_columns(self, today):
+    def test_returns_csv_with_required_columns(self, today, expiries):
         """Synth CSV must carry every column both consumers read:
         screen_pairs.load_front_month_panel reads TradDt/FinInstrmTp/TckrSymb/XpryDt/ClsPric;
         fetch_bhavcopy._parse_udiff_day's required-cols guard checks
         TckrSymb/FinInstrmTp/XpryDt/StrkPric/OptnTp/ClsPric/UndrlygPric/NewBrdLotQty.
         """
+        front = expiries[0]
         instruments = _instruments_for([
-            ("RELIANCE", "2026-05-28", 1001, 250),
-            ("INFY", "2026-05-28", 1002, 400),
+            ("RELIANCE", front, 1001, 250),
+            ("INFY", front, 1002, 400),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
         auth_mock = MagicMock()
@@ -108,15 +128,16 @@ class TestBuildTodayStfsViaKite:
         assert set(df["TckrSymb"]) == {"RELIANCE", "INFY"}
         rel = df[df["TckrSymb"] == "RELIANCE"].iloc[0]
         assert rel["ClsPric"] == pytest.approx(1327.00)
-        assert rel["XpryDt"] == "2026-05-28"
+        assert rel["XpryDt"] == front
 
-    def test_picks_front_month_when_multiple_expiries(self, today):
+    def test_picks_front_month_when_multiple_expiries(self, today, expiries):
         """If an instrument has multiple expiries listed, only the
         nearest-future one should appear in the synth CSV."""
+        front, mid, far = expiries
         instruments = _instruments_for([
-            ("RELIANCE", "2026-05-28", 1001, 250),
-            ("RELIANCE", "2026-06-25", 1002, 250),
-            ("RELIANCE", "2026-07-30", 1003, 250),
+            ("RELIANCE", front, 1001, 250),
+            ("RELIANCE", mid, 1002, 250),
+            ("RELIANCE", far, 1003, 250),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00, 1003: 1340.00})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
@@ -127,7 +148,7 @@ class TestBuildTodayStfsViaKite:
 
         df = pd.read_csv(io.BytesIO(csv_bytes))
         assert len(df) == 1
-        assert df.iloc[0]["XpryDt"] == "2026-05-28"
+        assert df.iloc[0]["XpryDt"] == front
         assert df.iloc[0]["ClsPric"] == pytest.approx(1327.00)
 
     def test_skips_already_expired_contracts(self, today):
@@ -174,12 +195,13 @@ class TestBuildTodayStfsViaKite:
         with patch("kite_auth.KiteAuthManager", return_value=auth_mock):
             assert _build_today_stfs_via_kite(today) is None
 
-    def test_individual_historical_data_failure_is_skipped_not_fatal(self, today):
+    def test_individual_historical_data_failure_is_skipped_not_fatal(self, today, expiries):
         """If one symbol's historical_data 5xx's, the rest should still be
         fetched — one flaky symbol can't sink the whole synthesis."""
+        front = expiries[0]
         instruments = _instruments_for([
-            ("RELIANCE", "2026-05-28", 1001, 250),
-            ("INFY", "2026-05-28", 1002, 400),
+            ("RELIANCE", front, 1001, 250),
+            ("INFY", front, 1002, 400),
         ])
         kite = MagicMock()
         kite.instruments.return_value = instruments
@@ -233,10 +255,10 @@ class TestDownloadBhavcopyFallback:
         assert out == b"AUTHORITATIVE_NSE_CONTENT"
         s.get.assert_not_called()
 
-    def test_nse_404_today_triggers_kite_fallback(self, isolated_raw_dir, today):
+    def test_nse_404_today_triggers_kite_fallback(self, isolated_raw_dir, today, expiries):
         """On NSE 404 for today, the Kite fallback should fire and the
         cache should be written with a sentinel marker."""
-        instruments = _instruments_for([("RELIANCE", "2026-05-28", 1001, 250)])
+        instruments = _instruments_for([("RELIANCE", expiries[0], 1001, 250)])
         kite = _mk_kite(instruments, {1001: 1327.00})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
 
@@ -310,15 +332,15 @@ class TestDownloadBhavcopyFallback:
 
 class TestSynthCsvIsScreenerCompatible:
 
-    def test_load_front_month_panel_consumes_synth_csv(self, tmp_path, today):
+    def test_load_front_month_panel_consumes_synth_csv(self, tmp_path, today, expiries):
         """The whole point of the fallback is that screen_pairs.py reads
         the synth CSV cleanly. Verify end-to-end."""
         from screen_pairs import load_front_month_panel
 
         # Synthesise today's CSV via the fallback
         instruments = _instruments_for([
-            ("RELIANCE", "2026-05-28", 1001, 250),
-            ("INFY", "2026-05-28", 1002, 400),
+            ("RELIANCE", expiries[0], 1001, 250),
+            ("INFY", expiries[0], 1002, 400),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
