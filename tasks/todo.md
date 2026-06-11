@@ -1,3 +1,22 @@
+# Live orders → marketable LIMIT with protection (2026-06-11)
+
+After the H15 fix let the first-ever live entry batch reach Zerodha
+(ICICIBANK/BPCL 11:03 IST), the broker rejected BOTH legs: "Market orders
+without market protection are not allowed via API. Please set market
+protection or use a Limit order." Clean atomic failure (no naked leg, book
+flat, M-B5 backoff engaged). Fix: `_live_execute` and the H7
+`_emergency_reverse_partial` now place LIMIT orders priced at fresh LTP
+padded `limit_protection_pct` (config, default 0.25%) toward the aggressive
+side, rounded outward to the instrument's tick size (from the session NFO
+dump, fallback 0.05). Crosses the book → fills like a market order with
+slippage bounded at the pad. The 2026-05-21 unfilled-LIMIT incident does not
+recur: `_poll_until_terminal` already books state only on confirmed
+COMPLETE, cancels at the 10s timeout, and C2 reverses a filled sibling.
+Knob added to config.ini [pair_trading] (gitignored seed). Tests: 5 added
+(buy/sell pad, outward tick rounding, quote-failure fallback to proposal
+price, H7 reversal uses LIMIT); backtest_pairs bootstrap updated for the new
+attr (caught by the coverage guard test). Full suite 692/692.
+
 # H15 margin precheck: count pledged collateral (2026-06-11)
 
 First-ever live entry signal (ICICIBANK/BPCL, ~10:10 IST) was blocked all

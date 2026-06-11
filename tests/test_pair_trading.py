@@ -86,6 +86,8 @@ def _make_strategy(
     s._place_order_fail_streak = 0
     s._place_order_skip_ticks_left = 0
     s._place_order_skip_window = 5
+    # Marketable-LIMIT pad (2026-06-11): live orders price at LTP ± this %.
+    s.limit_protection_pct = 0.25
     # M-B2: tests that assert exact fill prices default to 0bp slip;
     # dedicated slippage tests opt in by setting paper_slippage_bps.
     s.paper_slippage_bps = 0.0
@@ -1981,6 +1983,100 @@ class TestMarginPrecheck:
         s.kite.margins = MagicMock()
         s.execute_proposals(self._props())
         s.kite.margins.assert_not_called()
+
+
+class TestProtectiveLimitOrders:
+    """2026-06-11: Zerodha's API rejects naked MARKET orders on F&O
+    ('Market orders without market protection are not allowed via API') —
+    the first live entry batch was rejected on both legs. Live orders must
+    go out as marketable LIMITs at LTP padded limit_protection_pct toward
+    the aggressive side, so they fill like market orders but stay
+    API-legal with slippage bounded at the pad."""
+
+    def _live_strategy(self):
+        s = _make_strategy(mode="live")
+        s.kite.VARIETY_REGULAR = "regular"
+        s.kite.TRANSACTION_TYPE_BUY = "BUY"
+        s.kite.TRANSACTION_TYPE_SELL = "SELL"
+        s.kite.PRODUCT_NRML = "NRML"
+        s.kite.ORDER_TYPE_MARKET = "MARKET"
+        s.kite.ORDER_TYPE_LIMIT = "LIMIT"
+        s.kite.VALIDITY_DAY = "DAY"
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000_000.0}},
+        })
+        s.kite.instruments = MagicMock(return_value=[
+            {"tradingsymbol": "AAA26APRFUT", "tick_size": 0.05},
+        ])
+        s.kite.place_order = MagicMock(return_value="ORD-OK")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        return s
+
+    def _prop(self, transaction_type="BUY", price=1000.0):
+        from trade_proposer import TradeProposal
+        return TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=price, transaction_type=transaction_type,
+            iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
+            rationale="entry A",
+        )
+
+    def test_buy_places_limit_padded_above_ltp(self):
+        s = self._live_strategy()
+        s.kite.quote = MagicMock(return_value={
+            "NFO:AAA26APRFUT": {"last_price": 1000.0},
+        })
+        s._live_execute(self._prop("BUY"))
+        kwargs = s.kite.place_order.call_args.kwargs
+        assert kwargs["order_type"] == "LIMIT"
+        # 1000 * (1 + 0.25%) = 1002.50, already on a 0.05 tick
+        assert kwargs["price"] == 1002.50
+
+    def test_sell_places_limit_padded_below_ltp(self):
+        s = self._live_strategy()
+        s.kite.quote = MagicMock(return_value={
+            "NFO:AAA26APRFUT": {"last_price": 1000.0},
+        })
+        s._live_execute(self._prop("SELL"))
+        kwargs = s.kite.place_order.call_args.kwargs
+        assert kwargs["order_type"] == "LIMIT"
+        assert kwargs["price"] == 997.50
+
+    def test_pad_rounds_outward_to_tick(self):
+        # BUY must round UP to the next tick (more aggressive), never down
+        # below the pad: 333.30 * 1.0025 = 334.13325 → 334.15 on 0.05 ticks.
+        s = self._live_strategy()
+        s.kite.quote = MagicMock(return_value={
+            "NFO:AAA26APRFUT": {"last_price": 333.30},
+        })
+        s._live_execute(self._prop("BUY"))
+        assert s.kite.place_order.call_args.kwargs["price"] == 334.15
+
+    def test_quote_failure_falls_back_to_proposal_price(self):
+        # The fresh-LTP call failing must not block the order — the
+        # proposal's own quote (same tick, seconds old) is the fallback.
+        s = self._live_strategy()
+        s.kite.quote = MagicMock(side_effect=RuntimeError("quote down"))
+        s._live_execute(self._prop("BUY", price=2000.0))
+        kwargs = s.kite.place_order.call_args.kwargs
+        assert kwargs["order_type"] == "LIMIT"
+        assert kwargs["price"] == 2005.00
+
+    def test_emergency_partial_reverse_uses_protective_limit(self):
+        # The H7 inline partial-fill reversal hits the same API rule —
+        # a MARKET reversal there would be rejected and leave the orphan.
+        s = self._live_strategy()
+        s.kite.quote = MagicMock(return_value={
+            "NFO:AAA26APRFUT": {"last_price": 1000.0},
+        })
+        s._emergency_reverse_partial(self._prop("BUY"), 50, "ORIG-1")
+        kwargs = s.kite.place_order.call_args.kwargs
+        assert kwargs["order_type"] == "LIMIT"
+        assert kwargs["transaction_type"] == "SELL"  # reverse of BUY
+        assert kwargs["price"] == 997.50  # SELL side: padded BELOW LTP
 
 
 class TestEntryBatchAtomicity:

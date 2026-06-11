@@ -27,6 +27,7 @@ Mode dispatch:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -300,6 +301,14 @@ class PairTradingStrategy(BaseStrategy):
         # the cap, the entry is skipped.
         mln = cfg.get("max_leg_notional", "").strip()
         self.max_leg_notional: Optional[float] = float(mln) if mln else None
+
+        # Zerodha's API rejects naked MARKET orders on F&O ("Market orders
+        # without market protection are not allowed via API", first hit
+        # 2026-06-11). Live orders go out as marketable LIMITs priced
+        # LTP ± this percent on the aggressive side — fills like a market
+        # order, but slippage is bounded at the pad instead of unbounded.
+        lpp = cfg.get("limit_protection_pct", "").strip()
+        self.limit_protection_pct: float = float(lpp) if lpp else 0.25
 
         # max_leg_notional is the only hard cap on per-entry deployed notional.
         # In signals-only mode it's informational, but for paper / live it must
@@ -1594,14 +1603,52 @@ class PairTradingStrategy(BaseStrategy):
             "mode": "paper",
         }
 
+    def _tick_size_for(self, tradingsymbol: str) -> float:
+        # Tick size from the session NFO dump; 0.05 (the NSE F&O default)
+        # when the dump is unavailable or the symbol is missing.
+        try:
+            for row in self._get_nfo_instruments():
+                if row.get("tradingsymbol") == tradingsymbol:
+                    tick = float(row.get("tick_size") or 0)
+                    if tick > 0:
+                        return tick
+        except Exception as e:
+            logger.warning("tick_size lookup failed for %s: %s", tradingsymbol, e)
+        return 0.05
+
+    def _protective_limit_price(self, tradingsymbol: str,
+                                 transaction_type: str,
+                                 fallback_price: float) -> float:
+        """Marketable-LIMIT price: fresh LTP padded limit_protection_pct
+        toward the aggressive side (BUY above, SELL below), rounded outward
+        to tick size so the price stays exchange-valid AND at least as
+        aggressive as the pad. Falls back to the proposal's quote price if
+        the fresh quote fails — that quote is from the same tick, seconds
+        old at worst."""
+        base = self._get_last_price(tradingsymbol)
+        if base is None or base <= 0:
+            base = float(fallback_price)
+        tick = self._tick_size_for(tradingsymbol)
+        pad = base * self.limit_protection_pct / 100.0
+        # round(.., 9) before ceil/floor: float division wobble (1002.5/0.05
+        # = 20049.999...) must not push the price a spurious tick outward.
+        if transaction_type == "BUY":
+            price = math.ceil(round((base + pad) / tick, 9)) * tick
+        else:
+            price = math.floor(round((base - pad) / tick, 9)) * tick
+        return round(max(price, tick), 2)
+
     def _live_execute(self, prop: TradeProposal) -> Dict:
-        # Switched from LIMIT-at-LTP to MARKET (2026-05-21 live-readiness
-        # review): the prior LIMIT path returned status=PENDING immediately
-        # after place_order, and execute_proposals used to mutate state as
-        # if the order had filled — even when the LIMIT sat unfilled.
-        # MARKET guarantees a fill (or a clear reject), the slippage is
-        # already baked into the cost model, and we poll order_history to
-        # confirm before booking any state change.
+        # Marketable LIMIT with protection (2026-06-11): Zerodha's API
+        # rejects naked MARKET orders on F&O ("Market orders without market
+        # protection are not allowed via API"), so we send a LIMIT priced
+        # LTP ± limit_protection_pct on the aggressive side — it crosses
+        # the book and fills immediately like a market order, with slippage
+        # bounded at the pad. The 2026-05-21 LIMIT-at-LTP incident (order
+        # sat unfilled while state mutated as if filled) does NOT recur
+        # here: _poll_until_terminal books state only on a confirmed
+        # COMPLETE, cancels anything still open at timeout, and reports
+        # FAILED so C2 reverses a filled sibling leg.
         # M-B5: consecutive-failure backoff. Check (don't decrement) the
         # tick-counter here so a multi-leg batch in one tick only counts
         # as ONE tick of cooldown. The decrement happens in
@@ -1623,6 +1670,10 @@ class PairTradingStrategy(BaseStrategy):
             return {"order_id": None, "status": "FAILED",
                     "filled_lots": 0, "average_price": 0.0,
                     "error": f"validation: {e}", "mode": "live"}
+        limit_price = self._protective_limit_price(
+            prop.tradingsymbol, prop.transaction_type, prop.price,
+        )
+
         def _do_place():
             return self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR, exchange="NFO",
@@ -1633,7 +1684,8 @@ class PairTradingStrategy(BaseStrategy):
                 ),
                 quantity=abs(prop.quantity) * prop.lot_size,
                 product=self.kite.PRODUCT_NRML,
-                order_type=self.kite.ORDER_TYPE_MARKET,
+                order_type=self.kite.ORDER_TYPE_LIMIT,
+                price=limit_price,
                 validity=self.kite.VALIDITY_DAY,
                 tag=self._order_tag(prop),
             )
@@ -1811,13 +1863,16 @@ class PairTradingStrategy(BaseStrategy):
     def _emergency_reverse_partial(self, prop: TradeProposal,
                                     filled_shares: int,
                                     original_order_id: str) -> None:
-        # H7 follow-up: place an opposite-side MARKET order for the partial
+        # H7 follow-up: place an opposite-side order for the partial
         # quantity sitting on the broker after we treated the original
-        # order as FAILED. Best-effort: if this raises, we cannot recover
-        # automatically — log CRITICAL so notify-failure@ alerts surface
-        # the orphan and the operator squares it manually before reopen.
+        # order as FAILED. Marketable LIMIT, same as _live_execute — the
+        # API rejects naked MARKET orders. Best-effort: if this raises, we
+        # cannot recover automatically — log CRITICAL so notify-failure@
+        # alerts surface the orphan and the operator squares it manually
+        # before reopen.
+        reverse_type = "SELL" if prop.transaction_type == "BUY" else "BUY"
         reverse_side = (
-            self.kite.TRANSACTION_TYPE_SELL if prop.transaction_type == "BUY"
+            self.kite.TRANSACTION_TYPE_SELL if reverse_type == "SELL"
             else self.kite.TRANSACTION_TYPE_BUY
         )
         try:
@@ -1827,7 +1882,10 @@ class PairTradingStrategy(BaseStrategy):
                 transaction_type=reverse_side,
                 quantity=filled_shares,
                 product=self.kite.PRODUCT_NRML,
-                order_type=self.kite.ORDER_TYPE_MARKET,
+                order_type=self.kite.ORDER_TYPE_LIMIT,
+                price=self._protective_limit_price(
+                    prop.tradingsymbol, reverse_type, prop.price,
+                ),
                 validity=self.kite.VALIDITY_DAY,
                 tag=self._order_tag(prop),
             )
