@@ -1,3 +1,37 @@
+# Audit execution session 1 (2026-06-11) — Milestone 0 + quick wins
+
+Operator calls recorded (audit Open Questions): Q1 Taleb/arbitrage WILL go
+live eventually → 1.2 is the full poll-until-terminal port, not refuse-live.
+Q2 dashboard keeps RunManager + unconditional live 403 (task 1.3 as written).
+Q3 tick retention = nightly zstd of closed files >1 day old, delete archives
+at 90 days. Q4–Q6 deferred.
+
+Plan (audit task plan order, S-effort first):
+- [x] 0.1 CI: pytest + frontend build workflow (21d7601)
+- [x] 1.4 redeploy.sh: pip install after lockfile check + smoke timeout/message (038f4ea)
+- [x] 1.3 dashboard: unconditional live 403 + README claim fix (7530a5a)
+- [x] 0.3 characterization tests: taleb/arbitrage execute_proposals status handling (138eac7)
+- [x] 0.2 live-arming surface test (exact live unit argv, quad-lock refusals) (c40e299)
+- [x] 1.2 step 1: COMPLETE-whitelist in taleb+arbitrage execute_proposals (730d726)
+      (step 2, the live-executor port, is a separate session after 0.3 is green)
+
+## Review (2026-06-11 session)
+
+Milestone 0 complete; 3 of 7 Milestone 1 tasks landed (1.2 step 1, 1.3, 1.4).
+Full suite 702/702 after every commit. Notes for the next session:
+- 1.2 step 1 went FURTHER than whitelist: taleb+arbitrage _live_execute now
+  refuse BEFORE placing any order — with a whitelist but no fill polling, a
+  placed order would be untracked broker exposure. The refusal unblocks when
+  step 2 ports pair_trading's executor (place → poll → cancel/reverse,
+  marketable LIMIT per b1a1725).
+- 0.2 partial-by-design: quad-lock refusals + argparse tripwire are pinned;
+  the "normal session reaches tick loop" deep-stub integration is still open.
+- CI skip-guard allows exactly 3 known data_cache skips; if a suite legit
+  gains a skip, bump the count in .github/workflows/ci.yml with a comment.
+- Next up (audit order): 1.1 blind-window panel preload (M, ship via paper
+  first), 1.5 tick retention (operator chose: zstd >1d, delete at 90d),
+  1.6 taleb marking fixes, 1.7 dead-man's switch, 1.2 step 2 executor port.
+
 # Live orders → marketable LIMIT with protection (2026-06-11)
 
 After the H15 fix let the first-ever live entry batch reach Zerodha
