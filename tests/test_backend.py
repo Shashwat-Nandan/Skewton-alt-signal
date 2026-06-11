@@ -182,19 +182,20 @@ class TestRuns:
             "strategy": "pair_trading", "mode": "live", "params": {},
         })
         assert r.status_code == 403
-        assert "Live mode is disabled" in r.json()["detail"]
+        assert "not available from the dashboard" in r.json()["detail"]
 
-    def test_create_run_live_passes_gate_when_flag_set(self, live_mode_client):
-        # Inverse of test_create_run_live_rejected: with ALLOW_LIVE_MODE armed,
-        # the live request clears the 403 gate and proceeds to the auth boundary
-        # (401 here, since Kite is unauthenticated) — proving the gate is keyed
-        # to the flag, not always-on.
-        with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
-            r = live_mode_client.post("/api/runs", json={
-                "strategy": "pair_trading", "mode": "live", "params": {},
-            })
-        assert r.status_code == 401
-        assert "Live mode is disabled" not in r.text
+    def test_create_run_live_rejected_even_when_flag_set(self, live_mode_client):
+        # Audit 2026-06-10 task 1.3: the dashboard 403 is UNCONDITIONAL.
+        # ALLOW_LIVE_MODE arms the headless runners' quad-lock; on a host
+        # that sets it (production does), the dashboard must still refuse —
+        # RunManager has none of the runner-side risk controls (H-2). This
+        # test is the regression guard for the exact production hole the
+        # audit found: flag set in .env → dashboard silently armed.
+        r = live_mode_client.post("/api/runs", json={
+            "strategy": "pair_trading", "mode": "live", "params": {},
+        })
+        assert r.status_code == 403
+        assert "not available from the dashboard" in r.json()["detail"]
 
     def test_create_run_unauthenticated(self, client):
         with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):

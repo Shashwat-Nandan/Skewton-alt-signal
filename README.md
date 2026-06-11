@@ -227,6 +227,7 @@ identically.
   never write. The fetchers are the only writers.
 - **NIFTY-50 universe is hardcoded** in `screen_pairs.py`. Update by
   hand when constituents change.
-- **The dashboard refuses live mode** (`POST /runs` with
-  `mode=live` returns 403). To go live, follow §7 of
-  `deploy/VPS_DEPLOYMENT.md` — it's a deliberate gate.
+- **The dashboard refuses live mode unconditionally** (`POST /runs` with
+  `mode=live` returns 403, regardless of environment — `ALLOW_LIVE_MODE`
+  arms only the headless runners' quad-lock, never the dashboard). To go
+  live, follow §7 of `deploy/VPS_DEPLOYMENT.md` — it's a deliberate gate.

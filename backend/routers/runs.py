@@ -11,7 +11,6 @@ from strategies import STRATEGIES, VALID_MODES
 
 from .. import db, kite_oauth
 from ..run_manager import get_run_manager
-from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -19,7 +18,8 @@ router = APIRouter(prefix="/runs", tags=["runs"])
 
 class CreateRunRequest(BaseModel):
     strategy: str
-    # NOTE: live is intentionally excluded — see backend.settings.allow_live_mode.
+    # NOTE: live is accepted by the schema but unconditionally 403'd in
+    # create_run — the dashboard never trades live (audit 2026-06-10, 1.3).
     mode: Literal["signals", "paper", "live"]
     params: Dict[str, Any] = Field(default_factory=dict)
 
@@ -52,10 +52,18 @@ async def create_run(req: CreateRunRequest):
         raise HTTPException(status_code=400, detail=f"Unknown strategy {req.strategy!r}")
     if req.mode not in VALID_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {VALID_MODES}")
-    if req.mode == "live" and not get_settings().allow_live_mode:
+    if req.mode == "live":
+        # Audit 2026-06-10 task 1.3 (H-2): unconditional, no flag check.
+        # ALLOW_LIVE_MODE in the host .env exists to arm the HEADLESS
+        # runners' quad-lock; it must not also arm RunManager — a second
+        # execution engine with none of the runner-side risk controls
+        # (daily-loss halt, margin precheck, broker reconciliation,
+        # partial-fill reversal). Going live = deploy/VPS_DEPLOYMENT.md §7,
+        # never the dashboard.
         raise HTTPException(
             status_code=403,
-            detail="Live mode is disabled in this build. Use signals or paper.",
+            detail="Live mode is not available from the dashboard. "
+                   "Use the headless runner (deploy/VPS_DEPLOYMENT.md §7).",
         )
 
     kite = kite_oauth.get_authenticated_kite()
