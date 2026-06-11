@@ -40,6 +40,14 @@ fi
 echo "Checking dependency lockfiles ..."
 "$PROJECT_DIR/deploy/check_lockfile.sh"
 
+# 4b. Sync the venv to the locks (audit 2026-06-10 H-4: a deploy that bumps
+#     a dependency used to leave the running venv stale until someone
+#     remembered to pip install — a market-open crash vector). Hash-pinned
+#     and idempotent: a no-change deploy is a fast no-op here.
+echo "Syncing venv to lockfiles ..."
+"$PROJECT_DIR/.venv/bin/python" -m pip install --require-hashes --quiet \
+    -r "$PROJECT_DIR/requirements.lock" -r "$PROJECT_DIR/requirements-dev.lock"
+
 # 5. Rebuild frontend only if frontend/ changed since last deploy marker
 #    (or always — the build is ~30s and idempotent, so we don't bother
 #    with a marker)
@@ -85,8 +93,18 @@ else
 fi
 echo "Smoke check against ${SMOKE_BASES[*]} ..."
 "$PROJECT_DIR/deploy/smoke.sh" "${SMOKE_BASES[@]}" || {
-    echo "ERROR: smoke check failed — deploy not green" >&2
-    exit 3
+    # Distinguish "deploy broken" from "loopback raced a slow cold start"
+    # (audit H-4 / 2026-06 incidents: exit 3 on loopback while the public
+    # URL — which proxies to the same backend — was already green). If the
+    # public probe alone passes, the backend is demonstrably up: note it
+    # and exit 0 instead of crying wolf.
+    if [[ -n "$public_url" ]] && "$PROJECT_DIR/deploy/smoke.sh" "$public_url"; then
+        echo "NOTE: loopback smoke failed but public URL is green — backend is up;" >&2
+        echo "      loopback likely raced the cold start. Treating deploy as OK." >&2
+    else
+        echo "ERROR: smoke check failed — deploy not green" >&2
+        exit 3
+    fi
 }
 
 echo

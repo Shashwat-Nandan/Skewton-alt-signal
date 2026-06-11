@@ -25,7 +25,10 @@ fi
 
 # Cap on how long we'll wait for each base URL to become reachable on a
 # fresh deploy. Override via env if your stack is slower.
-READY_TIMEOUT_S="${READY_TIMEOUT_S:-60}"
+# 180s (was 60): the backend cold start has been observed >60s in production
+# (2026-06 redeploys exited 3 on loopback while the public URL was already
+# green — a false negative that taught the operator to distrust exit 3).
+READY_TIMEOUT_S="${READY_TIMEOUT_S:-180}"
 
 # Each entry: "<path>|<expected_status>". Most routes are gated behind the
 # dashboard session and return 401 to an unauthenticated probe — that's a
