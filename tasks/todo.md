@@ -1,3 +1,42 @@
+# H15 margin precheck: count pledged collateral (2026-06-11)
+
+First-ever live entry signal (ICICIBANK/BPCL, ~10:10 IST) was blocked all
+morning by H15: the account's full ₹4.87L sits in pledged stock collateral,
+so Zerodha's `available.live_balance` (free cash only) reads ₹0 and every
+batch failed `required > available`. Operator decision: count collateral.
+`_margin_precheck_ok` now gates on `live_balance + available.collateral`
+(missing key → 0, shape-guard unchanged) and the skip log shows the
+cash/collateral split. Accepted caveat (recorded in the code comment): with
+cash below 50% of margin, the exchange 50:50 rule means Zerodha charges
+delayed-payment interest (~0.035%/day, ≈₹51/day on a ₹296k position) while
+a position is open. Tests: 2 added (collateral-funded account proceeds;
+cash+collateral still short refuses), 109/109 pass. NOTE: the live runner
+loaded the old code at 09:12 IST — change takes effect at next unit start
+(tomorrow 09:12, or a deliberate operator restart today).
+
+# Host sync: pair-paper.service M-O5 (2026-06-11)
+
+Host `/etc/systemd/system/pair-paper.service` was a stale pre-M-O5 copy
+(`Type=oneshot`, no `Restart=`), so the unit sat in "activating (start)" all
+session and a mid-session crash would stay down until the next day's timer.
+The repo's `deploy/pair-paper.service` already had the fix; applied the M-O5
+deltas to the host unit keeping host-localized paths
+(`/root/algo-trading/...`, not the repo's `/opt/...`):
+`Type=simple`, `Restart=on-failure` + `RestartSec=30`,
+`StartLimitIntervalSec=600` + `StartLimitBurst=5` in `[Unit]`, and dropped
+`ProtectHome=true` from the base unit (the `override.conf` drop-in pinning
+`ProtectHome=false` stays as belt-and-suspenders). `daemon-reload` done with
+the 2026-06-11 session in flight — running PID untouched; new `Type` shows
+from the next start (verified via `systemctl show`: Type=simple,
+Restart=on-failure loaded). Host `pair-paper-persistent.service` (dormant
+while the live unit replaces it, timer disabled) was the same stale copy and
+was synced the same way later that day — same M-O5 deltas PLUS the missing
+`--quality-max-pvalue 0.05` persistent floor (2026-06-02 decision; the host
+copy predated it, so a return to persistent paper would have silently
+re-applied baseline's 0.025 double-jeopardy re-test). Non-comment directives
+now match `deploy/pair-paper-persistent.service` modulo host paths (verified
+by diff after path substitution).
+
 # Persistent pair trading → LIVE cutover (2026-06-07)
 
 Promote the **persistent** pair runner from paper to **live (real money)** for

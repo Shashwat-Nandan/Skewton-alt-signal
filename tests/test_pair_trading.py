@@ -1923,6 +1923,35 @@ class TestMarginPrecheck:
         s.kite.place_order.assert_not_called()
         assert s.state.legs == []
 
+    def test_collateral_counts_toward_available(self):
+        # 2026-06-11: a fully pledged account reports live_balance=0 with all
+        # usable margin under available.collateral. Futures margin can be
+        # posted from collateral, so the precheck must sum both — otherwise a
+        # collateral-funded live account is silently entry-disabled forever.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 0.0, "collateral": 486_000.0}},
+        })
+        s.kite.place_order = MagicMock(return_value="ORD-OK")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals(self._props(margin_a=20_000, margin_b=30_000))
+        assert s.kite.place_order.call_count == 2
+
+    def test_cash_plus_collateral_still_insufficient_skips_entry(self):
+        # The sum is the gate: cash and collateral together short of the
+        # batch requirement must still refuse, or leg B rejects after leg A
+        # fills and C2 reversal eats the round-trip cost.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 10_000.0, "collateral": 15_000.0}},
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props(margin_a=20_000, margin_b=30_000))
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
     def test_sufficient_margin_proceeds(self):
         s = self._live_strategy()
         s.kite.margins = MagicMock(return_value={

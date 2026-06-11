@@ -1419,7 +1419,18 @@ class PairTradingStrategy(BaseStrategy):
             return True
 
         try:
-            available = float(margins["equity"]["available"]["live_balance"])
+            # live_balance is free CASH only — Zerodha reports pledged
+            # holdings separately under available.collateral, and a fully
+            # pledged account shows live_balance=0 even with lakhs of usable
+            # margin (2026-06-11: blocked every entry on a collateral-funded
+            # account). Futures margin can be posted from collateral, so
+            # count both. Caveat (operator-accepted): the exchange's 50:50
+            # rule means cash short of 50% of margin accrues Zerodha
+            # delayed-payment interest (~0.035%/day) while a position is on.
+            avail_blob = margins["equity"]["available"]
+            cash = float(avail_blob["live_balance"])
+            collateral = float(avail_blob.get("collateral") or 0)
+            available = cash + collateral
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(
                 "%s/%s: margins() shape unexpected (%s) — proceeding without "
@@ -1430,9 +1441,9 @@ class PairTradingStrategy(BaseStrategy):
         required = sum(float(p.margin_required or 0) for p in proposals)
         if required > available:
             logger.warning(
-                "%s/%s: insufficient margin — required ₹%.0f > available ₹%.0f. "
-                "Skipping entry batch (H15).",
-                self.symbol_a, self.symbol_b, required, available,
+                "%s/%s: insufficient margin — required ₹%.0f > available ₹%.0f "
+                "(cash ₹%.0f + collateral ₹%.0f). Skipping entry batch (H15).",
+                self.symbol_a, self.symbol_b, required, available, cash, collateral,
             )
             return False
         return True
