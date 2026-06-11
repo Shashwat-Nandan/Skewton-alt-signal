@@ -3019,3 +3019,79 @@ class TestRehedgeChurnBounds:
         h3.state = HedgeState()
         h3.restore_state(blob)
         assert h3.state._attribution_baseline is None
+
+
+class TestLiveStatusHandling:
+    """Audit 2026-06-10 task 0.3 (C-1): execute_proposals skips state
+    mutation only on status == "FAILED". _live_execute returns PENDING for
+    every successfully-placed order (fill unknown) and REJECTED for
+    validation failures — both currently book costs, positions, and
+    realized P&L as if filled. These tests encode the INTENDED contract
+    (mutate on COMPLETE only); the PENDING/REJECTED ones are
+    xfail(strict=True) until task 1.2 lands the COMPLETE-whitelist, at
+    which point the markers come off."""
+
+    def _live_hedger(self):
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.kite = MagicMock()
+        hedger.state = HedgeState()
+        hedger.mode = "live"
+        hedger.underlying = "NIFTY"
+        hedger.exchange = "NFO"
+        hedger._cached_lot_size = 25
+        hedger._cached_futures_symbol = None
+        hedger._clock = lambda: datetime(2026, 3, 29, 10, 0)
+        hedger.immutable_params = {"total_capital": 500000}
+        hedger.tunable_params = {}
+        hedger.greeks = MagicMock()
+        hedger._update_portfolio_greeks = lambda: None
+        hedger._get_spot_price = lambda: 23000.0
+        return hedger
+
+    def _prop(self):
+        return TradeProposal(
+            tradingsymbol="NIFTY26403CE22000", instrument_token=1,
+            strike=22000, expiry="2026-04-03", option_type="CE",
+            lot_size=25, quantity=2, price=300,
+            transaction_type="BUY", iv=0.15, bid_ask_spread_pct=0.5,
+            margin_required=15000,
+        )
+
+    def _run_with_status(self, status):
+        h = self._live_hedger()
+        h._live_execute = lambda p: {"order_id": "X1", "status": status, "mode": "live"}
+        h.execute_proposals([self._prop()])
+        return h
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="C-1: PENDING (order placed, fill unknown) currently books "
+               "position+costs as if filled — whitelist lands in task 1.2",
+    )
+    def test_pending_does_not_mutate_state(self):
+        h = self._run_with_status("PENDING")
+        assert h.state.positions == []
+        assert h.state.realized_pnl == 0.0
+        assert h.state.total_transaction_costs == 0.0
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="C-1: REJECTED (order never placed) currently books "
+               "position+costs — whitelist lands in task 1.2",
+    )
+    def test_rejected_does_not_mutate_state(self):
+        h = self._run_with_status("REJECTED")
+        assert h.state.positions == []
+        assert h.state.realized_pnl == 0.0
+        assert h.state.total_transaction_costs == 0.0
+
+    def test_failed_does_not_mutate_state(self):
+        h = self._run_with_status("FAILED")
+        assert h.state.positions == []
+        assert h.state.realized_pnl == 0.0
+        assert h.state.total_transaction_costs == 0.0
+
+    def test_complete_books_position_and_costs(self):
+        h = self._run_with_status("COMPLETE")
+        assert len(h.state.positions) == 1
+        assert h.state.total_transaction_costs > 0.0

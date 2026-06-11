@@ -906,3 +906,45 @@ class TestEodReportLegContract:
         leg = report["open_calendars"][0]["legs"][0]
         assert "qty" in leg
         assert "tradingsymbol" in leg
+
+
+class TestLiveStatusHandling:
+    """Audit 2026-06-10 task 0.3 (C-1, arbitrage copy): same blacklist bug
+    as taleb — only FAILED skips _apply_fill, so PENDING/REJECTED book
+    fills. Intended contract: _apply_fill on COMPLETE only. xfail markers
+    come off with task 1.2."""
+
+    def _run_with_status(self, status):
+        s = _make_strategy(mode="live")
+        s._live_execute = lambda p: {"order_id": "X1", "status": status, "mode": "live"}
+        calls = []
+        s._apply_fill = lambda prop: calls.append(prop)
+        prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
+            rationale="calendar leg",
+        )
+        s.execute_proposals([prop])
+        return calls
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="C-1: PENDING currently triggers _apply_fill — whitelist in 1.2",
+    )
+    def test_pending_does_not_apply_fill(self):
+        assert self._run_with_status("PENDING") == []
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="C-1: REJECTED currently triggers _apply_fill — whitelist in 1.2",
+    )
+    def test_rejected_does_not_apply_fill(self):
+        assert self._run_with_status("REJECTED") == []
+
+    def test_failed_does_not_apply_fill(self):
+        assert self._run_with_status("FAILED") == []
+
+    def test_complete_applies_fill(self):
+        assert len(self._run_with_status("COMPLETE")) == 1
