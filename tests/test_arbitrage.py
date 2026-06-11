@@ -929,17 +929,9 @@ class TestLiveStatusHandling:
         s.execute_proposals([prop])
         return calls
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="C-1: PENDING currently triggers _apply_fill — whitelist in 1.2",
-    )
     def test_pending_does_not_apply_fill(self):
         assert self._run_with_status("PENDING") == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="C-1: REJECTED currently triggers _apply_fill — whitelist in 1.2",
-    )
     def test_rejected_does_not_apply_fill(self):
         assert self._run_with_status("REJECTED") == []
 
@@ -948,3 +940,19 @@ class TestLiveStatusHandling:
 
     def test_complete_applies_fill(self):
         assert len(self._run_with_status("COMPLETE")) == 1
+
+    def test_live_execute_refuses_without_placing_order(self):
+        # Same interim guard as taleb: no order may reach the broker until
+        # the poll-until-terminal executor exists (audit 1.2 step 2).
+        s = _make_strategy(mode="live")
+        prop = TradeProposal(
+            tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
+            expiry="2026-04-28", option_type="FUT", lot_size=100,
+            quantity=1, price=1000.0, transaction_type="BUY",
+            iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
+            rationale="calendar leg",
+        )
+        result = s._live_execute(prop)
+        assert result["status"] == "FAILED"
+        assert "not supported" in result["error"]
+        s.kite.place_order.assert_not_called()

@@ -47,7 +47,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 
 from trade_proposer import TradeProposal
 
-from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
+from .base import BaseStrategy, ExecutionMode
 
 logger = logging.getLogger(__name__)
 
@@ -306,8 +306,13 @@ class ArbitrageStrategy(BaseStrategy):
 
             result = self._paper_execute(prop) if self.is_paper_mode else self._live_execute(prop)
             results.append(result)
-            if result.get("status") == "FAILED":
-                logger.warning("Order FAILED for %s: %s", prop.tradingsymbol, result.get("error"))
+            # C-1 fix (audit 2026-06-10, task 1.2): COMPLETE-whitelist —
+            # PENDING/REJECTED used to fall through to _apply_fill and book
+            # phantom fills. Same contract as pair_trading/taleb.
+            if result.get("status") != "COMPLETE":
+                logger.warning("Order not COMPLETE for %s: status=%s error=%s",
+                               prop.tradingsymbol, result.get("status"),
+                               result.get("error", ""))
                 continue
             self._apply_fill(prop)
 
@@ -1070,25 +1075,18 @@ class ArbitrageStrategy(BaseStrategy):
         return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
 
     def _live_execute(self, prop: TradeProposal) -> Dict:
-        try:
-            validate_order(prop)
-        except OrderValidationError as e:
-            logger.error("Order rejected pre-submit: %s — %s", e, prop)
-            return {"order_id": None, "status": "REJECTED", "error": str(e), "mode": "live"}
-        try:
-            order_id = self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR, exchange="NFO",
-                tradingsymbol=prop.tradingsymbol,
-                transaction_type=(
-                    self.kite.TRANSACTION_TYPE_BUY if prop.transaction_type == "BUY"
-                    else self.kite.TRANSACTION_TYPE_SELL
-                ),
-                quantity=abs(prop.quantity) * prop.lot_size,
-                product=self.kite.PRODUCT_NRML,
-                order_type=self.kite.ORDER_TYPE_LIMIT,
-                price=prop.price,
-                validity=self.kite.VALIDITY_DAY,
-            )
-            return {"order_id": order_id, "status": "PENDING", "mode": "live"}
-        except Exception as e:
-            return {"order_id": None, "status": "FAILED", "error": str(e), "mode": "live"}
+        # Interim refusal (audit 2026-06-10, task 1.2 step 2 pending): no
+        # fill polling here — a placed order would return PENDING, the C-1
+        # whitelist would refuse to book it, and the broker position would
+        # be UNTRACKED. Refuse before any order reaches the broker until
+        # pair_trading's executor is ported (planned: operator decision
+        # 2026-06-11 says arbitrage WILL trade live eventually).
+        logger.error(
+            "live execution not yet supported for %s — order NOT placed "
+            "(no fill polling; see tasks/audit-2026-06-10.md task 1.2)",
+            prop.tradingsymbol,
+        )
+        return {"order_id": None, "status": "FAILED",
+                "error": "live execution not supported pending fill-polling "
+                         "port (audit 1.2)",
+                "mode": "live"}

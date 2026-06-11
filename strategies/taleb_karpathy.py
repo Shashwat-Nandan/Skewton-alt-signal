@@ -36,7 +36,7 @@ from regime_classifier import (
     RegimeFeatures, Structure, Thresholds as RegimeThresholds, classify,
 )
 
-from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
+from .base import BaseStrategy, ExecutionMode
 
 # Kite Connect's quote feed indexes the *spot* price under the index's
 # display name (with spaces), not the derivatives ticker. f"NSE:{u}"
@@ -1551,10 +1551,18 @@ class TalebKarpathyStrategy(BaseStrategy):
             result = self._paper_execute(prop) if self.is_paper_mode else self._live_execute(prop)
             results.append(result)
 
-            # Skip state mutation if the live order failed
-            if result.get("status") == "FAILED":
-                logger.warning("Order FAILED for %s: %s — skipping state update",
-                               prop.tradingsymbol, result.get("error", "unknown"))
+            # C-1 fix (audit 2026-06-10, task 1.2): COMPLETE-whitelist, not
+            # FAILED-blacklist. _live_execute used to return PENDING for
+            # every placed order (fill unknown) and REJECTED pre-submit;
+            # the old `== "FAILED"` skip booked both as fills — phantom
+            # positions, costs, and realized P&L. Mirrors pair_trading's
+            # execute_proposals: only a confirmed COMPLETE mutates state.
+            if result.get("status") != "COMPLETE":
+                logger.warning(
+                    "Order not COMPLETE for %s: status=%s error=%s — "
+                    "skipping state update",
+                    prop.tradingsymbol, result.get("status"),
+                    result.get("error", ""))
                 continue
 
             # Deduct transaction costs
@@ -2438,20 +2446,20 @@ class TalebKarpathyStrategy(BaseStrategy):
         return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
 
     def _live_execute(self, proposal):
-        try:
-            validate_order(proposal)
-        except OrderValidationError as e:
-            logger.error("Order rejected pre-submit: %s — %s", e, proposal)
-            return {"order_id": None, "status": "REJECTED", "error": str(e), "mode": "live"}
-        try:
-            order_id = self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR, exchange="NFO",
-                tradingsymbol=proposal.tradingsymbol,
-                transaction_type=self.kite.TRANSACTION_TYPE_BUY if proposal.transaction_type == "BUY" else self.kite.TRANSACTION_TYPE_SELL,
-                quantity=abs(proposal.quantity) * proposal.lot_size,
-                product=self.kite.PRODUCT_NRML, order_type=self.kite.ORDER_TYPE_LIMIT,
-                price=proposal.price, validity=self.kite.VALIDITY_DAY,
-            )
-            return {"order_id": order_id, "status": "PENDING", "mode": "live"}
-        except Exception as e:
-            return {"order_id": None, "status": "FAILED", "error": str(e), "mode": "live"}
+        # Interim refusal (audit 2026-06-10, task 1.2 step 2 pending): this
+        # path has no fill polling — a placed order would return PENDING,
+        # the C-1 whitelist would (correctly) refuse to book it, and the
+        # broker position would be UNTRACKED. Until pair_trading's executor
+        # (place → poll-until-terminal → cancel/partial-reverse, marketable
+        # LIMIT) is ported, refuse before any order reaches the broker.
+        # Operator decision 2026-06-11: taleb WILL trade live eventually —
+        # the port is planned work (audit 1.2 step 2 / 2.2), not dead code.
+        logger.error(
+            "live execution not yet supported for %s — order NOT placed "
+            "(no fill polling; see tasks/audit-2026-06-10.md task 1.2)",
+            proposal.tradingsymbol,
+        )
+        return {"order_id": None, "status": "FAILED",
+                "error": "live execution not supported pending fill-polling "
+                         "port (audit 1.2)",
+                "mode": "live"}

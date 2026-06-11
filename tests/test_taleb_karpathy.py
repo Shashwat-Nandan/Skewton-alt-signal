@@ -3063,22 +3063,12 @@ class TestLiveStatusHandling:
         h.execute_proposals([self._prop()])
         return h
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="C-1: PENDING (order placed, fill unknown) currently books "
-               "position+costs as if filled — whitelist lands in task 1.2",
-    )
     def test_pending_does_not_mutate_state(self):
         h = self._run_with_status("PENDING")
         assert h.state.positions == []
         assert h.state.realized_pnl == 0.0
         assert h.state.total_transaction_costs == 0.0
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="C-1: REJECTED (order never placed) currently books "
-               "position+costs — whitelist lands in task 1.2",
-    )
     def test_rejected_does_not_mutate_state(self):
         h = self._run_with_status("REJECTED")
         assert h.state.positions == []
@@ -3095,3 +3085,14 @@ class TestLiveStatusHandling:
         h = self._run_with_status("COMPLETE")
         assert len(h.state.positions) == 1
         assert h.state.total_transaction_costs > 0.0
+
+    def test_live_execute_refuses_without_placing_order(self):
+        # Interim guard until the fill-polling executor is ported (audit
+        # 1.2 step 2): a live order placed without polling would be booked
+        # nowhere (whitelist) but EXIST at the broker — untracked real
+        # exposure. The refusal must fire before kite.place_order.
+        h = self._live_hedger()
+        result = h._live_execute(self._prop())
+        assert result["status"] == "FAILED"
+        assert "not supported" in result["error"]
+        h.kite.place_order.assert_not_called()
