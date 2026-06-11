@@ -74,6 +74,13 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run
 
 Restart=on-failure
 RestartSec=30
+# Operator stop/restart sends SIGTERM; the runner's handler converts it to
+# KeyboardInterrupt, persists state, and exits 130. Without this, systemd
+# marks that graceful teardown 'failed' and OnFailure= latches HALT_ALL —
+# a false positive that froze the live runner after a routine restart on
+# 2026-06-11. 130 only ever comes from the SIGINT/SIGTERM handler path
+# (real crashes exit 1 or die by signal), so it is safe to whitelist.
+SuccessExitStatus=130
 TimeoutStartSec=0
 StandardOutput=journal
 StandardError=journal
