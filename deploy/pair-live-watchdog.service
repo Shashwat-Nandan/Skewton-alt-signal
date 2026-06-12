@@ -1,0 +1,20 @@
+[Unit]
+Description=Dead-man probe — LIVE pair runner heartbeat freshness + external HC ping (audit 1.7)
+Documentation=https://github.com/anthropics/claude-code
+# No OnFailure here: the script alerts directly and exits 0; a probe bug
+# surfaces in the journal (taleb-notify) rather than a page loop.
+
+[Service]
+Type=oneshot
+# --- HOST-LOCALIZE PROJECT_DIR for your VPS ---
+Environment=PROJECT_DIR=/opt/taleb-karpathy-kite
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+ExecStart=/bin/bash /opt/taleb-karpathy-kite/deploy/pair-live-watchdog.sh
+StandardOutput=journal
+StandardError=journal
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

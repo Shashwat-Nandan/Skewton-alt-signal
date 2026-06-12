@@ -55,7 +55,17 @@ Full suite 702/702 after every commit. Notes for the next session:
   options-only + CRITICAL page if the futures contract can't be resolved.
   Also closed the 3.5 sweep item "reset _consecutive_quote_failures on
   success" (same function). 721/721.
-- Next up (audit order): 1.7 dead-man's switch, 1.2 step 2 executor port.
+- [x] 1.7 dead-man's switch. deploy/pair-live-watchdog.{sh,service,timer} —
+  every 5 min in a 09:20–15:20 IST window (holiday-gated via holidays.csv),
+  heartbeat = mtime of pair_paper_state_persistent.json (persisted per tick,
+  H1, no runner changes). Healthy → HC_PING_URL_LIVE success ping; hung or
+  absent unit → Telegram (30-min debounce) + journal + /fail ping; exit 0
+  always (no OnFailure double-page). All 4 decision paths sandbox-tested;
+  installed + enabled on host. OPERATOR STEP REMAINING: create the
+  healthchecks.io check (period 5min, grace 10min) and put HC_PING_URL_LIVE
+  in .env — without it dead-VPS coverage does not exist (hung/absent runner
+  coverage works today via Telegram). Docs: VPS_DEPLOYMENT alerting §3.
+- Next up: 1.2 step 2 executor port (L; last open Milestone-1 item).
 
 # Live orders → marketable LIMIT with protection (2026-06-11)
 

@@ -156,6 +156,15 @@ Every trading `.service` carries `OnFailure=notify-failure@%n.service`. When the
 
    Both channels are independent — set one, both, or neither. A failed external ping logs a `user.err` line to the journal but does not propagate.
 
+3. **Dead-man's switch (audit 1.7)** — `pair-live-watchdog.timer` probes the
+   LIVE pair runner every 5 min during session hours: heartbeat fresh + unit
+   active → success ping to `HC_PING_URL_LIVE`; stale/absent → Telegram page
+   (debounced 30 min) + journal + `/fail` ping.
+
+   | Env var | Setup |
+   |---|---|
+   | `HC_PING_URL_LIVE` | Create a SECOND healthchecks.io check with **period 5 min, grace 10 min**; paste its base ping URL (no `/fail` suffix). The external service alerting on MISSING pings is the only layer that survives a dead VPS — without this var the watchdog still catches hung/absent runners via Telegram, but a dead VPS alerts nobody. |
+
 **Smoke-test the notifier** before relying on it — pick any non-critical unit (e.g. `fetch-bars.service`) and force a failure:
 
 ```bash
