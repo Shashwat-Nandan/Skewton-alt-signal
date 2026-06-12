@@ -28,9 +28,18 @@ Full suite 702/702 after every commit. Notes for the next session:
   the "normal session reaches tick loop" deep-stub integration is still open.
 - CI skip-guard allows exactly 3 known data_cache skips; if a suite legit
   gains a skip, bump the count in .github/workflows/ci.yml with a comment.
-- Next up (audit order): 1.1 blind-window panel preload (M, ship via paper
-  first), 1.5 tick retention (operator chose: zstd >1d, delete at 90d),
-  1.6 taleb marking fixes, 1.7 dead-man's switch, 1.2 step 2 executor port.
+- [x] 1.1 blind-window panel preload (ac6ce11). One shared bhavcopy read in
+  main() (candidates + open orphans, prior_state hoisted), injected via
+  spread_panel= into every constructor; self-load fallback intact. Off-hours
+  smoke with baseline unit argv: one read, 521d × 19 symbols, seeds in ~60ms,
+  180 obs/pair (identical to per-pair path), full run 3m37s vs 16min this
+  morning. 713/713. VERIFY NEXT SESSION (2026-06-12): both timers fire with
+  the new code — check 'Preloaded spread panel' in both logs and tick-loop
+  entry ≤ 09:15:30 (audit acceptance); EOD sidecar z's should line up with
+  2026-06-11's.
+- Next up (audit order): 1.5 tick retention (operator chose: zstd >1d,
+  delete at 90d), 1.6 taleb marking fixes, 1.7 dead-man's switch,
+  1.2 step 2 executor port.
 
 # Live orders → marketable LIMIT with protection (2026-06-11)
 
