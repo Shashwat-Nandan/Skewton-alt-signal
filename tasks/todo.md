@@ -48,8 +48,14 @@ Full suite 702/702 after every commit. Notes for the next session:
   8 × ~3.4GB post-06-08 capture ≈ 27GB — audit Open Q3's "is 3.4GB/day
   intentional" is still an open operator call; shrinking capture scope or
   KEEP_RAW shrinks it.
-- Next up (audit order): 1.6 taleb marking fixes, 1.7 dead-man's switch,
-  1.2 step 2 executor port.
+- [x] 1.6 taleb marking fixes (869985f). H-6a carry-last-good-mark + loud
+  staleness (loss gate fires through an outage — test pins it); H-6b flatten
+  prices at entry VWAP never 0.0; H-6c/d lookups raise instead of guessing
+  (stale lot table / NIFTYFUT placeholder); close-all degrades to
+  options-only + CRITICAL page if the futures contract can't be resolved.
+  Also closed the 3.5 sweep item "reset _consecutive_quote_failures on
+  success" (same function). 721/721.
+- Next up (audit order): 1.7 dead-man's switch, 1.2 step 2 executor port.
 
 # Live orders → marketable LIMIT with protection (2026-06-11)
 
