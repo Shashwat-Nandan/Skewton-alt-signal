@@ -19,6 +19,12 @@ filters by underlying name, so mixed-underlying JSONL replays cleanly.
 Writes one JSON line per tick to data_cache/ticks/ticks-YYYY-MM-DD.jsonl until
 15:30 IST. First line is a session header with the resolved instrument map.
 
+Retention (audit 1.5): tick-retention.timer keeps the newest 8 sessions as
+raw .jsonl (autoresearch replays the most recent 5), zstd-archives older
+ones in place, and deletes archives 90 days past their session date. To
+replay an archived day, decompress first: `zstd -d ticks-<date>.jsonl.zst`
+— backtest.load_captured_tape / list_captured_sessions read plain .jsonl only.
+
 Independent of run_paper.py — a WebSocket exception cannot disrupt the trading
 loop. Designed to accumulate tick microstructure data across many sessions so
 the daily-loss-trigger fair-value backtest (see 2026-05-12 hedger incident)

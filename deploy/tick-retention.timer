@@ -1,0 +1,11 @@
+[Unit]
+Description=Fire tick-retention.service nightly at 22:00 IST (after session close, before Sat autoresearch)
+
+[Timer]
+# Host system time is CEST: 18:30 CEST == 22:00 IST. Daily — weekend
+# firings are no-ops (no new raw files past the keep window).
+OnCalendar=*-*-* 18:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

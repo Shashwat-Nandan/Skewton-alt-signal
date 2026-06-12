@@ -1,0 +1,21 @@
+[Unit]
+Description=Tick-capture retention — zstd-archive old sessions, prune >90d (audit 1.5)
+Documentation=https://github.com/anthropics/claude-code
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+# --- HOST-LOCALIZE PROJECT_DIR for your VPS ---
+Environment=PROJECT_DIR=/opt/taleb-karpathy-kite
+ExecStart=/bin/bash /opt/taleb-karpathy-kite/deploy/tick-retention.sh
+# Retention math keys off filename dates; TZ only affects the -90d cutoff
+# boundary — keep it on market time like every other unit.
+Environment=TZ=Asia/Kolkata
+StandardOutput=journal
+StandardError=journal
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

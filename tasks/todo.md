@@ -37,8 +37,18 @@ Full suite 702/702 after every commit. Notes for the next session:
   the new code — check 'Preloaded spread panel' in both logs and tick-loop
   entry ≤ 09:15:30 (audit acceptance); EOD sidecar z's should line up with
   2026-06-11's.
-- Next up (audit order): 1.5 tick retention (operator chose: zstd >1d,
-  delete at 90d), 1.6 taleb marking fixes, 1.7 dead-man's switch,
+- [x] 1.5 tick retention. Policy amended from the operator's "compress >1d"
+  with cause: autoresearch replays the most recent eval_cycles(=5) sessions
+  via a *.jsonl glob, so raw retention is COUNT-based — keep newest 8 raw,
+  zstd the rest, prune archives 90d past their SESSION date (filename, not
+  mtime). deploy/tick-retention.{sh,service,timer}; installed + enabled on
+  host (22:00 IST nightly), zstd apt-installed. First run: 13 sessions
+  archived ~15:1 (704MB→45MB), dir 27G→19G; archive zstd -t verified;
+  list_captured_sessions still sees 8 raw. Standing cost is the raw window:
+  8 × ~3.4GB post-06-08 capture ≈ 27GB — audit Open Q3's "is 3.4GB/day
+  intentional" is still an open operator call; shrinking capture scope or
+  KEEP_RAW shrinks it.
+- Next up (audit order): 1.6 taleb marking fixes, 1.7 dead-man's switch,
   1.2 step 2 executor port.
 
 # Live orders → marketable LIMIT with protection (2026-06-11)
