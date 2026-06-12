@@ -598,6 +598,7 @@ def build_strategies(
     kite_refresh=None,
     book_notional_fn=None,
     max_book_notional: float = 0.0,
+    spread_panel: Optional[pd.DataFrame] = None,
 ):
     from strategies.pair_trading import PairTradingStrategy
 
@@ -615,6 +616,7 @@ def build_strategies(
                 nfo_instruments=nfo_instruments,
                 kite_refresh=kite_refresh,
                 book_notional_fn=book_notional_fn,
+                spread_panel=spread_panel,
             )
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
@@ -1094,6 +1096,7 @@ def build_orphan_strategies(
     kite_refresh=None,
     book_notional_fn=None,
     max_book_notional: float = 0.0,
+    spread_panel: Optional[pd.DataFrame] = None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -1121,6 +1124,7 @@ def build_orphan_strategies(
                 nfo_instruments=nfo_instruments,
                 kite_refresh=kite_refresh,
                 book_notional_fn=book_notional_fn,
+                spread_panel=spread_panel,
             )
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
@@ -1576,16 +1580,44 @@ def main():
     from strategies.pair_trading import _aggregate_book_notional
     book_notional_fn = _aggregate_book_notional if args.max_book_notional_inr > 0 else None
 
+    # Audit 2026-06-10 task 1.1: preload the bhavcopy front-month panel ONCE
+    # for every symbol any strategy will need — today's candidates plus any
+    # prior-state pair still holding a position (those become orphans below).
+    # Same pattern as the H19 NFO prefetch above. Before this, EVERY pair
+    # re-read all ~520 bhavcopy CSVs inside _seed_spread_history (~70s each),
+    # so a 09:12 start entered the tick loop after 09:19 — blind through the
+    # open while the market traded. prior_state is loaded here (pure JSON
+    # read) instead of after build_strategies for the same reason.
+    prior_state = load_prior_state(args.system, log)
+    panel_symbols = set(pairs["symbol_a"]) | set(pairs["symbol_b"])
+    for blob in prior_state.values():
+        if blob.get("state", {}).get("position", "FLAT") != "FLAT":
+            panel_symbols.update(blob.get("pair", []))
+    try:
+        from screen_pairs import load_front_month_panel
+        spread_panel = load_front_month_panel(sorted(panel_symbols), min_coverage=0.5)
+        log.info(
+            "Preloaded spread panel: %d trading days × %d symbols "
+            "(one bhavcopy read for all pairs)",
+            len(spread_panel), spread_panel.shape[1],
+        )
+    except Exception as e:
+        log.warning(
+            "Spread-panel preload failed (%s) — strategies fall back to "
+            "per-pair bhavcopy reads (slow startup, pre-1.1 behavior)", e,
+        )
+        spread_panel = None
+
     strategies = build_strategies(
         pairs, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
         kite_refresh=_refresh_kite,
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
+        spread_panel=spread_panel,
     )
 
     # Restore prior-session state (no-op if no state file exists yet).
-    prior_state = load_prior_state(args.system, log)
     matched_keys = restore_matching_strategies(strategies, prior_state, log)
     orphans = build_orphan_strategies(
         prior_state, matched_keys, args, kite, config_path, log,
@@ -1593,6 +1625,7 @@ def main():
         kite_refresh=_refresh_kite,
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
+        spread_panel=spread_panel,
     )
     strategies = strategies + orphans
 

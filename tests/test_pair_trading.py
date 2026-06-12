@@ -88,6 +88,9 @@ def _make_strategy(
     s._place_order_skip_window = 5
     # Marketable-LIMIT pad (2026-06-11): live orders price at LTP ± this %.
     s.limit_protection_pct = 0.25
+    # Audit 1.1: no runner-injected panel by default — seed tests that
+    # exercise the injected path set _spread_panel explicitly.
+    s._spread_panel = None
     # M-B2: tests that assert exact fill prices default to 0bp slip;
     # dedicated slippage tests opt in by setting paper_slippage_bps.
     s.paper_slippage_bps = 0.0
@@ -2230,3 +2233,58 @@ class TestRegistry:
         from strategies import STRATEGIES, get_strategy
         assert "pair_trading" in STRATEGIES
         assert get_strategy("pair_trading") is PairTradingStrategy
+
+
+class TestSpreadPanelInjection:
+    """Audit 2026-06-10 task 1.1: the runner preloads ONE bhavcopy panel and
+    injects it; _seed_spread_history must consume it without re-reading
+    ~520 CSVs per pair (the open blind window), and must keep the per-pair
+    column slicing + self-load fallback byte-identical for callers that
+    don't inject (backtests, ad-hoc construction)."""
+
+    def _panel(self, n=80):
+        import pandas as pd
+        idx = pd.date_range("2026-01-01", periods=n, freq="D")
+        return pd.DataFrame(
+            {"AAA": [100.0 + i for i in range(n)],
+             "BBB": [50.0 + 0.5 * i for i in range(n)]},
+            index=idx,
+        )
+
+    def test_injected_panel_seeds_without_file_read(self, monkeypatch):
+        import screen_pairs
+        monkeypatch.setattr(
+            screen_pairs, "load_front_month_panel",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("must not re-read bhavcopy when panel injected")),
+        )
+        s = _make_strategy(hedge_ratio=2.0)
+        panel = self._panel()
+        s._spread_panel = panel
+        s._seed_spread_history()
+        expected = (panel["AAA"] - 2.0 * panel["BBB"]).dropna().tolist()
+        assert s._spread_history == expected[-s.lookback_days * 3:]
+
+    def test_no_panel_falls_back_to_self_load(self, monkeypatch):
+        import screen_pairs
+        calls = []
+        panel = self._panel()
+        def fake_load(universe, **kw):
+            calls.append(list(universe))
+            return panel
+        monkeypatch.setattr(screen_pairs, "load_front_month_panel", fake_load)
+        s = _make_strategy(hedge_ratio=2.0)
+        assert s._spread_panel is None
+        s._seed_spread_history()
+        assert calls == [["AAA", "BBB"]]
+        assert len(s._spread_history) > 0
+
+    def test_injected_panel_missing_leg_leaves_seed_empty(self):
+        # A coverage-dropped symbol is absent from the shared panel; the
+        # existing missing-column warning path must fire (empty seed,
+        # intraday accumulation) rather than crashing or re-reading files.
+        import pandas as pd
+        s = _make_strategy()
+        s._spread_panel = pd.DataFrame({"AAA": [1.0, 2.0]})
+        s._seed_spread_history()
+        assert s._spread_history == []

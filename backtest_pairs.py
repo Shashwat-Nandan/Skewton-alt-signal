@@ -210,6 +210,7 @@ def make_strategy(
     s._place_order_skip_ticks_left = 0
     s._place_order_skip_window = 5
     s.limit_protection_pct = 0.25
+    s._spread_panel = None
     s._session_start_realized = 0.0
     s._session_start_unrealized = 0.0
     s.state = PairState()

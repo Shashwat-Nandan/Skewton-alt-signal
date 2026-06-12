@@ -197,6 +197,7 @@ class PairTradingStrategy(BaseStrategy):
         nfo_instruments: Optional[List[dict]] = None,
         kite_refresh: Optional[Callable[[], object]] = None,
         book_notional_fn: Optional[Callable[[], float]] = None,
+        spread_panel: Optional[pd.DataFrame] = None,
     ):
         super().__init__(kite, config_path=config_path, mode=mode)
 
@@ -366,6 +367,13 @@ class PairTradingStrategy(BaseStrategy):
         # state is carried across sessions by the runner.
         self._session_start_realized: float = 0.0
         self._session_start_unrealized: float = 0.0
+
+        # Audit 2026-06-10 task 1.1: optional preloaded bhavcopy panel
+        # (rows=dates, cols=symbols), shared across all of a runner's
+        # strategies — same pattern as the H19 nfo_instruments prefetch.
+        # When absent (backtests, tests, ad-hoc construction),
+        # _seed_spread_history self-loads exactly as before.
+        self._spread_panel = spread_panel
 
         self._seed_spread_history()
 
@@ -1512,20 +1520,28 @@ class PairTradingStrategy(BaseStrategy):
         closes for both legs. If bhavcopy isn't available the strategy starts
         with an empty buffer and accumulates intraday observations until z-score
         becomes computable (~20 ticks).
+
+        Prefers the runner-injected `_spread_panel` (audit 1.1): one bhavcopy
+        read shared by every pair instead of ~520 CSVs re-read per pair —
+        the per-pair reads kept the live runner blind past 09:19. Per-pair
+        column slicing stays here either way.
         """
-        try:
-            from screen_pairs import load_front_month_panel
-            panel = load_front_month_panel(
-                [self.symbol_a, self.symbol_b],
-                min_coverage=0.5,
-            )
-        except Exception as e:
-            logger.warning(
-                "Could not seed spread history from bhavcopy: %s — "
-                "z-score will be unavailable until ~20 intraday ticks accumulate.",
-                e,
-            )
-            return
+        if self._spread_panel is not None:
+            panel = self._spread_panel
+        else:
+            try:
+                from screen_pairs import load_front_month_panel
+                panel = load_front_month_panel(
+                    [self.symbol_a, self.symbol_b],
+                    min_coverage=0.5,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not seed spread history from bhavcopy: %s — "
+                    "z-score will be unavailable until ~20 intraday ticks accumulate.",
+                    e,
+                )
+                return
 
         if self.symbol_a not in panel.columns or self.symbol_b not in panel.columns:
             logger.warning("Bhavcopy panel missing one or both pair legs; spread seed empty")
