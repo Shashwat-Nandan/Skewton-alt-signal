@@ -1819,13 +1819,17 @@ class TalebKarpathyStrategy(BaseStrategy):
             if not match.empty:
                 self._cached_lot_size = int(match.iloc[0]["lot_size"])
                 return self._cached_lot_size
-        except Exception:
-            pass
-        # Fallback: current NSE defaults (as of 2025)
-        fallback = {"NIFTY": 25, "BANKNIFTY": 15, "FINNIFTY": 25}
-        self._cached_lot_size = fallback.get(self.underlying, 25)
-        logger.warning("Using fallback lot size %d for %s", self._cached_lot_size, self.underlying)
-        return self._cached_lot_size
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not resolve lot size for {self.underlying} from "
+                "kite.instruments — refusing to size on a guess. (Audit "
+                "H-6c: the old silent fallback table was pre-Nov-2024 — "
+                "NIFTY 25 vs actual 75 sized hedges 3x wrong.)"
+            ) from e
+        raise RuntimeError(
+            f"No {self.underlying} option rows in kite.instruments('NFO') — "
+            "cannot determine lot size; refusing to size on a guess (H-6c)."
+        )
 
     def _get_futures_symbol(self) -> str:
         """Look up the nearest-month futures tradingsymbol from Kite instruments."""
@@ -1839,10 +1843,17 @@ class TalebKarpathyStrategy(BaseStrategy):
             if not futs.empty:
                 self._cached_futures_symbol = futs.iloc[0]["tradingsymbol"]
                 return self._cached_futures_symbol
-        except Exception:
-            pass
-        logger.warning("Could not look up futures symbol for %s, using placeholder", self.underlying)
-        return f"{self.underlying}FUT"
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not resolve front-month futures symbol for "
+                f"{self.underlying} from kite.instruments (H-6d: the old "
+                f"'{self.underlying}FUT' placeholder is not a real contract "
+                "— paper booked fake fills on it, live would reject)."
+            ) from e
+        raise RuntimeError(
+            f"No {self.underlying} FUT rows in kite.instruments('NFO') — "
+            "cannot resolve futures symbol (H-6d); refusing the placeholder."
+        )
 
     def _spot_quote_key(self) -> str:
         return _INDEX_SPOT_SYMBOLS.get(self.underlying, f"NSE:{self.underlying}")
@@ -2374,14 +2385,41 @@ class TalebKarpathyStrategy(BaseStrategy):
 
         # Close futures hedge if any
         if abs(self.state.futures_hedge_delta) > 0:
-            lot_size = self._get_lot_size()
+            # H-6c/d now raise on lookup failure. In THIS path (safety
+            # trigger) a raise must not abort the option-leg closes above:
+            # degrade to options-only and page the operator about the
+            # unflattened hedge instead of flattening nothing.
+            try:
+                lot_size = self._get_lot_size()
+                fut_symbol = self._get_futures_symbol()
+            except Exception as e:
+                logger.critical(
+                    "close-all: cannot resolve futures contract (%s) — "
+                    "closing option legs only; futures hedge (net delta "
+                    "%.1f) NOT flattened — SQUARE IT MANUALLY before the "
+                    "next session.", e, self.state.futures_hedge_delta,
+                )
+                return proposals
             fut_lots = abs(round(self.state.futures_hedge_delta / lot_size))
             if fut_lots > 0:
+                # H-6b: never price the flatten at `spot or 0.0` — a failed
+                # spot fetch booked the close at 0.0 in paper (realized P&L
+                # corrupted by ~entry_vwap × lots × lot_size). Fall back to
+                # the position's own entry VWAP: the leg books ~flat, and
+                # validate_order's price>0 gate can't reject the flatten.
+                spot = self._get_spot_price()
+                if not spot or spot <= 0:
+                    spot = self.state.futures_entry_vwap
+                    logger.error(
+                        "close-all: spot quote failed — pricing futures "
+                        "flatten at entry VWAP %.2f instead of 0.0 (H-6b).",
+                        spot,
+                    )
                 proposals.append(TradeProposal(
-                    tradingsymbol=self._get_futures_symbol(),
+                    tradingsymbol=fut_symbol,
                     instrument_token=0, strike=0, expiry="", option_type="FUT",
                     lot_size=lot_size, quantity=fut_lots,
-                    price=self._get_spot_price() or 0.0,
+                    price=spot,
                     transaction_type="SELL" if self.state.futures_hedge_delta > 0 else "BUY",
                     iv=0, bid_ask_spread_pct=0.0, margin_required=0.0,
                     rationale="Close futures hedge (safety trigger)",
@@ -2414,23 +2452,34 @@ class TalebKarpathyStrategy(BaseStrategy):
             self.state.max_drawdown = dd
 
     def _update_positions_prices(self, spot):
+        # H-6a staleness ledger (lazy init — same pattern as
+        # _consecutive_quote_failures; many tests construct via __new__).
+        if not hasattr(self, "_stale_marks"):
+            self._stale_marks = {}
         for pos in self.state.positions:
             try:
                 q = self.kite.quote([f"{self.exchange}:{pos.tradingsymbol}"])
                 pos.current_price = q[list(q.keys())[0]]["last_price"]
+                self._stale_marks.pop(pos.tradingsymbol, None)
+                self._consecutive_quote_failures = 0
             except Exception as e:
-                # Don't carry stale marks forward — clearing forces the
-                # downstream rehedge math to either get fresh quotes next
-                # tick or skip. Silent fallback to the last good price
-                # (the previous behaviour) was the 2026-05-04 incident class.
+                # H-6a (audit 1.6): carry the LAST GOOD mark and flag
+                # staleness — never reset to entry_price. The old reset
+                # zeroed the leg's unrealized P&L exactly when
+                # _should_exit's loss gates needed it, and quote outages
+                # correlate with the volatile tape that trips those gates.
+                # The 2026-05-04 incident class was a SILENT carry; this
+                # carry is loud: per-leg stale counter + escalating log.
                 consecutive = getattr(self, "_consecutive_quote_failures", 0) + 1
                 self._consecutive_quote_failures = consecutive
+                stale = self._stale_marks.get(pos.tradingsymbol, 0) + 1
+                self._stale_marks[pos.tradingsymbol] = stale
                 log = logger.error if consecutive >= 5 else logger.warning
                 log(
-                    "Quote failed for %s (consecutive=%d): %s",
-                    pos.tradingsymbol, consecutive, e,
+                    "Quote failed for %s (leg stale ticks=%d, consecutive=%d): "
+                    "%s — carrying last good mark %.2f",
+                    pos.tradingsymbol, stale, consecutive, e, pos.current_price,
                 )
-                pos.current_price = pos.entry_price
         unrealized = sum((p.current_price - p.entry_price) * p.quantity * p.lot_size for p in self.state.positions)
         # Futures unrealized P/L: (current_spot - entry_vwap) * net_lots * lot_size
         if self.state.futures_lots != 0 and self.state.futures_entry_vwap > 0:

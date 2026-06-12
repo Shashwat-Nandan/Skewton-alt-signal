@@ -3096,3 +3096,131 @@ class TestLiveStatusHandling:
         assert result["status"] == "FAILED"
         assert "not supported" in result["error"]
         h.kite.place_order.assert_not_called()
+
+
+class TestMarkingFallbacks:
+    """Audit 2026-06-10 task 1.6 (H-6): quote/lookup fallbacks must never
+    corrupt the safety stops. (a) A quote outage carries the last good
+    mark — unrealized P&L stays intact so _should_exit's loss gates can
+    still fire (the old reset-to-entry zeroed it exactly when the tape
+    was volatile). (c)/(d) lot-size and futures-symbol lookups fail loud
+    instead of guessing (stale NIFTY=25 table → 3x sizing; 'NIFTYFUT'
+    placeholder → fake paper fills). (b) the close-all futures flatten
+    never prices at 0.0 and never aborts the option-leg closes."""
+
+    def _hedger_with_position(self):
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.underlying = "NIFTY"
+        h.exchange = "NFO"
+        h._cached_lot_size = None
+        h._cached_futures_symbol = None
+        h._clock = lambda: datetime(2026, 6, 11, 10, 0)
+        h.immutable_params = {"total_capital": 500000}
+        h.tunable_params = {}
+        h._consecutive_quote_failures = 0
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26JUN23000PE", instrument_token=1,
+                strike=23000, expiry="2026-06-25", option_type="PE",
+                lot_size=75, quantity=2, entry_price=300.0,
+                current_price=350.0, iv=0.15,  # last good mark: +7500 unreal
+            ),
+        ]
+        return h
+
+    # ── H-6a: quote outage keeps the last good mark ──────────────
+
+    def test_quote_outage_carries_last_good_mark(self):
+        h = self._hedger_with_position()
+        h.kite.quote = MagicMock(side_effect=RuntimeError("exchange feed down"))
+        h._record_pnl_snapshot = lambda: None
+        h._update_positions_prices(23000.0)
+        pos = h.state.positions[0]
+        assert pos.current_price == 350.0          # NOT reset to entry 300
+        assert h.state.unrealized_pnl == (350.0 - 300.0) * 2 * 75
+        assert h._stale_marks["NIFTY26JUN23000PE"] == 1
+        assert h._consecutive_quote_failures == 1
+
+    def test_quote_recovery_clears_staleness(self):
+        h = self._hedger_with_position()
+        h._record_pnl_snapshot = lambda: None
+        h.kite.quote = MagicMock(side_effect=RuntimeError("down"))
+        h._update_positions_prices(23000.0)
+        h.kite.quote = MagicMock(return_value={
+            "NFO:NIFTY26JUN23000PE": {"last_price": 360.0},
+        })
+        h._update_positions_prices(23000.0)
+        assert h.state.positions[0].current_price == 360.0
+        assert "NIFTY26JUN23000PE" not in h._stale_marks
+        assert h._consecutive_quote_failures == 0  # reset on success (3.5)
+
+    def test_loss_gate_still_fires_through_quote_outage(self):
+        # The point of H-6a: a deep loss must remain visible to
+        # _should_exit while quotes are down. Mark the leg at a heavy
+        # loss, kill the feed, and assert the daily-loss gate trips.
+        h = self._hedger_with_position()
+        h.immutable_params["max_daily_loss_pct"] = 1.0   # ₹5,000 on 5L
+        h.state.positions[0].current_price = 100.0       # -30,000 unreal
+        h._record_pnl_snapshot = lambda: None
+        h.kite.quote = MagicMock(side_effect=RuntimeError("down"))
+        h._update_positions_prices(23000.0)
+        h.state._current_day_pnl = h.state.unrealized_pnl
+        assert h.state.unrealized_pnl == (100.0 - 300.0) * 2 * 75
+        h._record_loss = lambda: None
+        h._daily_loss_stop_date = None
+        assert h._should_exit(MagicMock(), 23000.0) is True
+
+    # ── H-6c/d: lookups fail loud, never guess ───────────────────
+
+    def test_lot_size_lookup_failure_raises(self):
+        h = self._hedger_with_position()
+        h.kite.instruments = MagicMock(side_effect=RuntimeError("api down"))
+        with pytest.raises(RuntimeError, match="refusing to size"):
+            h._get_lot_size()
+
+    def test_lot_size_no_rows_raises(self):
+        h = self._hedger_with_position()
+        h.kite.instruments = MagicMock(return_value=[
+            {"name": "OTHER", "instrument_type": "CE", "lot_size": 10,
+             "tradingsymbol": "X", "expiry": "2026-06-25"},
+        ])
+        with pytest.raises(RuntimeError, match="lot size"):
+            h._get_lot_size()
+
+    def test_futures_symbol_lookup_failure_raises_no_placeholder(self):
+        h = self._hedger_with_position()
+        h.kite.instruments = MagicMock(side_effect=RuntimeError("api down"))
+        with pytest.raises(RuntimeError, match="NIFTYFUT|futures symbol"):
+            h._get_futures_symbol()
+
+    # ── H-6b: close-all flatten pricing + degradation ────────────
+
+    def _hedger_with_futures(self):
+        h = self._hedger_with_position()
+        h.state.futures_hedge_delta = 150.0
+        h.state.futures_lots = 2
+        h.state.futures_entry_vwap = 23150.0
+        h._get_lot_size = lambda: 75
+        h._get_futures_symbol = lambda: "NIFTY26JUNFUT"
+        return h
+
+    def test_flatten_prices_at_entry_vwap_when_spot_fails(self):
+        h = self._hedger_with_futures()
+        h._get_spot_price = lambda: None
+        props = h._generate_close_all_proposals()
+        fut = [p for p in props if p.option_type == "FUT"]
+        assert len(fut) == 1
+        assert fut[0].price == 23150.0      # entry VWAP, never 0.0
+        assert fut[0].transaction_type == "SELL"
+
+    def test_flatten_degrades_to_options_only_on_lookup_failure(self):
+        # H-6c/d raising must not abort the safety close of the option
+        # legs — degrade, don't fail the whole flatten.
+        h = self._hedger_with_futures()
+        h._get_lot_size = MagicMock(side_effect=RuntimeError("no instruments"))
+        props = h._generate_close_all_proposals()
+        assert len(props) == 1
+        assert props[0].option_type == "PE"   # option close survived
