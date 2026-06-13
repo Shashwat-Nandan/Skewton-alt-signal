@@ -241,6 +241,33 @@ class TestRuns:
             assert r.status_code == 200
             assert r.json()["status"] in ("STOPPING", "STOPPED")
 
+    def test_create_run_builds_strategy_off_event_loop(self, client):
+        # Audit 2026-06-10 task 2.7 (M-9): pair __init__ seeds spread
+        # history from bhavcopy and fetches the NFO dump — minutes, not
+        # ms. If construction runs on the event loop, every dashboard
+        # request freezes for the duration. Pin that RunManager routes it
+        # through asyncio.to_thread.
+        import asyncio as _asyncio
+
+        fake_strategy = MagicMock()
+        fake_strategy.scan_and_propose.return_value = []
+        fake_strategy.check_and_rehedge.return_value = []
+        fake_strategy.generate_eod_report.return_value = {"strategy": "fake"}
+
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=MagicMock()), \
+             patch("backend.run_manager.get_strategy",
+                   return_value=lambda **kw: fake_strategy), \
+             patch("backend.run_manager.asyncio.to_thread",
+                   side_effect=_asyncio.to_thread) as to_thread:
+            r = client.post("/api/runs", json={
+                "strategy": "pair_trading", "mode": "paper", "params": {},
+            })
+            assert r.status_code == 201
+            assert to_thread.called, (
+                "strategy construction must go through asyncio.to_thread"
+            )
+            client.post(f"/api/runs/{r.json()['id']}/stop")
+
     def test_get_run_not_found(self, client):
         r = client.get("/api/runs/does-not-exist")
         assert r.status_code == 404

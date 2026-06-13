@@ -95,9 +95,13 @@ class RunManager:
 
     # ── Lifecycle ──
 
-    def create_run(
+    def _build_strategy(
         self, strategy_name: str, mode: str, params: Dict[str, Any], kite,
-    ) -> Run:
+    ) -> BaseStrategy:
+        # Sync and potentially SLOW: pair strategies seed spread history
+        # from the bhavcopy archive and fetch the NFO instruments dump in
+        # __init__ — minutes, not milliseconds. Must run off the event
+        # loop (audit 2026-06-10 task 2.7 / M-9).
         strategy_cls = get_strategy(strategy_name)
         kwargs = {k: v for k, v in params.items()
                   if k in ("symbol_a", "symbol_b", "hedge_ratio")}
@@ -113,6 +117,17 @@ class RunManager:
         )
         if max_leg is not None and hasattr(strategy, "max_leg_notional"):
             strategy.max_leg_notional = float(max_leg)
+        return strategy
+
+    async def create_run(
+        self, strategy_name: str, mode: str, params: Dict[str, Any], kite,
+    ) -> Run:
+        # Construction happens in a worker thread so a slow __init__ can't
+        # freeze every other dashboard request; task creation stays on the
+        # loop thread (asyncio.create_task requires it).
+        strategy = await asyncio.to_thread(
+            self._build_strategy, strategy_name, mode, params, kite,
+        )
 
         run = Run(
             id=str(uuid.uuid4()),
