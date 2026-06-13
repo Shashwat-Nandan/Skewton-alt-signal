@@ -10,3 +10,4 @@
 
 pytest
 httpx                   # required by fastapi.testclient.TestClient
+ruff==0.15.17

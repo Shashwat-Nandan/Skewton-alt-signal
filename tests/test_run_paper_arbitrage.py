@@ -43,7 +43,6 @@ class TestFilenameNamespacing:
         assert arb.HALT_NEW_ENTRIES_PATH == pairs.HALT_NEW_ENTRIES_PATH
 
     def test_eod_sidecar_naming(self, tmp_path, monkeypatch):
-        from datetime import datetime
 
         class _Strat:
             name = "arbitrage"

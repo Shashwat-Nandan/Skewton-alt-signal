@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta
 from typing import List
 
 import pytest

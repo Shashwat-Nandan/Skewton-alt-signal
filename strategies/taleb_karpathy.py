@@ -1246,7 +1246,6 @@ class TalebKarpathyStrategy(BaseStrategy):
         cash settlement — fail loud and let the runner exit non-zero so
         notify-failure@ alerts the operator to manually flatten.
         """
-        today_iso = today.isoformat()
         for p in self.state.positions:
             if not p.expiry:
                 continue
@@ -1777,15 +1776,13 @@ class TalebKarpathyStrategy(BaseStrategy):
                 logger.info("Max holding period exceeded.")
                 return True
 
-        # Gate: gap exit — if spot moved > threshold since entry
+        # Gate: gap exit — if spot moved > threshold since entry.
+        # (A per-strike pct-move check was stubbed here for years and never
+        # implemented — strike-based gap is approximate; real gap needs prev
+        # close. The unrealized-loss proxy below is the actual gate.)
         if self.state.positions and self.state.entry_time:
             gap_threshold = self.immutable_params["gap_exit_threshold_pct"]
-            for pos in self.state.positions:
-                if pos.entry_price > 0:
-                    pct_move = abs(spot - pos.strike) / pos.strike * 100
-                    # Check if underlying has gapped beyond threshold
-                    pass  # Strike-based gap is approximate; real gap needs prev close
-            # Simpler: check if unrealized loss exceeds gap threshold of capital
+            # Check if unrealized loss exceeds gap threshold of capital
             if self.state.unrealized_pnl < -(capital * gap_threshold / 100):
                 logger.warning("Gap exit triggered: unrealized P/L ₹%.0f exceeds gap threshold", self.state.unrealized_pnl)
                 self._record_loss()

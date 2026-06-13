@@ -14,7 +14,7 @@ import json
 import logging
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel

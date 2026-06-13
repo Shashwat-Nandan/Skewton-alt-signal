@@ -5,7 +5,6 @@ import json
 import os
 import sys
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest

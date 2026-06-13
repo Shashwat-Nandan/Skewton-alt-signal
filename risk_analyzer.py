@@ -14,14 +14,13 @@ Implements the advanced risk analysis tools from Dynamic Hedging:
 """
 
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 
 import numpy as np
-import pandas as pd
 
 from greeks_engine import (
-    GreeksEngine, OptionContract, PortfolioGreeks, time_to_expiry,
+    GreeksEngine, OptionContract, PortfolioGreeks,
 )
 
 logger = logging.getLogger(__name__)
@@ -165,7 +164,6 @@ class RiskAnalyzer:
         rehedge_count = 0
         max_pnl = 0.0
         min_pnl = 0.0
-        days = len(daily_returns)
         hedge_delta = 0.0  # Delta of our futures hedge
 
         for day_idx, ret in enumerate(daily_returns):

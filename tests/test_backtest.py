@@ -4,7 +4,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from pathlib import Path
 import backtest
 from backtest import (
     generate_synthetic_data, MockKite, run_backtest,
@@ -283,7 +282,6 @@ class TestLoadIVSkewSeed:
         """drop_recent must trim the TAIL (most-recent) of each series — the
         coarse guard against a replay ranking against its own/future IV."""
         import json
-        from pathlib import Path
         d = tmp_path / "data_cache"
         d.mkdir()
         (d / "iv_history_NIFTY.json").write_text(json.dumps({

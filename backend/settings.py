@@ -1,7 +1,6 @@
 """Backend configuration via env vars (with sensible defaults)."""
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
 

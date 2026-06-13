@@ -17,7 +17,6 @@ If no data file is provided, generates synthetic data for a smoke test.
 import argparse
 import logging
 import math
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -25,10 +24,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from greeks_engine import GreeksEngine, OptionContract, implied_volatility_bisect
+from greeks_engine import GreeksEngine
 from strategies.taleb_karpathy import (
-    TalebKarpathyStrategy, HedgeState, _INDEX_SPOT_SYMBOLS,
-    estimate_transaction_cost,
+    TalebKarpathyStrategy, _INDEX_SPOT_SYMBOLS,
 )
 
 logger = logging.getLogger(__name__)

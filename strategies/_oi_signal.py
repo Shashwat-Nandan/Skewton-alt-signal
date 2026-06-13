@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List
 
 import pandas as pd
 

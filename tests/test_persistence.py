@@ -1,11 +1,9 @@
 """Tests for the SQLite persistence layer (backend/db.py) and restart hydration."""
 from __future__ import annotations
 
-import json
 import os
 import sys
 from datetime import datetime
-from unittest.mock import MagicMock
 
 import pytest
 

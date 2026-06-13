@@ -43,7 +43,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional
 
 from trade_proposer import TradeProposal
 

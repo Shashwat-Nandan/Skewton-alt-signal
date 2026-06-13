@@ -35,11 +35,9 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -558,11 +556,9 @@ def main() -> int:
     # Fill yesterday's queued entry signals at TODAY'S OPEN (from bhavcopy
     # panel). Close-scan only — open-scan doesn't have today's official
     # bhavcopy yet, so pending fills wait until evening.
-    n_filled_today = 0
     if args.scan == "close" and args.mode == "paper":
         f_filled, f_skip_gap, f_skip_stale, f_skip_open = _fill_pending_entries(
             strategy, today, args.scan, log)
-        n_filled_today = f_filled
         if f_filled or f_skip_gap or f_skip_stale or f_skip_open:
             log.info("Pending entries: %d filled, %d skipped (gap), "
                      "%d skipped (stale), %d skipped (already-open)",

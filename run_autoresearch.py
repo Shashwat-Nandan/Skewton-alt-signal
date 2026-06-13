@@ -12,7 +12,6 @@ Usage:
   python run_autoresearch.py --metric net_pnl --data historical.csv
 """
 import argparse
-import copy
 import json
 import logging
 import sys
@@ -296,7 +295,7 @@ def main():
     print(f"  Baseline:       {loop.baseline_metric:.6f}" if loop.baseline_metric != -999999.0
           else f"  Baseline:       {loop.baseline_metric}")
     print(f"  Best:           {loop.best_metric_value:.6f}")
-    print(f"\n  Best parameters:")
+    print("\n  Best parameters:")
     for k, v in sorted(loop.best_params.items()):
         if k in loop.TUNABLE_RANGES:
             print(f"    {k:<30s} = {v}")
@@ -304,7 +303,7 @@ def main():
 
     # Save best params
     loop._save_best_params()
-    print(f"  Best params:    best_params.json")
+    print("  Best params:    best_params.json")
     print("=" * 60)
 
     # Validation run on truly unseen data. seed_iv/skew default to None (IV

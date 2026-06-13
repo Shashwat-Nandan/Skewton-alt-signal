@@ -244,12 +244,12 @@ print(f"\nPeak |net delta| over replay window: {abs(peak[3]):.1f} shares "
       f"with fut={peak[1]}")
 print(f"  → max round(delta/lot) = {round(peak[3]/LOT)} (sub-half-lot drift never crosses 1)")
 
-print(f"\n=== Hedge timeline (replayed against actual fut stream) ===")
+print("\n=== Hedge timeline (replayed against actual fut stream) ===")
 for ts, side, qty, p, lots_after, cum in hedge_events:
     print(f"  {ts.strftime('%H:%M:%S')}  {side:>14}  {qty}L @ {p:>9.2f}  "
           f"book→{lots_after:+d}L  cum_realized=₹{cum:>+9,.0f}")
 
-print(f"\n=== P&L breakdown ===")
+print("\n=== P&L breakdown ===")
 print(f"  Entry  09:15:05:  CE {CE_ENTRY:.2f} + PE {PE_ENTRY:.2f}  cost ₹{ENTRY_QTY*LOT*(CE_ENTRY+PE_ENTRY):,.0f}")
 print(f"  Close  15:14:00:  CE {ce_close:.2f} + PE {pe_close:.2f}")
 print()
@@ -257,9 +257,9 @@ print(f"  Options gross               = ₹{opt_gross:>+10,.0f}")
 print(f"  Options round-trip costs    = ₹{-opt_costs:>+10,.0f}")
 print(f"  Hedge realized              = ₹{realized_fut_pnl:>+10,.0f}")
 print(f"  Hedge costs                 = ₹{-hedge_costs:>+10,.0f}")
-print(f"  ────────────────────────────────────────────")
+print("  ────────────────────────────────────────────")
 total = opt_gross - opt_costs + realized_fut_pnl - hedge_costs
 print(f"  TOTAL day P&L (replay)      = ₹{total:>+10,.0f}")
 print()
 print(f"  (Hedge replay covers 09:15→{end_intraday.strftime('%H:%M')}; ")
-print(f"   10:42→15:14 is held with no further hedging.)")
+print("   10:42→15:14 is held with no further hedging.)")

@@ -34,7 +34,6 @@ from ``_eq_data.load_equity_panel()`` once per scan.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
@@ -44,7 +43,7 @@ import pandas as pd
 from trade_proposer import TradeProposal
 
 from . import _indicators as ind
-from ._eq_data import load_equity_panel, load_universe
+from ._eq_data import load_equity_panel
 from ._fii_dii import build_fii_signal
 from ._market_profile_eq import panel_value_area
 from ._oi_signal import build_oi_panel

@@ -214,7 +214,7 @@ class TestPairPaperCompare:
         _write_eod(cache, EXPECTED_DAYS[-1], "baseline", [
             _pair_report("RELIANCE", "TCS", realized=500.0),
         ])
-        r = client.get(f"/api/pair-paper-compare?days=5&end=2026-05-17")
+        r = client.get("/api/pair-paper-compare?days=5&end=2026-05-17")
         assert r.status_code == 200
         body = r.json()
         dates = [row["date"] for row in body["daily"]]
@@ -248,17 +248,17 @@ class TestPairPaperCompare:
         assert "end" in r.json()["detail"].lower()
 
     def test_single_system_param_returns_400(self, client):
-        r = client.get(f"/api/pair-paper-compare?days=3&systems=baseline")
+        r = client.get("/api/pair-paper-compare?days=3&systems=baseline")
         assert r.status_code == 400
         assert "at least 2" in r.json()["detail"]
 
     def test_days_above_max_returns_422(self, client):
         # FastAPI Query(ge=1, le=30) enforces the bound — 31 should 422.
-        r = client.get(f"/api/pair-paper-compare?days=31")
+        r = client.get("/api/pair-paper-compare?days=31")
         assert r.status_code == 422
 
     def test_days_below_min_returns_422(self, client):
-        r = client.get(f"/api/pair-paper-compare?days=0")
+        r = client.get("/api/pair-paper-compare?days=0")
         assert r.status_code == 422
 
     def test_unknown_system_returns_empty_data_not_error(self, client):

@@ -16,17 +16,14 @@ Requirements:
 """
 
 import argparse
-import json
 import logging
-import math
 import os
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -355,10 +352,6 @@ def fetch_option_chain_data(
                     "volume": row.get("volume", 0),
                 })
 
-    # Also fetch futures (nearest expiry FUT)
-    futs = instruments_df[instruments_df["instrument_type"] == "FUT"].sort_values("expiry")
-    fut_row = futs.iloc[0] if not futs.empty else None
-
     logger.info("Fetched candles for %d instruments across %d windows",
                 len(fetched_tokens), len(windows))
 
@@ -554,15 +547,15 @@ def main():
     logger.info("Saved %d rows to %s", len(data), output_path)
 
     # Summary
-    print(f"\nData fetched successfully:")
+    print("\nData fetched successfully:")
     print(f"  Rows:       {len(data):,}")
     print(f"  Timestamps: {data['timestamp'].nunique():,}")
     print(f"  Symbols:    {data['symbol'].nunique()}")
     print(f"  Date range: {data['timestamp'].min()} — {data['timestamp'].max()}")
     print(f"  Output:     {output_path}")
-    print(f"\nTo run backtest:")
+    print("\nTo run backtest:")
     print(f"  python backtest.py --data {output_path} --underlying {args.underlying}")
-    print(f"\nTo run autoresearch:")
+    print("\nTo run autoresearch:")
     print(f"  python run_autoresearch.py --data {output_path}")
 
 

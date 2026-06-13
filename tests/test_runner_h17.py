@@ -9,7 +9,6 @@ data_cache/pair_paper_state_*.json.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -134,7 +133,9 @@ def test_quality_max_pvalue_typo_tripwire_rejects(bad):
     """--quality-max-pvalue outside (0, 0.05] must fail at parse-time (exit 2)
     with a clear message, rather than silently trade on a wrong selection gate.
     parser.error fires before any env/network work, so this is hermetic."""
-    import subprocess, sys, os
+    import subprocess
+    import sys
+    import os
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     r = subprocess.run(
         [sys.executable, "run_paper_pairs.py", "--system", "persistent",

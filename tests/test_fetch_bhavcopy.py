@@ -17,11 +17,9 @@ screener sees today's STF closes anyway. These tests pin the contract:
 from __future__ import annotations
 
 import io
-import json
 import os
 import sys
 from datetime import datetime
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd

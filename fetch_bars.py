@@ -31,7 +31,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 

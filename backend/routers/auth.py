@@ -73,7 +73,7 @@ def callback(
     if status == "error" or not request_token:
         raise HTTPException(status_code=400, detail="Kite login was cancelled or failed")
     try:
-        session = kite_oauth.exchange_request_token(request_token)
+        kite_oauth.exchange_request_token(request_token)
     except Exception:
         # KiteConnect TokenException messages can contain URL fragments
         # and API-key prefixes — log full details server-side, return a

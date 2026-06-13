@@ -21,18 +21,20 @@ References:
   - program.md pattern: human writes intent, agent executes experiments
 """
 
-import os
 import copy
 import json
 import time
 import random
 import logging
 import configparser
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -622,8 +624,8 @@ class HedgeResearchLoop:
 
         # Top: metric over experiments
         ax1 = axes[0]
-        accepted = df[df["accepted"] == True]
-        rejected = df[df["accepted"] == False]
+        accepted = df[df["accepted"]]
+        rejected = df[~df["accepted"]]
 
         ax1.scatter(rejected["experiment_id"], rejected[metric_col],
                     c="red", alpha=0.4, s=20, label="Discarded")

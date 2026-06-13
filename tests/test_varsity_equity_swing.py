@@ -22,7 +22,6 @@ from strategies import _indicators as ind
 from strategies._market_profile_eq import (
     _value_area,
     rolling_value_area,
-    panel_value_area,
 )
 from strategies._oi_signal import classify_oi
 from strategies.varsity_equity_swing import (

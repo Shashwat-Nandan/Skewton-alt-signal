@@ -1,0 +1,18 @@
+# Audit 2026-06-10 task 2.4: lint gate, enforced in CI.
+#
+# Rule set = ruff defaults (pyflakes F + pycodestyle errors E4/E7/E9) minus
+# rules the codebase violates as deliberate house style:
+#   E701/E702  one-line `if x: return` guards and `a; b` statement pairs
+#              are used throughout runners/strategies
+#   E741       short ambiguous names (`l` for legs) are the existing
+#              convention in pair/arbitrage leg loops
+#   E402       runners/scripts/tests bootstrap sys.path / load_dotenv
+#              before imports — load-bearing order, not an accident
+#
+# ruff-format is deliberately NOT enforced: it would rewrite most of the
+# codebase, which contradicts "minimal rule set matching current style"
+# (audit task 2.4) and CLAUDE.md Rule 11 (conformance > taste).
+target-version = "py311"
+
+[lint]
+ignore = ["E701", "E702", "E741", "E402"]

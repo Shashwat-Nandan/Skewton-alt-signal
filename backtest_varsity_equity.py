@@ -46,7 +46,6 @@ import logging
 import math
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -406,7 +405,7 @@ def main():
     summary = bt.run()
 
     print("=" * 78)
-    print(f"Varsity Equity Swing — Backtest Summary")
+    print("Varsity Equity Swing — Backtest Summary")
     print("=" * 78)
     print(f"  Universe          : {len(universe)} symbols")
     print(f"  Date range        : {panel['date'].min().date()} → {panel['date'].max().date()}")
@@ -422,7 +421,7 @@ def main():
     print("-" * 78)
     if summary["total_trades"] == 0:
         print(f"  No trades fired. Score sentinel: {summary['score']}")
-        print(f"  Likely cause: warm-up too long for the available history")
+        print("  Likely cause: warm-up too long for the available history")
         print(f"  (need {bt.strategy.params['trend_long_window']:.0f}+ bars before SMA-long evaluates).")
         return 1
     print(f"  Total trades      : {summary['total_trades']}")

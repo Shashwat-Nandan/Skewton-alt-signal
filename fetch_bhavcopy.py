@@ -443,7 +443,7 @@ def main():
     print(f"  Symbols:  {data['symbol'].nunique()}")
     print(f"  Expiries: {data['expiry'].nunique()}")
     print(f"  Range:    {data['timestamp'].min()} — {data['timestamp'].max()}")
-    print(f"\nTo run backtest:")
+    print("\nTo run backtest:")
     print(f"  python backtest.py --data {output_path} --underlying {args.underlying}")
 
 

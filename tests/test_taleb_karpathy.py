@@ -244,7 +244,6 @@ class TestResetAndMetrics:
 
     def test_get_strategy_metrics_daily_aggregation(self):
         """P2: Sharpe/Sortino should be based on daily returns, not tick-level."""
-        from datetime import date
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         hedger.state = HedgeState()
         # Simulate 5 daily returns already flushed
@@ -1257,7 +1256,7 @@ class TestPerTradeAttribution:
         )
 
     def test_emits_one_attribution_per_cycle(self, mock_hedger):
-        from datetime import datetime, timedelta
+        from datetime import datetime
         # Open
         mock_hedger.execute_proposals([self._open(qty=2, price=300)])
         assert mock_hedger.state._attribution_baseline is not None
@@ -1370,7 +1369,6 @@ class TestRealizedVolEstimator:
 
     def test_window_filter_drops_old_samples(self):
         from datetime import datetime, timedelta
-        import numpy as np
         h = self._make_hedger()
         h._clock = lambda: datetime(2026, 4, 19, 15, 30)
         old_t = datetime(2026, 4, 1)  # ~18 days old
@@ -2392,7 +2390,6 @@ class TestGammaThetaRatio:
     autoresearch primary metric — guard against silent regression."""
 
     def _make_hedger(self):
-        from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
         h.state = HedgeState()
         h.immutable_params = {"total_capital": 500000}

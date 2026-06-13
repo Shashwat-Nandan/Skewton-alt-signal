@@ -3,7 +3,6 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import pytest
 from regime_classifier import (
     RegimeFeatures, Structure, Thresholds, classify,
 )
@@ -55,12 +54,8 @@ class TestRegimeClassifier:
         assert classify(f) == Structure.CALENDAR_SHORT_FRONT
 
     def test_unmatched_regime_returns_no_trade(self):
-        """High IV + low RV/IV + low skew + low vvol fits no regime."""
-        f = RegimeFeatures(
-            iv_percentile=85.0, rv_iv_ratio=0.6, skew_percentile=85.0,
-        )
-        # Skew above risk-reversal threshold, so this DOES match. Try a
-        # genuinely unmatched: high IV but low skew, low RV, low vvol.
+        """iv_pct between straddle-max and calendar-min, low skew, low
+        RV/IV, low vvol — fits no regime."""
         f2 = RegimeFeatures(
             iv_percentile=65.0, rv_iv_ratio=0.7, skew_percentile=65.0,
             vol_of_vol=0.05,

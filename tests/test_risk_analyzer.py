@@ -32,13 +32,13 @@ class TestMonteCarlo:
         assert 0 <= report.pct_profitable <= 100
 
     def test_more_paths_reduces_variance(self, analyzer, long_straddle):
-        r1 = analyzer.path_dependence_monte_carlo(
+        # Smoke at two path counts — should produce results, not crash.
+        analyzer.path_dependence_monte_carlo(
             long_straddle, 22000, 30 / 365, n_paths=5, trading_days=5,
         )
         r2 = analyzer.path_dependence_monte_carlo(
             long_straddle, 22000, 30 / 365, n_paths=50, trading_days=5,
         )
-        # More paths should generally produce results (not crash)
         assert r2.n_paths == 50
 
     def test_seed_makes_run_deterministic(self, analyzer, long_straddle):

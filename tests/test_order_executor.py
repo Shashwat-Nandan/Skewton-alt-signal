@@ -15,7 +15,6 @@ that protect real money:
   least as aggressive as the pad — a price rounded the wrong way could
   rest in the book unfilled, which is exactly the 2026-05-21 incident.
 """
-import pytest
 
 from strategies.order_executor import (
     KiteOrderExecutor,

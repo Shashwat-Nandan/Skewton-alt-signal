@@ -7,7 +7,6 @@ without regressions.
 """
 from __future__ import annotations
 
-import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -476,8 +475,6 @@ class TestIndexPanelIngestion:
         from backtest_arbitrage import load_stf_panel
         panel = load_stf_panel(instrument_types=("IDF",))
         assert not panel.empty
-        # Index-future tickers we expect to find.
-        expected = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
         present = set(panel["symbol"].unique())
         # At least the two flagship indices must be there.
         assert "NIFTY" in present

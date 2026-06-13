@@ -36,13 +36,13 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional, Tuple
 
 from trade_proposer import TradeProposal
 
-from .arbitrage import ArbitrageStrategy, CalendarPosition, CalendarTrade
+from .arbitrage import ArbitrageStrategy, CalendarPosition
 from .base import ExecutionMode
 
 logger = logging.getLogger(__name__)

@@ -25,6 +25,11 @@ jobs:
           .venv-ci/bin/python -m pip install --require-hashes \
             -r requirements.lock -r requirements-dev.lock
 
+      # Audit task 2.4: lint gate. Rule set + deliberate ignores live in
+      # ruff.toml (format check intentionally absent — see comment there).
+      - name: ruff
+        run: .venv-ci/bin/python -m ruff check .
+
       # run_backtest and several suites read config.ini (gitignored — the
       # operator's copy holds credentials). The checked-in template has the
       # same sections minus secrets; tests need only the [strategy] shape.

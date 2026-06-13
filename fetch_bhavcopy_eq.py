@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import io
 import logging
-import sys
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone

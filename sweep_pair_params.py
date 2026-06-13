@@ -126,7 +126,7 @@ def main() -> int:
         seed_panel = None
         mode_label = "IN-SAMPLE (lookahead bias — use --train-fraction for honest results)"
 
-    print(f"\nPair-trading risk-knob sweep")
+    print("\nPair-trading risk-knob sweep")
     print(f"  mode: {mode_label}")
     print(f"  top={args.top}, lookback={args.lookback_days}d, max-hold={args.max_holding_days}d, "
           f"entry={args.entry_z} exit={args.exit_z} stop={args.stop_z}, "

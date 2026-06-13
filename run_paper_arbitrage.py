@@ -42,7 +42,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 

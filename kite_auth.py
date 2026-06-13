@@ -13,9 +13,7 @@ Dependencies: kiteconnect, pyotp, requests
 
 import os
 import json
-import time
 import logging
-import hashlib
 import configparser
 from datetime import datetime, timedelta
 from pathlib import Path
