@@ -21,7 +21,9 @@ deliberately stay in run_paper_pairs.py.
 """
 from __future__ import annotations
 
+import fcntl
 import logging
+import os
 import signal
 import time
 from datetime import date, datetime, timedelta
@@ -55,6 +57,38 @@ SILENT_FAIL_THRESHOLD = 3
 
 HOLIDAY_HORIZON_DAYS = 30
 HOLIDAYS_PER_YEAR_FLOOR = 8
+
+
+def acquire_lock(lock_path: Path, log: logging.Logger,
+                 *, label: str = "runner") -> int:
+    """Single-instance flock. Refuse to start if another process already
+    holds `lock_path` — two processes sharing a state file would clobber
+    each other's writes (last-write-wins silently drops mutations).
+
+    Opens the lock file and takes fcntl.flock(LOCK_EX | LOCK_NB). Returns
+    the open FD — the caller MUST keep the reference alive for the process
+    lifetime so the OS holds the lock until the process exits (the kernel
+    releases on close, which includes crash / SIGKILL).
+
+    Raises RuntimeError if the lock is already held (BlockingIOError from
+    the non-blocking flock). `label` names the runner in that error.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RuntimeError(
+            f"Another {label} is already holding the lock "
+            f"(lock file: {lock_path}). Refusing to start a second "
+            f"instance — concurrent writes to the state file would "
+            f"silently lose mutations. If the previous process died "
+            f"abnormally, `rm {lock_path}` after confirming none is "
+            f"actually running."
+        )
+    log.info("Runner lock acquired: %s (pid %d)", lock_path, os.getpid())
+    return fd
 
 
 def load_holidays(path: Path) -> set[date]:

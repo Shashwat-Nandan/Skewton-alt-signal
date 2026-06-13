@@ -33,7 +33,6 @@ Assumes the process sees wall-clock IST (systemd sets TZ=Asia/Kolkata).
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import logging
 import os
@@ -61,6 +60,7 @@ from runner_common import (
     SILENT_FAIL_THRESHOLD,
     TICK_SECONDS,
     HeartbeatTracker,
+    acquire_lock,
     assert_disk_space_ok,
     assert_holiday_data_fresh,
     assert_timezone_ist,
@@ -113,30 +113,14 @@ def state_file_path(system: str) -> Path:
 
 
 def acquire_runner_lock(system: str, log: logging.Logger) -> int:
-    """Refuse to start if another arbitrage runner already holds the lock for
-    this --system tag. Two processes sharing a state file would clobber each
-    other's writes. Returns the open FD — the caller must keep the reference
-    alive so the OS holds the lock until the process exits.
-
-    Note: the lock file name is arbitrage-specific so it does NOT collide with
-    the pair runner's lock (sharing it would make the two runners block each
-    other for no reason)."""
-    DATA_CACHE.mkdir(parents=True, exist_ok=True)
-    path = DATA_CACHE / LOCK_FILE_TEMPLATE.format(system=system)
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        raise RuntimeError(
-            f"Another arbitrage-paper runner is already holding the lock for "
-            f"--system={system} (lock file: {path}). Refusing to start a "
-            f"second runner — concurrent writes to the state file would "
-            f"silently lose mutations. If the previous runner died abnormally, "
-            f"`rm {path}` after confirming no process is actually running."
-        )
-    log.info("Runner lock acquired: %s (pid %d)", path, os.getpid())
-    return fd
+    """Refuse to start if another arbitrage runner already holds the lock
+    for this --system tag. Thin wrapper over runner_common's generic
+    acquire_lock (audit 2.1); the lock file name is arbitrage-specific so
+    it does NOT collide with the pair runner's lock."""
+    return acquire_lock(
+        DATA_CACHE / LOCK_FILE_TEMPLATE.format(system=system), log,
+        label=f"arbitrage-paper runner (--system={system})",
+    )
 
 
 def load_prior_state(system: str, log: logging.Logger) -> Optional[Dict]:
