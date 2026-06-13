@@ -658,6 +658,8 @@ def main():
         log.warning(
             "disable_calendar=true — running as a basis-monitoring service "
             "only; NO calendar spreads will be traded this session.")
+    # After all CLI overrides — drift ground truth (audit 2.3).
+    strategy.log_effective_params()
 
     # Restore prior-session open spreads. restore_strategy → restore_state
     # captures the session baseline internally; call it explicitly too so the

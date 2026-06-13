@@ -324,6 +324,7 @@ def main():
     log.info("Mode: PAPER  underlying=%s  capital=%.0f",
              hedger.underlying, hedger.immutable_params["total_capital"])
     log.info("Tunable params: %s", hedger.tunable_params)
+    hedger.log_effective_params()
 
     # Restore any open position from yesterday's session before the tick loop.
     restore_state_if_any(hedger, log)

@@ -1,3 +1,34 @@
+# Audit execution session 3 (2026-06-13) — Milestone 2
+
+Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
+- [x] 2.4 ruff in CI (47b6ce4) — ruff.toml (defaults − E701/E702/E741/E402),
+      ruff==0.15.17 pinned; 184 violations cleared, 742/742.
+- [x] 2.7 RunManager hygiene (9feff26) — create_run async, _build_strategy
+      via asyncio.to_thread; router awaits; to_thread-routing test pins it.
+- [x] 2.3 config observability + safe regen. EFFECTIVE_PARAMS one-line JSON
+      dump (BaseStrategy.log_effective_params) wired into all 4 runners +
+      RunManager after every CLI/param override (drift ground truth).
+      run_autoresearch --out + _save_best_params(out_file=) atomic temp+
+      rename; weekly script writes the dated candidate DIRECTLY (no
+      cp/mv/restore dance → SIGKILL-safe by construction, no canonical
+      write). Retention rule documented in the weekly-script header (keep
+      newest 8 candidates, prune older by date; best_params.json tracked &
+      never auto-written; preautoresearch* deprecated). Removed 4 untracked
+      preautoresearch orphans from root. Tests: tests/test_observability.py
+      (7). Open: best_params.pre-resweep-2026-05-07.json is still TRACKED
+      clutter — left in place (deleting a tracked file is the operator's
+      call); flag if you want it untracked.
+- [ ] 2.5 parameter-generator tests (L) — autoresearch _mutate_one/fitness/
+      accept-reject/save round-trip; screen_pairs β/half-life on synthetic
+      cointegrated series; real-constructor PairTradingStrategy test via
+      config_template.ini
+- [ ] 2.1 shared runner scaffolding (L) — runner_common.py, one runner per
+      commit; run_paper.py + run_equity_swing.py gain missing protections
+- [ ] 2.6 User=taleb units (M) — paper units first, full green session
+      before flipping the live unit; data_cache 0750
+- [ ] 2.2 pair executor migration onto strategies/order_executor.py (XL) —
+      break down separately; paper soak before the live swap
+
 # Audit execution session 2 (2026-06-12) — 1.2 step 2: live-executor port
 
 Morning verification of 1.1/1.7 done: both runners logged "Preloaded spread

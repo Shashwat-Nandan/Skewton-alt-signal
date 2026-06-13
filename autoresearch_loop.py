@@ -548,17 +548,23 @@ class HedgeResearchLoop:
                 f"{params.get('entry_iv_percentile_max', 0):.0f}\n"
             )
 
-    def _save_best_params(self):
+    def _save_best_params(self, out_file: str = "best_params.json"):
         """Save best parameters to a JSON file for easy loading.
 
         Preserves out-of-schema fields (e.g. `_migrations` semantic-shift
-        history) from the previous file so they survive each autoresearch
-        run instead of being clobbered.
+        history) from the canonical best_params.json so they survive each
+        autoresearch run instead of being clobbered.
+
+        Writes via a temp file + atomic rename (audit 2026-06-10 task 2.3):
+        a `kill -9` mid-write can never leave `out_file` half-written. The
+        weekly regen passes a dated candidate path here so it never touches
+        the canonical file at all.
         """
-        best_file = "best_params.json"
+        # Preservation always reads the canonical file — that's where the
+        # _migrations history lives, regardless of where we're writing.
         preserved = {}
         try:
-            with open(best_file) as f:
+            with open("best_params.json") as f:
                 existing = json.load(f)
             for k, v in existing.items():
                 if k not in ("best_params", "best_metric",
@@ -573,9 +579,14 @@ class HedgeResearchLoop:
             "timestamp": datetime.now().isoformat(),
             **preserved,
         }
-        with open(best_file, "w") as f:
+        # Atomic: write a sibling temp then rename. Path.replace is an
+        # atomic os.replace on the same filesystem.
+        out_path = Path(out_file)
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        with open(tmp_path, "w") as f:
             json.dump(output, f, indent=2)
-        logger.info("Best parameters saved to %s", best_file)
+        tmp_path.replace(out_path)
+        logger.info("Best parameters saved to %s", out_file)
 
     def _setup_logging(self):
         """Configure file logging for the autoresearch loop."""

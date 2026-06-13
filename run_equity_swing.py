@@ -502,6 +502,7 @@ def main() -> int:
              strategy.params["risk_reward"],
              int(strategy.params["mp_enabled"]), int(strategy.params["oi_enabled"]),
              int(strategy.params["fii_enabled"]))
+    strategy.log_effective_params()
 
     # Anchor the scan at today (close) or the most recent prior trading day
     # (open). Then verify the panel actually contains that date — otherwise

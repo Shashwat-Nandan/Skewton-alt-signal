@@ -104,6 +104,11 @@ def main():
                         help="Window size in days for historical data cross-validation (default: 5)")
     parser.add_argument("--validation-data", type=str, default=None,
                         help="Path to separate validation CSV (overrides hold-out split)")
+    parser.add_argument("--out", type=str, default="best_params.json",
+                        help="Where to write the winning params (default: "
+                             "best_params.json). The weekly regen points "
+                             "this at a dated candidate so the canonical "
+                             "file is never touched (audit 2.3).")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -302,8 +307,8 @@ def main():
     print(f"\n  Results log:    {loop.results_file}")
 
     # Save best params
-    loop._save_best_params()
-    print("  Best params:    best_params.json")
+    loop._save_best_params(out_file=args.out)
+    print(f"  Best params:    {args.out}")
     print("=" * 60)
 
     # Validation run on truly unseen data. seed_iv/skew default to None (IV

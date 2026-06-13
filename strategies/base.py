@@ -102,6 +102,33 @@ class BaseStrategy(ABC):
     def generate_eod_report(self) -> Dict:
         """Snapshot of P&L, trades, and risk metrics for the trading day."""
 
+    # ── Observability ──
+
+    def log_effective_params(self) -> None:
+        """One-line EFFECTIVE_PARAMS JSON dump for drift forensics (audit
+        2026-06-10 task 2.3 / M-3): config.ini, best_params.json, and CLI
+        overrides all funnel into instance attributes by the end of
+        __init__, so the resolved values logged here are the ground truth
+        for "what did this strategy actually run with today". Runners and
+        RunManager call this once, right after construction.
+
+        Included: public scalar attrs + flat dicts of scalars (e.g.
+        taleb's tunable_params). Skipped: private attrs, the kite client,
+        the raw config object, and anything nested — this is a params
+        snapshot, not a state dump."""
+        def _scalar(v):
+            return isinstance(v, (bool, int, float, str))
+        blob = {}
+        for k, v in vars(self).items():
+            if k.startswith("_") or k in ("kite", "config"):
+                continue
+            if _scalar(v):
+                blob[k] = v
+            elif isinstance(v, dict) and v and all(_scalar(x) for x in v.values()):
+                blob[k] = v
+        logger.info("EFFECTIVE_PARAMS %s %s", self.name,
+                    json.dumps(blob, sort_keys=True, default=str))
+
     # ── Mode helpers (used by subclasses' execute dispatch) ──
 
     @property

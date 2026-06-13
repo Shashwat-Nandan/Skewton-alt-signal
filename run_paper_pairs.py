@@ -644,6 +644,9 @@ def build_strategies(
             s.max_leg_notional, s.stop_cooldown_minutes,
             len(s._spread_history),
         )
+        # After all CLI overrides — this line, not config.ini, is the
+        # drift ground truth (audit 2.3).
+        s.log_effective_params()
         instances.append(s)
 
     if not instances:
@@ -1137,6 +1140,7 @@ def build_orphan_strategies(
             s.max_leg_notional = args.max_leg_notional
             s.stop_cooldown_minutes = args.stop_cooldown_minutes
             s.restore_state(blob)
+            s.log_effective_params()
             orphans.append(s)
             log.info(
                 "[%s] ORPHAN — held position is not in today's candidates; "

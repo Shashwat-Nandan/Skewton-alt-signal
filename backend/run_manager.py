@@ -117,6 +117,10 @@ class RunManager:
         )
         if max_leg is not None and hasattr(strategy, "max_leg_notional"):
             strategy.max_leg_notional = float(max_leg)
+        # After all overrides — drift ground truth (audit 2.3). Safe in the
+        # worker thread (logging is threadsafe); the only mutation already
+        # happened above.
+        strategy.log_effective_params()
         return strategy
 
     async def create_run(
