@@ -30,7 +30,7 @@ StartLimitBurst=5
 # M-O5: Type=simple so Restart=on-failure can engage on mid-session crashes.
 Type=simple
 # --- EDIT THESE THREE FOR YOUR VPS ---
-User=root
+User=taleb
 WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata

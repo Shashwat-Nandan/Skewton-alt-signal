@@ -46,8 +46,23 @@ Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
       run_paper.py — they make SIGTERM exit 130, which taleb-hedger.service
       (OnFailure set, NO SuccessExitStatus=130) would treat as failure and
       false-page. That needs a paired unit change → fold into 2.6 host work.
-- [ ] 2.6 User=taleb units (M) — paper units first, full green session
-      before flipping the live unit; data_cache 0750
+- [~] 2.6 User=taleb units — CODE/CANON + runbook done; HOST APPLY is
+      operator-gated (live-money). Discovered: host has NO 'taleb' user and
+      runs EVERY unit as root (data_cache + all state files root:root) — the
+      repo's User=taleb was canon the host never matched. So 2.6 is a
+      host-wide privilege migration, not a 4-unit flip.
+      DONE: (a) deferred-2.1 hardening — run_paper.py now installs the
+      SIGTERM→KeyboardInterrupt handler + a HeartbeatTracker (silent-dead-
+      trader: token-expired session no longer exits 0 after trading nothing;
+      breach → exit 1 → OnFailure); taleb-hedger.service gets
+      SuccessExitStatus=130 so clean stop/restart isn't a false page. tick()
+      now returns ok-bool (test_run_paper.py, 4 tests). (b) set User=taleb in
+      the 4 trading deploy files (canon now consistent; redeploy.sh does NOT
+      auto-install these units so no footgun). (c) full operator runbook in
+      VPS_DEPLOYMENT §6.5 (useradd → chown data_cache/logs 0750 → daemon-
+      reload → restart paper-first, validate a session, live LAST in a
+      window; rollback).
+      REMAINING (operator, host, maintenance window): run §6.5.
 - [ ] 2.2 pair executor migration onto strategies/order_executor.py (XL) —
       break down separately; paper soak before the live swap
 

@@ -333,6 +333,73 @@ sudo systemctl daemon-reload   # only if any unit file changed
 
 Avoid pulling between 09:10 and 15:30 IST. `run_paper.py` reloads `config.ini` and `holidays.csv` only at startup, so config edits take effect on the next day's fire — this is intentional, since a mid-session reload would void the day's risk accounting.
 
+### 6.5 Migrate the runners to a non-root user (least privilege — audit 2.6)
+
+**Why:** the runners place real orders and write state; running them as
+`root` means any bug or compromised dependency runs as root. The unit
+files name `User=taleb`, but a host provisioned before this was enforced
+may still run everything as root (check with
+`systemctl show -p User <unit>`; if `data_cache/` and its `*.json` are
+`root:root`, you are running as root). This is a **host migration**, not a
+code change — do it in a maintenance window, paper units first, the LIVE
+pair unit LAST.
+
+> **ORDER MATTERS.** Create the user and `chown` the data BEFORE pointing
+> any unit at `User=taleb`. A unit started as `taleb` against root-owned
+> `data_cache/` cannot write its state/lock file and will crash on
+> startup — for the live unit that is a trading outage.
+
+```bash
+# 1. Create the service account (no login, no home shell needed).
+sudo useradd --system --shell /usr/sbin/nologin taleb
+
+# 2. Hand the runtime tree to taleb. data_cache + logs are written every
+#    tick; the repo root holds .env / config.ini / .kite_session.json the
+#    runners READ. 0750 on data_cache keeps state private to the account.
+cd /opt/taleb-karpathy-kite
+sudo chown -R taleb:taleb data_cache logs
+sudo chmod 0750 data_cache
+sudo chown taleb:taleb .env config.ini .kite_session.json 2>/dev/null || true
+
+# 3. Confirm the unit files declare User=taleb (the repo canon does for
+#    every runner). If your /etc/systemd/system/ copies still say
+#    User=root, edit them now, then:
+sudo systemctl daemon-reload
+```
+
+**Restart sequence — paper first, validate, then live:**
+
+```bash
+# 3a. Paper / daily runners first (no real money at risk):
+sudo systemctl restart taleb-hedger.service          # if mid-session; else wait for tomorrow's timer
+sudo systemctl start    pair-paper.service            # baseline pair paper
+# After each, confirm it runs as taleb and can write state:
+systemctl show -p User pair-paper.service             # → User=taleb
+ls -l data_cache/pair_paper_state_baseline.json       # → owner taleb, fresh mtime
+
+# 3b. Run a FULL paper session green (one trading day) before touching the
+#     live unit. Check the EOD sidecar wrote and no permission errors in
+#     the journal:
+journalctl -u pair-paper.service --since today | grep -iE "perm|denied|read-only"
+
+# 3c. LIVE pair unit LAST, only inside a maintenance window (it interrupts
+#     a live session on restart). Have rollback ready (step 4).
+sudo systemctl restart pair-paper-persistent-live.service
+systemctl show -p User pair-paper-persistent-live.service   # → User=taleb
+# Then reconcile against the broker before the next tick (the runner does
+# this on startup; confirm the "reconcile" lines in the journal are clean).
+```
+
+**Rollback** (if a unit can't start as taleb): set that unit back to
+`User=root`, `sudo chown -R root:root data_cache logs`, `daemon-reload`,
+restart. The live unit's startup broker-reconciliation means a brief
+root↔taleb flip does not lose positions, but do it between ticks.
+
+The dashboard backend (`dashboard-backend.service`) and the fetch/verify
+timers already run as `taleb`; only the four trading runners
+(`pair-paper`, `pair-paper-persistent`, `pair-paper-persistent-live`,
+`arbitrage-paper`) and any root-owned helpers need this pass.
+
 ---
 
 ## 7. Going live: paper → real money

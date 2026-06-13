@@ -18,7 +18,7 @@ StartLimitBurst=5
 # mid-session crashes. Mirrors pair-paper.service.
 Type=simple
 # --- EDIT THESE THREE FOR YOUR VPS ---
-User=root
+User=taleb
 WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata

@@ -16,7 +16,7 @@ StartLimitBurst=5
 # until the next day's timer.
 Type=simple
 # --- EDIT THESE FOR YOUR VPS ---
-User=root
+User=taleb
 WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata

@@ -16,7 +16,7 @@ StartLimitBurst=5
 # 11:00 IST unrecovered until the next day's timer at 09:15 IST.
 Type=simple
 # --- EDIT THESE THREE FOR YOUR VPS ---
-User=root
+User=taleb
 WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
