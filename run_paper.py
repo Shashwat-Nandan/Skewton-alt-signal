@@ -27,13 +27,31 @@ import sys
 import time
 import logging
 import argparse
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 
 from _state_backup import archive_state_backup, assert_no_orphan_backups
+
+# Shared runner scaffolding (audit 2.1). The Taleb daily runner used to
+# carry its own (older, un-hardened) copies of the holiday helpers and the
+# session-time constants; point it at the one scaffold so they can't drift,
+# and pick up the disk/tz pre-flights + single-instance lock it lacked.
+from runner_common import (
+    HARD_STOP,
+    MARKET_OPEN,
+    SESSION_END_AT,
+    TICK_SECONDS,
+    acquire_lock,
+    assert_disk_space_ok,
+    assert_holiday_data_fresh,
+    assert_timezone_ist,
+    is_trading_day,
+    load_holidays,
+    sleep_until,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -42,69 +60,16 @@ HOLIDAYS_PATH = HERE / "holidays.csv"
 LOG_DIR = HERE / "logs"
 DATA_CACHE = HERE / "data_cache"
 STATE_FILE = DATA_CACHE / "taleb_paper_state.json"
-
-MARKET_OPEN = (9, 15)
-# Wall-clock when the tick loop ends. Open positions are NOT flattened
-# here — they survive to the next session via the state file. The only
-# session-end exits are (a) --force-flatten-on-exit (ops hatch) and
-# (b) a held leg whose contract expires today.
-SESSION_END_AT = (15, 25)
-HARD_STOP = (15, 30)    # never tick past this
-TICK_SECONDS = 60
+LOCK_FILE = DATA_CACHE / ".taleb_paper.lock"
+# Open positions are NOT flattened at SESSION_END_AT — they survive to the
+# next session via the state file; the only session-end exits are
+# --force-flatten-on-exit and a held leg whose contract expires today.
 
 
-def load_holidays(path: Path) -> set[date]:
-    if not path.exists():
-        return set()
-    days: set[date] = set()
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        token = line.split(",", 1)[0].strip()
-        days.add(date.fromisoformat(token))
-    return days
-
-
-def is_trading_day(d: date, holidays: set[date]) -> tuple[bool, str]:
-    if d.weekday() >= 5:
-        return False, f"{d} is a weekend"
-    if d in holidays:
-        return False, f"{d} is an NSE holiday"
-    return True, ""
-
-
-HOLIDAY_HORIZON_DAYS = 30
-HOLIDAYS_PER_YEAR_FLOOR = 8
-
-
-def assert_holiday_data_fresh(holidays: set[date], today: date,
-                              log: logging.Logger) -> None:
-    # holidays.csv is hand-maintained from the NSE circular; a partial
-    # or expired list silently treats lunar holidays (Holi, Diwali, etc.)
-    # as trading days. Fail loud per CLAUDE.md Rule 12.
-    if not holidays:
-        msg = ("holidays.csv loaded zero entries — refusing to start. "
-               "Populate from the NSE 'Holidays — Trading' circular.")
-        log.error(msg)
-        raise RuntimeError(msg)
-    last = max(holidays)
-    horizon = today + timedelta(days=HOLIDAY_HORIZON_DAYS)
-    if last < horizon:
-        msg = (f"holidays.csv last entry is {last}, less than "
-               f"{HOLIDAY_HORIZON_DAYS} days past today ({today}). "
-               f"Refusing to start — update from the NSE circular and "
-               f"redeploy.")
-        log.error(msg)
-        raise RuntimeError(msg)
-    this_year_count = sum(1 for h in holidays if h.year == today.year)
-    if this_year_count < HOLIDAYS_PER_YEAR_FLOOR:
-        msg = (f"holidays.csv has only {this_year_count} entries for "
-               f"{today.year}; NSE typically has 13-17 per year. The list "
-               f"is likely missing lunar holidays (Holi, Diwali, etc.). "
-               f"Refusing to start — update from the NSE circular.")
-        log.error(msg)
-        raise RuntimeError(msg)
+# load_holidays, is_trading_day, assert_holiday_data_fresh and sleep_until
+# are imported from runner_common (audit 2.1) — the hardened versions
+# (precise malformed-date errors, CSV-header tolerance) replace the older
+# local copies this runner carried.
 
 
 def setup_logging(today: date) -> logging.Logger:
@@ -120,15 +85,6 @@ def setup_logging(today: date) -> logging.Logger:
         force=True,
     )
     return logging.getLogger("run_paper")
-
-
-def sleep_until(target: datetime, log: logging.Logger):
-    while True:
-        delta = (target - datetime.now()).total_seconds()
-        if delta <= 0:
-            return
-        log.info("Waiting %.0fs until %s", delta, target.strftime("%H:%M:%S"))
-        time.sleep(min(delta, 60))
 
 
 def tick(hedger, log: logging.Logger):
@@ -298,12 +254,23 @@ def main():
     today = datetime.now().date()
     log = setup_logging(today)
 
+    # Pre-flight gates (audit 2.1 — protections this runner previously
+    # lacked). TZ first: a wrong-TZ run misquotes market hours and holiday
+    # boundaries silently (the unit sets TZ=Asia/Kolkata). Disk next: a full
+    # partition corrupts the state-file write. Both fail loud.
+    assert_timezone_ist(log)
+    assert_disk_space_ok([DATA_CACHE, LOG_DIR], log)
+
     holidays = load_holidays(HOLIDAYS_PATH)
     assert_holiday_data_fresh(holidays, today, log)
     ok, reason = is_trading_day(today, holidays)
     if not ok and not args.force:
         log.info("No-op: %s. Exiting.", reason)
         return 0
+
+    # Single-instance lock — a second concurrent run would clobber the
+    # shared state file. Held for the process lifetime via _lock_fd.
+    _lock_fd = acquire_lock(LOCK_FILE, log, label="taleb paper runner")  # noqa: F841
 
     log.info("=" * 60)
     log.info("PAPER TRADING SESSION — %s", today)
