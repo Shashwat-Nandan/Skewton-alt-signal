@@ -18,10 +18,16 @@ Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
       (7). Open: best_params.pre-resweep-2026-05-07.json is still TRACKED
       clutter — left in place (deleting a tracked file is the operator's
       call); flag if you want it untracked.
-- [ ] 2.5 parameter-generator tests (L) — autoresearch _mutate_one/fitness/
-      accept-reject/save round-trip; screen_pairs β/half-life on synthetic
-      cointegrated series; real-constructor PairTradingStrategy test via
-      config_template.ini
+- [x] 2.5 parameter-generator tests. tests/test_autoresearch_loop.py (14):
+      _mutate_one clamp/rounding/invariants, _evaluate_experiment accept
+      sign (>/strictly-better), _run_experiment drawdown-veto + zero-trade
+      penalty + variance penalty (consistent beats spiky). tests/
+      test_screen_pairs.py (8): _hedge_ratio recovers known β incl. sign +
+      y/x orientation; _half_life on AR(1) with known reversion speed,
+      explosive→inf, random-walk→non-reverting. test_pair_trading.py
+      TestRealConstructor (5): REAL __init__ via config_template.ini — β
+      below/above bound + missing-β refusals, happy-path seed-from-panel,
+      paper-mode notional-cap requirement. +27 tests.
 - [ ] 2.1 shared runner scaffolding (L) — runner_common.py, one runner per
       commit; run_paper.py + run_equity_swing.py gain missing protections
 - [ ] 2.6 User=taleb units (M) — paper units first, full green session

@@ -2287,3 +2287,78 @@ class TestSpreadPanelInjection:
         s._spread_panel = pd.DataFrame({"AAA": [1.0, 2.0]})
         s._seed_spread_history()
         assert s._spread_history == []
+
+
+# ──────────────────────────────────────────────────────────
+# Real constructor (audit 2026-06-10 task 2.5)
+# ──────────────────────────────────────────────────────────
+
+class TestRealConstructor:
+    """Every other test bypasses __init__ via __new__. These exercise the
+    REAL constructor against the checked-in config_template.ini, so the
+    beta-bound refusal and the bhavcopy seeding actually run — the audit's
+    "__init__ executed by at least one test" acceptance, plus a guard on
+    the |beta| in [0.1, 10] gate that protects leg-B sizing."""
+
+    CONFIG = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "config_template.ini")
+
+    def _panel(self):
+        import numpy as np
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=80, freq="D")
+        return pd.DataFrame(
+            {"AAA": 100.0 + np.arange(80) * 0.5,
+             "BBB": 50.0 + np.arange(80) * 0.2},
+            index=idx,
+        )
+
+    def test_beta_below_min_is_refused(self):
+        # |beta| = 0.05 < HEDGE_RATIO_MIN (0.1): leg B is so small the
+        # "hedge" is really leg A alone. Refuse to construct.
+        with pytest.raises(ValueError, match="hedge_ratio out of range"):
+            PairTradingStrategy(
+                kite=MagicMock(), config_path=self.CONFIG, mode="signals",
+                symbol_a="AAA", symbol_b="BBB", hedge_ratio=0.05,
+            )
+
+    def test_beta_above_max_is_refused(self):
+        # |beta| = 12 > HEDGE_RATIO_MAX (10): leg B notional dwarfs leg A.
+        with pytest.raises(ValueError, match="hedge_ratio out of range"):
+            PairTradingStrategy(
+                kite=MagicMock(), config_path=self.CONFIG, mode="signals",
+                symbol_a="AAA", symbol_b="BBB", hedge_ratio=12.0,
+            )
+
+    def test_missing_beta_is_refused(self):
+        # No arg, and config_template has no [pair_trading] hedge_ratio.
+        with pytest.raises(ValueError, match="hedge_ratio must be supplied"):
+            PairTradingStrategy(
+                kite=MagicMock(), config_path=self.CONFIG, mode="signals",
+                symbol_a="AAA", symbol_b="BBB", hedge_ratio=None,
+            )
+
+    def test_valid_beta_constructs_and_seeds_from_panel(self):
+        # Happy path: in-bounds beta, signals mode (no notional cap needed),
+        # injected panel so seeding doesn't touch the filesystem. __init__
+        # runs end to end.
+        s = PairTradingStrategy(
+            kite=MagicMock(), config_path=self.CONFIG, mode="signals",
+            symbol_a="AAA", symbol_b="BBB", hedge_ratio=0.5,
+            spread_panel=self._panel(),
+        )
+        assert s.symbol_a == "AAA"
+        assert s.symbol_b == "BBB"
+        assert s.hedge_ratio == 0.5
+        # seed = AAA - 0.5*BBB over the 80-row panel
+        assert len(s._spread_history) == 80
+
+    def test_non_signals_mode_requires_notional_cap(self):
+        # config_template has no [pair_trading] max_leg_notional, so paper/
+        # live must refuse rather than run with leg-B sizing uncapped.
+        with pytest.raises(ValueError, match="max_leg_notional must be set"):
+            PairTradingStrategy(
+                kite=MagicMock(), config_path=self.CONFIG, mode="paper",
+                symbol_a="AAA", symbol_b="BBB", hedge_ratio=0.5,
+                spread_panel=self._panel(),
+            )
