@@ -43,11 +43,14 @@ from runner_common import (
     HARD_STOP,
     MARKET_OPEN,
     SESSION_END_AT,
+    SILENT_FAIL_THRESHOLD,
     TICK_SECONDS,
+    HeartbeatTracker,
     acquire_lock,
     assert_disk_space_ok,
     assert_holiday_data_fresh,
     assert_timezone_ist,
+    install_signal_handlers,
     is_trading_day,
     load_holidays,
     sleep_until,
@@ -61,6 +64,7 @@ LOG_DIR = HERE / "logs"
 DATA_CACHE = HERE / "data_cache"
 STATE_FILE = DATA_CACHE / "taleb_paper_state.json"
 LOCK_FILE = DATA_CACHE / ".taleb_paper.lock"
+SILENT_FAIL_FLAG = DATA_CACHE / "taleb_paper_silent_fail.flag"
 # Open positions are NOT flattened at SESSION_END_AT — they survive to the
 # next session via the state file; the only session-end exits are
 # --force-flatten-on-exit and a held leg whose contract expires today.
@@ -87,14 +91,20 @@ def setup_logging(today: date) -> logging.Logger:
     return logging.getLogger("run_paper")
 
 
-def tick(hedger, log: logging.Logger):
-    """One intraday iteration. Failures logged but do not kill the loop."""
+def tick(hedger, log: logging.Logger) -> bool:
+    """One intraday iteration. Failures logged but do not kill the loop.
+    Returns True if the tick completed without a swallowed exception, False
+    if scan or rehedge raised — the HeartbeatTracker uses this to detect a
+    systemic fault (e.g. token expired mid-session) where every tick fails
+    and the runner would otherwise exit 0 SUCCESS having traded nothing."""
+    ok = True
     try:
         proposals = hedger.scan_and_propose()
         if proposals:
             hedger.execute_proposals(proposals)
     except Exception as e:
         log.exception("scan_and_propose failed: %s", e)
+        ok = False
 
     try:
         rehedge = hedger.check_and_rehedge()
@@ -102,6 +112,8 @@ def tick(hedger, log: logging.Logger):
             hedger.execute_proposals(rehedge)
     except Exception as e:
         log.exception("check_and_rehedge failed: %s", e)
+        ok = False
+    return ok
 
 
 def _has_open_position(hedger) -> bool:
@@ -272,6 +284,11 @@ def main():
     # shared state file. Held for the process lifetime via _lock_fd.
     _lock_fd = acquire_lock(LOCK_FILE, log, label="taleb paper runner")  # noqa: F841
 
+    # SIGTERM → KeyboardInterrupt so `systemctl stop`/restart runs the EOD
+    # teardown (and returns 130, whitelisted via SuccessExitStatus=130 in
+    # taleb-hedger.service) instead of dying without persisting state.
+    install_signal_handlers(log)
+
     log.info("=" * 60)
     log.info("PAPER TRADING SESSION — %s", today)
     log.info("=" * 60)
@@ -312,11 +329,28 @@ def main():
     log.info("Entering tick loop (every %ds until %s)",
              TICK_SECONDS, session_end_ts.strftime("%H:%M"))
 
+    # Silent-dead-trader detector: a systemic fault (token expired, kite
+    # outage) makes every tick fail while the loop swallows the errors and
+    # would otherwise exit 0 at 15:25 having traded nothing. On
+    # SILENT_FAIL_THRESHOLD consecutive failed ticks, break and exit
+    # non-zero so taleb-hedger.service's OnFailure= alerts.
+    heartbeat = HeartbeatTracker(SILENT_FAIL_THRESHOLD, SILENT_FAIL_FLAG, log)
+    silent_fail = False
+
     try:
         while datetime.now() < session_end_ts:
-            tick(hedger, log)
+            ok = tick(hedger, log)
+            if heartbeat.record_tick(1, 0 if ok else 1):
+                silent_fail = True
+                break
             remaining = (session_end_ts - datetime.now()).total_seconds()
             time.sleep(max(1, min(TICK_SECONDS, remaining)))
+
+        if silent_fail:
+            log.critical("Silent-fail heartbeat breached — persisting state "
+                         "and exiting non-zero so OnFailure alerts.")
+            end_of_session(hedger, today, args, log)
+            return 1
 
         log.info("Session-end window reached.")
         end_of_session(hedger, today, args, log)

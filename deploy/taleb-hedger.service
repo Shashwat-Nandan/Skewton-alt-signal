@@ -19,6 +19,11 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run
 # Oneshot sessions should not auto-restart mid-day — the timer fires again tomorrow.
 # Paper mode exits cleanly at 15:25 IST.
 TimeoutStartSec=0
+# run_paper.py installs a SIGTERM→KeyboardInterrupt handler so `systemctl
+# stop`/restart runs the EOD teardown and exits 130. Whitelist 130 as
+# success so a clean operator stop doesn't fire OnFailure (audit 2.1/2.6).
+# A genuine silent-fail breach exits 1 → OnFailure still alerts.
+SuccessExitStatus=130
 StandardOutput=journal
 StandardError=journal
 
