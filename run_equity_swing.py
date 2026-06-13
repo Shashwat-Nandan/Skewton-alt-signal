@@ -47,6 +47,16 @@ sys.path.insert(0, str(HERE))
 CONFIG_PATH = str(HERE / "config.ini")
 HOLIDAYS_PATH = HERE / "holidays.csv"
 LOG_DIR = HERE / "logs"
+DATA_CACHE = HERE / "data_cache"
+
+# Shared pre-flight gates (audit 2.1). The equity scan runner kept its own
+# holiday helpers (left in place — private, different signatures) but
+# lacked the tz/disk pre-flights and a single-instance lock; add those.
+from runner_common import (  # noqa: E402  (after the sys.path bootstrap above)
+    acquire_lock,
+    assert_disk_space_ok,
+    assert_timezone_ist,
+)
 
 
 def _load_holidays() -> set:
@@ -464,11 +474,27 @@ def main() -> int:
     today = datetime.now().date()
     log = _setup_logging(today)
 
+    # Pre-flight gates (audit 2.1 — protections this runner lacked). TZ
+    # first (a wrong-TZ run misquotes the trading-day boundary; the unit
+    # sets TZ=Asia/Kolkata); disk next (a full partition corrupts DB
+    # writes). Both fail loud.
+    assert_timezone_ist(log)
+    assert_disk_space_ok([LOG_DIR, DATA_CACHE], log)
+
     _assert_holiday_data_fresh(today, log)
     ok, reason = _is_trading_day(today)
     if not ok and not args.force:
         log.info("No-op: %s. Exiting.", reason)
         return 0
+
+    # Single-instance lock, keyed by scan kind: two concurrent same-kind
+    # scans would double-drain equity_pending_entries (double bookings).
+    # open + close are different kinds and never overlap, so they don't
+    # block each other. Held for the process lifetime via _lock_fd.
+    _lock_fd = acquire_lock(  # noqa: F841
+        DATA_CACHE / f".equity_swing_{args.scan}.lock", log,
+        label=f"equity-swing runner (--scan={args.scan})",
+    )
 
     log.info("=" * 60)
     log.info("EQUITY SWING SCAN — kind=%s  mode=%s  date=%s", args.scan, args.mode, today)

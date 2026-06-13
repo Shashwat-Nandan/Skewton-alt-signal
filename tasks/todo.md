@@ -28,18 +28,24 @@ Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
       TestRealConstructor (5): REAL __init__ via config_template.ini — β
       below/above bound + missing-β refusals, happy-path seed-from-panel,
       paper-mode notional-cap requirement. +27 tests.
-- [~] 2.1 shared runner scaffolding — PART 1 done (keystone): runner_common.py
-      holds the 15 shared symbols (session-time consts, HALT_ALL/NEW paths,
-      holiday/tz/disk preflights, sleep_until, install_signal_handlers,
-      HeartbeatTracker) extracted VERBATIM from run_paper_pairs; pair runner
-      imports+re-exports them (all 13 consumers unaffected); arbitrage runner
-      repointed off run_paper_pairs → runner_common (cross-import GONE).
-      96 pair-suite + 16 arb-suite green; full suite pending.
-      REMAINING (separate commits, "protections they lack"): flock single-
-      instance consolidation (pairs+arb each have own copy; run_paper.py +
-      run_equity_swing.py have NONE) into runner_common; then add tz/disk/
-      holiday preflight + heartbeat to run_paper.py and run_equity_swing.py.
-      These ADD behavior to the Taleb-daily + equity runners → own validation.
+- [x] 2.1 shared runner scaffolding — DONE across pt1+pt2.
+      PT1 (900deb9): runner_common.py with the 15 shared symbols extracted
+      verbatim; pairs imports+re-exports; arbitrage repointed (cross-import
+      gone).
+      PT2: (A) generic acquire_lock() in runner_common; pairs + arbitrage
+      acquire_runner_lock now thin wrappers over it (lock tests green,
+      "already holding the lock" message preserved). (B) run_paper.py: de-dup
+      its OLD holiday helpers + session constants + sleep_until → runner_common
+      (now gets the hardened load_holidays w/ precise errors + header
+      tolerance); added assert_timezone_ist + assert_disk_space_ok + a
+      single-instance lock (.taleb_paper.lock). (C) run_equity_swing.py: added
+      tz + disk pre-flights + a PER-SCAN lock (.equity_swing_{open,close}.lock
+      — two same-kind scans would double-drain pending entries; open/close
+      coexist). All 3 units already set TZ=Asia/Kolkata so the tz gate is safe.
+      DELIBERATELY DEFERRED: install_signal_handlers + HeartbeatTracker for
+      run_paper.py — they make SIGTERM exit 130, which taleb-hedger.service
+      (OnFailure set, NO SuccessExitStatus=130) would treat as failure and
+      false-page. That needs a paired unit change → fold into 2.6 host work.
 - [ ] 2.6 User=taleb units (M) — paper units first, full green session
       before flipping the live unit; data_cache 0750
 - [ ] 2.2 pair executor migration onto strategies/order_executor.py (XL) —
