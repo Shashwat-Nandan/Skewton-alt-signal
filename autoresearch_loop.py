@@ -272,11 +272,16 @@ class HedgeResearchLoop:
     # what the band would have allowed. With probability
     # `joint_mutation_prob` the proposer mutates one pair instead of
     # one param.
+    # Joint-mutation pairs (Phase 2.5). EVERY key here MUST also be in
+    # TUNABLE_RANGES — _mutate_one indexes TUNABLE_RANGES[param], so a pair
+    # naming a non-tunable raises KeyError when joint mutation selects it.
+    # (min_rv_iv_ratio was dropped from TUNABLE_RANGES on 2026-06-07 but
+    # left here, crashing the 2026-06-13 weekly run; _propose_mutation now
+    # also filters defensively.) test_autoresearch_loop pins the invariant.
     JOINT_PAIRS = [
         ("rehedge_delta_threshold", "gamma_scalp_band_pct"),
         ("cost_hurdle_factor", "gamma_scalp_band_pct"),
         ("entry_iv_percentile_min", "entry_iv_percentile_max"),
-        ("min_rv_iv_ratio", "rv_window_days"),
     ]
 
     def _mutate_one(self, params: Dict, param_name: str) -> Tuple[float, float]:
@@ -326,16 +331,19 @@ class HedgeResearchLoop:
         joint_prob = self.config.getfloat(
             "autoresearch", "joint_mutation_prob", fallback=0.0,
         )
+        # A joint pair is usable only if BOTH keys are in the params
+        # snapshot AND still in TUNABLE_RANGES (a key dropped from the
+        # ranges but left in JOINT_PAIRS / best_params.json would KeyError
+        # in _mutate_one — the 2026-06-13 crash). Filter once, then decide.
+        available = [
+            p for p in self.JOINT_PAIRS
+            if all(k in params and k in self.TUNABLE_RANGES for k in p)
+        ]
         do_joint = (joint_prob > 0
                     and random.random() < joint_prob
-                    and any(all(p in params for p in pair)
-                            for pair in self.JOINT_PAIRS))
+                    and bool(available))
 
         if do_joint:
-            # Pick a joint pair where both keys are in baseline_params
-            # (skip if a tunable was added since the params snapshot).
-            available = [p for p in self.JOINT_PAIRS
-                         if all(k in params for k in p)]
             pair = random.choice(available)
             primary, secondary = pair
             old_v1, new_v1 = self._mutate_one(params, primary)

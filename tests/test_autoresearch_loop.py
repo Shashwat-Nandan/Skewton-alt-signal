@@ -29,6 +29,48 @@ def _loop(**attrs):
     return loop
 
 
+# ── JOINT_PAIRS ↔ TUNABLE_RANGES consistency (2026-06-13 crash) ──
+
+class TestJointPairsConsistency:
+    """The 2026-06-13 weekly autoresearch died with KeyError
+    'min_rv_iv_ratio': it was dropped from TUNABLE_RANGES on 2026-06-07 but
+    left in JOINT_PAIRS (and still present in best_params.json), so the
+    joint-availability check passed on params membership while _mutate_one
+    KeyError'd on the missing range. Pin both the static invariant and the
+    runtime guard so a future drop can't reintroduce the crash."""
+
+    def test_every_joint_pair_key_is_a_tunable(self):
+        for pair in HedgeResearchLoop.JOINT_PAIRS:
+            for key in pair:
+                assert key in HedgeResearchLoop.TUNABLE_RANGES, (
+                    f"JOINT_PAIRS names {key!r}, absent from TUNABLE_RANGES "
+                    f"— _mutate_one would KeyError when this pair is picked"
+                )
+
+    def test_propose_mutation_skips_stale_non_tunable_pair(self, monkeypatch):
+        # Force the joint branch every time and inject a stale pair whose
+        # key is in params but NOT in TUNABLE_RANGES — _propose_mutation
+        # must NOT crash; it falls through to a valid single-param walk.
+        import configparser
+
+        cfg = configparser.ConfigParser()
+        cfg.add_section("autoresearch")
+        cfg.set("autoresearch", "joint_mutation_prob", "1.0")
+        loop = _loop(
+            config=cfg, mutation_step=0.1,
+            baseline_params={"gamma_scalp_band_pct": 1.0,
+                             "min_rv_iv_ratio": 1.2},   # stale, in params only
+        )
+        monkeypatch.setattr(HedgeResearchLoop, "JOINT_PAIRS",
+                            [("min_rv_iv_ratio", "rv_window_days")])
+        monkeypatch.setattr("autoresearch_loop.random.random", lambda: 0.0)
+        monkeypatch.setattr("autoresearch_loop.random.choice", lambda seq: seq[0])
+        monkeypatch.setattr(np.random, "normal", lambda *a, **k: 0.01)
+        # Should not raise (no usable joint pair → single-param walk).
+        params, name, old, new = loop._propose_mutation()
+        assert name in loop.TUNABLE_RANGES   # a real single-param mutation
+
+
 # ── _mutate_one ────────────────────────────────────────────
 
 class TestMutateOne:
