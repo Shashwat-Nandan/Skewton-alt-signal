@@ -1565,9 +1565,15 @@ class TalebKarpathyStrategy(BaseStrategy):
                     result.get("error", ""))
                 continue
 
+            # Book at the actual fill when the executor reports one (live
+            # marketable LIMITs can fill inside the protection pad). Paper
+            # results carry no average_price → prop.price, so paper
+            # accounting is unchanged. Mirrors pair_trading._apply_fill.
+            fill_price = float(result.get("average_price") or 0.0) or prop.price
+
             # Deduct transaction costs
             cost = estimate_transaction_cost(
-                prop.price, prop.quantity, prop.lot_size, prop.transaction_type,
+                fill_price, prop.quantity, prop.lot_size, prop.transaction_type,
                 instrument_type="FUT" if prop.option_type == "FUT" else "OPT",
             )
             self.state.total_transaction_costs += cost
@@ -1585,20 +1591,20 @@ class TalebKarpathyStrategy(BaseStrategy):
                     # Adding to position — update VWAP
                     if new_lots != 0:
                         old_notional = old_lots * self.state.futures_entry_vwap
-                        add_notional = signed_lots * prop.price
+                        add_notional = signed_lots * fill_price
                         self.state.futures_entry_vwap = (old_notional + add_notional) / new_lots
                 elif new_lots == 0:
                     # Fully closed — book realized P/L
-                    realized = (prop.price - self.state.futures_entry_vwap) * old_lots * prop.lot_size
+                    realized = (fill_price - self.state.futures_entry_vwap) * old_lots * prop.lot_size
                     self.state.realized_pnl += realized
                     self.state.futures_entry_vwap = 0.0
                     had_any_close = True
                     logger.info("Closed futures hedge: realized P/L ₹%.0f", realized)
                 else:
                     # Flipped direction — close old, open remainder
-                    realized = (prop.price - self.state.futures_entry_vwap) * old_lots * prop.lot_size
+                    realized = (fill_price - self.state.futures_entry_vwap) * old_lots * prop.lot_size
                     self.state.realized_pnl += realized
-                    self.state.futures_entry_vwap = prop.price
+                    self.state.futures_entry_vwap = fill_price
                     had_any_close = True
                     logger.info("Flipped futures hedge: realized P/L ₹%.0f", realized)
                 self.state.futures_lots = new_lots
@@ -1616,7 +1622,7 @@ class TalebKarpathyStrategy(BaseStrategy):
                     new_qty = old_qty + signed_qty
                     if new_qty == 0:
                         # Fully closed — book realized P/L
-                        realized = (prop.price - existing.entry_price) * old_qty * existing.lot_size
+                        realized = (fill_price - existing.entry_price) * old_qty * existing.lot_size
                         self.state.realized_pnl += realized
                         self.state.positions.remove(existing)
                         had_any_close = True
@@ -1626,7 +1632,7 @@ class TalebKarpathyStrategy(BaseStrategy):
                         if old_qty * signed_qty < 0:
                             # Partial close: book realized P/L on the closed portion
                             closed_qty = min(abs(old_qty), abs(signed_qty)) * (1 if old_qty > 0 else -1)
-                            realized = (prop.price - existing.entry_price) * closed_qty * existing.lot_size
+                            realized = (fill_price - existing.entry_price) * closed_qty * existing.lot_size
                             self.state.realized_pnl += realized
                             had_any_close = True
                         existing.quantity = new_qty
@@ -1636,7 +1642,7 @@ class TalebKarpathyStrategy(BaseStrategy):
                         tradingsymbol=prop.tradingsymbol, instrument_token=prop.instrument_token,
                         strike=prop.strike, expiry=prop.expiry, option_type=prop.option_type,
                         lot_size=prop.lot_size, quantity=signed_qty,
-                        entry_price=prop.price, current_price=prop.price, iv=prop.iv,
+                        entry_price=fill_price, current_price=fill_price, iv=prop.iv,
                     ))
 
         if is_entry_batch and self.state.positions:
@@ -2495,20 +2501,32 @@ class TalebKarpathyStrategy(BaseStrategy):
         return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
 
     def _live_execute(self, proposal):
-        # Interim refusal (audit 2026-06-10, task 1.2 step 2 pending): this
-        # path has no fill polling — a placed order would return PENDING,
-        # the C-1 whitelist would (correctly) refuse to book it, and the
-        # broker position would be UNTRACKED. Until pair_trading's executor
-        # (place → poll-until-terminal → cancel/partial-reverse, marketable
-        # LIMIT) is ported, refuse before any order reaches the broker.
-        # Operator decision 2026-06-11: taleb WILL trade live eventually —
-        # the port is planned work (audit 1.2 step 2 / 2.2), not dead code.
-        logger.error(
-            "live execution not yet supported for %s — order NOT placed "
-            "(no fill polling; see tasks/audit-2026-06-10.md task 1.2)",
-            proposal.tradingsymbol,
-        )
-        return {"order_id": None, "status": "FAILED",
-                "error": "live execution not supported pending fill-polling "
-                         "port (audit 1.2)",
-                "mode": "live"}
+        # Audit 1.2 step 2: delegate to the shared executor (place →
+        # poll-until-terminal → cancel/partial-reverse, marketable LIMIT —
+        # the semantics the pair runner proved live on 2026-06-11). The
+        # C-1 whitelist in execute_proposals books state only on the
+        # executor's confirmed COMPLETE.
+        executor = self._order_executor()
+        # Rebind in case the runner swapped the kite client (token refresh).
+        executor.kite = self.kite
+        return executor.execute(proposal)
+
+    def _order_executor(self):
+        # Lazy so __new__-bypass tests and paper/signals runs never build
+        # it (and it isn't an __init__ attr the backtest bootstrap must
+        # mirror).
+        if getattr(self, "_live_order_executor", None) is None:
+            from .order_executor import KiteOrderExecutor
+            try:
+                lpp = self.config.getfloat(
+                    "strategy", "limit_protection_pct", fallback=0.25)
+            except Exception:
+                lpp = 0.25
+            self._live_order_executor = KiteOrderExecutor(
+                self.kite,
+                order_tag=f"taleb-{self.underlying}",
+                limit_protection_pct=lpp,
+                exchange=self.exchange,
+                get_instruments=self._fetch_nfo_instruments_with_retry,
+            )
+        return self._live_order_executor

@@ -1,3 +1,51 @@
+# Audit execution session 2 (2026-06-12) — 1.2 step 2: live-executor port
+
+Morning verification of 1.1/1.7 done: both runners logged "Preloaded spread
+panel" (521d), tick loop by 09:13:33 IST (acceptance ≤ 09:15:30); watchdog
+probing every 5 min, HC_PING_URL_LIVE in .env, zero failure lines.
+
+Plan — port pair_trading's order executor to taleb + arbitrage live paths.
+Design: NEW shared module (strategies/order_executor.py) used by taleb +
+arbitrage only; pair_trading keeps its own byte-identical copy until task
+2.2 migrates it (live-money path, needs a paper soak). This makes 2.2 a
+migration instead of an extraction.
+- [x] strategies/order_executor.py — KiteOrderExecutor: validate → marketable
+      LIMIT (LTP±pad, tick-rounded) → place with H8 token-refresh-once /
+      M-B4 network-retry-once / OrderException-no-retry taxonomy → poll
+      order_history until terminal (10s/1s) → exact-fill check (H7 partial →
+      inline reverse) → cancel-on-timeout. NO M-B5 backoff (pair-strategy
+      state; revisit in 2.2).
+- [x] taleb _live_execute → delegate to executor (lazy, no __init__ attr);
+      book fills at result average_price (port of pair _apply_fill semantics;
+      paper unchanged — no average_price key)
+- [x] arbitrage _live_execute → same; _apply_fill gains optional result param
+- [x] tests: new test_order_executor.py (fake kite, full taxonomy);
+      replace the two refuses-without-placing tests with delegation tests;
+      fill-price booking tests
+- [x] full suite green (742/742, was 721), commit
+
+## Review (2026-06-12 session)
+
+1.2 step 2 done — Milestone 1 is fully closed. Notes:
+- The executor module is a PORT, not a refactor: pair_trading still runs
+  its own byte-identical copy of this logic. A behavior fix found in either
+  copy must be applied to both until 2.2 migrates pair onto the module
+  (live-money path — needs a paper soak first).
+- Deliberately not ported: M-B5 consecutive-failure backoff (pair-strategy
+  state, persisted/decremented per tick by pair's execute_proposals). A
+  taleb/arbitrage live runner gets it when 2.2 unifies call sites.
+- Booking now uses the executor's average_price in taleb execute_proposals
+  and arbitrage _apply_fill (mirrors pair). Paper results carry no
+  average_price key → prop.price → paper accounting byte-identical (full
+  suite + characterization tests prove it).
+- Taleb/arbitrage live remains UNARMED operationally: no live units exist
+  for them and the quad-lock still gates arming. This change makes the live
+  path *correct*, not *enabled*. Before ever arming: give the executor a
+  margin precheck analog (pair H15) and wire kite_refresh (H8 callback is
+  supported but neither runner passes one yet).
+- Milestone 2 is next (2.1 runner scaffolding, 2.2 executor migration for
+  pair, 2.3+); 0.2's deep-stub tick-loop integration test still open.
+
 # Audit execution session 1 (2026-06-11) — Milestone 0 + quick wins
 
 Operator calls recorded (audit Open Questions): Q1 Taleb/arbitrage WILL go

@@ -918,7 +918,7 @@ class TestLiveStatusHandling:
         s = _make_strategy(mode="live")
         s._live_execute = lambda p: {"order_id": "X1", "status": status, "mode": "live"}
         calls = []
-        s._apply_fill = lambda prop: calls.append(prop)
+        s._apply_fill = lambda prop, result=None: calls.append(prop)
         prop = TradeProposal(
             tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
             expiry="2026-04-28", option_type="FUT", lot_size=100,
@@ -941,18 +941,55 @@ class TestLiveStatusHandling:
     def test_complete_applies_fill(self):
         assert len(self._run_with_status("COMPLETE")) == 1
 
-    def test_live_execute_refuses_without_placing_order(self):
-        # Same interim guard as taleb: no order may reach the broker until
-        # the poll-until-terminal executor exists (audit 1.2 step 2).
-        s = _make_strategy(mode="live")
-        prop = TradeProposal(
+    def _leg_prop(self):
+        return TradeProposal(
             tradingsymbol="AAA26APRFUT", instrument_token=1, strike=0,
             expiry="2026-04-28", option_type="FUT", lot_size=100,
             quantity=1, price=1000.0, transaction_type="BUY",
             iv=0, bid_ask_spread_pct=0.01, margin_required=20000,
             rationale="calendar leg",
         )
+
+    def test_live_execute_delegates_to_shared_executor(self):
+        # Audit 1.2 step 2: the refusal is gone — _live_execute hands the
+        # proposal to the shared KiteOrderExecutor and rebinds the kite
+        # client so a runner-side token refresh propagates.
+        from unittest.mock import MagicMock
+        s = _make_strategy(mode="live")
+        executor = MagicMock()
+        executor.execute.return_value = {
+            "order_id": "X1", "status": "COMPLETE", "filled_lots": 1,
+            "average_price": 1001.0, "mode": "live",
+        }
+        s._live_order_executor = executor
+        prop = self._leg_prop()
         result = s._live_execute(prop)
-        assert result["status"] == "FAILED"
-        assert "not supported" in result["error"]
-        s.kite.place_order.assert_not_called()
+        executor.execute.assert_called_once_with(prop)
+        assert executor.kite is s.kite
+        assert result["status"] == "COMPLETE"
+
+    def test_order_executor_wiring(self):
+        # The lazily-built executor carries arbitrage's identity: per-
+        # symbol tags via _symbol_from_tradingsymbol, NFO, the cached
+        # instruments dump, and the 0.25 default pad.
+        from strategies.order_executor import KiteOrderExecutor
+        s = _make_strategy(mode="live")
+        # the fixture's config is a MagicMock; emulate "no override in
+        # config.ini" so the 0.25 fallback is what's under test
+        s.config.getfloat = lambda *a, fallback=None: fallback
+        ex = s._order_executor()
+        assert isinstance(ex, KiteOrderExecutor)
+        assert ex._tag_for(self._leg_prop()) == "arb-AAA"
+        assert ex.exchange == "NFO"
+        assert ex.limit_protection_pct == 0.25
+        assert s._order_executor() is ex  # built once
+
+    def test_apply_fill_books_at_actual_average_price(self):
+        # Audit 1.2 step 2: live fills book at the executor's reported
+        # average_price, not the proposal quote. Paper results carry no
+        # average_price → prop.price (pinned elsewhere).
+        s = _make_strategy(mode="paper")
+        s._apply_fill(self._leg_prop(), {"average_price": 1003.5})
+        trade = next(iter(s.state.open_calendars.values()))
+        assert trade.legs[0].entry_price == 1003.5
+        assert trade.legs[0].current_price == 1003.5

@@ -3086,16 +3086,51 @@ class TestLiveStatusHandling:
         assert len(h.state.positions) == 1
         assert h.state.total_transaction_costs > 0.0
 
-    def test_live_execute_refuses_without_placing_order(self):
-        # Interim guard until the fill-polling executor is ported (audit
-        # 1.2 step 2): a live order placed without polling would be booked
-        # nowhere (whitelist) but EXIST at the broker — untracked real
-        # exposure. The refusal must fire before kite.place_order.
+    def test_complete_books_at_actual_average_price(self):
+        # Audit 1.2 step 2: live fills book at the executor's reported
+        # average_price (marketable LIMITs can fill inside the protection
+        # pad), not the proposal's quote. Paper results carry no
+        # average_price → prop.price, pinned by the booking tests above.
         h = self._live_hedger()
-        result = h._live_execute(self._prop())
-        assert result["status"] == "FAILED"
-        assert "not supported" in result["error"]
-        h.kite.place_order.assert_not_called()
+        h._live_execute = lambda p: {
+            "order_id": "X1", "status": "COMPLETE", "filled_lots": 2,
+            "average_price": 305.0, "mode": "live",
+        }
+        h.execute_proposals([self._prop()])
+        assert h.state.positions[0].entry_price == 305.0
+        assert h.state.positions[0].current_price == 305.0
+
+    def test_live_execute_delegates_to_shared_executor(self):
+        # Audit 1.2 step 2: the refusal is gone — _live_execute now hands
+        # the proposal to the shared KiteOrderExecutor (place → poll →
+        # cancel/partial-reverse) and rebinds the kite client so a
+        # runner-side token refresh propagates.
+        h = self._live_hedger()
+        executor = MagicMock()
+        executor.execute.return_value = {
+            "order_id": "X1", "status": "COMPLETE", "filled_lots": 2,
+            "average_price": 300.0, "mode": "live",
+        }
+        h._live_order_executor = executor
+        prop = self._prop()
+        result = h._live_execute(prop)
+        executor.execute.assert_called_once_with(prop)
+        assert executor.kite is h.kite
+        assert result["status"] == "COMPLETE"
+
+    def test_order_executor_wiring(self):
+        # The lazily-built executor carries taleb's identity: underlying-
+        # tagged orders, the strategy's exchange, instruments-dump tick
+        # lookup, and the 0.25 default pad when config has no override.
+        from strategies.order_executor import KiteOrderExecutor
+        h = self._live_hedger()
+        ex = h._order_executor()
+        assert isinstance(ex, KiteOrderExecutor)
+        assert ex._tag_for(self._prop()) == "taleb-NIFTY"
+        assert ex.exchange == "NFO"
+        assert ex.limit_protection_pct == 0.25
+        assert ex._get_instruments == h._fetch_nfo_instruments_with_retry
+        assert h._order_executor() is ex  # built once
 
 
 class TestMarkingFallbacks:

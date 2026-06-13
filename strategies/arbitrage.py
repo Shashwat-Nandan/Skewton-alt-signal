@@ -314,7 +314,7 @@ class ArbitrageStrategy(BaseStrategy):
                                prop.tradingsymbol, result.get("status"),
                                result.get("error", ""))
                 continue
-            self._apply_fill(prop)
+            self._apply_fill(prop, result)
 
         return results
 
@@ -912,10 +912,16 @@ class ArbitrageStrategy(BaseStrategy):
     # FILL HANDLING / STATE UPDATES
     # ══════════════════════════════════════════════════════════
 
-    def _apply_fill(self, prop: TradeProposal) -> None:
+    def _apply_fill(self, prop: TradeProposal,
+                    result: Optional[Dict] = None) -> None:
         from strategies.taleb_karpathy import estimate_transaction_cost
+        # Book at the actual fill when the executor reports one (live
+        # marketable LIMITs can fill inside the protection pad). Paper
+        # results carry no average_price → prop.price, so paper accounting
+        # is unchanged. Mirrors pair_trading._apply_fill.
+        fill_price = float((result or {}).get("average_price") or 0.0) or prop.price
         cost = estimate_transaction_cost(
-            prop.price, prop.quantity, prop.lot_size, prop.transaction_type,
+            fill_price, prop.quantity, prop.lot_size, prop.transaction_type,
             instrument_type="FUT",
         )
 
@@ -949,24 +955,24 @@ class ArbitrageStrategy(BaseStrategy):
                 expiry=prop.expiry,
                 lot_size=prop.lot_size,
                 quantity=signed_qty,
-                entry_price=prop.price,
-                current_price=prop.price,
+                entry_price=fill_price,
+                current_price=fill_price,
             ))
         else:
             old_qty = existing.quantity
             new_qty = old_qty + signed_qty
             if new_qty == 0:
-                realized = (prop.price - existing.entry_price) * old_qty * existing.lot_size
+                realized = (fill_price - existing.entry_price) * old_qty * existing.lot_size
                 self.state.realized_pnl += realized
                 trade.legs.remove(existing)
             elif old_qty * signed_qty < 0:
                 closed_qty = min(abs(old_qty), abs(signed_qty)) * (1 if old_qty > 0 else -1)
-                realized = (prop.price - existing.entry_price) * closed_qty * existing.lot_size
+                realized = (fill_price - existing.entry_price) * closed_qty * existing.lot_size
                 self.state.realized_pnl += realized
                 existing.quantity = new_qty
             else:
                 existing.entry_price = (
-                    existing.entry_price * old_qty + prop.price * signed_qty
+                    existing.entry_price * old_qty + fill_price * signed_qty
                 ) / new_qty
                 existing.quantity = new_qty
 
@@ -1075,18 +1081,32 @@ class ArbitrageStrategy(BaseStrategy):
         return {"order_id": f"PAPER-{int(time.time())}", "status": "COMPLETE", "mode": "paper"}
 
     def _live_execute(self, prop: TradeProposal) -> Dict:
-        # Interim refusal (audit 2026-06-10, task 1.2 step 2 pending): no
-        # fill polling here — a placed order would return PENDING, the C-1
-        # whitelist would refuse to book it, and the broker position would
-        # be UNTRACKED. Refuse before any order reaches the broker until
-        # pair_trading's executor is ported (planned: operator decision
-        # 2026-06-11 says arbitrage WILL trade live eventually).
-        logger.error(
-            "live execution not yet supported for %s — order NOT placed "
-            "(no fill polling; see tasks/audit-2026-06-10.md task 1.2)",
-            prop.tradingsymbol,
-        )
-        return {"order_id": None, "status": "FAILED",
-                "error": "live execution not supported pending fill-polling "
-                         "port (audit 1.2)",
-                "mode": "live"}
+        # Audit 1.2 step 2: delegate to the shared executor (place →
+        # poll-until-terminal → cancel/partial-reverse, marketable LIMIT —
+        # the semantics the pair runner proved live on 2026-06-11). The
+        # C-1 whitelist in execute_proposals books state only on the
+        # executor's confirmed COMPLETE.
+        executor = self._order_executor()
+        # Rebind in case the runner swapped the kite client (token refresh).
+        executor.kite = self.kite
+        return executor.execute(prop)
+
+    def _order_executor(self):
+        # Lazy so __new__-bypass tests and paper/signals runs never build it.
+        if getattr(self, "_live_order_executor", None) is None:
+            from .order_executor import KiteOrderExecutor
+            try:
+                lpp = self.config.getfloat(
+                    "strategy", "limit_protection_pct", fallback=0.25)
+            except Exception:
+                lpp = 0.25
+            self._live_order_executor = KiteOrderExecutor(
+                self.kite,
+                order_tag=lambda p: (
+                    f"arb-{self._symbol_from_tradingsymbol(p.tradingsymbol)}"
+                ),
+                limit_protection_pct=lpp,
+                exchange="NFO",
+                get_instruments=self._load_instruments,
+            )
+        return self._live_order_executor
