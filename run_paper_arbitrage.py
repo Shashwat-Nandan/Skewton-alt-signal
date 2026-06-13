@@ -23,7 +23,7 @@ spreads on single-stock futures). Runs alongside the pair-trading runner
 
 The generic safety scaffolding (TZ / disk / holiday pre-flight gates, the
 silent-fail heartbeat, the operator HALT_ALL / HALT_NEW_ENTRIES kill switches,
-session-time constants) is imported from run_paper_pairs rather than copied —
+session-time constants) is imported from runner_common rather than copied —
 those helpers carry no pair-specific state. Arbitrage keeps its OWN lock file,
 state file, and daily-loss flag so the two runners never clobber or freeze each
 other.
@@ -48,10 +48,11 @@ from dotenv import load_dotenv
 
 from _state_backup import archive_state_backup, assert_no_orphan_backups
 
-# Reuse the pair runner's generic, state-free safety helpers + constants.
-# These have no pair-specific coupling — they gate on wall-clock, disk, and
-# the holidays file, which are shared infrastructure.
-from run_paper_pairs import (
+# Shared, state-free safety helpers + constants (audit 2.1). These gate on
+# wall-clock, disk, and the holidays file — shared infrastructure with no
+# pair-specific coupling. Sourced from runner_common so this runner no
+# longer imports from a sibling runner.
+from runner_common import (
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
     HARD_STOP,

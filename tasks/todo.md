@@ -28,8 +28,18 @@ Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
       TestRealConstructor (5): REAL __init__ via config_template.ini — β
       below/above bound + missing-β refusals, happy-path seed-from-panel,
       paper-mode notional-cap requirement. +27 tests.
-- [ ] 2.1 shared runner scaffolding (L) — runner_common.py, one runner per
-      commit; run_paper.py + run_equity_swing.py gain missing protections
+- [~] 2.1 shared runner scaffolding — PART 1 done (keystone): runner_common.py
+      holds the 15 shared symbols (session-time consts, HALT_ALL/NEW paths,
+      holiday/tz/disk preflights, sleep_until, install_signal_handlers,
+      HeartbeatTracker) extracted VERBATIM from run_paper_pairs; pair runner
+      imports+re-exports them (all 13 consumers unaffected); arbitrage runner
+      repointed off run_paper_pairs → runner_common (cross-import GONE).
+      96 pair-suite + 16 arb-suite green; full suite pending.
+      REMAINING (separate commits, "protections they lack"): flock single-
+      instance consolidation (pairs+arb each have own copy; run_paper.py +
+      run_equity_swing.py have NONE) into runner_common; then add tz/disk/
+      holiday preflight + heartbeat to run_paper.py and run_equity_swing.py.
+      These ADD behavior to the Taleb-daily + equity runners → own validation.
 - [ ] 2.6 User=taleb units (M) — paper units first, full green session
       before flipping the live unit; data_cache 0750
 - [ ] 2.2 pair executor migration onto strategies/order_executor.py (XL) —
