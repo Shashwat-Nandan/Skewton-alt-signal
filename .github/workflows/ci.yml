@@ -25,17 +25,24 @@ jobs:
           .venv-ci/bin/python -m pip install --require-hashes \
             -r requirements.lock -r requirements-dev.lock
 
+      # run_backtest and several suites read config.ini (gitignored — the
+      # operator's copy holds credentials). The checked-in template has the
+      # same sections minus secrets; tests need only the [strategy] shape.
+      - name: Provision config.ini from template
+        run: cp config_template.ini config.ini
+
       # -rs surfaces every skip in the summary: two suites skip without the
-      # operator's data_cache (test_backtest.py:176, test_calendar_
-      # meanreversion.py:474,493). The grep guard fails the job if MORE
-      # tests start silently skipping than those known three (Rule 12).
+      # operator's data_cache — 6 tick-session tests (test_backtest.py:179-
+      # 260) and 2 bhavcopy IDF-panel tests (test_calendar_meanreversion.py:
+      # 474,493). The grep guard fails the job if MORE tests start silently
+      # skipping than those known eight (Rule 12).
       - name: Run test suite
         run: |
           .venv-ci/bin/python -m pytest tests/ -q -rs 2>&1 | tee pytest.out
           test ${PIPESTATUS[0]} -eq 0
           skips=$(grep -c "^SKIPPED" pytest.out || true)
-          if [ "$skips" -gt 3 ]; then
-            echo "::error::$skips tests skipped (3 known data_cache skips allowed)"
+          if [ "$skips" -gt 8 ]; then
+            echo "::error::$skips tests skipped (8 known data_cache skips allowed)"
             exit 1
           fi
 
