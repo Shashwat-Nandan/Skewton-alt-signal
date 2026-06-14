@@ -15,12 +15,14 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 ExecStart=/opt/taleb-karpathy-kite/deploy/run_weekly_autoresearch.sh
 # -------------------------------
 
-# Autoresearch can take a while (40 experiments × 3 cycles × 5-day windows).
+# Autoresearch can take a while (40 experiments × eval_cycles sessions each).
 # No restart on failure: investigate via journalctl and re-fire next week.
-# 4h (was 2h): under the 2026-06-01 config (gamma_theta_ratio, eval-cycles 3,
-# full captured-tape replay of ~1.2GB sessions) a full sweep runs ~3.1h
-# (~4.7 min × 40 exp). The 2h cap SIGTERM'd the 2026-06-06 run at 25/40.
-TimeoutStartSec=4h
+# 10h (was 4h): 2026-06-14 widened eval-cycles 3→5 (full Mon–Fri week per
+# experiment), so a full sweep runs ~6h (~9 min × 40 exp) vs the prior ~3.5h.
+# The 4h cap would SIGTERM the 5-cycle run ~2/3 through. 10h leaves comfortable
+# margin for a slow/loaded host while still bounding a genuinely hung run.
+# (History: 2h cap SIGTERM'd the 2026-06-06 run at 25/40 → raised to 4h.)
+TimeoutStartSec=10h
 StandardOutput=journal
 StandardError=journal
 
