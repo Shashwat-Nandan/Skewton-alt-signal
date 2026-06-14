@@ -46,6 +46,14 @@ logger = logging.getLogger(__name__)
 # distinguish a flat-fitness regime from a strategy that's blowing up.
 ZERO_TRADE_PENALTY = -1e6
 
+# Objectives measured in rupees of P&L. For these a zero-trade session is a
+# LEGITIMATE ₹0 outcome (and on edgeless tape, better than a losing config),
+# so it must NOT get ZERO_TRADE_PENALTY — that would push the optimizer to
+# overtrade rather than let it choose to trade less. For ratio objectives
+# (gamma_theta_ratio, sharpe_ratio) a no-trade session is undefined, so the
+# penalty still applies. See _run_experiment.
+PNL_METRICS = frozenset({"net_pnl", "realized_pnl"})
+
 
 class HedgeResearchLoop:
     """
@@ -463,9 +471,16 @@ class HedgeResearchLoop:
                 )
                 metrics = results["metrics"]
                 if metrics.get("total_trades", 0) == 0:
-                    logger.debug("  Cycle %d: 0 trades — penalty %.0f",
-                                 cycle + 1, ZERO_TRADE_PENALTY)
-                    metrics = {**metrics, self.primary_metric: ZERO_TRADE_PENALTY}
+                    # P&L objective: no trades = ₹0, a real outcome — don't
+                    # penalize (penalizing pushes overtrading). Ratio
+                    # objective: no trades is undefined → penalty.
+                    if self.primary_metric in PNL_METRICS:
+                        logger.debug("  Cycle %d: 0 trades — net P&L 0.0", cycle + 1)
+                        metrics = {**metrics, self.primary_metric: 0.0}
+                    else:
+                        logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                     cycle + 1, ZERO_TRADE_PENALTY)
+                        metrics = {**metrics, self.primary_metric: ZERO_TRADE_PENALTY}
                 cycle_metrics.append(metrics)
 
             except Exception as e:

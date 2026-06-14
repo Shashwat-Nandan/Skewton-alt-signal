@@ -1,3 +1,20 @@
+# Autoresearch objective → net_pnl (2026-06-14)
+
+Finding: optimizing gamma_theta_ratio is decoupled from P&L — the 2026-06-13
+candidate (gtr 0.95) lost MORE than baseline in-sample (-₹7,814 vs -₹1,171
+realized over the 3 training sessions; one day scored gtr 1.31 while booking
+-₹5.6k). Fix: optimize net_pnl (₹ realized+unrealized, net of costs).
+- autoresearch_loop.py: PNL_METRICS set; zero-trade session scores ₹0 for a
+  P&L objective (was -1e6 ratio penalty → that pushed overtrading). Variance
+  penalty + DD veto already make net_pnl risk-aware.
+- config.ini + config_template.ini [autoresearch] metric → net_pnl;
+  run_weekly_autoresearch.sh --metric net_pnl (+ rationale comment).
+- Tests: net_pnl zero-trade=0, P&L objective prefers profit, ratio still
+  penalized, PNL_METRICS guard (19 in test_autoresearch_loop). End-to-end
+  smoke on tape.
+NOTE: this fixes MISALIGNMENT, not the separate inert-gates flat-fitness
+issue ([[autoresearch-inert-gates]]) nor the 3-session window (eval_cycles=3).
+
 # Audit execution session 3 (2026-06-13) — Milestone 2
 
 Order: S-effort/low-risk first; host-touching + XL last (same as session 1).

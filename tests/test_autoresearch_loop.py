@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from autoresearch_loop import ZERO_TRADE_PENALTY, HedgeResearchLoop
+from autoresearch_loop import PNL_METRICS, ZERO_TRADE_PENALTY, HedgeResearchLoop
 
 
 def _loop(**attrs):
@@ -183,12 +183,45 @@ class TestRunExperiment:
         loop = _run_loop(eval_cycles=1, max_dd_threshold=20.0)
         assert loop._run_experiment({"gamma_scalp_band_pct": 1.2}) == -999999.0
 
-    def test_zero_trades_gets_penalty(self, monkeypatch):
+    def test_zero_trades_gets_penalty_for_ratio_metric(self, monkeypatch):
         _patch_backtest(monkeypatch, [
             {"gamma_theta_ratio": 9.9, "total_trades": 0, "max_drawdown": 0},
         ])
         loop = _run_loop(eval_cycles=1)
         assert loop._run_experiment({"gamma_scalp_band_pct": 1.2}) == ZERO_TRADE_PENALTY
+
+    def test_zero_trades_scores_zero_for_pnl_metric(self, monkeypatch):
+        # 2026-06-14 objective fix: with a net_pnl objective a no-trade
+        # session is ₹0 (a real outcome), NOT the -1e6 ratio penalty —
+        # otherwise the optimizer is pushed to overtrade instead of being
+        # allowed to trade less when that's more profitable.
+        _patch_backtest(monkeypatch, [
+            {"net_pnl": 0.0, "total_trades": 0, "max_drawdown": 0},
+        ])
+        loop = _run_loop(eval_cycles=1, primary="net_pnl")
+        assert loop._run_experiment({"gamma_scalp_band_pct": 1.2}) == 0.0
+
+    def test_net_pnl_objective_prefers_more_profit(self, monkeypatch):
+        # The accept scalar IS the rupee P&L (variance-penalised). A flat,
+        # profitable pair must beat a flat, losing one.
+        _patch_backtest(monkeypatch, [
+            {"net_pnl": 5000.0, "total_trades": 3, "max_drawdown": 0},
+            {"net_pnl": 5000.0, "total_trades": 3, "max_drawdown": 0},
+        ])
+        win = _run_loop(eval_cycles=2, primary="net_pnl")._run_experiment({"x": 1})
+        _patch_backtest(monkeypatch, [
+            {"net_pnl": -8000.0, "total_trades": 3, "max_drawdown": 0},
+            {"net_pnl": -8000.0, "total_trades": 3, "max_drawdown": 0},
+        ])
+        lose = _run_loop(eval_cycles=2, primary="net_pnl")._run_experiment({"x": 1})
+        assert win == pytest.approx(5000.0)   # zero variance → no penalty
+        assert lose == pytest.approx(-8000.0)
+        assert win > lose
+
+    def test_net_pnl_is_a_recognized_pnl_metric(self):
+        # Guard the objective the weekly cron uses against a future typo
+        # that would silently score 0 every experiment (flat fitness).
+        assert "net_pnl" in PNL_METRICS
 
     def test_variance_penalty_subtracts_half_a_stddev(self, monkeypatch):
         # cycles return 10 and 20 → mean 15, std 5, penalty 0.5*5 → 12.5

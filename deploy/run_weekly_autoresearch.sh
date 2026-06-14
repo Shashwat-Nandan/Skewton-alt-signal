@@ -71,22 +71,23 @@ PY="$PROJECT_DIR/.venv/bin/python"
   CANDIDATE="candidate_params_$TODAY.json"
 
   # 2026-05-27: drop --data so run_autoresearch.py:198 takes the
-  # captured-tape replay path. The CSV-based path bypassed Phase 2.3
-  # and replayed daily bars (12 ticks/day), which can't exercise the
-  # gamma_theta_ratio metric the uplift was designed for. Tape sessions
+  # captured-tape replay path. The CSV-based path replayed daily bars
+  # (12 ticks/day) and can't exercise an intraday objective. Tape sessions
   # live in data_cache/ticks/ticks-*.jsonl.
-  # 2026-06-01: optimize gamma_theta_ratio, not sharpe_ratio. Each cycle
-  # replays ONE captured session, which flushes ~1 daily P&L bucket — too few
-  # for an annualized Sharpe, so post the degenerate-Sharpe fix (#13)
-  # sharpe_ratio is a constant 0.0 across every experiment (flat fitness).
-  # gamma_theta_ratio (realized scalp / realized theta) is well-defined on a
-  # single session and is the Phase 2.4 metric the uplift was designed for —
-  # it matches config.ini's [autoresearch] default and the comment above.
+  # 2026-06-14: optimize net_pnl (₹ realized+unrealized, net of costs), NOT
+  # gamma_theta_ratio. The ratio is DECOUPLED from money: the 2026-06-13 run
+  # drove gamma_theta_ratio to 0.95 while the "winner" lost MORE than baseline
+  # in-sample (a 1.31 ratio day still booked -₹5.6k). net_pnl is well-defined
+  # on a single session (unlike Sharpe, which needs many daily buckets and is
+  # a flat 0.0 here) and is what we actually care about. The loop's variance
+  # penalty + drawdown veto make it risk-aware; zero-trade sessions score ₹0
+  # (not the ratio penalty) so the optimizer can choose to trade less rather
+  # than be pushed to overtrade.
   echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, captured-tape replay)..."
   "$PY" run_autoresearch.py \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
-      --metric gamma_theta_ratio \
+      --metric net_pnl \
       --eval-cycles 3 \
       --window-days 5 \
       --out "$CANDIDATE"
