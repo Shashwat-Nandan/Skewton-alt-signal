@@ -266,7 +266,22 @@ def main():
         loop._run_experiment = patched_run
 
     # ── Run ──
-    data_desc = f"historical ({args.data})" if args.data else f"synthetic ({args.days} days)"
+    # Describe the data the eval will ACTUALLY use. When --data is given the
+    # loop replays that CSV; otherwise _run_experiment prefers captured tape
+    # (the most recent eval_cycles sessions) and only falls back to synthetic
+    # GBM when no tape exists. Mirror that selection here so the headline log
+    # and the COMPLETE summary don't mislabel a tape run as "synthetic".
+    if args.data:
+        data_desc = f"historical ({args.data})"
+    else:
+        from backtest import list_captured_sessions
+        captured = list_captured_sessions(args.underlying)
+        replay = captured[-args.eval_cycles:] if captured else []
+        if replay:
+            data_desc = (f"captured tape ({len(replay)} sessions: "
+                         f"{replay[0]}..{replay[-1]})")
+        else:
+            data_desc = f"synthetic ({args.days} days, no captured tape)"
     logger.info("=" * 60)
     logger.info("AUTORESEARCH: %d experiments, metric=%s, %d cycles, data=%s",
                 args.experiments, args.metric, args.eval_cycles, data_desc)
