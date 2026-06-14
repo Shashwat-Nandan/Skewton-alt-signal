@@ -51,6 +51,12 @@ _INDEX_SPOT_SYMBOLS = {
 
 logger = logging.getLogger(__name__)
 
+# Audit 3.5: bleed_history / stability_history are append-only per-tick
+# diagnostics that nothing reads back and that serialize_state deliberately
+# skips. Bound them so a long or wedged session can't grow them without limit
+# (a normal session is ~360 ticks; this only bites pathological cases).
+_DIAG_HISTORY_CAP = 500
+
 
 def estimate_transaction_cost(
     price: float, quantity: int, lot_size: int, transaction_type: str,
@@ -627,6 +633,8 @@ class TalebKarpathyStrategy(BaseStrategy):
             # ── Gap #14: Stability test ──
             stability = self.risk.stability_test(test_positions, spot, T)
             self.state.stability_history.append(stability)
+            if len(self.state.stability_history) > _DIAG_HISTORY_CAP:
+                del self.state.stability_history[:-_DIAG_HISTORY_CAP]
             if not stability.is_stable:
                 for w in stability.warnings:
                     logger.warning("Stability: %s", w)
@@ -928,6 +936,8 @@ class TalebKarpathyStrategy(BaseStrategy):
             self.state.positions, spot, T, per_leg_T=per_leg_arg,
         )
         self.state.bleed_history.append(bleed)
+        if len(self.state.bleed_history) > _DIAG_HISTORY_CAP:
+            del self.state.bleed_history[:-_DIAG_HISTORY_CAP]
 
         # Neutrality check
         neutrality = self.risk.neutrality_check(pf)

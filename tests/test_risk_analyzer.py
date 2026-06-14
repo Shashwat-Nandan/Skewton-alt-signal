@@ -31,6 +31,22 @@ class TestMonteCarlo:
         assert report.worst_path_pnl <= report.best_path_pnl
         assert 0 <= report.pct_profitable <= 100
 
+    def test_mc_aggregates_are_numerically_consistent(self, analyzer, long_straddle):
+        """Numeric invariants (audit 3.2): the reported mean must lie within
+        [worst, best] and equal the mean of the per-path P&Ls, and
+        pct_profitable must equal the share of paths with pnl > 0. Catches an
+        aggregation bug that worst<=best alone would miss."""
+        r = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=40, trading_days=10, seed=7,
+        )
+        pnls = [p.final_pnl for p in r.path_results]
+        assert r.worst_path_pnl == pytest.approx(min(pnls))
+        assert r.best_path_pnl == pytest.approx(max(pnls))
+        assert r.worst_path_pnl <= r.mean_pnl <= r.best_path_pnl
+        assert r.mean_pnl == pytest.approx(sum(pnls) / len(pnls))
+        exp_pct = 100.0 * sum(1 for p in pnls if p > 0) / len(pnls)
+        assert r.pct_profitable == pytest.approx(exp_pct)
+
     def test_more_paths_reduces_variance(self, analyzer, long_straddle):
         # Smoke at two path counts — should produce results, not crash.
         analyzer.path_dependence_monte_carlo(
@@ -85,10 +101,13 @@ class TestBleedForecast:
 
 class TestHedgeDecision:
     def test_straddle_prefers_hard_delta(self, analyzer, long_straddle):
-        """ATM straddle should typically have positive gamma everywhere → hard delta OK."""
+        """A long straddle is positive-gamma everywhere → no gamma flip points
+        → hedge_decision must pick HARD delta (futures), not soft. (Was a
+        tautological `hard or soft` assertion — audit 3.2.)"""
         decision = analyzer.hedge_decision(long_straddle, 22000, 30 / 365)
-        # For a simple long straddle, gamma should be positive → hard delta
-        assert decision.use_hard_delta or decision.use_soft_delta  # Must recommend something
+        assert decision.gamma_flips == []          # positive gamma, no flips
+        assert decision.use_hard_delta is True
+        assert decision.use_soft_delta is False
 
     def test_decision_has_rationale(self, analyzer, long_straddle):
         decision = analyzer.hedge_decision(long_straddle, 22000, 30 / 365)

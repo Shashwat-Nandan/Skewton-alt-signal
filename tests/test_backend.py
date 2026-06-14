@@ -82,15 +82,14 @@ class TestMeta:
         assert r.status_code == 200
         body = r.json()
         assert body["version"] == "0.1.0"
-        assert body["live_mode_enabled"] is False
 
-    def test_root_live_mode_enabled_when_flag_set(self, live_mode_client):
-        # Inverse of test_root: with ALLOW_LIVE_MODE armed the meta endpoint
-        # must report it, so the flag is actually covered rather than only ever
-        # asserted false.
+    def test_root_does_not_leak_live_mode_posture(self, live_mode_client):
+        # Audit 3.5: the unauthenticated root must NOT reveal whether live mode
+        # is armed — even when ALLOW_LIVE_MODE is set. (Live is unconditionally
+        # refused at the dashboard anyway; the flag was a pure info-leak.)
         r = live_mode_client.get("/")
         assert r.status_code == 200
-        assert r.json()["live_mode_enabled"] is True
+        assert "live_mode_enabled" not in r.json()
 
     def test_strategies_list(self, client):
         r = client.get("/api/strategies")

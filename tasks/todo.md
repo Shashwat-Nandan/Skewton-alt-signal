@@ -1,3 +1,25 @@
+# Milestone 3 — Quality & polish (2026-06-14)
+
+Triage: 3.4 (STT/cost model) BLOCKED on operator NSE-rate verification (don't
+change cost model on memory). 3.7 (mid-session reconcile cadence) touches the
+LIVE path → operator-coordinated. Rest are safe code/test/docs.
+- [x] 3.5 (partial — the safe Lows): deleted dead claude_example.py; dropped
+      redundant idx_bars_token_ts (= bars PK verbatim; DROP IF EXISTS cleans
+      old DBs); removed live_mode_enabled info-leak from unauthenticated / (+3
+      backend tests updated); capped bleed_history/stability_history (append-
+      only diagnostics nothing reads) at 500. REMAINING 3.5: single
+      _max_drawdown, single _save_iv_history/tick, trim closed_trades
+      serialization, logrotate + unit-sync script.
+- [x] 3.2 tests: replaced tautological hedge_decision `hard or soft` with the
+      real no-flip→hard-delta assertion; added MC numeric-consistency test
+      (mean within [worst,best], = mean of path final_pnls, pct_profitable
+      matches); new tests/test_state_backup.py (archive write/prune + orphan
+      guard).
+- [ ] 3.6 de-flake test_kite_throttle wall-clock (inject clock); 3.1 docs
+      refresh; 3.3 /api/equity/signals tail-with-limit; 3.8 split
+      classify_pair_candidates out of run_paper_pairs.
+- [ ] 3.4 BLOCKED (NSE rates); 3.7 live-path (operator).
+
 # Autoresearch objective → net_pnl (2026-06-14)
 
 Finding: optimizing gamma_theta_ratio is decoupled from P&L — the 2026-06-13

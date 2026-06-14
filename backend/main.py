@@ -102,10 +102,12 @@ def create_app() -> FastAPI:
 
     @app.get("/", tags=["meta"])
     def root():
+        # Audit 3.5: do NOT expose live-arming posture on the unauthenticated
+        # root. The dashboard refuses live unconditionally (task 1.3) and the
+        # SPA doesn't consume this flag, so it was a pure info-leak.
         return {
             "name": app.title,
             "version": app.version,
-            "live_mode_enabled": settings.allow_live_mode,
         }
 
     return app

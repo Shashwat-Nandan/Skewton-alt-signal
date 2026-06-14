@@ -111,8 +111,11 @@ CREATE TABLE IF NOT EXISTS bars (
     PRIMARY KEY (instrument_token, interval_minutes, ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_bars_token_ts
-    ON bars (instrument_token, interval_minutes, ts);
+-- idx_bars_token_ts dropped (audit 3.5): it duplicated the bars PRIMARY KEY
+-- (instrument_token, interval_minutes, ts) verbatim, which SQLite already
+-- backs with an index — pure write overhead. DROP IF EXISTS also cleans DBs
+-- created before this change.
+DROP INDEX IF EXISTS idx_bars_token_ts;
 
 -- ──────────────────────────────────────────────────────────
 -- Equity-swing paper book (Phase 3)
