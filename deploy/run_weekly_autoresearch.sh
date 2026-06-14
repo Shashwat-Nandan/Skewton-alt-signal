@@ -83,12 +83,17 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # penalty + drawdown veto make it risk-aware; zero-trade sessions score ₹0
   # (not the ratio penalty) so the optimizer can choose to trade less rather
   # than be pushed to overtrade.
+  # 2026-06-14: --eval-cycles 5 (was 3). eval_cycles does double duty — it's
+  # both the cycles-per-experiment AND the size of the most-recent-sessions
+  # window (replay_sessions = captured[-eval_cycles:]). 5 → replay the full
+  # trading week (Mon–Fri), one cycle each, for a less thin / less recency-
+  # biased fitness sample. Costs ~+67% runtime (~3.5h → ~6h for 40 experiments).
   echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, captured-tape replay)..."
   "$PY" run_autoresearch.py \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
       --metric net_pnl \
-      --eval-cycles 3 \
+      --eval-cycles 5 \
       --window-days 5 \
       --out "$CANDIDATE"
 
