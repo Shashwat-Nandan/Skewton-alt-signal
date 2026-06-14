@@ -361,6 +361,12 @@ class TestRunBacktestSeeding:
         # No seed: both windows must START empty even though __init__ loaded
         # the live persisted history. Pre-fix, _skew_history started non-empty
         # (leak); this pins the symmetry.
-        run_backtest(data, underlying="NIFTY")
+        # Neutralize the IV-percentile entry gate so the scan deterministically
+        # reaches _compute_skew_percentile regardless of best_params.json — a
+        # tighter promoted entry_iv_percentile_max would otherwise short-circuit
+        # on the cold-start neutral IV (50.0) before skew is ever computed.
+        run_backtest(data, underlying="NIFTY", tunable_params={
+            "entry_iv_percentile_min": 0.0, "entry_iv_percentile_max": 100.0,
+        })
         assert seen["iv"] == 0
         assert seen["skew"] == 0
