@@ -1,12 +1,12 @@
 {
   "best_params": {
-    "rehedge_delta_threshold": 0.6454,
-    "gamma_scalp_band_pct": 1.5,
+    "rehedge_delta_threshold": 0.9013,
+    "gamma_scalp_band_pct": 1.6413,
     "position_size_pct": 12.9409,
     "vega_limit": 4000.0,
     "max_holding_period_hours": 22.0,
-    "entry_iv_percentile_min": 10.0,
-    "entry_iv_percentile_max": 85.0,
+    "entry_iv_percentile_min": 8.0,
+    "entry_iv_percentile_max": 43.0,
     "max_entry_alpha": 143013.0,
     "mc_worst_path_loss_pct": 3.0,
     "mc_min_mean_pnl": -10000.0,
@@ -16,13 +16,25 @@
     "skew_pct_max": 80.0,
     "enable_regime_dispatch": true,
     "max_layered_structures": 1,
-    "t0_band_factor": 0.5
+    "t0_band_factor": 0.5,
+    "regime_straddle_iv_pct_max": 60.0,
+    "regime_straddle_rv_iv_ratio_min": 1.0,
+    "regime_straddle_skew_pct_max": 70.0,
+    "regime_calendar_iv_pct_min": 70.0,
+    "regime_calendar_skew_pct_max": 60.0,
+    "regime_risk_reversal_skew_pct_min": 80.0,
+    "regime_backspread_vvol_min": 0.15,
+    "regime_asymmetric_strangle_rv_iv_min": 1.3,
+    "regime_asymmetric_strangle_skew_pct_min": 70.0,
+    "max_rehedge_lots_per_tick": 20,
+    "rehedge_cooldown_seconds": 180.0,
+    "max_rehedges_per_session": 20
   },
   "best_metric": {
-    "net_pnl": -1954.0001849500381
+    "net_pnl": -762.2626632540844
   },
-  "total_experiments": 30,
-  "timestamp": "2026-05-23T15:36:49.136867",
+  "total_experiments": 40,
+  "timestamp": "2026-06-14T16:56:33.640179",
   "_seed_note": "Seeded with Phase 3 flags enabled (regime_dispatch=true, layered=2, t0=0.5) so the autoresearch hill-climber explores the regime-routed structure space rather than tying at 0.0 across the legacy-only float space.",
   "_migrations": [
     {
