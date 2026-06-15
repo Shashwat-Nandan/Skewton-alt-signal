@@ -548,3 +548,172 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ──────────────────────────────────────────────────────────
+# Candidate classification (audit 3.8: moved here from run_paper_pairs so
+# backtests/sweeps can import the screen logic without importing the live
+# runner). run_paper_pairs re-exports these for its own use + back-compat.
+# ──────────────────────────────────────────────────────────
+
+# Quality floor — pairs below any of these may be statistically cointegrated
+# but are economically untradeable: half-life longer than max_holding_days
+# rules out reversion in window; correlation below 0.65 means the relationship
+# is too weak to anchor the spread; p above 0.025 (tighter than the screener's
+# default 0.05) cuts the false-positive rate across a multi-pair book.
+QUALITY_MIN_CORR = 0.65
+QUALITY_MAX_HALFLIFE = 5.0   # days
+QUALITY_MAX_PVALUE = 0.025
+
+# Leg-concentration cap — no single symbol may participate in more than this
+# many pairs in the book. Prevents one stock's idiosyncratic move from
+# driving multiple positions' P&L in the same direction.
+LEG_CONCENTRATION_CAP = 2
+
+
+def classify_pair_candidates(
+    df: pd.DataFrame,
+    top: int,
+    log: logging.Logger | None = None,
+    *,
+    exclude_symbols: set[str] | None = None,
+    max_hedge_ratio: float | None = None,
+    max_pvalue: float | None = None,
+    seed_leg_count: dict[str, int] | None = None,
+) -> pd.DataFrame:
+    """Annotate every candidate row with its disposition under the four-pass
+    runner logic (see `run_paper_pairs.select_pairs` for the passes).
+
+    Adds three columns to a copy of `df`:
+      - `select_score`: composite percentile-rank score (NaN if dropped by
+         excluded/β/quality before scoring).
+      - `processing_rank`: 1..N admit order (NaN if not admitted).
+      - `skip_reason`: '' for admitted, otherwise one of {'excluded', 'beta',
+         'quality', 'leg_cap', 'cutoff'}.
+
+    Optional rule overrides (defaults preserve live runner behavior):
+      - `exclude_symbols`: skip any pair where either leg is in this set
+         (skip_reason='excluded'). Used to blacklist e.g. Adani group when
+         the OOS backtest flags them as a persistent drag.
+      - `max_hedge_ratio`: override `HEDGE_RATIO_MAX` for the |β| upper
+         bound. Used to tighten the tradeable hedge-ratio band beyond the
+         strategy's defensive defaults.
+      - `max_pvalue`: override `QUALITY_MAX_PVALUE` for the cointegration
+         p-value ceiling. The persistent system passes 0.05 here: its CSV
+         already cleared the persistence screen's p<0.05 in ≥2 of N rolling
+         windows, so re-testing the latest single window at the tighter 0.025
+         is double-jeopardy. corr / half-life floors are unaffected — those
+         are economic-tradeability gates, system-agnostic.
+
+    Row order is preserved so callers can render the original candidate
+    sequence with annotations layered on. Used by both `select_pairs` (which
+    filters down to admitted rows) and the dashboard API (which surfaces the
+    full annotated list).
+    """
+    from strategies.pair_trading import HEDGE_RATIO_MIN, HEDGE_RATIO_MAX
+
+    beta_upper = max_hedge_ratio if max_hedge_ratio is not None else HEDGE_RATIO_MAX
+    pvalue_ceiling = max_pvalue if max_pvalue is not None else QUALITY_MAX_PVALUE
+
+    out = df.copy()
+    # Coerce numeric columns to float, mapping non-coercible values (e.g. a
+    # manually-edited CSV with a typo, or the test_malformed_row_skipped
+    # fixture) to NaN. Without this, pandas ≥2 reads a mixed-type column as
+    # object dtype and any comparison like `correlation >= 0.65` raises a
+    # TypeError on the underlying StringArray. NaN naturally fails all the
+    # downstream quality_mask comparisons → the row gets skip_reason='quality'.
+    for col in ("correlation", "hedge_ratio", "coint_pvalue", "half_life_days",
+                "spread_vol_pct"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out["select_score"] = float("nan")
+    out["processing_rank"] = pd.NA
+    out["skip_reason"] = ""
+
+    # Excluded-symbol blacklist runs before the β filter so a banned symbol
+    # never costs a rank slot even when its hedge ratio is benign.
+    if exclude_symbols:
+        excluded_mask = (
+            out["symbol_a"].isin(exclude_symbols)
+            | out["symbol_b"].isin(exclude_symbols)
+        )
+        out.loc[excluded_mask, "skip_reason"] = "excluded"
+        if log is not None and excluded_mask.any():
+            log.info("Excluded %d candidate(s) via blacklist: %s",
+                     int(excluded_mask.sum()),
+                     ", ".join(sorted(exclude_symbols)))
+    else:
+        excluded_mask = pd.Series(False, index=out.index)
+
+    abs_beta = out["hedge_ratio"].abs()
+    beta_mask = (
+        ~excluded_mask
+        & (abs_beta >= HEDGE_RATIO_MIN)
+        & (abs_beta <= beta_upper)
+    )
+    beta_dropped = ~excluded_mask & ~beta_mask
+    out.loc[beta_dropped, "skip_reason"] = "beta"
+    if log is not None and beta_dropped.any():
+        log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
+                 int(beta_dropped.sum()), HEDGE_RATIO_MIN, beta_upper)
+
+    quality_mask = (
+        beta_mask
+        & (out["correlation"] >= QUALITY_MIN_CORR)
+        & (out["half_life_days"] <= QUALITY_MAX_HALFLIFE)
+        & (out["coint_pvalue"] <= pvalue_ceiling)
+    )
+    quality_dropped = beta_mask & ~quality_mask
+    out.loc[quality_dropped, "skip_reason"] = "quality"
+    if log is not None and quality_dropped.any():
+        log.info("Quality floor (corr≥%.2f, HL≤%.1fd, p≤%.3f) dropped %d more",
+                 QUALITY_MIN_CORR, QUALITY_MAX_HALFLIFE, pvalue_ceiling,
+                 int(quality_dropped.sum()))
+
+    if not quality_mask.any():
+        return out
+
+    # Recompute percentile ranks within the quality-passing subset so the
+    # added corr_rank component is calibrated to the candidates that are
+    # actually selectable, not the whole 46-row screen.
+    sub = out.loc[quality_mask]
+    p_rank = sub["coint_pvalue"].rank(pct=True)
+    hl_rank = sub["half_life_days"].rank(pct=True)
+    vol_rank = (-sub["spread_vol_pct"]).rank(pct=True)
+    corr_rank = (-sub["correlation"]).rank(pct=True)
+    out.loc[quality_mask, "select_score"] = (p_rank + hl_rank + vol_rank + corr_rank) / 4.0
+
+    # Percentile ranks over an 18-row quality-passing set produce many ties.
+    # Break them by correlation desc — consistent with this whole composite's
+    # bias toward mean-reversion confidence over bps-per-reversion.
+    walk_order = (
+        out.loc[quality_mask]
+        .sort_values(["select_score", "correlation"], ascending=[True, False])
+        .index.tolist()
+    )
+
+    admitted_count = 0
+    # H17: seed with cross-runner counts so two runners (baseline + persistent)
+    # can't each independently admit the same symbol up to the per-runner cap
+    # and end up with 2× per-symbol exposure overall.
+    leg_count: dict[str, int] = dict(seed_leg_count or {})
+    for idx in walk_order:
+        if admitted_count >= top:
+            out.loc[idx, "skip_reason"] = "cutoff"
+            continue
+        a = out.at[idx, "symbol_a"]
+        b = out.at[idx, "symbol_b"]
+        if (leg_count.get(a, 0) >= LEG_CONCENTRATION_CAP
+                or leg_count.get(b, 0) >= LEG_CONCENTRATION_CAP):
+            out.loc[idx, "skip_reason"] = "leg_cap"
+            if log is not None:
+                log.info("  skipped %s/%s — leg-concentration cap (%dx) reached",
+                         a, b, LEG_CONCENTRATION_CAP)
+            continue
+        admitted_count += 1
+        out.loc[idx, "processing_rank"] = admitted_count
+        leg_count[a] = leg_count.get(a, 0) + 1
+        leg_count[b] = leg_count.get(b, 0) + 1
+
+    return out

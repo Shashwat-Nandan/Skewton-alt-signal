@@ -32,7 +32,7 @@ from backtest_pairs_rule import (
     portfolio_weekly_pnl,
     weekly_checkpoints,
 )
-from run_paper_pairs import classify_pair_candidates
+from screen_pairs import classify_pair_candidates
 from screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
 
 logger = logging.getLogger("sweep_top")

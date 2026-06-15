@@ -46,7 +46,7 @@ import pandas as pd
 # Re-use existing building blocks — Rule 7: don't fork the selection logic
 # and don't reimplement screening.
 from backtest_pairs import backtest_one, load_lot_sizes
-from run_paper_pairs import classify_pair_candidates
+from screen_pairs import classify_pair_candidates
 from screen_pairs import (
     NIFTY_50, load_front_month_panel, screen_pairs, screen_pairs_persistent,
 )
