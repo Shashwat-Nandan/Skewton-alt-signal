@@ -67,6 +67,7 @@ class KiteRateLimiter:
     def __init__(
         self, rate_per_sec: float = DEFAULT_RATE_PER_SEC,
         burst: int = DEFAULT_BURST,
+        *, clock=time.monotonic, sleep=time.sleep,
     ):
         if rate_per_sec <= 0:
             raise ValueError("rate_per_sec must be positive")
@@ -75,7 +76,12 @@ class KiteRateLimiter:
         self._rate = float(rate_per_sec)
         self._burst = int(burst)
         self._tokens = float(burst)
-        self._last_refill = time.monotonic()
+        # clock/sleep are injectable so tests can drive a deterministic fake
+        # clock (no real waits, no wall-clock-flaky assertions — audit 3.6).
+        # Production defaults to the monotonic clock + real sleep.
+        self._clock = clock
+        self._sleep = sleep
+        self._last_refill = self._clock()
         self._lock = threading.Lock()
 
     def acquire(self) -> float:
@@ -85,7 +91,7 @@ class KiteRateLimiter:
         total_wait = 0.0
         while True:
             with self._lock:
-                now = time.monotonic()
+                now = self._clock()
                 elapsed = now - self._last_refill
                 self._last_refill = now
                 self._tokens = min(
@@ -104,7 +110,7 @@ class KiteRateLimiter:
                 # the lock, then sleep — letting other threads keep the
                 # bucket honest while we wait.
                 wait = (1.0 - self._tokens) / self._rate
-            time.sleep(wait)
+            self._sleep(wait)
             total_wait += wait
 
 

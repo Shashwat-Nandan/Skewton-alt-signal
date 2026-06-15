@@ -22,32 +22,40 @@ from kite_throttle import (
 )
 
 
+class FakeClock:
+    """Deterministic monotonic clock. `sleep` advances virtual time, so the
+    token bucket behaves exactly as in production without any real waits —
+    no wall-clock-flaky upper/lower bounds (audit 3.6)."""
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
 class TestKiteRateLimiterBasics:
     def test_burst_passes_without_waiting(self):
         """The first N≤burst calls drain the initial bucket — none of
-        them should block. Token refill rate is irrelevant until the
-        bucket empties."""
-        limiter = KiteRateLimiter(rate_per_sec=2.0, burst=5)
-        t0 = time.monotonic()
+        them should block (exact: zero virtual time elapses)."""
+        fc = FakeClock()
+        limiter = KiteRateLimiter(rate_per_sec=2.0, burst=5, clock=fc, sleep=fc.sleep)
         for _ in range(5):
             assert limiter.acquire() == 0.0
-        # Five token consumptions on a 5-token bucket → no waits, so
-        # the whole loop should be <50ms (system jitter only).
-        assert time.monotonic() - t0 < 0.05
+        assert fc.t == 0.0   # no sleeps → virtual clock unmoved
 
     def test_exhausted_bucket_throttles_to_rate(self):
-        """After draining the burst, subsequent calls block at the
-        configured rate. With rate=10/s and burst=1, three back-to-back
-        calls should take ≥ (N-1)/rate seconds total."""
-        limiter = KiteRateLimiter(rate_per_sec=10.0, burst=1)
-        t0 = time.monotonic()
-        for _ in range(3):
-            limiter.acquire()
-        elapsed = time.monotonic() - t0
-        # (3 calls - 1 free) × (1/10s) = 0.20s minimum
-        assert elapsed >= 0.18, f"throttle not enforced: only {elapsed:.3f}s for 3 calls"
-        # And not absurdly slow — under 0.5s for sanity.
-        assert elapsed < 0.5
+        """After draining the burst, each further call blocks exactly
+        1/rate. rate=10/s burst=1: 3 calls → 1 free + 2×0.1s = 0.20s."""
+        fc = FakeClock()
+        limiter = KiteRateLimiter(rate_per_sec=10.0, burst=1, clock=fc, sleep=fc.sleep)
+        waits = [limiter.acquire() for _ in range(3)]
+        assert waits[0] == 0.0                       # burst token, free
+        assert waits[1] == pytest.approx(0.1)        # one refill period
+        assert waits[2] == pytest.approx(0.1)
+        assert fc.t == pytest.approx(0.2)            # exact total, no jitter
 
     def test_rejects_nonpositive_rate(self):
         with pytest.raises(ValueError):
@@ -113,19 +121,19 @@ class TestThrottleKite:
         assert kite.quote.__wrapped__ is not None
 
     def test_actually_throttles_through_wrapper(self):
-        """End-to-end: 3 wrapped calls on a 10/s burst=1 client should
-        take at least 0.18s — proves the wrapper actually calls
-        limiter.acquire() rather than just labeling the method."""
+        """End-to-end: 3 wrapped calls on a 10/s burst=1 client must incur
+        exactly 0.2s of throttling — proves the wrapper actually calls
+        limiter.acquire() rather than just labeling the method. Fake clock
+        → deterministic (audit 3.6)."""
+        fc = FakeClock()
         kite = MagicMock()
         kite.quote = MagicMock(return_value={})
-        limiter = KiteRateLimiter(rate_per_sec=10.0, burst=1)
+        limiter = KiteRateLimiter(rate_per_sec=10.0, burst=1, clock=fc, sleep=fc.sleep)
         throttle_kite(kite, limiter, methods=("quote",))
 
-        t0 = time.monotonic()
         for _ in range(3):
             kite.quote(["x"])
-        elapsed = time.monotonic() - t0
-        assert elapsed >= 0.18, f"wrapper bypassed throttler: {elapsed:.3f}s"
+        assert fc.t == pytest.approx(0.2), f"wrapper bypassed throttler: {fc.t:.3f}s"
 
     def test_default_methods_cover_kite_surface(self):
         """Smoke check: the DEFAULT_THROTTLED_METHODS list mentions
