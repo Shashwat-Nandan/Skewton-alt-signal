@@ -11,7 +11,7 @@ code and the same on-disk caches:
 
 | System | Entry point | What it does |
 | --- | --- | --- |
-| Headless daemon | `run_paper.py` | Mon–Fri 09:15–15:25 IST: paper-trades, flattens at close, exits cleanly. Driven by systemd. |
+| Headless daemons | `run_paper.py` (Taleb-Karpathy), `run_paper_pairs.py` (pairs — incl. the live `pair-paper-persistent-live` runner), `run_paper_arbitrage.py` (calendar spreads), `run_equity_swing.py` (equity swing) | Mon–Fri, systemd-timer driven: paper/live-trade the session, persist state, exit cleanly. Four strategies, one per runner. |
 | Browser dashboard | `backend/main.py` (FastAPI) + `frontend/` (React/Vite) | Pick a strategy + mode in a UI, watch live signals / paper trades / P&L. **Never** trades live. |
 
 Live trading is **off** in the dashboard by design — it stays on the
@@ -69,7 +69,9 @@ Top-level Python entry points (most are CLI scripts):
 
 | File | Role |
 | --- | --- |
-| `run_paper.py` | Daily unattended paper-trader; fires from `taleb-hedger.timer` |
+| `run_paper.py` | Daily unattended Taleb-Karpathy paper-trader; fires from `taleb-hedger.timer` |
+| `run_paper_pairs.py` | Daily pair-trading runner (baseline + persistent systems); fires from `pair-paper*.timer`. The live pair runner is `pair-paper-persistent-live` |
+| `run_paper_arbitrage.py` | Daily calendar-spread arbitrage runner; fires from `arbitrage-paper.timer` |
 | `run_equity_swing.py` | Twice-daily Varsity equity scan (fires from `equity-swing-{open,close}.timer`) |
 | `run.py` | Headless mode + autoresearch loop |
 | `run_autoresearch.py` | Standalone parameter sweep with hold-out validation |

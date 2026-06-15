@@ -5,14 +5,21 @@
 A single repository running **two parallel systems** against the same Zerodha
 Kite Connect account:
 
-1. **Headless paper-trading + autoresearch daemon.** Runs on a VPS under
-   `systemd`. Authenticates via TOTP (`kite_auth.py`), executes the
-   Taleb-Karpathy strategy in paper mode through the trading session, and
-   sweeps strategy parameters once a week against recent NIFTY history.
+1. **Headless paper/live-trading + autoresearch daemons.** Run on a VPS under
+   `systemd`. Authenticate via TOTP (`kite_auth.py`) and run one strategy per
+   timer-driven runner through the trading session: Taleb-Karpathy
+   (`run_paper.py`), pair trading (`run_paper_pairs.py` — a baseline and a
+   persistent system, the latter with a real-money `pair-paper-persistent-live`
+   variant), calendar-spread arbitrage (`run_paper_arbitrage.py`), and Varsity
+   equity swing (`run_equity_swing.py`). The autoresearch loop sweeps
+   Taleb-Karpathy parameters once a week against recent captured NIFTY tape.
+   Going live is documented in `deploy/VPS_DEPLOYMENT.md` §7 (least-privilege
+   user migration in §6.5).
 2. **Browser dashboard.** A FastAPI backend + React SPA. Authenticates via
-   Kite OAuth. Lets a user pick a strategy (Taleb-Karpathy or Pair Trading),
-   pick a mode (signals-only or paper), and watch live signals / trades /
-   P&L. Live trading from the dashboard is intentionally rejected.
+   Kite OAuth. Lets a user pick a strategy (Taleb-Karpathy, Pair Trading,
+   Arbitrage, or Equity Swing), pick a mode (signals-only or paper), and watch
+   live signals / trades / P&L. Live trading from the dashboard is
+   unconditionally rejected.
 
 Both share:
 

@@ -49,7 +49,10 @@ cd /opt/taleb-karpathy-kite
 git clone <your-repo-url> .
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install -r requirements.txt   # or whatever pin file you maintain
+# Hash-pinned lockfiles are the source of truth (there is no requirements.txt).
+# requirements.in/-dev.in are the human-edited inputs; the .lock files are
+# generated via `uv pip compile … --generate-hashes` and installed verbatim.
+.venv/bin/pip install --require-hashes -r requirements.lock -r requirements-dev.lock
 ```
 
 Adjust the user name (`taleb`) and the path (`/opt/taleb-karpathy-kite`) consistently — they appear in both `.service` files.
@@ -326,7 +329,7 @@ Same for `taleb-hedger.service`. The hedger refuses to actually trade outside th
 sudo -u taleb bash -c '
   cd /opt/taleb-karpathy-kite
   git pull --ff-only
-  .venv/bin/pip install -r requirements.txt
+  .venv/bin/pip install --require-hashes -r requirements.lock -r requirements-dev.lock
 '
 sudo systemctl daemon-reload   # only if any unit file changed
 ```

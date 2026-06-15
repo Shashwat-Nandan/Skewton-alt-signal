@@ -15,9 +15,22 @@ LIVE path → operator-coordinated. Rest are safe code/test/docs.
       (mean within [worst,best], = mean of path final_pnls, pct_profitable
       matches); new tests/test_state_backup.py (archive write/prune + orphan
       guard).
-- [ ] 3.6 de-flake test_kite_throttle wall-clock (inject clock); 3.1 docs
-      refresh; 3.3 /api/equity/signals tail-with-limit; 3.8 split
-      classify_pair_candidates out of run_paper_pairs.
+- [x] 3.6 de-flake test_kite_throttle: KiteRateLimiter takes injectable
+      clock+sleep; deterministic-rate tests use a FakeClock (exact, instant,
+      no wall-clock upper-bound flake). test_thread_safe stays real (genuine
+      concurrency, safe lower bound). 9 pass in ~1s (was ~2s+).
+- [x] 3.3 /api/equity/signals: tail-read (last 4 MB) + `limit` param instead
+      of parsing the whole shared feed (can be 358 MB) per poll. +2 tests.
+- [x] 3.8 split classify_pair_candidates + QUALITY_*/LEG_CONCENTRATION_CAP →
+      screen_pairs.py; run_paper_pairs re-exports (select_pairs/dashboard/
+      tests unchanged); backtest_pairs_rule + sweep_top repointed → neither
+      imports the live runner anymore. 31 affected tests green.
+- [x] 3.1 docs: README entry-point + script tables add run_paper_pairs /
+      run_paper_arbitrage (four strategies/runners); architecture.md intro
+      updated to 4 strategies + live runners + §7/§6.5 links; VPS_DEPLOYMENT
+      requirements.txt → --require-hashes lockfile flow (2 spots).
+- [ ] 3.5 tail (single _max_drawdown, single _save_iv_history/tick, trim
+      closed_trades serialization, logrotate + unit-sync script).
 - [ ] 3.4 BLOCKED (NSE rates); 3.7 live-path (operator).
 
 # Autoresearch objective → net_pnl (2026-06-14)
