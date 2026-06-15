@@ -36,6 +36,27 @@ class TestTransactionCosts:
         cost_large = estimate_transaction_cost(100.0, 10, 25, "BUY")
         assert cost_large > cost_small
 
+    def test_options_sell_stt_rate(self):
+        # Audit 3.4: options STT = 0.150% of premium turnover on sell, per the
+        # NSE schedule. Isolate STT as (sell cost - buy cost) + buy stamp:
+        # the only side-dependent levies are STT (sell) and stamp (buy), so
+        # sell_cost - buy_cost = STT - stamp.
+        turnover = 300.0 * 2 * 25                       # 15,000
+        buy = estimate_transaction_cost(300.0, 2, 25, "BUY", instrument_type="OPT")
+        sell = estimate_transaction_cost(300.0, 2, 25, "SELL", instrument_type="OPT")
+        stamp = turnover * 0.00003                       # buy-side stamp
+        stt = (sell - buy) + stamp
+        assert stt == pytest.approx(turnover * 0.0015)   # 0.150%
+
+    def test_futures_sell_stt_rate(self):
+        # Audit 3.4: futures STT = 0.050% of traded turnover on sell.
+        turnover = 1000.0 * 1 * 25                       # 25,000
+        buy = estimate_transaction_cost(1000.0, 1, 25, "BUY", instrument_type="FUT")
+        sell = estimate_transaction_cost(1000.0, 1, 25, "SELL", instrument_type="FUT")
+        stamp = turnover * 0.00003
+        stt = (sell - buy) + stamp
+        assert stt == pytest.approx(turnover * 0.0005)   # 0.050%
+
 
 class TestPositionNetting:
     """P0: Verify position netting in execute_proposals."""

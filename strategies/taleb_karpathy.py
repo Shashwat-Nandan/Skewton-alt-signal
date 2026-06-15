@@ -83,16 +83,21 @@ def estimate_transaction_cost(
     # Flat brokerage (discount broker like Zerodha: ₹20 per executed order)
     brokerage = 20.0
 
-    # STT differs by instrument type
+    # STT (sell side only for F&O). Rates per NSE "SEBI/Turnover Fees/STT
+    # & Other Levies" schedule (audit 3.4, verified 2026-06-15):
+    #   Equity Futures (sell): 0.050% of traded price (turnover)
+    #   Equity Options (sell): 0.150% of option premium (turnover)
+    # Both were materially understated before (0.0125% / 0.0625%), which made
+    # the cost hurdle too lax. Options-exercise STT (0.150% on intrinsic,
+    # paid by the purchaser at settlement) is NOT modeled here — this is a
+    # per-order estimate; positions are closed/flattened before settlement.
     stt = 0.0
     if instrument_type == "FUT":
-        # Futures: 0.0125% on sell side (on turnover)
         if transaction_type == "SELL":
-            stt = turnover * 0.000125
+            stt = turnover * 0.0005
     else:
-        # Options: 0.0625% on sell side (on premium turnover)
         if transaction_type == "SELL":
-            stt = turnover * 0.000625
+            stt = turnover * 0.0015
 
     # Exchange transaction charges differ by product
     if instrument_type == "FUT":

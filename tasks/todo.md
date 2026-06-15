@@ -31,7 +31,13 @@ LIVE path → operator-coordinated. Rest are safe code/test/docs.
       requirements.txt → --require-hashes lockfile flow (2 spots).
 - [ ] 3.5 tail (single _max_drawdown, single _save_iv_history/tick, trim
       closed_trades serialization, logrotate + unit-sync script).
-- [ ] 3.4 BLOCKED (NSE rates); 3.7 live-path (operator).
+- [x] 3.4 STT rates corrected against the NSE schedule (operator-provided
+      2026-06-15): futures sell STT 0.0125%→0.050%; options sell STT
+      0.0625%→0.150% (both were understated → cost hurdle too lax, fed
+      overtrading). +2 rate-pinning tests. Other levies (exchange/SEBI/GST/
+      stamp) NOT touched — only STT was on the provided schedule; verify
+      separately before changing. Affects pair+arbitrage futures costs too.
+- [ ] 3.7 live-path (operator); 3.5 tail (small Lows remaining).
 
 # Autoresearch objective → net_pnl (2026-06-14)
 
