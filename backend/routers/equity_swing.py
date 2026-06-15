@@ -189,11 +189,32 @@ def list_positions(
     return EquityPositionsResponse(positions=out)
 
 
+# signals-<date>.jsonl is the SHARED feed for every strategy and can reach
+# hundreds of MB intraday. The dashboard only shows recent signals, so we
+# read just the tail (audit 3.3) instead of parsing the whole file per poll.
+_SIGNALS_TAIL_BYTES = 4 * 1024 * 1024   # scan at most the last 4 MB
+
+
+def _tail_text(path, max_bytes: int) -> str:
+    """Return the last <= max_bytes of `path` as text, dropping a leading
+    partial line so callers always get whole JSON records."""
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+            f.readline()   # discard the partial first line
+        return f.read().decode("utf-8", errors="replace")
+
+
 @router.get("/signals", response_model=EquitySignalsResponse)
 def list_signals(
     date_: Optional[str] = Query(
         None, alias="date",
         description="ISO date (YYYY-MM-DD). Defaults to today.",
+    ),
+    limit: int = Query(
+        200, ge=1, le=2000,
+        description="Max recent equity signals to return (newest last).",
     ),
 ) -> EquitySignalsResponse:
     iso = date_ or date.today().isoformat()
@@ -211,30 +232,32 @@ def list_signals(
     ).isoformat(timespec="milliseconds")
 
     signals: List[EquitySignal] = []
-    with path.open() as f:
-        for ln, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError as e:
-                logger.warning("signals-%s.jsonl:%d malformed (%s)", iso, ln, e)
-                continue
-            if rec.get("strategy") != "varsity_equity_swing":
-                continue
-            try:
-                signals.append(EquitySignal(
-                    timestamp=str(rec.get("timestamp", "")),
-                    tradingsymbol=str(rec["tradingsymbol"]),
-                    transaction_type=str(rec["transaction_type"]),
-                    quantity=int(rec.get("quantity", 0)),
-                    price=float(rec.get("price", 0.0)),
-                    rationale=rec.get("rationale"),
-                ))
-            except (KeyError, TypeError, ValueError) as e:
-                logger.warning("signals-%s.jsonl:%d skip row (%s)", iso, ln, e)
-    return EquitySignalsResponse(date=iso, generated_at=generated_at, signals=signals)
+    for ln, raw in enumerate(_tail_text(path, _SIGNALS_TAIL_BYTES).splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            logger.warning("signals-%s.jsonl tail:%d malformed (%s)", iso, ln, e)
+            continue
+        if rec.get("strategy") != "varsity_equity_swing":
+            continue
+        try:
+            signals.append(EquitySignal(
+                timestamp=str(rec.get("timestamp", "")),
+                tradingsymbol=str(rec["tradingsymbol"]),
+                transaction_type=str(rec["transaction_type"]),
+                quantity=int(rec.get("quantity", 0)),
+                price=float(rec.get("price", 0.0)),
+                rationale=rec.get("rationale"),
+            ))
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning("signals-%s.jsonl tail:%d skip row (%s)", iso, ln, e)
+    # Newest last; cap to `limit` (keep the most recent).
+    return EquitySignalsResponse(
+        date=iso, generated_at=generated_at, signals=signals[-limit:],
+    )
 
 
 @router.get("/scans", response_model=EquityScansResponse)

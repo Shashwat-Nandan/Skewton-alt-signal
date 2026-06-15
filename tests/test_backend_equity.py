@@ -177,6 +177,40 @@ class TestSignals:
         r = client.get("/api/equity/signals?date=not-a-date")
         assert r.status_code == 400
 
+    def test_limit_returns_most_recent(self, client, tmp_path):
+        # Audit 3.3: many signals, limit caps to the NEWEST n (newest last).
+        path = tmp_path / "logs" / "signals-2026-05-08.jsonl"
+        self._write_jsonl(path, [
+            {"timestamp": f"2026-05-08T15:{i:02d}:00",
+             "strategy": "varsity_equity_swing", "tradingsymbol": f"SYM{i}",
+             "transaction_type": "BUY", "quantity": 1, "price": 100.0}
+            for i in range(20)
+        ])
+        r = client.get("/api/equity/signals?date=2026-05-08&limit=5")
+        assert r.status_code == 200
+        syms = [s["tradingsymbol"] for s in r.json()["signals"]]
+        assert syms == ["SYM15", "SYM16", "SYM17", "SYM18", "SYM19"]
+
+    def test_only_tail_is_parsed_on_huge_file(self, client, tmp_path, monkeypatch):
+        # Audit 3.3: a multi-MB shared feed must not be parsed whole. Shrink
+        # the tail window and assert only records within it are returned —
+        # proving the endpoint reads the tail, not the entire file.
+        import backend.routers.equity_swing as eq_router
+        monkeypatch.setattr(eq_router, "_SIGNALS_TAIL_BYTES", 2000)  # ~2 KB
+        path = tmp_path / "logs" / "signals-2026-05-08.jsonl"
+        self._write_jsonl(path, [
+            {"timestamp": f"2026-05-08T10:{i:02d}:00",
+             "strategy": "varsity_equity_swing", "tradingsymbol": f"OLD{i}",
+             "transaction_type": "BUY", "quantity": 1, "price": 100.0,
+             "rationale": "x" * 200}                     # fat rows to exceed 2 KB
+            for i in range(100)
+        ])
+        r = client.get("/api/equity/signals?date=2026-05-08")
+        syms = [s["tradingsymbol"] for s in r.json()["signals"]]
+        assert len(syms) < 100                            # whole file NOT parsed
+        assert syms[-1] == "OLD99"                        # newest present
+        assert "OLD0" not in syms                          # oldest beyond tail dropped
+
 
 class TestScans:
     def test_empty(self, client):
