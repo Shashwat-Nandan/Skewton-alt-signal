@@ -1,3 +1,38 @@
+# 2.2 — migrate pair_trading onto the shared order_executor (PLAN, 2026-06-16)
+
+Goal: one implementation of place→poll→cancel/partial-reverse. pair's
+_live_execute delegates to strategies/order_executor.KiteOrderExecutor (which
+was ported FROM pair, so semantics already match). taleb+arbitrage already
+delegate; pair is the last copy.
+
+KEEP in pair (NOT in the executor — they're pair-strategy state/flow):
+- M-B5 consecutive-failure backoff (gate in _live_execute + _track_place_order_outcome)
+- H15 margin precheck (execute_proposals, pre-loop) — already separate
+- C2 entry-batch atomic reversal (_reverse_filled_legs) — already separate
+
+Implementation steps:
+- [x] added lazy _order_executor() on pair (mirrors taleb/arbitrage).
+- [x] _live_execute keeps the M-B5 skip-gate, then delegates to executor.execute.
+- [x] deleted pair's duplicate executor internals (_protective_limit_price,
+      _tick_size_for, _poll_until_terminal, _emergency_reverse_partial, inline
+      _do_place); removed now-unused `math` import. KEPT _get_last_price,
+      _get_nfo_instruments, _try_refresh_kite, _order_tag, M-B5 + _track.
+- [x] tests: the 4 TestProtectiveLimitOrders _live_execute tests pass UNCHANGED;
+      repointed the direct _emergency_reverse_partial test to the executor.
+      207 pass across pair+executor+runner suites — byte-identical.
+
+Validation / soak / rollout (HONEST: paper does NOT hit _live_execute, so the
+test matrix + live canary are the real gates):
+- [x] pair suite byte-identical green (207); full suite + CI: pending push.
+- [ ] integration smoke: run pair-paper-persistent (PAPER) one session on host
+      — confirms construction/serialize/import integrity (not the executor path).
+- [ ] LIVE canary (operator): restart pair-paper-persistent-live mid-session in
+      a low-activity window; watch the FIRST live entry+exit closely (marketable
+      LIMIT price, order_history poll, state file, EOD sidecar, broker reconcile);
+      HALT_ALL armed. Rollback = git revert + restart (executor change only
+      affects the live order path; main landing does NOT auto-deploy — the host
+      runs stale code until the operator restarts the unit).
+
 # Milestone 3 — Quality & polish (2026-06-14)
 
 Triage: 3.4 (STT/cost model) BLOCKED on operator NSE-rate verification (don't

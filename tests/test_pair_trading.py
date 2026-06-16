@@ -2070,11 +2070,15 @@ class TestProtectiveLimitOrders:
     def test_emergency_partial_reverse_uses_protective_limit(self):
         # The H7 inline partial-fill reversal hits the same API rule —
         # a MARKET reversal there would be rejected and leave the orphan.
+        # Audit 2.2: the reversal now lives in the shared executor; assert it
+        # through the executor pair builds (same fake kite, same protective
+        # LIMIT semantics).
         s = self._live_strategy()
         s.kite.quote = MagicMock(return_value={
             "NFO:AAA26APRFUT": {"last_price": 1000.0},
         })
-        s._emergency_reverse_partial(self._prop("BUY"), 50, "ORIG-1")
+        s._order_executor()._emergency_reverse_partial(
+            self._prop("BUY"), 50, "ORIG-1")
         kwargs = s.kite.place_order.call_args.kwargs
         assert kwargs["order_type"] == "LIMIT"
         assert kwargs["transaction_type"] == "SELL"  # reverse of BUY
