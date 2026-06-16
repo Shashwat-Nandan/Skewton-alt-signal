@@ -37,7 +37,14 @@ LIVE path → operator-coordinated. Rest are safe code/test/docs.
       overtrading). +2 rate-pinning tests. Other levies (exchange/SEBI/GST/
       stamp) NOT touched — only STT was on the provided schedule; verify
       separately before changing. Affects pair+arbitrage futures costs too.
-- [ ] 3.7 live-path (operator); 3.5 tail (small Lows remaining).
+- [x] 3.5 tail: single _save_iv_history/tick (removed the redundant skew-side
+      save; the IV-side save runs first every tick and persists both); cap
+      closed_trades serialization to last 200 (_CLOSED_TRADES_PERSIST — state
+      file is rewritten per tick, dashboard reads today-only); _max_drawdown
+      already single (_update_drawdown, one field — no change). deploy/
+      logrotate-taleb.conf (compress + 90d prune of logs/*.log) +
+      deploy/sync-units.sh (read-only unit-drift checker; --apply gated).
+- [ ] 3.7 live-path mid-session reconcile cadence (operator-coordinated).
 
 # Autoresearch objective → net_pnl (2026-06-14)
 

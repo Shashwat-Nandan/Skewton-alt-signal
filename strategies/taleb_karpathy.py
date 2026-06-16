@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # (a normal session is ~360 ticks; this only bites pathological cases).
 _DIAG_HISTORY_CAP = 500
 
+# Audit 3.5: cap closed_trades written to the (per-tick-rewritten) state file.
+# The dashboard reads today-only, and a session closes well under this many,
+# so today's trades survive a same-day restart while the file stops growing
+# unboundedly across sessions.
+_CLOSED_TRADES_PERSIST = 200
+
 
 def estimate_transaction_cost(
     price: float, quantity: int, lot_size: int, transaction_type: str,
@@ -1156,7 +1162,13 @@ class TalebKarpathyStrategy(BaseStrategy):
                 "max_drawdown": self.state.max_drawdown,
                 "peak_pnl": self.state.peak_pnl,
                 "total_transaction_costs": self.state.total_transaction_costs,
-                "closed_trades": self.state.closed_trades,
+                # Audit 3.5: persist only the most recent closed trades. The
+                # state file is rewritten every tick (H1), so serializing the
+                # full ever-growing history bloats each write. The dashboard
+                # only reads TODAY's closed trades (positions.py _is_today
+                # filter), and a session closes far fewer than this cap, so
+                # today's are always present after a same-day restart.
+                "closed_trades": self.state.closed_trades[-_CLOSED_TRADES_PERSIST:],
                 "_prev_snapshot_pnl": self.state._prev_snapshot_pnl,
                 "_current_day_pnl": self.state._current_day_pnl,
                 "_current_trading_date": (
@@ -2165,7 +2177,11 @@ class TalebKarpathyStrategy(BaseStrategy):
         self._skew_history.append(skew)
         if len(self._skew_history) > self._iv_history_max_size:
             self._skew_history = self._skew_history[-self._iv_history_max_size:]
-        self._save_iv_history()
+        # Audit 3.5: no separate save here — _save_iv_history persists BOTH
+        # histories and already fired in _compute_iv_percentile earlier this
+        # tick (it runs before the IV-band gate, so on every scan). This skew
+        # append rides the next tick's save (and end_of_session's), avoiding a
+        # redundant second file write per tick.
 
         if len(self._skew_history) < 30:
             return 50.0
