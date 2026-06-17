@@ -55,6 +55,7 @@ def _make_strategy(
     s.disable_calendar = disable_calendar
     s.lots_per_leg = 1
     s.max_open_calendars = 5
+    s.calendar_margin_pct = 0.06
     s.max_leg_notional = None
     s.total_capital = 500_000
     s.state = ArbitrageState()
@@ -269,6 +270,28 @@ class TestCalendarEntry:
         )
         s._observe_universe = lambda: [self._snap(symbol="AAA", carry_diff=0.03)]
         assert s.scan_and_propose() == []
+
+    def test_lot_mismatch_skips_calendar(self):
+        # Audit 2026-06-17: near/next lot sizes differ (lot revision) → the
+        # 1-lot-each spread wouldn't share-offset; skip rather than open an
+        # un-offset outright stub.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        snap = self._snap(carry_diff=-0.04)
+        snap["next"]["lot_size"] = 125          # near=100, next=125 → mismatch
+        assert s._build_calendar_entry(snap) == []
+
+    def test_calendar_margin_is_spread_aware(self):
+        # Audit 2026-06-17: calendar legs are margined as one-leg notional ×
+        # calendar_margin_pct, split across the two legs — NOT 0.20×notional
+        # per leg. near=100 next=101 lot=100 qty=1 → one_leg_notional=10,100;
+        # leg_margin = 10,100 × 0.06 / 2 = 303.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        props = s._build_calendar_entry(self._snap(carry_diff=-0.04))
+        assert len(props) == 2
+        for p in props:
+            assert p.margin_required == pytest.approx(303.0)
+            # Far below the old per-leg 0.20×notional (~₹2,000).
+            assert p.margin_required < p.price * p.lot_size * 0.20
 
     def test_max_leg_notional_skip(self):
         s = _make_strategy(mode="paper", calendar_entry_annual=0.02)

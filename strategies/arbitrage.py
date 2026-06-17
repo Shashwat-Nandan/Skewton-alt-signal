@@ -172,6 +172,13 @@ class ArbitrageStrategy(BaseStrategy):
         self.calendar_max_leg_basis = float(cfg.get("calendar_max_leg_basis", 0.10))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
         self.max_open_calendars = int(cfg.get("max_open_calendars", 5))
+        # Calendar-spread margin estimate as a fraction of ONE leg's notional
+        # (audit 2026-06-17). A futures calendar is margined on inter-month
+        # basis risk, not two outright SPANs — real Zerodha basket margin was
+        # ~4-7% of one leg's notional vs the old 0.20×notional PER LEG (~7x
+        # too high). This is an informational proxy; the authoritative live
+        # number is kite.basket_order_margins — gate live sizing on THAT.
+        self.calendar_margin_pct = float(cfg.get("calendar_margin_pct", 0.06))
         # Per-leg notional cap so a 1-lot RELIANCE+ITC pair doesn't deploy ₹50L silently.
         mln = cfg.get("max_leg_notional", "").strip()
         self.max_leg_notional: Optional[float] = float(mln) if mln else None
@@ -804,25 +811,48 @@ class ArbitrageStrategy(BaseStrategy):
               SHORT_CALENDAR → SELL F2 + BUY F1
           carry_diff < 0 (next is cheap):
               LONG_CALENDAR  → BUY  F2 + SELL F1
-        Both legs use the same `lots_per_leg` since F1 ≈ F2 in absolute price.
+        Both legs use the same `lots_per_leg`. We require the two expiries to
+        share a lot size (see the mismatch guard) so 1 lot each is a clean
+        share-offset spread.
         """
         near = snap["near"]
         nxt = snap["next"]
         cd = snap["carry_diff"]
         symbol = snap["symbol"]
 
-        # Refuse if even 1 lot busts the cap (we can't go fractional).
-        if self.max_leg_notional:
-            one_lot_near = snap["near_price"] * int(near["lot_size"])
-            one_lot_next = snap["next_price"] * int(nxt["lot_size"])
-            if max(one_lot_near, one_lot_next) > self.max_leg_notional:
-                logger.warning(
-                    "%s calendar: 1-lot leg ₹%.0f exceeds cap ₹%.0f — skipping",
-                    symbol, max(one_lot_near, one_lot_next), self.max_leg_notional,
-                )
-                return []
+        # Lot-size mismatch guard (audit follow-up 2026-06-17). NSE revises
+        # single-stock-futures lot sizes per expiry, so during a transition the
+        # near and next months can carry DIFFERENT lots (e.g. HCLTECH 350 near
+        # / 400 next). At whole-lot sizing those don't share-offset — "1 lot
+        # each" leaves a residual OUTRIGHT stub: unintended directional
+        # exposure AND it forfeits the calendar-spread margin benefit. Skip
+        # such calendars until both expiries share a lot size again.
+        near_lot = int(near["lot_size"])
+        next_lot = int(nxt["lot_size"])
+        if near_lot != next_lot:
+            logger.warning(
+                "%s calendar: near/next lot sizes differ (%d vs %d) — skipping "
+                "to avoid an un-offset outright stub (lot revision in progress)",
+                symbol, near_lot, next_lot,
+            )
+            return []
 
         qty = self.lots_per_leg
+        one_lot_near = snap["near_price"] * near_lot
+        one_lot_next = snap["next_price"] * next_lot
+
+        # Refuse if even 1 lot busts the cap (we can't go fractional).
+        if self.max_leg_notional and max(one_lot_near, one_lot_next) > self.max_leg_notional:
+            logger.warning(
+                "%s calendar: 1-lot leg ₹%.0f exceeds cap ₹%.0f — skipping",
+                symbol, max(one_lot_near, one_lot_next), self.max_leg_notional,
+            )
+            return []
+
+        # Calendar-spread margin: one-leg notional × calendar_margin_pct, split
+        # evenly across the two legs (they net for margin — not 0.20 per leg).
+        leg_margin = max(one_lot_near, one_lot_next) * qty * self.calendar_margin_pct / 2.0
+
         if cd > 0:
             side_near, side_next = "BUY", "SELL"
             position: CalendarPosition = "SHORT_CALENDAR"
@@ -837,8 +867,10 @@ class ArbitrageStrategy(BaseStrategy):
             f"(diff={cd*100:.2f}% ann., near {snap['dte_near']}d / next {snap['dte_next']}d)"
         )
         return [
-            self._make_fut_proposal(near, qty, snap["near_price"], side_near, rationale),
-            self._make_fut_proposal(nxt, qty, snap["next_price"], side_next, rationale),
+            self._make_fut_proposal(near, qty, snap["near_price"], side_near,
+                                    rationale, margin_required=leg_margin),
+            self._make_fut_proposal(nxt, qty, snap["next_price"], side_next,
+                                    rationale, margin_required=leg_margin),
         ]
 
     def _build_calendar_exit(
@@ -890,8 +922,12 @@ class ArbitrageStrategy(BaseStrategy):
     def _make_fut_proposal(
         self, fut: dict, quantity: int, price: float,
         transaction_type: str, rationale: str,
+        margin_required: Optional[float] = None,
     ) -> TradeProposal:
         notional = price * fut["lot_size"] * quantity
+        # Default: outright SPAN proxy (0.20×notional). Calendar legs pass an
+        # explicit spread-aware margin (one-leg notional × calendar_margin_pct,
+        # split across the two legs) since they net for margin.
         return TradeProposal(
             tradingsymbol=fut["tradingsymbol"],
             instrument_token=int(fut.get("instrument_token", 0)),
@@ -904,7 +940,8 @@ class ArbitrageStrategy(BaseStrategy):
             transaction_type=transaction_type,
             iv=0.0,
             bid_ask_spread_pct=0.0,
-            margin_required=notional * 0.20,
+            margin_required=(notional * 0.20 if margin_required is None
+                             else float(margin_required)),
             rationale=rationale,
         )
 
