@@ -97,6 +97,12 @@ CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
 # the operator must `rm` to acknowledge and resume.
 HALT_DAILY_LOSS_PATH = DATA_CACHE / "HALT_DAILY_LOSS"
 
+# 3.7 / M-6: how often to re-reconcile against the broker DURING a live
+# session. The startup gate alone leaves a drift window from one start to the
+# next (a manual square-off, an un-captured partial, an expiry) — re-check
+# hourly so drift is caught within the session, not the next morning.
+RECONCILE_INTERVAL_S = 3600
+
 
 def ensure_pair_config(orig_path: str, cli_max_leg_notional: float, log: logging.Logger) -> str:
     """PairTradingStrategy.__init__ refuses to construct in paper mode without
@@ -886,6 +892,34 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
              len(expected_tradingsymbols))
 
 
+def reconcile_mid_session(strategies, kite, log: logging.Logger) -> bool:
+    """3.7 / M-6: periodic in-session drift check. Unlike the startup gate
+    (reconcile_with_broker, which RAISES to refuse start), a mismatch or a
+    kite.positions() failure here must NOT crash the live loop. On drift, log
+    CRITICAL and touch HALT_NEW_ENTRIES so no NEW exposure opens while existing
+    positions can still exit — then leave escalation (HALT_ALL / manual
+    square-off) to the operator. Returns True iff drift was detected.
+
+    No-op when no live strategy is present (paper books have no broker truth)."""
+    if not any(getattr(s, "mode", "paper") == "live" for s in strategies):
+        return False
+    try:
+        reconcile_with_broker(strategies, kite, log)
+        return False
+    except Exception as e:
+        log.critical(
+            "MID-SESSION RECONCILE DRIFT: %s — touching HALT_NEW_ENTRIES "
+            "(existing positions keep exiting; investigate broker vs state "
+            "before clearing the flag).", e,
+        )
+        try:
+            HALT_NEW_ENTRIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            HALT_NEW_ENTRIES_PATH.touch()
+        except Exception as te:
+            log.exception("Failed to touch HALT_NEW_ENTRIES: %s", te)
+        return True
+
+
 def write_eod_sidecar(strategies, today: date, log: logging.Logger,
                        system: str = "baseline"):
     """Per-pair EOD reports for verify_pair_paper.py to consume.
@@ -1283,9 +1317,18 @@ def main():
         log=log,
     )
     silent_fail = False
+    last_reconcile = time.monotonic()
     try:
         while datetime.now() < session_end_ts:
             halt_state.refresh(log)
+            # 3.7 / M-6: re-reconcile against the broker hourly during live
+            # sessions so drift is caught in-session, not at next startup.
+            # Non-fatal: on drift it touches HALT_NEW_ENTRIES (caught by the
+            # next halt_state.refresh) rather than crashing the loop.
+            if (args.mode == "live"
+                    and time.monotonic() - last_reconcile >= RECONCILE_INTERVAL_S):
+                reconcile_mid_session(strategies, kite, log)
+                last_reconcile = time.monotonic()
             n_errored = 0
             for s in strategies:
                 outcome = tick_one(s, log,

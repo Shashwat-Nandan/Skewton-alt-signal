@@ -145,3 +145,72 @@ def test_share_mismatch_still_blocks(caplog):
     }])
     with pytest.raises(RuntimeError, match="reconciliation FAILED"):
         reconcile_with_broker([s], kite, logging.getLogger("test"))
+
+
+# ──────────────────────────────────────────────────────────
+# 3.7 / M-6 — mid-session reconcile cadence (non-fatal drift handling)
+# ──────────────────────────────────────────────────────────
+
+def _live_leg_strategy():
+    return _LiveStrategy("AAA", "BBB", [
+        _Leg("AAA26APRFUT", quantity=1, lot_size=100, entry_price=1000.0),
+    ])
+
+
+def test_mid_session_clean_reconcile_no_halt(tmp_path, monkeypatch):
+    # A matching broker book → no drift, no HALT_NEW_ENTRIES, returns False.
+    import run_paper_pairs as rp
+    halt = tmp_path / "HALT_NEW_ENTRIES"
+    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+    s = _live_leg_strategy()
+    kite = _kite_with_positions([{
+        "exchange": "NFO", "tradingsymbol": "AAA26APRFUT",
+        "quantity": 100, "average_price": 1000.0,
+    }])
+    drift = rp.reconcile_mid_session([s], kite, logging.getLogger("test"))
+    assert drift is False
+    assert not halt.exists()
+
+
+def test_mid_session_drift_halts_new_entries_without_raising(tmp_path, monkeypatch, caplog):
+    # Share mismatch mid-session must NOT raise (would crash the live loop) —
+    # it touches HALT_NEW_ENTRIES and returns True so existing positions still
+    # exit while no new exposure opens.
+    import run_paper_pairs as rp
+    halt = tmp_path / "HALT_NEW_ENTRIES"
+    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+    caplog.set_level(logging.CRITICAL, logger="")
+    s = _live_leg_strategy()
+    kite = _kite_with_positions([{
+        "exchange": "NFO", "tradingsymbol": "AAA26APRFUT",
+        "quantity": 50, "average_price": 1000.0,   # broker disagrees on shares
+    }])
+    drift = rp.reconcile_mid_session([s], kite, logging.getLogger("test"))
+    assert drift is True
+    assert halt.exists()                            # new entries halted
+    assert any("MID-SESSION RECONCILE DRIFT" in r.message for r in caplog.records)
+
+
+def test_mid_session_kite_failure_halts_not_raises(tmp_path, monkeypatch):
+    # A kite.positions() outage mid-session must also halt-new, not crash.
+    import run_paper_pairs as rp
+    halt = tmp_path / "HALT_NEW_ENTRIES"
+    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+    s = _live_leg_strategy()
+    kite = MagicMock()
+    kite.positions = MagicMock(side_effect=RuntimeError("kite down"))
+    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test")) is True
+    assert halt.exists()
+
+
+def test_mid_session_noop_for_paper(tmp_path, monkeypatch):
+    # Paper books have no broker truth → no-op, no HALT, no kite call.
+    import run_paper_pairs as rp
+    halt = tmp_path / "HALT_NEW_ENTRIES"
+    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+    s = _live_leg_strategy()
+    s.mode = "paper"
+    kite = MagicMock()
+    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test")) is False
+    assert not halt.exists()
+    kite.positions.assert_not_called()

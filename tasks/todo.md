@@ -26,7 +26,15 @@ test matrix + live canary are the real gates):
 - [x] pair suite byte-identical green (207); full suite + CI: pending push.
 - [ ] integration smoke: run pair-paper-persistent (PAPER) one session on host
       — confirms construction/serialize/import integrity (not the executor path).
-- [ ] LIVE canary (operator): restart pair-paper-persistent-live mid-session in
+- [~] LIVE canary ARMED 2026-06-17: started pair-paper-persistent-live pre-market
+      (05:35 IST). Boot smoke under the migrated code PASSED on the real broker —
+      auth, NFO prefetch, panel preload, build_strategies (new executor wiring),
+      EFFECTIVE_PARAMS mode=live, held positions restored (ICICIBANK/BPCL SHORT,
+      HDFCLIFE/HDFCBANK LONG orphan), "Broker reconciliation OK: 4 positions
+      match", now Waiting until 09:15 → live tick loop. 09:12 timer trigger is a
+      no-op (unit already active, single-instance lock). Monitor set for ~09:25
+      to capture the first live order through the shared executor. HALT_ALL ready.
+- (orig) LIVE canary (operator): restart pair-paper-persistent-live mid-session in
       a low-activity window; watch the FIRST live entry+exit closely (marketable
       LIMIT price, order_history poll, state file, EOD sidecar, broker reconcile);
       HALT_ALL armed. Rollback = git revert + restart (executor change only
@@ -79,7 +87,17 @@ LIVE path → operator-coordinated. Rest are safe code/test/docs.
       already single (_update_drawdown, one field — no change). deploy/
       logrotate-taleb.conf (compress + 90d prune of logs/*.log) +
       deploy/sync-units.sh (read-only unit-drift checker; --apply gated).
-- [ ] 3.7 live-path mid-session reconcile cadence (operator-coordinated).
+- [x] 3.7 mid-session reconcile cadence (M-6): reconcile_mid_session() re-runs
+      the broker reconcile hourly during LIVE sessions (RECONCILE_INTERVAL_S);
+      non-fatal — on drift (mismatch or kite.positions() failure) it logs
+      CRITICAL + touches HALT_NEW_ENTRIES (existing positions still exit) rather
+      than crashing the loop; no-op in paper. +4 tests. Affects live path only;
+      lands on main without auto-deploy (picked up on next live restart).
+- [ ] 2.6 HOST APPLY only remaining (operator, maintenance window): useradd
+      taleb + chown data_cache/logs/.env/config.ini/.kite_session.json + chmod
+      0750 + host-unit User=taleb + daemon-reload + restart (live unit LAST).
+      Runbook: VPS_DEPLOYMENT §6.5. NOT doable autonomously / not during a live
+      session.
 
 # Autoresearch objective → net_pnl (2026-06-14)
 
