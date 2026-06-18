@@ -1720,6 +1720,12 @@ class TalebKarpathyStrategy(BaseStrategy):
                     "entry_time": baseline["entry_time"],
                     "exit_time": exit_time,
                     "holding_minutes": holding_minutes,
+                    # active_structure_types still holds the entered structure(s)
+                    # here — it is reset to [] further below. Record it so the
+                    # dashboard can label the trade by its real structure
+                    # (straddle / asymmetric_strangle / …) instead of assuming
+                    # a straddle.
+                    "structure": ", ".join(self.state.active_structure_types),
                     "n_legs": baseline["n_legs"],
                     "n_rehedges": self.state.rehedge_count - baseline["rehedges_at_entry"],
                     "entry_atm_iv": baseline["entry_atm_iv"],

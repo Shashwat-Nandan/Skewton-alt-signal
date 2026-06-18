@@ -39,8 +39,9 @@ DATA_CACHE = REPO_ROOT / "data_cache"
 # ─────────────────────────── response shape ───────────────────────────
 
 class OpenPosition(BaseModel):
-    # `group` lets the UI keep pair legs visually together; for the Taleb
-    # straddle both legs share one group "NIFTY straddle".
+    # `group` lets the UI keep pair legs visually together; a Taleb structure's
+    # legs share one group named for the structure, e.g. "NIFTY straddle" or
+    # "NIFTY asymmetric strangle".
     group: str
     tradingsymbol: str
     side: str  # "LONG" or "SHORT"
@@ -134,18 +135,45 @@ def _state_mode(payload: Optional[dict]) -> str:
 
 # ─────────────────────────── per-system builders ───────────────────────────
 
+# Taleb regime dispatch routes to one of several structures (not just a
+# straddle). Map the runner's structure value(s) to a display name so the
+# dashboard labels each trade by what was actually traded.
+_STRUCTURE_LABELS = {
+    "straddle": "straddle",
+    "risk_reversal_long_put": "risk reversal",
+    "calendar_short_front": "calendar",
+    "backspread": "backspread",
+    "asymmetric_strangle": "asymmetric strangle",
+}
+
+
+def _taleb_group(types) -> str:
+    """Group label for a Taleb position/trade from its structure value(s).
+
+    `types` is the runner's active_structure_types (a list) or the
+    comma-joined `structure` string recorded on a closed trade. Falls back to
+    "NIFTY options" when the structure is unknown (e.g. trades closed before
+    the structure was recorded)."""
+    if isinstance(types, str):
+        types = [t.strip() for t in types.split(",") if t.strip()]
+    names = [_STRUCTURE_LABELS.get(t, t.replace("_", " ")) for t in (types or [])]
+    names = list(dict.fromkeys(names))  # dedupe, preserve order
+    return "NIFTY " + " + ".join(names) if names else "NIFTY options"
+
+
 def _build_taleb_block(today: date) -> SystemBlock:
     path = DATA_CACHE / "taleb_paper_state.json"
     payload = _load_state(path)
     if not payload:
         return SystemBlock(
-            name="taleb", label="Taleb straddle", mode=_state_mode(payload),
+            name="taleb", label="Taleb hedger", mode=_state_mode(payload),
             state_file=path.name, available=False,
             summary=_empty_summary(), open_positions=[], closed_today=[],
         )
 
     state = payload.get("state", {}) or {}
     entry_time = state.get("entry_time")
+    open_group = _taleb_group(state.get("active_structure_types"))
 
     open_positions: List[OpenPosition] = []
     for p in state.get("positions", []) or []:
@@ -167,7 +195,7 @@ def _build_taleb_block(today: date) -> SystemBlock:
         if expiry:
             note_bits.append(f"exp {expiry}")
         open_positions.append(OpenPosition(
-            group="NIFTY straddle",
+            group=open_group,
             tradingsymbol=str(p.get("tradingsymbol", "")),
             side="LONG" if qty > 0 else "SHORT",
             quantity=abs(qty),
@@ -183,15 +211,18 @@ def _build_taleb_block(today: date) -> SystemBlock:
     for t in state.get("closed_trades", []) or []:
         if not _is_today(t.get("exit_time"), today):
             continue
-        # The taleb schema stores gross+costs separately; report net realized
-        # as gross + costs (costs are negative).
-        gross = float(t.get("gross_pnl", 0.0))
+        # The taleb runner deducts costs from realized_pnl as legs close
+        # (realized_pnl -= cost), so the per-trade `gross_pnl` field is ALREADY
+        # net of costs. Report it directly; `costs` is the positive cost total
+        # carried alongside for display (matches the pair block convention and
+        # the net state-level realized_pnl in the summary).
+        net = float(t.get("gross_pnl", 0.0))
         costs = float(t.get("costs", 0.0))
         closed_today.append(ClosedTrade(
-            group="NIFTY straddle",
+            group=_taleb_group(t.get("structure")),
             entry_time=t.get("entry_time"),
             exit_time=t.get("exit_time"),
-            realized_pnl=gross + costs,
+            realized_pnl=net,
             transaction_costs=costs,
             note=f"{t.get('n_rehedges', 0)} rehedges · "
                  f"{t.get('holding_minutes', 0)} min held",
@@ -201,7 +232,7 @@ def _build_taleb_block(today: date) -> SystemBlock:
     unrealized = float(state.get("unrealized_pnl", 0.0))
     costs = float(state.get("total_transaction_costs", 0.0))
     return SystemBlock(
-        name="taleb", label="Taleb straddle", mode=_state_mode(payload),
+        name="taleb", label="Taleb hedger", mode=_state_mode(payload),
         state_file=path.name, updated_at=payload.get("saved_at"), available=True,
         summary=SystemSummary(
             realized_pnl=realized,
