@@ -1179,23 +1179,32 @@ class PairTradingStrategy(BaseStrategy):
         qty_a_shares = qty_a * fut_a["lot_size"]
         expected_gain_inr = expected_dspread * qty_a_shares
 
-        from strategies.taleb_karpathy import estimate_transaction_cost
+        # LIVE-GATE FREEZE: pin the legacy futures exchange rate here so the
+        # 2026-06-19 cost-accuracy fix (which corrected a ~10x-high FUT exchange
+        # charge, ~30% of round-trip cost) does NOT silently loosen this live
+        # entry hurdle. Re-tuning the pair gate to the corrected cost is a
+        # separate, deliberate decision — until then this runner's behavior is
+        # unchanged. (Accounting in _apply_fill uses the corrected default.)
+        from strategies.taleb_karpathy import (
+            _FUT_EXCHANGE_RATE_LEGACY,
+            estimate_transaction_cost,
+        )
         rt_cost = (
             estimate_transaction_cost(
                 prices[self.symbol_a], qty_a, fut_a["lot_size"], "BUY",
-                instrument_type="FUT",
+                instrument_type="FUT", fut_exchange_rate=_FUT_EXCHANGE_RATE_LEGACY,
             )
             + estimate_transaction_cost(
                 prices[self.symbol_b], qty_b, fut_b["lot_size"], "SELL",
-                instrument_type="FUT",
+                instrument_type="FUT", fut_exchange_rate=_FUT_EXCHANGE_RATE_LEGACY,
             )
             + estimate_transaction_cost(
                 prices[self.symbol_a], qty_a, fut_a["lot_size"], "SELL",
-                instrument_type="FUT",
+                instrument_type="FUT", fut_exchange_rate=_FUT_EXCHANGE_RATE_LEGACY,
             )
             + estimate_transaction_cost(
                 prices[self.symbol_b], qty_b, fut_b["lot_size"], "BUY",
-                instrument_type="FUT",
+                instrument_type="FUT", fut_exchange_rate=_FUT_EXCHANGE_RATE_LEGACY,
             )
         )
 

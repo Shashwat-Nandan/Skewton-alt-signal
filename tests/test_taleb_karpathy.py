@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 from strategies.taleb_karpathy import (
     TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
-    _apply_best_params,
+    _apply_best_params, _FUT_EXCHANGE_RATE_LEGACY,
 )
 from trade_proposer import TradeProposal
 from greeks_engine import OptionContract
@@ -56,6 +56,31 @@ class TestTransactionCosts:
         stamp = turnover * 0.00003
         stt = (sell - buy) + stamp
         assert stt == pytest.approx(turnover * 0.0005)   # 0.050%
+
+    def test_futures_exchange_charge_corrected_rate(self):
+        # Regression lock for the 2026-06-19 fix: FUT exchange charge ≈ 0.0019%
+        # (₹190/cr), NOT the pre-fix 0.02%. The relational tests above pass at
+        # either rate, so pin the FULL cost here — this FAILS if someone reverts
+        # the exchange rate. FUT BUY, turnover 25,000:
+        #   brokerage 20 + exch 25000*0.000019=0.475 + sebi 0.025
+        #   + gst 0.18*(20+0.475+0.025)=3.69 + stamp 25000*0.00003=0.75
+        #   + slippage 25000*0.0002=5.0  = 29.94  (BUY → no STT)
+        cost = estimate_transaction_cost(1000.0, 1, 25, "BUY", instrument_type="FUT")
+        assert cost == pytest.approx(29.94, abs=0.01)
+
+    def test_legacy_fut_exchange_rate_override(self):
+        # The pair-gate freeze mechanism: passing the legacy rate must yield a
+        # HIGHER cost than the corrected default, and the gap must equal the
+        # exchange-charge delta grossed up for GST (the only affected levy).
+        turnover = 1000.0 * 1 * 25
+        corrected = estimate_transaction_cost(1000.0, 1, 25, "BUY", instrument_type="FUT")
+        legacy = estimate_transaction_cost(
+            1000.0, 1, 25, "BUY", instrument_type="FUT",
+            fut_exchange_rate=_FUT_EXCHANGE_RATE_LEGACY,
+        )
+        assert legacy > corrected
+        exch_delta = turnover * (_FUT_EXCHANGE_RATE_LEGACY - 0.000019)
+        assert (legacy - corrected) == pytest.approx(exch_delta * 1.18, abs=0.01)
 
 
 class TestPositionNetting:

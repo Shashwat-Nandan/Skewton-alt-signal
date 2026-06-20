@@ -159,8 +159,10 @@ class ArbitrageStrategy(BaseStrategy):
             str(cfg.get("disable_calendar", "false")).strip().lower() in ("true", "1", "yes")
         )
 
-        # Calendar spread — tradable
-        self.calendar_entry_annual = float(cfg.get("calendar_entry_annual", 0.020))
+        # Calendar spread — tradable. Default 0.05: below ~0.04-0.05 the carry
+        # capture doesn't clear the round-trip cost and the book bleeds on
+        # expiry-week convergence churn (2026-06-19 incident). Was 0.020.
+        self.calendar_entry_annual = float(cfg.get("calendar_entry_annual", 0.05))
         self.calendar_exit_annual = float(cfg.get("calendar_exit_annual", 0.005))
         self.calendar_max_holding_days = int(cfg.get("calendar_max_holding_days", 15))
         self.calendar_min_dte_near = int(cfg.get("calendar_min_dte_near", 4))

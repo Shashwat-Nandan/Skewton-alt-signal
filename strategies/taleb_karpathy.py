@@ -64,9 +64,20 @@ _DIAG_HISTORY_CAP = 500
 _CLOSED_TRADES_PERSIST = 200
 
 
+# NSE equity-futures exchange transaction charge ≈ ₹190/cr = 0.0019% of
+# turnover (corrected 2026-06-19 from a ~10x-too-high 0.0002). Exposed as a
+# parameter ONLY so the live pair-trading entry gate can pin the PRIOR value
+# and keep its hurdle unchanged while this accuracy fix lands for arbitrage /
+# accounting — see pair_trading._has_sufficient_edge. Everything else uses the
+# corrected default.
+_FUT_EXCHANGE_RATE = 0.000019
+_FUT_EXCHANGE_RATE_LEGACY = 0.0002  # pre-fix value; live pair gate freeze only
+
+
 def estimate_transaction_cost(
     price: float, quantity: int, lot_size: int, transaction_type: str,
     instrument_type: str = "OPT",
+    fut_exchange_rate: float = _FUT_EXCHANGE_RATE,
 ) -> float:
     """
     Estimate total transaction costs for an Indian options/futures order.
@@ -107,7 +118,12 @@ def estimate_transaction_cost(
 
     # Exchange transaction charges differ by product
     if instrument_type == "FUT":
-        exchange_charges = turnover * 0.0002  # ~0.02% for futures
+        # Futures exchange transaction charge. Default ≈ ₹190/cr (0.0019%); the
+        # prior 0.0002 (0.02%) was ~10x too high — a decimal slip that inflated
+        # calendar-spread costs (2026-06-19 calendar-loss investigation). The
+        # rate is a parameter only so the live pair gate can pin the legacy
+        # value; all other callers use the corrected default.
+        exchange_charges = turnover * fut_exchange_rate
     else:
         exchange_charges = turnover * 0.00053  # ~0.053% for options
 
