@@ -287,6 +287,14 @@ def main():
                         help="N most-oversold gappers to buy (overrides config).")
     parser.add_argument("--total-capital", type=float, default=None,
                         help="Capital deployed (overrides config).")
+    parser.add_argument("--gap-std-mult", type=float, default=None,
+                        help="k: require gap_ret <= -k*ret_std (overrides "
+                             "config). The systemd unit deploys 2.0 — the only "
+                             "config that stayed positive out-of-sample.")
+    parser.add_argument("--no-trend-filter", action="store_true",
+                        help="Disable the 'open > long-MA' refinement. The "
+                             "backtest's OOS-survivor config drops it; the "
+                             "systemd unit passes this flag.")
     parser.add_argument("--max-daily-loss-inr", type=float, default=30_000.0,
                         help="Session ΔP&L floor (₹). On breach touches "
                              "HALT_BUY_ON_GAP_DAILY_LOSS. 0 disables.")
@@ -350,6 +358,10 @@ def main():
         strategy.params["max_positions"] = args.max_positions
     if args.total_capital is not None:
         strategy.params["total_capital"] = args.total_capital
+    if args.gap_std_mult is not None:
+        strategy.params["gap_std_mult"] = args.gap_std_mult
+    if args.no_trend_filter:
+        strategy.params["use_trend_filter"] = 0
     strategy.set_panel(panel, sorted(panel["symbol"].unique().tolist()))
     # Append today's placeholder row so the shifted features resolve at today's
     # index even though the daily bhavcopy panel only reaches yesterday at 09:20

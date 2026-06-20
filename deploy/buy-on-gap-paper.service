@@ -19,9 +19,15 @@ Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # Tunables (gap threshold, trend filter, stop, sizing) live in config.ini
-# [buy_on_gap]; size knobs can be overridden here. NOTE: this strategy has NO
-# live mode (BuyOnGapStrategy raises for mode=live) — paper only.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_buy_on_gap.py --max-daily-loss-inr 30000
+# [buy_on_gap]; the flags below override them for the deployed paper run. NOTE:
+# this strategy has NO live mode (BuyOnGapStrategy raises for mode=live).
+#
+# --gap-std-mult 2.0 --no-trend-filter = the OOS-survivor config. The in-code /
+# config defaults are book-faithful (k=1.0, trend on) and lose out-of-sample;
+# only the deep-gap, trend-off variant stayed positive in the 2025-06→2026-06
+# test split (Sharpe ~0.46), so that's what we forward-test on paper. Drop
+# these two flags to fall back to the book-faithful default.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_buy_on_gap.py --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend-filter
 # -------------------------------
 
 # A clean 15:25 IST teardown returns 0 and does NOT trigger restart, so the
