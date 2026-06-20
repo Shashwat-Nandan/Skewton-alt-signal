@@ -1,0 +1,23 @@
+[Unit]
+Description=Fire buy-on-gap-paper.service Mon–Fri at 09:14 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:14 IST — staggered after taleb-hedger (09:10), pair-paper (09:11/09:12)
+# and arbitrage-paper (09:13) so the TOTP logins don't collide on the shared
+# .kite_session.json. The runner self-gates on 09:15 (waits for the open) and
+# only opens its book in the 09:20–09:45 entry window, so an early start is safe.
+OnCalendar=Mon..Fri *-*-* 09:14:00 Asia/Kolkata
+
+# If the VPS was asleep or systemd missed the window, run once to catch up.
+# run_paper_buy_on_gap.py refuses to start after 15:30, and runs exit-only if
+# started past the 09:45 entry cutoff — safe to be Persistent.
+Persistent=true
+
+# Jitter to avoid thundering-herd Kite logins on multi-account VPSes.
+RandomizedDelaySec=60
+
+Unit=buy-on-gap-paper.service
+
+[Install]
+WantedBy=timers.target

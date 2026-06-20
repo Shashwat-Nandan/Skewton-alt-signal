@@ -1,6 +1,7 @@
 """Pluggable trading strategies. Each strategy subclasses BaseStrategy."""
 from .arbitrage import ArbitrageStrategy
 from .base import BaseStrategy, ExecutionMode, VALID_MODES
+from .buy_on_gap import BuyOnGapStrategy
 from .pair_trading import PairTradingStrategy
 from .taleb_karpathy import TalebKarpathyStrategy
 from .varsity_equity_swing import VarsityEquitySwingStrategy
@@ -11,6 +12,7 @@ STRATEGIES: dict[str, type[BaseStrategy]] = {
     PairTradingStrategy.name: PairTradingStrategy,
     ArbitrageStrategy.name: ArbitrageStrategy,
     VarsityEquitySwingStrategy.name: VarsityEquitySwingStrategy,
+    BuyOnGapStrategy.name: BuyOnGapStrategy,
 }
 
 
@@ -30,6 +32,7 @@ __all__ = [
     "PairTradingStrategy",
     "ArbitrageStrategy",
     "VarsityEquitySwingStrategy",
+    "BuyOnGapStrategy",
     "STRATEGIES",
     "get_strategy",
 ]

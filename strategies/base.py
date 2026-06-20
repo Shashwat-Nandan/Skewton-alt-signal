@@ -29,7 +29,10 @@ VALID_MODES = ("signals", "paper", "live")
 # checks live in the risk-gate path; this is the floor of last resort before
 # kite.place_order. Bounds chosen so any real Indian equity-derivatives order
 # passes; obvious-broken values are rejected.
-_TRADINGSYMBOL_RE = re.compile(r"^[A-Z0-9&\-]{3,30}$")
+# Min length 2: NSE has genuine 2-char equity symbols (e.g. LT = Larsen &
+# Toubro). The earlier 3-char floor silently rejected them pre-submit, dropping
+# valid equity orders (caught in the buy_on_gap review 2026-06-19).
+_TRADINGSYMBOL_RE = re.compile(r"^[A-Z0-9&\-]{2,30}$")
 _ABS_MAX_LOTS_PER_ORDER = 10000
 _MAX_PRICE_INR = 1_000_000
 

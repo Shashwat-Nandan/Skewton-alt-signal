@@ -1,6 +1,7 @@
 import type {
   ArbitrageResponse,
   AuthStatus,
+  BuyOnGapResponse,
   EquityPendingEntriesResponse,
   EquityPositionsResponse,
   EquityScansResponse,
@@ -111,6 +112,15 @@ export const api = {
     if (params.system) q.set("system", params.system);
     const qs = q.toString();
     return http<ArbitrageResponse>(`/arbitrage-paper${qs ? `?${qs}` : ""}`);
+  },
+
+  buyOnGapPaper: (params: { days?: number; end?: string; system?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    if (params.end) q.set("end", params.end);
+    if (params.system) q.set("system", params.system);
+    const qs = q.toString();
+    return http<BuyOnGapResponse>(`/buy-on-gap-paper${qs ? `?${qs}` : ""}`);
   },
 
   equityPositions: (status?: "open" | "closed") => {

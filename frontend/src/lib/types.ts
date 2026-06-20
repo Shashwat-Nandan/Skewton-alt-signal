@@ -247,6 +247,55 @@ export type ArbitrageResponse = {
   open_calendars: ArbitrageOpenCalendar[];
 };
 
+// ── Buy-on-Gap (intraday mean reversion) ──
+
+export type BuyOnGapDailyRow = {
+  date: string;
+  has_data: boolean;
+  /** This session's P&L delta (session realized + unrealized delta). */
+  day_pnl: number | null;
+  /** This session's realized delta alone (net of costs). */
+  day_realized: number | null;
+  n_closed_trades: number | null;
+  n_open_positions: number | null;
+  win_rate: number | null;
+  /** Cumulative book P&L as of this EOD (already cumulative — not re-summed). */
+  cumulative_net_pnl: number | null;
+};
+
+export type BuyOnGapOpenPosition = {
+  symbol: string;
+  entry_px: number;
+  qty: number;
+  stop_px: number;
+  gap_z: number;
+  last_mtm_px: number;
+  pnl: number;
+};
+
+export type BuyOnGapSummary = {
+  system: string;
+  n_days_with_data: number;
+  latest_date: string | null;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  net_pnl: number;
+  transaction_costs: number;
+  n_closed_trades: number;
+  n_open_positions: number;
+  win_rate: number;
+  universe_size: number | null;
+};
+
+export type BuyOnGapResponse = {
+  start_date: string;
+  end_date: string;
+  system: string;
+  summary: BuyOnGapSummary;
+  daily: BuyOnGapDailyRow[];
+  open_positions: BuyOnGapOpenPosition[];
+};
+
 // ── Equity Swing ──
 
 export type EquityPosition = {
