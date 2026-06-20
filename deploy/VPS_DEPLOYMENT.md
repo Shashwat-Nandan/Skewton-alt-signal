@@ -19,6 +19,8 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `pair-paper.service`          | Oneshot, ~6 hours             | Runs `run_paper_pairs.py` — top-N cointegrated STF pairs, paper mode, EOD JSON sidecar |
 | `arbitrage-paper.timer`       | Mon–Fri 09:13 IST + jitter    | Fires `arbitrage-paper.service` (1-min offset after pair-paper to stagger TOTP logins) |
 | `arbitrage-paper.service`     | Type=simple, ~6 hours         | Runs `run_paper_arbitrage.py` — calendar/term-structure spreads, paper mode, EOD sidecar |
+| `buy-on-gap-paper.timer`      | Mon–Fri 09:14 IST + jitter    | Fires `buy-on-gap-paper.service` (1-min offset after arbitrage to stagger TOTP logins) |
+| `buy-on-gap-paper.service`    | Type=simple, ~6 hours         | Runs `run_paper_buy_on_gap.py` — intraday gap-down mean reversion, paper mode, EOD sidecar |
 | `pair-verify.timer`           | Mon–Fri 16:00 IST + jitter    | Fires `pair-verify.service`                                                          |
 | `pair-verify.service`         | Oneshot, ~5 min               | Runs `verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
 | `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
@@ -197,6 +199,59 @@ It mirrors `pair-paper`: the timer fires **Mon–Fri 09:13 IST** (staggered afte
 **Host reconciliation note (2026-06-03).** On the current VPS this unit had been hand-installed as `Type=oneshot` with no `Restart=`, so a mid-session crash would stay dead until the next day's timer fire (only `notify-failure@` alerting). It was reconciled to match `deploy/arbitrage-paper.service` byte-for-byte except the path substitution (`/opt/taleb-karpathy-kite` → `/root/algo-trading/taleb-karpathy-kite`), restoring `Type=simple` + `Restart=on-failure` (`RestartSec=30`) + `StartLimitBurst=5`/`StartLimitIntervalSec=600`. A clean 15:25 IST teardown returns 0 and does **not** trip the restart, so the daily-timer pattern is unaffected. An interim `arbitrage-paper.service.d/restart.conf` drop-in — used to apply those directives before the full reconcile — was removed as redundant once the base unit matched. The pre-reconcile unit is backed up at `/root/arbitrage-paper.service.pre-reconcile.bak`.
 
 **Keep host units matching the template.** Per-host tweaks belong in the base unit (mirror generic ones back into `deploy/`) or a documented drop-in — don't let a hand-edit silently diverge from `deploy/arbitrage-paper.service`, or crash-recovery behaviour drifts unnoticed.
+
+---
+
+### 3.3 Buy-on-Gap paper runner (strategy #5)
+
+Intraday gap-down mean reversion (Ernie Chan §4.3): at the open it buys NIFTY-200 names that gapped down by more than `k·σ`, and exits every position at the same-day close (plus a wide catastrophic stop). **Paper only** — `BuyOnGapStrategy` raises for `mode=live`. It ships its own pair of units.
+
+**Before you start — two host gotchas:**
+
+1. **Path / user substitution.** Like every unit, `deploy/buy-on-gap-paper.{service,timer}` are written for `User=taleb` + `/opt/taleb-karpathy-kite`. Apply the *same* substitution you used for the other units on this host (current VPS: `User=root`, `/opt/taleb-karpathy-kite` → `/root/algo-trading/taleb-karpathy-kite`) in `ExecStart`, `WorkingDirectory`, `EnvironmentFile`, and `ReadWritePaths`. Keep the host unit matching the template otherwise (see the §3.2 note).
+2. **Install OUTSIDE market hours (≈ after 15:30 IST).** The timer is `Persistent=true`, so `enable --now` *after* 09:14 makes systemd treat today's fire as missed and starts the service **immediately** — which authenticates Kite right then. A fresh login while the **live pair runner** holds the shared `.kite_session.json` can invalidate its token (see `tasks/lessons.md` / the no-auth-while-live memory). Installing in the evening makes any catch-up run a harmless no-op (the runner refuses to start after 15:30).
+
+```bash
+# Run these in the evening, after the live pair runner's session has ended.
+sudo cp deploy/buy-on-gap-paper.service /etc/systemd/system/
+sudo cp deploy/buy-on-gap-paper.timer   /etc/systemd/system/
+# …then apply the host path/User substitution to the installed .service…
+sudo systemctl daemon-reload
+sudo systemctl enable --now buy-on-gap-paper.timer
+systemctl list-timers buy-on-gap-paper.timer   # confirm next fire is tomorrow 09:14 IST
+```
+
+The timer fires **Mon–Fri 09:14 IST** (staggered after taleb-hedger/pair/arbitrage so the TOTP logins don't collide on the shared session). The service runs:
+
+```
+run_paper_buy_on_gap.py --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend-filter
+```
+
+`--gap-std-mult 2.0 --no-trend-filter` is the **OOS-survivor** config: the book-faithful default (k=1.0, trend on) loses out-of-sample, so the deployed run forward-tests the deep-gap, trend-off variant (the in-code default stays book-faithful — drop the two flags to revert). The runner self-gates to the 09:15 open, opens its book once in the **09:20–09:45** entry window, holds with a catastrophic stop, then flattens at **15:25 IST**, exits 0, and writes `data_cache/buy_on_gap_paper_eod_<date>.json` — the EOD sidecar the `/buy-on-gap` dashboard tab reads.
+
+**Dashboard wiring (two extra steps — the units alone won't surface it):**
+
+- **Backend** has no auto-deploy, so the new `/api/buy-on-gap-paper` router 404s until you restart it:
+  ```bash
+  sudo systemctl restart dashboard-backend.service
+  ```
+- **Frontend** is a pre-built SPA, so the new "Buy-on-Gap" nav tab needs a rebuild + redeploy of `frontend/dist` (same step as any other dashboard UI change — see [section 10](#10-strategy-dashboard)).
+
+**Smoke-test before the first live session (safe, no trading):**
+
+```bash
+# preflight + panel + feature build, NO auth, NO orders — must exit 0
+TZ=Asia/Kolkata .venv/bin/python run_paper_buy_on_gap.py --dry-run --force
+```
+
+**Observe a real session:**
+
+```bash
+journalctl -u buy-on-gap-paper.service -f          # live trade-loop journal
+tail -f logs/paper-buy-on-gap-$(date +%F).log      # richer per-day file
+```
+
+Operator controls are the same shape as the other runners: the shared `HALT_ALL` / `HALT_NEW_ENTRIES` kill switches apply, and a session-loss breach auto-touches `data_cache/HALT_BUY_ON_GAP_DAILY_LOSS` (entries suspend, exits continue; `rm` it to resume).
 
 ---
 
