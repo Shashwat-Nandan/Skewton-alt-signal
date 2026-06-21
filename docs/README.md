@@ -59,6 +59,9 @@ Crons that produce the inputs the strategies consume.
   live strategy.
 - [research/autoresearch_pattern.md](./research/autoresearch_pattern.md) —
   Karpathy-style autoresearch pattern: theoretical foundation.
+- [research/hmm_market_regime_detection.md](./research/hmm_market_regime_detection.md) —
+  Hidden Markov Model regime detection: mechanics, what maps onto this
+  codebase vs. what doesn't, and a scoped implementation path.
 
 ## Cross-reference: cron timer ↔ doc
 
