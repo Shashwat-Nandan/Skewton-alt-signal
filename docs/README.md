@@ -59,6 +59,11 @@ Crons that produce the inputs the strategies consume.
   live strategy.
 - [research/autoresearch_pattern.md](./research/autoresearch_pattern.md) —
   Karpathy-style autoresearch pattern: theoretical foundation.
+- [research/linear_regression_signals.md](./research/linear_regression_signals.md) —
+  Linear regression as the signal workhorse: alpha as the intercept, single/
+  multi-factor models, reading an OLS summary, the OOS + IC + Newey-West +
+  multiple-testing gauntlet, and a profitability-first implementation path
+  (grade the `varsity` additive score, correct the sweeps).
 - [research/hmm_market_regime_detection.md](./research/hmm_market_regime_detection.md) —
   Hidden Markov Model regime detection: mechanics, what maps onto this
   codebase vs. what doesn't, and a scoped implementation path.

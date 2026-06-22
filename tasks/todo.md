@@ -1,3 +1,26 @@
+# Linear-regression signals doc (2026-06-22)
+
+Goal: a reference doc on implementing linear-regression signals for
+profitability + the learnings for our built system.
+
+- [x] Survey existing regression machinery: `screen_pairs.py` (OLS hedge
+      ratio, intercept SE), `varsity_equity_swing` additive score,
+      `run_autoresearch.py` hold-out splitter, `sweep_*.py`.
+- [x] Wrote `docs/research/linear_regression_signals.md` — theory (alpha =
+      intercept), reading an OLS summary, the OOS/IC/Newey-West/Bonferroni
+      gauntlet, "Relevance to this codebase", and a 5-step profitability-first
+      implementation path.
+- [x] Linked it from `docs/README.md` research index.
+
+Review: doc is documentation-only (no code/strategy change). Key learnings
+surfaced — (1) the `varsity` `score += 1.0` boosts are an un-fitted,
+un-validated multi-factor model; (2) sweeps report best-of-many Sharpe with no
+multiple-testing correction; (3) hold-out exists but IC/Newey-West discipline
+is the gap. Step 1 (a pure `factor_eval.grade_factor` harness) is the highest-
+leverage next action but was NOT implemented — doc only, per the request.
+
+---
+
 # 2.2 — migrate pair_trading onto the shared order_executor (PLAN, 2026-06-16)
 
 Goal: one implementation of place→poll→cancel/partial-reverse. pair's
