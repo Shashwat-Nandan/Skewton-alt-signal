@@ -61,8 +61,11 @@ export function Header() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["session"] }),
   });
 
+  // `relative z-50` on the header: its `backdrop-blur` creates a stacking
+  // context, so the dropdown's z-50 is scoped inside it; without lifting the
+  // whole header above <main>, page content paints over the open menu.
   return (
-    <header className="border-b border-border bg-card/40 backdrop-blur-sm">
+    <header className="relative z-50 border-b border-border bg-card/40 backdrop-blur-sm">
       <div className="container flex h-14 items-center justify-between gap-2 sm:gap-4">
         <div className="flex min-w-0 items-center gap-2 sm:gap-3">
           {/* Hamburger — all nav lives behind this. */}
