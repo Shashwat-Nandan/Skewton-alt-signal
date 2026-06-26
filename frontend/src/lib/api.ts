@@ -7,6 +7,7 @@ import type {
   EquityScansResponse,
   EquitySignalsResponse,
   FiiDiiResponse,
+  KalmanPairsResponse,
   MarketProfileResponse,
   MarketProfileSymbol,
   PairCandidatesResponse,
@@ -121,6 +122,13 @@ export const api = {
     if (params.system) q.set("system", params.system);
     const qs = q.toString();
     return http<BuyOnGapResponse>(`/buy-on-gap-paper${qs ? `?${qs}` : ""}`);
+  },
+
+  kalmanPairs: (params: { end?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.end) q.set("end", params.end);
+    const qs = q.toString();
+    return http<KalmanPairsResponse>(`/kalman-pairs${qs ? `?${qs}` : ""}`);
   },
 
   equityPositions: (status?: "open" | "closed") => {

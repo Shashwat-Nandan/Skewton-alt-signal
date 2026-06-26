@@ -98,3 +98,49 @@ class TestNetPnl:
         _write_state(tmp_path, monkeypatch, _payload())
         block = positions._build_taleb_block(date(2026, 6, 17))
         assert block.summary.realized_pnl == -12106.19
+
+
+class TestKalmanBlock:
+    """The Kalman paper book must appear as its own Positions block. Its state
+    file is named off the `*paper_state*` glob (to stay out of the live notional
+    cap), so list_positions must list it explicitly; it reuses the pair block
+    builder, so the live open legs surface like any other pair system."""
+
+    def _write_kalman(self, tmp_path, monkeypatch, *, position, legs, closed=None):
+        monkeypatch.setattr(positions, "DATA_CACHE", tmp_path)
+        (tmp_path / "kalman_pairs_runner_state.json").write_text(json.dumps({
+            "system": "kalman", "mode": "paper",
+            "updated_at": "2026-06-29T11:00:00",
+            "pairs": [{
+                "pair": ["ICICIBANK", "BPCL"],
+                "state": {
+                    "position": position, "entry_z": 2.1,
+                    "entry_time": "2026-06-29T10:20:00",
+                    "realized_pnl": -50.0, "unrealized_pnl": 1200.0,
+                    "total_transaction_costs": 300.0,
+                    "legs": legs, "closed_trades": closed or [],
+                },
+            }],
+        }))
+
+    def test_open_position_surfaces_with_correct_sides(self, tmp_path, monkeypatch):
+        self._write_kalman(tmp_path, monkeypatch, position="SHORT_SPREAD", legs=[
+            {"symbol": "ICICIBANK", "tradingsymbol": "ICICIBANK29JUNFUT",
+             "lot_size": 700, "quantity": -1, "entry_price": 1370.0, "current_price": 1365.0},
+            {"symbol": "BPCL", "tradingsymbol": "BPCL29JUNFUT",
+             "lot_size": 1800, "quantity": 1, "entry_price": 310.0, "current_price": 311.0},
+        ])
+        block = next(b for b in positions.list_positions().systems if b.name == "kalman")
+        assert block.available and block.mode == "paper"
+        assert block.label.startswith("Pair trading — Kalman")
+        assert {p.tradingsymbol for p in block.open_positions} == {
+            "ICICIBANK29JUNFUT", "BPCL29JUNFUT"}
+        short = next(p for p in block.open_positions if p.tradingsymbol == "ICICIBANK29JUNFUT")
+        assert short.side == "SHORT" and short.quantity == 1   # signed qty → side
+        assert block.summary.unrealized_pnl == 1200.0
+        assert block.summary.n_open_positions == 2
+
+    def test_absent_state_file_is_unavailable_not_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(positions, "DATA_CACHE", tmp_path)  # no kalman file written
+        block = next(b for b in positions.list_positions().systems if b.name == "kalman")
+        assert block.available is False and block.open_positions == []

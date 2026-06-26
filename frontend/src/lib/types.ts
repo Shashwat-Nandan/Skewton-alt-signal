@@ -296,6 +296,41 @@ export type BuyOnGapResponse = {
   open_positions: BuyOnGapOpenPosition[];
 };
 
+// ── Kalman pairs (time-varying hedge ratio) ──
+
+export type KalmanPair = {
+  pair: string;
+  model: string | null;
+  /** γ_t the filter currently tracks (live predicted hedge ratio / elasticity). */
+  gamma: number | null;
+  /** μ_t the filter currently tracks (intercept). */
+  mu: number | null;
+  position: string; // FLAT | LONG_SPREAD | SHORT_SPREAD
+  /** Rolling z-score of the Kalman spread. */
+  current_z: number | null;
+  /** z the open position was entered at (0 while flat). */
+  entry_z: number | null;
+  /** Structure risk band (₹), present only while a position is open. */
+  stop_inr: number | null;
+  target_inr: number | null;
+  spread_std: number | null;
+  day_pnl: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  n_closed_trades: number;
+  spread_history_size: number | null;
+};
+
+export type KalmanPairsResponse = {
+  latest_date: string | null;
+  /** Total Kalman EOD sidecars on disk (≤ end) — how many sessions recorded. */
+  n_sessions_recorded: number;
+  n_pairs: number;
+  /** P&L of the LATEST session only (not cumulative across n_sessions_recorded). */
+  session_pnl: number;
+  pairs: KalmanPair[];
+};
+
 // ── Equity Swing ──
 
 export type EquityPosition = {

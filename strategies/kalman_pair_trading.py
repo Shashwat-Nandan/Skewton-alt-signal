@@ -681,6 +681,10 @@ class KalmanPairStrategy(BaseStrategy):
         self.state.mean_revert_streak = 0
         self.state.unrealized_pnl = 0.0
         self._pending_exit_reason = None
+        # Drop the entry's structure risk band — it describes the now-closed
+        # position; leaving it stale would surface a phantom stop/target on a
+        # FLAT pair (e.g. in the EOD report / dashboard).
+        self._last_risk_band = None
 
     # ──────────────────────────────────────────────────────────────────
     # Signal publishing (seam for the §4 contract)
@@ -712,6 +716,10 @@ class KalmanPairStrategy(BaseStrategy):
             "gamma_today": self._gamma_today,
             "last_step_date": (self._last_step_date.isoformat()
                                if self._last_step_date else None),
+            # Persist the structure risk band so a restart mid-open-position
+            # doesn't blank the EOD/dashboard risk envelope for a live position
+            # (it's set only at entry, so it can't be recomputed without it).
+            "last_risk_band": self._last_risk_band,
             "state": {
                 "position": self.state.position,
                 "entry_z": self.state.entry_z,
@@ -753,6 +761,7 @@ class KalmanPairStrategy(BaseStrategy):
         self._gamma_today = float(blob.get("gamma_today", self._filter.a[1]))
         lsd = blob.get("last_step_date")
         self._last_step_date = date.fromisoformat(lsd) if lsd else None
+        self._last_risk_band = blob.get("last_risk_band")
 
         s = blob["state"]
         self.state = KalmanPairState(

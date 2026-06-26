@@ -1,8 +1,9 @@
 """Live position tracker.
 
-Reads the three paper-trading state JSONs that the runners rewrite every
-few seconds during market hours, and returns a unified view of:
-  - open positions per system (Taleb straddle, pair-baseline, pair-persistent)
+Reads the per-system state JSONs that the runners rewrite every few seconds
+during market hours, and returns a unified view of:
+  - open positions per system (Taleb, pair-baseline, pair-persistent [live],
+    Kalman pairs)
   - today's closed trades per system
   - a per-system P&L summary (realized + unrealized + costs)
 
@@ -342,6 +343,12 @@ def list_positions() -> PositionsResponse:
                           "pair_paper_state_baseline.json", today),
         _build_pair_block("pair_persistent", "Pair trading — persistent",
                           "pair_paper_state_persistent.json", today),
+        # Kalman pairs (time-varying γ_t, paper-only). Its state file is named
+        # off the `*paper_state*` glob to stay out of the live notional cap, so
+        # it must be listed explicitly here. Same serialize shape → reuses the
+        # pair block builder unchanged.
+        _build_pair_block("kalman", "Pair trading — Kalman (γ_t)",
+                          "kalman_pairs_runner_state.json", today),
     ]
     return PositionsResponse(
         generated_at=datetime.now().isoformat(timespec="seconds"),

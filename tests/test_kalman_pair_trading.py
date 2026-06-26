@@ -227,6 +227,20 @@ def test_restore_rejects_wrong_pair():
         strat.restore_state(blob)
 
 
+def test_serialize_preserves_risk_band_for_open_position():
+    """A restart mid-open-position must not blank the structure risk band. It's
+    computed only at entry, so it has to round-trip through serialize/restore —
+    else the EOD/dashboard shows no stop/target for a live position."""
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.scan_and_propose())
+    assert strat.state.position != "FLAT" and strat._last_risk_band is not None
+    clone, _ = _make()
+    clone.restore_state(strat.serialize_state())
+    assert clone._last_risk_band == strat._last_risk_band
+
+
 def test_beta_lock_holds_open_position_hedge_ratio():
     """Once a position is open, the hedge ratio used to manage it must stay
     pinned to entry-γ even as the filter keeps tracking and γ drifts. Otherwise
