@@ -424,6 +424,18 @@ def main() -> int:
             log.info("Not a trading day (%s) — exiting.", reason)
             return 0
 
+    # Hard-stop guard BEFORE auth. A post-15:30 invocation — e.g. an evening
+    # `systemctl enable --now` catch-up fire (timer is Persistent=true) — must
+    # exit WITHOUT a fresh Kite login, which would otherwise invalidate the
+    # cached session the live runner reuses (no-auth-while-live-runner). The
+    # session-timing checks after setup repeat this for the normal pre-open path.
+    now0 = datetime.now()
+    if now0 >= now0.replace(hour=HARD_STOP[0], minute=HARD_STOP[1],
+                            second=0, microsecond=0):
+        log.info("Started after hard stop %02d:%02d IST — nothing to do (no auth).",
+                 *HARD_STOP)
+        return 0
+
     # Assigned to a local that lives for main()'s scope so the FD stays
     # open (lock released on process exit, including SIGKILL).
     lock_fd = acquire_lock(LOCK_PATH, log, label="kalman_pairs")  # noqa: F841

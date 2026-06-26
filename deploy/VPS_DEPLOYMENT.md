@@ -270,7 +270,7 @@ It writes its own files, deliberately named to slot into the existing tooling **
 **Before you start — the same two host gotchas as §3.3:**
 
 1. **Path / user substitution.** `deploy/kalman-pairs-paper.{service,timer}` are written for `User=taleb` + `/opt/taleb-karpathy-kite`. Apply the *same* substitution you used for the other units (current VPS: `User=root`, `/opt/taleb-karpathy-kite` → `/root/algo-trading/taleb-karpathy-kite`) in `ExecStart`, `WorkingDirectory`, `EnvironmentFile`, and `ReadWritePaths`. Keep the host unit matching the template otherwise (see §3.2).
-2. **Install OUTSIDE market hours (≈ after 15:30 IST).** The timer is `Persistent=true`, so `enable --now` after 09:16 makes systemd run today's "missed" fire **immediately**, authenticating Kite right then. A fresh login while the **live pair runner** holds the shared `.kite_session.json` can invalidate its token (no-auth-while-live-runner — `tasks/lessons.md`). Install in the evening so any catch-up fire is a harmless no-op (the runner refuses to start after 15:30).
+2. **Install OUTSIDE market hours (≈ after 15:30 IST).** The timer is `Persistent=true`, so `enable --now` after 09:16 makes systemd run today's "missed" fire immediately. The runner has a hard-stop guard **before** Kite auth, so a post-15:30 catch-up fire exits without authenticating — no fresh login, no `.kite_session.json` collision with the live runner (no-auth-while-live-runner — `tasks/lessons.md`). Installing in the evening therefore makes that catch-up a true no-op while still arming tomorrow's 09:16 timer. (Installing *during* market hours would fire a real session immediately — don't.)
 
 ```bash
 # Run in the evening, after the live pair runner's session has ended.
@@ -319,6 +319,74 @@ ls -l data_cache/pair_paper_kalman_eod_$(date +%F).json
 ```
 
 Operator controls: the shared `HALT_ALL` / `HALT_NEW_ENTRIES` kill switches apply (it reads the same flags). There is **no** Kalman-specific daily-loss breaker — it's a paper book; rely on the shared switches. A pair whose log-elasticity γ is non-cointegrable (|γ| outside [0.1, 10]) is skipped at build with a logged reason — expect fewer pairs than the static runner on the same candidates.
+
+#### 3.4.1 Operator install checklist (current VPS: `User=root`, `/root/algo-trading/taleb-karpathy-kite`)
+
+Concrete, ordered steps with this host's substitution baked in. **Run in the evening** (after ~15:30 IST) on a weekday so tomorrow trades.
+
+**Pre-flight:**
+```bash
+ssh <vps>
+cd /root/algo-trading/taleb-karpathy-kite
+systemctl status pair-paper-persistent-live.service   # confirm today's LIVE session ended (inactive/exited)
+git checkout main && git pull --ff-only               # pull the Kalman system + this runbook
+```
+
+**1. Offline smoke-test (no auth — must be green before installing):**
+```bash
+.venv/bin/python -m pytest tests/test_kalman_filter.py tests/test_kalman_pair_trading.py \
+    tests/test_run_paper_kalman_pairs.py -q
+.venv/bin/python validate_kalman_filter.py            # Phase-0 gate, exits 0
+```
+
+**2. Install the units with this host's substitution applied:**
+```bash
+sudo cp deploy/kalman-pairs-paper.service /etc/systemd/system/
+sudo cp deploy/kalman-pairs-paper.timer   /etc/systemd/system/
+sudo sed -i \
+  -e 's#User=taleb#User=root#' \
+  -e 's#/opt/taleb-karpathy-kite#/root/algo-trading/taleb-karpathy-kite#g' \
+  /etc/systemd/system/kalman-pairs-paper.service
+# OPTIONAL — clean A/B vs the persistent LIVE book (trade the SAME pairs):
+# sudo sed -i 's#--max-leg-notional 1000000#& --candidates data_cache/pair_candidates_persistent.csv#' \
+#   /etc/systemd/system/kalman-pairs-paper.service
+sudo systemctl daemon-reload
+```
+
+**3. Verify the substituted unit BEFORE arming it:**
+```bash
+systemctl cat kalman-pairs-paper.service | grep -E 'User=|ExecStart=|WorkingDirectory=|EnvironmentFile=|ReadWritePaths='
+# every path must read /root/algo-trading/taleb-karpathy-kite ; User=root
+```
+
+**4. Arm the timer (evening `--now` is a clean no-op thanks to the pre-auth hard-stop guard):**
+```bash
+sudo systemctl enable --now kalman-pairs-paper.timer
+journalctl -u kalman-pairs-paper.service --since "5 min ago"   # evening fire → "Started after hard stop … (no auth)"
+systemctl list-timers kalman-pairs-paper.timer                 # next fire = tomorrow 09:16 IST
+```
+
+**5. Dashboard (optional, any time):**
+```bash
+sudo systemctl restart dashboard-backend.service   # picks up the BOTH→ALL compare-router change
+# 3-system default needs a frontend rebuild (§10); until then type
+# systems=baseline,persistent,kalman in the /pair-paper-compare tab.
+```
+
+**6. Next morning — watch the first session (this IS the live smoke-test; paper, no real orders):**
+```bash
+journalctl -u kalman-pairs-paper.service -f
+tail -f logs/paper-kalman-pairs-$(date +%F).log
+# after 15:25 IST:
+ls -l data_cache/pair_paper_kalman_eod_$(date +%F).json
+.venv/bin/python compare_kalman_vs_paper.py --system persistent   # Kalman vs the live book
+```
+
+**Rollback / stop:**
+```bash
+sudo systemctl disable --now kalman-pairs-paper.timer   # stop arming
+sudo systemctl stop kalman-pairs-paper.service          # kill a mid-session run (paper → nothing to unwind)
+```
 
 ---
 
