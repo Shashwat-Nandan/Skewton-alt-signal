@@ -1,13 +1,14 @@
 [Unit]
-Description=Fire kalman-pairs-paper.service Mon–Fri at 09:14 IST
+Description=Fire kalman-pairs-paper.service Mon–Fri at 09:16 IST
 Documentation=man:systemd.timer(5)
 
 [Timer]
-# 09:14 IST — staggered after taleb-hedger (09:10), pair-paper (09:11/09:12),
-# and arbitrage-paper (09:13) so the TOTP logins don't collide on the shared
-# .kite_session.json. run_paper_kalman_pairs.py self-gates on 09:15 anyway, so
-# it waits for the open regardless.
-OnCalendar=Mon..Fri *-*-* 09:14:00 Asia/Kolkata
+# 09:16 IST — staggered after taleb-hedger (09:10), pair-paper (09:11/09:12),
+# arbitrage-paper (09:13), and buy-on-gap (09:14) so the TOTP logins don't
+# collide on the shared .kite_session.json (09:14 is buy-on-gap's slot). Firing
+# just after the 09:15 open is fine: the others have already populated the
+# cached session, so this run reuses it rather than logging in fresh.
+OnCalendar=Mon..Fri *-*-* 09:16:00 Asia/Kolkata
 
 # If the VPS was asleep or systemd missed the window, run once to catch up.
 # The runner refuses to start after 15:30, so Persistent is safe.

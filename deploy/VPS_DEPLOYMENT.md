@@ -21,6 +21,8 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `arbitrage-paper.service`     | Type=simple, ~6 hours         | Runs `run_paper_arbitrage.py` — calendar/term-structure spreads, paper mode, EOD sidecar |
 | `buy-on-gap-paper.timer`      | Mon–Fri 09:14 IST + jitter    | Fires `buy-on-gap-paper.service` (1-min offset after arbitrage to stagger TOTP logins) |
 | `buy-on-gap-paper.service`    | Type=simple, ~6 hours         | Runs `run_paper_buy_on_gap.py` — intraday gap-down mean reversion, paper mode, EOD sidecar |
+| `kalman-pairs-paper.timer`    | Mon–Fri 09:16 IST + jitter    | Fires `kalman-pairs-paper.service` (after buy-on-gap; just after the open, reuses cached session) |
+| `kalman-pairs-paper.service`  | Type=simple, ~6 hours         | Runs `run_paper_kalman_pairs.py` — Kalman time-varying-γ pairs, paper-only, A/B vs static (§3.4) |
 | `pair-verify.timer`           | Mon–Fri 16:00 IST + jitter    | Fires `pair-verify.service`                                                          |
 | `pair-verify.service`         | Oneshot, ~5 min               | Runs `verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
 | `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
@@ -252,6 +254,71 @@ tail -f logs/paper-buy-on-gap-$(date +%F).log      # richer per-day file
 ```
 
 Operator controls are the same shape as the other runners: the shared `HALT_ALL` / `HALT_NEW_ENTRIES` kill switches apply, and a session-loss breach auto-touches `data_cache/HALT_BUY_ON_GAP_DAILY_LOSS` (entries suspend, exits continue; `rm` it to resume).
+
+---
+
+### 3.4 Kalman pair runner (forward A/B vs the static pair book)
+
+Same long-short pairs trade as `pair-paper`, but the hedge ratio γ_t is tracked by a Kalman filter (time-varying) instead of the static screener β (Palomar Ch. 15 §15.6). It runs **paper-only** alongside the static pair runner on the **same candidate universe**, so `/pair-paper-compare` shows Kalman-γ vs static-β on identical forward data — that head-to-head **is** the forward A/B test (Phase-2 found Kalman more stationary + ~70% smaller OOS loss, and +43% on the live book's last month, but absolute profitability is regime-dependent — the forward test is what settles it). `KalmanPairStrategy` raises for `mode=live`; there is no live path until the A/B shows an edge.
+
+It writes its own files, deliberately named to slot into the existing tooling **and** to stay isolated:
+
+- EOD sidecar `data_cache/pair_paper_kalman_eod_<date>.json` — the `pair_paper_{system}` convention, so `/pair-paper-compare` and `compare_paper_systems.py` pick up the `kalman` system with no new code.
+- State `data_cache/kalman_pairs_runner_state.json` — deliberately **not** a `*paper_state*.json` name, so this paper book is **not** summed into the live runner's notional cap (`_aggregate_book_notional`) or its H17 per-symbol concentration limiter. Isolated paper book.
+- Log `logs/paper-kalman-pairs-<date>.log`.
+
+**Before you start — the same two host gotchas as §3.3:**
+
+1. **Path / user substitution.** `deploy/kalman-pairs-paper.{service,timer}` are written for `User=taleb` + `/opt/taleb-karpathy-kite`. Apply the *same* substitution you used for the other units (current VPS: `User=root`, `/opt/taleb-karpathy-kite` → `/root/algo-trading/taleb-karpathy-kite`) in `ExecStart`, `WorkingDirectory`, `EnvironmentFile`, and `ReadWritePaths`. Keep the host unit matching the template otherwise (see §3.2).
+2. **Install OUTSIDE market hours (≈ after 15:30 IST).** The timer is `Persistent=true`, so `enable --now` after 09:16 makes systemd run today's "missed" fire **immediately**, authenticating Kite right then. A fresh login while the **live pair runner** holds the shared `.kite_session.json` can invalidate its token (no-auth-while-live-runner — `tasks/lessons.md`). Install in the evening so any catch-up fire is a harmless no-op (the runner refuses to start after 15:30).
+
+```bash
+# Run in the evening, after the live pair runner's session has ended.
+sudo cp deploy/kalman-pairs-paper.service /etc/systemd/system/
+sudo cp deploy/kalman-pairs-paper.timer   /etc/systemd/system/
+# …then apply the host path/User substitution to the installed .service…
+sudo systemctl daemon-reload
+sudo systemctl enable --now kalman-pairs-paper.timer
+systemctl list-timers kalman-pairs-paper.timer   # confirm next fire is tomorrow 09:16 IST
+```
+
+The timer fires **Mon–Fri 09:16 IST** (staggered after taleb-hedger/pair/arbitrage/buy-on-gap; firing just after the 09:15 open is fine — the others have already populated the cached session, so this run reuses it rather than logging in fresh). The service runs:
+
+```
+run_paper_kalman_pairs.py --top 10 --max-leg-notional 1000000
+```
+
+To make the A/B a clean same-pairs comparison against the **persistent** live book, point it at that book's universe with `--candidates data_cache/pair_candidates_persistent.csv` (default is `pair_candidates.csv`, the baseline set). The runner self-gates to the 09:15 open, seeds each pair's filter from the bhavcopy daily-close history (log prices), runs the tick loop, steps each filter once at **15:25 IST** on the close, exits 0, and writes the EOD sidecar. On restart after missed sessions it replays the elapsed bhavcopy days to catch the filters up.
+
+**Dashboard wiring — lighter than the other runners (no new router):**
+
+- The `kalman` EOD is read by the **already-deployed** `/pair-paper-compare` router with no restart — just query `?systems=baseline,persistent,kalman` (the `systems` field is free-text in the tab).
+- To get `kalman` in the tab's **default** view + the `"ALL"` label fix, restart the backend and rebuild the SPA:
+  ```bash
+  sudo systemctl restart dashboard-backend.service       # picks up the BOTH→ALL router change
+  ```
+  Frontend: rebuild + redeploy `frontend/dist` (see [section 10](#10-strategy-dashboard)) for the 3-system default; until then, type the systems manually.
+
+**Smoke-test:**
+
+```bash
+# 1. Offline, NO auth — the filter/strategy logic (must all pass / exit 0):
+.venv/bin/python -m pytest tests/test_kalman_filter.py tests/test_kalman_pair_trading.py \
+    tests/test_run_paper_kalman_pairs.py -q
+.venv/bin/python validate_kalman_filter.py        # Phase-0 correctness gate, exits 0
+```
+
+The runner itself has **no `--dry-run`** (unlike buy-on-gap) — `build_strategies` needs the live NFO instrument dump + bhavcopy panel, so the runner can only start with a Kite session. It is **paper-only and places no orders**, so the first scheduled paper session *is* the live smoke-test (money-safe; the only real risk is the TOTP collision the evening-install avoids). Watch the first session:
+
+```bash
+journalctl -u kalman-pairs-paper.service -f        # live journal
+tail -f logs/paper-kalman-pairs-$(date +%F).log    # richer per-day file
+# After 15:25 IST, confirm the sidecar landed and the A/B is visible:
+ls -l data_cache/pair_paper_kalman_eod_$(date +%F).json
+.venv/bin/python compare_kalman_vs_paper.py --system persistent   # Kalman vs the live book
+```
+
+Operator controls: the shared `HALT_ALL` / `HALT_NEW_ENTRIES` kill switches apply (it reads the same flags). There is **no** Kalman-specific daily-loss breaker — it's a paper book; rely on the shared switches. A pair whose log-elasticity γ is non-cointegrable (|γ| outside [0.1, 10]) is skipped at build with a logged reason — expect fewer pairs than the static runner on the same candidates.
 
 ---
 
