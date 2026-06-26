@@ -173,7 +173,7 @@ def compare_systems(
                        key=lambda k: -max(pair_pnl[k].values(), default=0.0)):
         present = [s for s in sys_list if s in pair_pnl[lbl]]
         if len(present) == len(sys_list):
-            tag = "BOTH"
+            tag = "ALL"   # "BOTH" misreads now that >2 systems can be compared
         else:
             tag = f"only {','.join(present)}"
         per_pair_rows.append(PerPairRow(

@@ -22,7 +22,10 @@ import type {
 } from "@/lib/types";
 
 const DEFAULT_DAYS = 5;
-const DEFAULT_SYSTEMS = "baseline,persistent";
+// "kalman" = the Kalman-filter pairs forward A/B test (run_paper_kalman_pairs.py).
+// Shows alongside the static baseline/persistent books once that runner is live;
+// the compare endpoint renders empty cells for any system without a sidecar yet.
+const DEFAULT_SYSTEMS = "baseline,persistent,kalman";
 
 function PnLCell({ value }: { value: number | null | undefined }) {
   if (value == null) return <span className="text-muted-foreground">—</span>;
@@ -156,11 +159,11 @@ export function PaperSystemCompare() {
     <Card>
       <CardHeader className="flex flex-row flex-wrap items-end justify-between gap-3 pb-3">
         <div>
-          <CardTitle className="text-base">Baseline vs persistent paper systems</CardTitle>
+          <CardTitle className="text-base">Paper pair systems — head-to-head</CardTitle>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Head-to-head over the last {days} trading days. P&amp;L is net of transaction costs.
-            Persistent admission requires ≥2 of 6 rolling cointegration windows (see
-            tasks/todo.md 2026-05-17).
+            Baseline vs persistent (static β) vs kalman (time-varying γ — the forward
+            A/B test) over the last {days} trading days. P&amp;L is net of transaction
+            costs; a system with no sidecar for a day shows an empty cell.
           </p>
         </div>
         <div className="flex flex-wrap gap-3">

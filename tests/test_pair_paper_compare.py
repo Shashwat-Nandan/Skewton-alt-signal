@@ -152,9 +152,45 @@ class TestPairPaperCompare:
         assert per_pair["RELIANCE/TCS"]["traded_by"] == "only baseline"
         assert per_pair["RELIANCE/TCS"]["by_system"]["baseline"] == pytest.approx(7000.0)
         assert per_pair["RELIANCE/TCS"]["by_system"]["persistent"] is None
-        assert per_pair["CIPLA/ITC"]["traded_by"] == "BOTH"
+        assert per_pair["CIPLA/ITC"]["traded_by"] == "ALL"
         assert per_pair["CIPLA/ITC"]["by_system"]["baseline"] == pytest.approx(-1500.0)
         assert per_pair["CIPLA/ITC"]["by_system"]["persistent"] == pytest.approx(4500.0)
+
+    def test_kalman_system_included_three_way(self, client):
+        """The Kalman forward A/B test surfaces here for free: run_paper_kalman_pairs
+        writes pair_paper_kalman_eod_<date>.json (the `pair_paper_{system}`
+        convention), so `systems=baseline,persistent,kalman` compares the
+        time-varying-γ book head-to-head with the static books — no dedicated
+        router. Pin that the kalman tag is read and aggregated like any other."""
+        cache: Path = client._cache
+        _write_eod(cache, EXPECTED_DAYS[0], "persistent", [
+            _pair_report("ICICIBANK", "BPCL", realized=2000.0),
+        ])
+        # Kalman traded the same pair, different (better) P&L — the A/B signal.
+        _write_eod(cache, EXPECTED_DAYS[0], "kalman", [
+            _pair_report("ICICIBANK", "BPCL", realized=3500.0),
+        ])
+        _write_eod(cache, EXPECTED_DAYS[1], "kalman", [
+            _pair_report("ICICIBANK", "BPCL", realized=1000.0, n_trades=2),
+        ])
+
+        r = client.get(
+            f"/api/pair-paper-compare?days=5&end={END}"
+            "&systems=baseline,persistent,kalman"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["systems"] == ["baseline", "persistent", "kalman"]
+        agg = {row["system"]: row for row in body["aggregate"]}
+        assert agg["kalman"]["net_pnl"] == pytest.approx(4500.0)
+        assert agg["kalman"]["n_days_with_data"] == 2
+        assert agg["persistent"]["net_pnl"] == pytest.approx(2000.0)
+        # Per-pair shows kalman vs persistent on the same pair (the A/B view).
+        per_pair = {row["pair"]: row for row in body["per_pair"]}
+        bp = per_pair["ICICIBANK/BPCL"]
+        assert bp["by_system"]["kalman"] == pytest.approx(4500.0)
+        assert bp["by_system"]["persistent"] == pytest.approx(2000.0)
+        assert bp["by_system"]["baseline"] is None
 
     def test_no_eod_files_returns_empty_window(self, client):
         # No sidecars at all — endpoint must still 200 with zero-filled aggregate.
