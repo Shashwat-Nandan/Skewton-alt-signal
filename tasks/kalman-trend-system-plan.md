@@ -208,22 +208,37 @@ surface.
 (reproduce the paper's train/test result) is the go/no-go for 3 and 4.**
 
 ### Phase 0 — Filter core + optimizer + correctness gate
-- [ ] `strategies/kalman_trend.py` — pure, no I/O. `KalmanTrendFilter` built from
-      explicit `(Φ, H, Q, R, P₀, c)` (a `from_params(p1…p15, model=1..4)` factory
-      maps the Table-1 layout to matrices). `update(close)` returns predicted
-      state, the one-step **prediction of the next close** `H·(Φ x_{t|t}+c)`,
-      innovation `vₜ`+variance `Fₜ`. Forward pass per D&K §4.2 (reuse the
-      recursion shape validated in `kalman_filter.py`). `serialize`/`deserialize`
-      of the FULL state `(x, P)`. Fail loud on NaN / non-PSD `Q`/`R` / degenerate.
-- [ ] `optimize_kalman_trend.py` (or a function in the backtest) — **CMA-ES**
-      (`cmaes`) over the 18 params, **objective = train-period Sharpe of the
-      fixed-tick trend strategy − λ·‖p‖₁** (L1 penalty). Bounds/`σ`/`λ` per B §4.7;
-      restart-with-growing-λ optional (B Remark 4.6).
-- [ ] `tests/test_kalman_trend.py` (Rule 9): recovers a known constant-slope
-      trend; **detects a reversal within N bars** (frozen-estimate variant fails);
-      prediction uses predicted state (no look-ahead, pinned); the CMA-ES+L1 fit
-      recovers a known **sparse** optimum on a synthetic objective; serialize→
-      deserialize identity; NaN/short/flat → fail loud.
+- [x] `strategies/kalman_trend.py` — pure, no I/O. `KalmanTrendFilter` built from
+      explicit `(F, H, Q, R, P₀, c)`; `from_params(p1…p15, model=1..4)` maps the
+      Table-1 layout to matrices. `update(close)` returns the causal one-step
+      **prediction of the next close** `H·(F x_{t|t}+c)`, predicted/filtered
+      (level, velocity), innovation `vₜ`+variance `Fₜ`, std innovation. Forward
+      pass per D&K §4.2. `serialize`/`deserialize` of the FULL state `(x, P)`.
+      Fails loud on NaN / non-PSD `Q`/`P₀` / `R<0` / divergent `Fₜ≤0`.
+  - **Finding 1 — Q parameterization (Rule 1).** Table-1's literal `Q` makes the
+    paper's *own* optimum **indefinite** (not a valid covariance). Implemented Q
+    as a **Cholesky product** `Q=LLᵀ` — the only reading under which Table-2's
+    optimum is a clean rank-1 PSD matrix (det 0 exactly). Faithful + valid.
+  - **Finding 2 — Table-2 optimum diverges (Rule 12).** The reported optimal
+    `Φ=[[24.8,0],[0,11.8]]` is an **explosive** transition (position ×24.8/bar) →
+    the filter diverges, `Fₜ`≤0. The filter fails loud on it (test pins this).
+    The OCR'd 15-d vector is almost certainly mis-transcribed / the thin
+    experiment isn't reproducible at face value. **Consequence:** the correctness
+    gate targets the paper's *qualitative* claim (optimized Kalman beats MA
+    crossover OOS), **not** the literal Table-2 vector.
+- [ ] `optimize_kalman_trend.py` — **CMA-ES** (`cmaes`) over the 18 params,
+      **objective = train-period Sharpe of the fixed-tick trend strategy − λ·‖p‖₁**
+      (L1 penalty). Catches the filter's fail-loud (divergent params) → bad
+      fitness so CMA-ES steers away. Needs the fixed-tick trend simulation as the
+      objective (a pure `simulate_fixed_tick_trend`), plus the `cmaes` dep.
+- [x] `tests/test_kalman_trend.py` (Rule 9), 11 pass: recovers a known constant
+      slope; **one-step forecast beats a same-lag SMA** (the paper's claim; a
+      lagging predictor fails); **adapts to a trend reversal within N bars**
+      (frozen-velocity would not); forecast is causal (truncation-identical);
+      serialize→deserialize byte-identical through subsequent steps; indefinite-Q
+      / R<0 / NaN / too-few-params / model-4-nonzero-control fail loud;
+      model-4-zero-control ≡ model-3; Table-2 optimum diverges (fail loud).
+      (The CMA-ES+L1 sparse-recovery test moves to `optimize_kalman_trend` tests.)
 - [ ] **Correctness gate:** `validate_kalman_trend.py` — runs the whole pipeline
       on a real daily index-futures series, 6mo/6mo, and asserts the optimized
       Kalman OOS Sharpe **beats the MA-crossover baseline OOS Sharpe** and the
