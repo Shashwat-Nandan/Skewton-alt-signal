@@ -1,3 +1,31 @@
+# Kalman-Filter Trend-Following System (PLAN, 2026-06-27)
+
+New, independent single-instrument trend follower from Benhamou, "Kalman filter
+demystified" (hal-02012471 / arXiv 1811.11618). Distinct from the existing
+Kalman PAIRS system: tracks one instrument's [level, velocity] (Newtonian
+local-linear-trend) and trades it outright long/short; signal = causal one-step
+KF prediction vs prior close with a dead-band µ; ATR/tick stop+target.
+
+ALGORITHM IS ENTIRELY PAPER-FAITHFUL (user directive 2026-06-27): Table-1
+Model-4 state-space (state=[position,velocity]; general Φ/H; full Q; control
+c_t); fixed profit-target/stop-loss in TICKS; joint 18-param fit via CMA-ES on
+TRAIN Sharpe + L1 penalty; single 6mo train / 6mo test split. Repo infra (runner
+scaffolding, market-on-open via equity_pending_entries, signal contract,
+dashboard) is reused; the algorithm/exits/optimizer are the paper's, unchanged.
+Adds a new dep `cmaes` (the paper's optimizer).
+
+Full plan in `tasks/kalman-trend-system-plan.md`. Phases: 0 filter core +
+optimizer + correctness gate → 1 strategy → 2 backtest = reproduce the paper
+(GO/NO-GO) → 3 paper runner → 4 dashboard. Correctness gate = optimized Kalman
+OOS Sharpe beats the MA-crossover baseline (paper Tables 2–7: train Sharpe 1.62,
+test 1.40 vs MA 0.41).
+
+Status: PLAN WRITTEN, paper-faithful — awaiting user sign-off on D1–D7. No code
+yet (Verify-Plan checkpoint per CLAUDE.md). Overfitting risk (18 params/6 months)
+acknowledged in §7 and reported in findings, not engineered away (per directive).
+
+---
+
 # Linear-regression signals doc (2026-06-22)
 
 Goal: a reference doc on implementing linear-regression signals for
