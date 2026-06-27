@@ -253,20 +253,23 @@ surface.
       sparsity mechanism); the Kalman fit finds a profitable, multi-trade strategy
       on a regime-switching series; the fit rejects unstable models 3/4.
 - [x] **Correctness gate:** `validate_kalman_trend.py` — 6mo train / 6mo test,
-      fits Kalman + MA on train, compares **TEST** Sharpe. **NIFTY: GATE PASSED —
-      Kalman OOS Sharpe 0.66 vs MA 0.31** (paper's claim reproduced; cf. paper
-      1.40 vs 0.41), 6 test trades, sparsity 2.0. Targets the paper's *qualitative*
-      claim, not the explosive Table-2 vector (finding #2). Missing data → clean
+      fits Kalman + MA on train, compares **TEST** Sharpe across **multiple seeds**
+      (a single-seed pass is cherry-picking — finding #3). Missing data → clean
       exit 2 with remediation; genuine Kalman<MA → exit 1.
-  - [x] **BANKNIFTY fetch wired** (`fetch_index_daily.py`, 5 tests): resolves the
-        F&O symbol → NSE spot name (BANKNIFTY→"NIFTY BANK") via `KiteAuthManager`'s
-        cached session, pulls daily candles, writes `data_cache/BANKNIFTY_daily.csv`
-        (date,close) — exactly what the gate reads. Verified end-to-end against a
-        mock Kite (resolver + frame shaping + gate consumption).
-  - [ ] **OPERATOR (host):** `python fetch_index_daily.py --symbol BANKNIFTY
-        --days 400` on the VPS (reuse the cached session — no fresh login while a
-        live runner is active), then `python validate_kalman_trend.py` to close out
-        the BANKNIFTY gate. Can't run from CI (no valid Kite session).
+  - [x] **BANKNIFTY fetch wired + run** (`fetch_index_daily.py`, 5 tests): resolves
+        the F&O symbol → NSE spot name (BANKNIFTY→"NIFTY BANK"), reuses `.env`
+        (`load_dotenv`) + the Kite session, writes `data_cache/BANKNIFTY_daily.csv`
+        (gitignored). Fetched 271 daily closes (2025-05-23→2026-06-25).
+  - **Finding 3 — NO-GO under faithful replication (Rule 12).** Full writeup in
+    `tasks/kalman-trend-findings.md`. 5-seed gate: **NIFTY** Kalman median OOS
+    Sharpe **0.20 vs MA 0.93** (win-rate 20%); **BANKNIFTY** Kalman **−0.07 vs MA
+    0.07** (40%). Kalman's median OOS **loses to MA on both**; per-seed OOS swings
+    −1.18→+1.03 while train Sharpe is 2–5 → the fit **overfits**, the result is
+    seed luck. The earlier "NIFTY 0.66 vs 0.31" was seed-0 luck. This confirms
+    §7 risk #1 (single-split multi-param overfit), not a bug (signals causal, MA
+    fit identically). **GATE FAILED.** Do not promote to Phase 1. Decision (A stop
+    / B walk-forward robustness / C match the paper's intraday-futures setting) is
+    in the findings doc — recommend A or B.
 
 ### Phase 1 — Strategy class
 - [ ] `strategies/kalman_trend_following.py` — `KalmanTrendStrategy(BaseStrategy)`.

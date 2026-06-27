@@ -89,28 +89,39 @@ def evaluate_oos(prices: np.ndarray, n_train: int, *, kind: str, params: dict,
 
 
 def run_symbol(symbol: str, closes: np.ndarray, *, n_gen: int, l1_lambda: float,
-               cost: float, seed: int) -> dict:
+               cost: float, seeds: list[int]) -> dict:
+    """Fit + evaluate across MULTIPLE optimizer seeds. CMA-ES on a single
+    train/test split overfits, so any one seed's OOS Sharpe is noise (a single
+    seed can swing from +0.7 to −10). We report the per-seed distribution and
+    base the verdict on the MEDIAN seed — a single-seed pass would be
+    cherry-picking (Rule 12)."""
     n = len(closes)
     if n < 60:
         raise ValueError(f"{symbol}: need >= 60 daily bars, got {n}")
     n_train = n // 2
     train = closes[:n_train]
 
-    kal = o.fit_kalman_trend(train, model=1, tick_size=TICK_SIZE,
-                             cost_per_unit=cost, l1_lambda=l1_lambda,
-                             n_gen=n_gen, seed=seed)
-    ma = o.fit_ma_crossover(train, tick_size=TICK_SIZE, cost_per_unit=cost,
-                            n_gen=n_gen, seed=seed)
-    kal_test = evaluate_oos(closes, n_train, kind="kalman", params=kal, cost=cost)
-    ma_test = evaluate_oos(closes, n_train, kind="ma", params=ma, cost=cost)
+    kal_tests, ma_tests, wins = [], [], 0
+    for seed in seeds:
+        kal = o.fit_kalman_trend(train, model=1, tick_size=TICK_SIZE,
+                                 cost_per_unit=cost, l1_lambda=l1_lambda,
+                                 n_gen=n_gen, seed=seed)
+        ma = o.fit_ma_crossover(train, tick_size=TICK_SIZE, cost_per_unit=cost,
+                                n_gen=n_gen, seed=seed)
+        k = evaluate_oos(closes, n_train, kind="kalman", params=kal, cost=cost).sharpe
+        m = evaluate_oos(closes, n_train, kind="ma", params=ma, cost=cost).sharpe
+        kal_tests.append(k)
+        ma_tests.append(m)
+        wins += int(k >= m)
+    kal_med = float(np.median(kal_tests))
+    ma_med = float(np.median(ma_tests))
     return {
-        "symbol": symbol, "n_bars": n, "n_train": n_train,
-        "kal_train_sharpe": kal["train_sharpe"],
-        "ma_train_sharpe": ma["train_sharpe"],
-        "kal_test_sharpe": kal_test.sharpe, "ma_test_sharpe": ma_test.sharpe,
-        "kal_test_trades": kal_test.n_trades, "ma_test_trades": ma_test.n_trades,
-        "kal_sparsity": kal["l1_norm_normalized"],
-        "passed": kal_test.sharpe >= ma_test.sharpe,
+        "symbol": symbol, "n_bars": n, "n_seeds": len(seeds),
+        "kal_test_median": kal_med, "ma_test_median": ma_med,
+        "kal_test_min": float(np.min(kal_tests)),
+        "kal_test_max": float(np.max(kal_tests)),
+        "win_rate": wins / len(seeds),
+        "passed": kal_med >= ma_med,
     }
 
 
@@ -119,12 +130,14 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--symbols", default="NIFTY,BANKNIFTY")
     ap.add_argument("--csv", default=None, help="date,close CSV (overrides --symbols)")
-    ap.add_argument("--n-gen", type=int, default=150)
+    ap.add_argument("--n-gen", type=int, default=100)
     ap.add_argument("--l1-lambda", type=float, default=0.1)
     ap.add_argument("--cost", type=float, default=2.5,
                     help="per-side cost in index points (round trip = 2x)")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seeds", type=int, default=5,
+                    help="number of optimizer seeds to aggregate (0..N-1)")
     args = ap.parse_args()
+    seeds = list(range(args.seeds))
 
     if args.csv:
         df = pd.read_csv(args.csv)
@@ -143,29 +156,28 @@ def main() -> int:
     results, all_pass = [], True
     for sym, closes in jobs:
         r = run_symbol(sym, closes, n_gen=args.n_gen, l1_lambda=args.l1_lambda,
-                       cost=args.cost, seed=args.seed)
+                       cost=args.cost, seeds=seeds)
         results.append(r)
         all_pass &= r["passed"]
 
-    print("\nKalman trend-following correctness gate (paper §6 claim: "
-          "optimized Kalman ≥ MA crossover, out of sample)\n")
-    hdr = (f"{'symbol':<10}{'bars':>6}{'kal_train':>11}{'ma_train':>10}"
-           f"{'kal_TEST':>10}{'ma_TEST':>9}{'kal_trd':>8}{'sparsity':>10}{'  verdict'}")
+    print(f"\nKalman trend-following correctness gate (paper §6 claim: optimized "
+          f"Kalman ≥ MA crossover, out of sample) — {len(seeds)} seeds\n")
+    hdr = (f"{'symbol':<10}{'bars':>6}{'kalOOS_med':>11}{'maOOS_med':>11}"
+           f"{'kalOOS_min':>11}{'kalOOS_max':>11}{'win_rate':>10}{'  verdict'}")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
-        print(f"{r['symbol']:<10}{r['n_bars']:>6}{r['kal_train_sharpe']:>11.2f}"
-              f"{r['ma_train_sharpe']:>10.2f}{r['kal_test_sharpe']:>10.2f}"
-              f"{r['ma_test_sharpe']:>9.2f}{r['kal_test_trades']:>8}"
-              f"{r['kal_sparsity']:>10.2f}"
+        print(f"{r['symbol']:<10}{r['n_bars']:>6}{r['kal_test_median']:>11.2f}"
+              f"{r['ma_test_median']:>11.2f}{r['kal_test_min']:>11.2f}"
+              f"{r['kal_test_max']:>11.2f}{r['win_rate']:>10.0%}"
               f"{'   PASS' if r['passed'] else '   FAIL'}")
     print()
     if all_pass:
-        print("GATE PASSED — Kalman beats the MA baseline out of sample on all "
-              "symbols.\n")
+        print("GATE PASSED — Kalman's MEDIAN OOS Sharpe beats the MA baseline on "
+              "all symbols.\n")
         return 0
-    print("GATE FAILED — Kalman did NOT beat the MA baseline OOS on at least one "
-          "symbol. Do not promote past Phase 0 (Rule 12).\n")
+    print("GATE FAILED — Kalman's median OOS Sharpe did NOT beat the MA baseline "
+          "on at least one symbol. Do not promote past Phase 0 (Rule 12).\n")
     return 1
 
 

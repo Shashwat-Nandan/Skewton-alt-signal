@@ -101,6 +101,12 @@ def main() -> int:
     ap.add_argument("--output", default=None, help="override output path")
     args = ap.parse_args()
 
+    # Load KITE_* credentials from .env in-process, as the other fetch scripts do
+    # (fetch_historical_data.py / fetch_bars.py) — KiteAuthManager reads them from
+    # the environment.
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+
     to_d = datetime.strptime(args.to_date, "%Y-%m-%d").date() if args.to_date else date.today()
     from_d = (datetime.strptime(args.from_date, "%Y-%m-%d").date()
               if args.from_date else to_d - timedelta(days=args.days))
