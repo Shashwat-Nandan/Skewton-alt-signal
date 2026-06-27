@@ -24,6 +24,7 @@ numpy
 pandas
 scipy
 statsmodels
+cmaes                   # CMA-ES optimizer for the Kalman trend-following fit
 
 # Auth
 pyotp

@@ -226,11 +226,19 @@ surface.
     experiment isn't reproducible at face value. **Consequence:** the correctness
     gate targets the paper's *qualitative* claim (optimized Kalman beats MA
     crossover OOS), **not** the literal Table-2 vector.
-- [ ] `optimize_kalman_trend.py` — **CMA-ES** (`cmaes`) over the 18 params,
-      **objective = train-period Sharpe of the fixed-tick trend strategy − λ·‖p‖₁**
-      (L1 penalty). Catches the filter's fail-loud (divergent params) → bad
-      fitness so CMA-ES steers away. Needs the fixed-tick trend simulation as the
-      objective (a pure `simulate_fixed_tick_trend`), plus the `cmaes` dep.
+- [x] `optimize_kalman_trend.py` — pure: the fixed-tick trend `simulate` (daily-
+      close stop/target approximation, documented), `kalman_direction` (Alg 4) +
+      `ma_direction` (Alg 5) causal signals, `run_cmaes` (the paper's optimizer,
+      `cmaes` dep added to requirements.in/lock), and `fit_kalman_trend` /
+      `fit_ma_crossover` maximizing train Sharpe (Kalman adds the L1 penalty).
+      Catches the filter's fail-loud (divergent params) → worst fitness so CMA-ES
+      steers away. **Conditioning fixes (Rule 1):** decision vector is in std-dev/
+      price-point space (data-driven bounds scaled to the daily move), CMA-ES runs
+      in normalized [0,1] coords (one well-scaled `sigma`), and the L1 is taken in
+      normalized space (scale-invariant sparsity). **D5 deviation (Rule 12):** the
+      fit optimizes **model 1** (Newtonian, Φ fixed) — model 3/4's free Φ diverges
+      (finding #2), so the literal 18-param model-4 fit is not reproducible; this
+      is the stable Table-1 spec.
 - [x] `tests/test_kalman_trend.py` (Rule 9), 11 pass: recovers a known constant
       slope; **one-step forecast beats a same-lag SMA** (the paper's claim; a
       lagging predictor fails); **adapts to a trend reversal within N bars**
@@ -238,13 +246,22 @@ surface.
       serialize→deserialize byte-identical through subsequent steps; indefinite-Q
       / R<0 / NaN / too-few-params / model-4-nonzero-control fail loud;
       model-4-zero-control ≡ model-3; Table-2 optimum diverges (fail loud).
-      (The CMA-ES+L1 sparse-recovery test moves to `optimize_kalman_trend` tests.)
-- [ ] **Correctness gate:** `validate_kalman_trend.py` — runs the whole pipeline
-      on a real daily index-futures series, 6mo/6mo, and asserts the optimized
-      Kalman OOS Sharpe **beats the MA-crossover baseline OOS Sharpe** and the
-      optimum is sparse. EXIT 0 = gate passed → unblocks later phases; FAIL LOUD
-      otherwise. (If the paper's S&P 500 `EP` daily series is available, assert
-      proximity to Table 2/3.)
+- [x] `tests/test_optimize_kalman_trend.py` (Rule 9), 10 pass: stop/target book at
+      the LEVEL not the close (long/short, target/stop); costs reduce realized;
+      Kalman signal is net-long on an uptrend / net-short on a downtrend; MA flips
+      on reversal; **CMA-ES+L1 shrinks irrelevant params to ~0** (the paper's
+      sparsity mechanism); the Kalman fit finds a profitable, multi-trade strategy
+      on a regime-switching series; the fit rejects unstable models 3/4.
+- [x] **Correctness gate:** `validate_kalman_trend.py` — 6mo train / 6mo test,
+      fits Kalman + MA on train, compares **TEST** Sharpe. **NIFTY: GATE PASSED —
+      Kalman OOS Sharpe 0.66 vs MA 0.31** (paper's claim reproduced; cf. paper
+      1.40 vs 0.41), 6 test trades, sparsity 2.0. Targets the paper's *qualitative*
+      claim, not the explosive Table-2 vector (finding #2). Missing data → clean
+      exit 2 with remediation; genuine Kalman<MA → exit 1.
+  - [ ] **BANKNIFTY: data-blocked.** No BANKNIFTY index daily series is cached and
+        a Kite fetch can't run from CI (needs a TOTP login + `.env`; cached token
+        stale). The gate is wired (`load_daily_closes`) — drop
+        `data_cache/BANKNIFTY_daily.csv` (date,close) on the HOST and re-run.
 
 ### Phase 1 — Strategy class
 - [ ] `strategies/kalman_trend_following.py` — `KalmanTrendStrategy(BaseStrategy)`.

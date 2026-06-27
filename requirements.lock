@@ -251,6 +251,10 @@ click==8.4.2 \
     --hash=sha256:9a6cea6e60b17ebe0a44c5cc636d94f09bd66142c1cd7d8b4cd731c4917a15f6 \
     --hash=sha256:e6f9f66136c816745b9d65817da91d61d957fb16e02e4dcd0552553c5a197b76
     # via uvicorn
+cmaes==0.13.0 \
+    --hash=sha256:69a252b0291d08100351e37c2918c7c6d929b02ab7dcd9dd14fc02c7c98cc1b9 \
+    --hash=sha256:ccf61c73d5792cf44b50672b63f28c590082d1c1f5ab5155e2dd6e5305427cad
+    # via -r requirements.in
 constantly==23.10.4 \
     --hash=sha256:3fd9b4d1c3dc1ec9757f3c52aef7e53ad9323dbe39f51dfd4c43853b68dfa3f9 \
     --hash=sha256:aa92b70a33e2ac0bb33cd745eb61776594dc48764b06c35e0efd050b7f1c7cbd
@@ -412,6 +416,7 @@ numpy==2.4.6 \
     --hash=sha256:f74a575920ab21fe304421a3fc28793d82e299cae9eccb37084e9fc7f3617c20
     # via
     #   -r requirements.in
+    #   cmaes
     #   pandas
     #   patsy
     #   scipy
