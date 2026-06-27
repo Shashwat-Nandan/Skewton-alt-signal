@@ -258,10 +258,15 @@ surface.
       1.40 vs 0.41), 6 test trades, sparsity 2.0. Targets the paper's *qualitative*
       claim, not the explosive Table-2 vector (finding #2). Missing data → clean
       exit 2 with remediation; genuine Kalman<MA → exit 1.
-  - [ ] **BANKNIFTY: data-blocked.** No BANKNIFTY index daily series is cached and
-        a Kite fetch can't run from CI (needs a TOTP login + `.env`; cached token
-        stale). The gate is wired (`load_daily_closes`) — drop
-        `data_cache/BANKNIFTY_daily.csv` (date,close) on the HOST and re-run.
+  - [x] **BANKNIFTY fetch wired** (`fetch_index_daily.py`, 5 tests): resolves the
+        F&O symbol → NSE spot name (BANKNIFTY→"NIFTY BANK") via `KiteAuthManager`'s
+        cached session, pulls daily candles, writes `data_cache/BANKNIFTY_daily.csv`
+        (date,close) — exactly what the gate reads. Verified end-to-end against a
+        mock Kite (resolver + frame shaping + gate consumption).
+  - [ ] **OPERATOR (host):** `python fetch_index_daily.py --symbol BANKNIFTY
+        --days 400` on the VPS (reuse the cached session — no fresh login while a
+        live runner is active), then `python validate_kalman_trend.py` to close out
+        the BANKNIFTY gate. Can't run from CI (no valid Kite session).
 
 ### Phase 1 — Strategy class
 - [ ] `strategies/kalman_trend_following.py` — `KalmanTrendStrategy(BaseStrategy)`.
