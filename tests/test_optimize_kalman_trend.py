@@ -121,3 +121,20 @@ def test_fit_kalman_finds_profitable_strategy_on_trends():
 def test_fit_kalman_rejects_unstable_models():
     with pytest.raises(NotImplementedError):
         o.fit_kalman_trend(100 + np.arange(50.0), model=3)
+
+
+def test_reduced_fit_is_smaller_and_model2_and_evaluable():
+    """The reduced fit (Option B) must expose ONE filter knob on model 2 and
+    round-trip through evaluate() — fewer params is the whole anti-overfit point,
+    and evaluate must honor the model tag (not assume model 1)."""
+    rng = np.random.default_rng(5)
+    segs = [100 + 0.6 * np.arange(80), 148 - 0.6 * np.arange(80),
+            100 + 0.6 * np.arange(80)]
+    prices = np.concatenate(segs) + rng.normal(0, 1.0, 240)
+    fit = o.fit_kalman_reduced(prices, n_gen=60, seed=1)
+    assert fit["model"] == 2
+    assert "s_vel" in fit and fit["n_trades"] >= 3
+    # evaluate must reconstruct a model-2 filter (a model-1 assumption would
+    # mis-shape the param vector); reproduces the in-sample Sharpe.
+    res = o.evaluate(prices, kind="kalman", params=fit)
+    assert res.sharpe == pytest.approx(fit["train_sharpe"], rel=1e-6)

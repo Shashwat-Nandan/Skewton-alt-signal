@@ -352,13 +352,79 @@ def fit_ma_crossover(
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# REDUCED Kalman fit (robustness discipline — Option B)
+# ──────────────────────────────────────────────────────────────────────────
+# The full 5-filter-param fit overfits a single 6mo window (train Sharpe 2–5 →
+# OOS noise; see tasks/kalman-trend-findings.md). The reduced model keeps the
+# stable Newtonian structure and exposes ONE filter knob — the velocity process
+# std (signal-to-noise: how fast the trend may turn) — with R and P₀ seeded from
+# the data. Decision vector: [s_vel, µ, stop, target] (4, all scaled to the daily
+# move d). Fewer params + walk-forward selection is the regularization; no L1
+# needed. Built on model 2 so level/velocity get distinct initial variances.
+def _kalman_reduced_bounds(d: float) -> np.ndarray:
+    return np.array([
+        [1e-4 * d, 2.0 * d],    # s_vel  velocity process std (the only filter knob)
+        [0.0, 3.0 * d],         # µ      dead-band (price points)
+        [0.2 * d, 30.0 * d],    # stop   (ticks)
+        [0.2 * d, 60.0 * d],    # target (ticks)
+    ])
+
+
+def _reduced_to_pvector(x, d: float) -> np.ndarray:
+    """[s_vel,…] → model-2 p=[p1=0, p2=0, p3=s_vel, p4=R, p5=P0_level, p6=P0_vel].
+    Q = diag(0, s_vel²) (random walk on velocity only); R = d² (obs noise ≈ the
+    one-step change variance); P₀ = diag((10d)², d²) (mild diffuse prior)."""
+    return np.array([0.0, 0.0, x[0], d * d, (10.0 * d) ** 2, d * d])
+
+
+def fit_kalman_reduced(
+    train_prices,
+    *,
+    tick_size: float = 1.0,
+    cost_per_unit: float = 0.0,
+    n_gen: int = 120,
+    seed: int = 0,
+) -> dict:
+    """Reduced 4-param CMA-ES fit (Option B). Returns model-2 filter params + the
+    trade params + train Sharpe. Tagged `model=2` so `evaluate` reconstructs it."""
+    prices = np.asarray(train_prices, float)
+    d = _daily_scale(prices)
+    bounds = _kalman_reduced_bounds(d)
+
+    def objective_min(x):
+        p = _reduced_to_pvector(x, d)
+        try:
+            direction = kalman_direction(prices, p, model=2, mu=x[1])
+        except (ValueError, NotImplementedError):
+            return 1e12
+        res = simulate(prices, direction, stop_ticks=x[2], target_ticks=x[3],
+                       tick_size=tick_size, cost_per_unit=cost_per_unit)
+        return -res.sharpe
+
+    x0 = np.array([0.2 * d, 0.2 * d, 5.0 * d, 10.0 * d])
+    best_x, _ = run_cmaes(objective_min, x0, bounds=bounds, sigma=0.25,
+                          n_gen=n_gen, seed=seed)
+    p = _reduced_to_pvector(best_x, d)
+    direction = kalman_direction(prices, p, model=2, mu=best_x[1])
+    res = simulate(prices, direction, stop_ticks=best_x[2], target_ticks=best_x[3],
+                   tick_size=tick_size, cost_per_unit=cost_per_unit)
+    return {
+        "model": 2, "filter_params": p.tolist(), "s_vel": float(best_x[0]),
+        "mu": float(best_x[1]), "stop_ticks": float(best_x[2]),
+        "target_ticks": float(best_x[3]), "train_sharpe": res.sharpe,
+        "n_trades": res.n_trades,
+    }
+
+
 def evaluate(prices, *, kind: str, params: dict, tick_size: float = 1.0,
              cost_per_unit: float = 0.0) -> SimResult:
     """Run a fitted parameter set forward on `prices` (e.g. the test slice).
     `kind` ∈ {'kalman','ma'}. Causal — the signal is regenerated on this slice."""
     prices = np.asarray(prices, float)
     if kind == "kalman":
-        d = kalman_direction(prices, params["filter_params"], model=1, mu=params["mu"])
+        d = kalman_direction(prices, params["filter_params"],
+                             model=params.get("model", 1), mu=params["mu"])
     elif kind == "ma":
         d = ma_direction(prices, short=params["short"], long=params["long"],
                          offset=params["offset"])

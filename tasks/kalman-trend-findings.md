@@ -58,3 +58,37 @@ itself is the source of the fragility.
 
 Recommendation: **A or B.** Do not promote to Phase 1 (paper runner) on this
 result — there is no demonstrated OOS edge to trade.
+
+---
+
+# Option B — robustness discipline (2026-06-27)
+
+Re-ran with the anti-overfit discipline the single-split protocol lacked:
+- **Reduced 4-param Kalman fit** (`fit_kalman_reduced`): ONE filter knob (velocity
+  process std) + µ/stop/target; R and P₀ seeded from the data. Fewer params = the
+  regularization. (Down from 8 params; built on the stable Newtonian model 2.)
+- **Walk-forward** (`backtest_kalman_trend.py`): many rolling train→test folds;
+  fit on each train, score the immediately-following OOS test, multi-seed.
+- **Pooled OOS metric:** concatenate the non-overlapping test-slice daily P&L
+  across folds → ONE Sharpe. (A per-20-bar-window Sharpe is dominated by the
+  no-trade penalty — that first cut was degenerate and not interpretable.)
+
+## Result on the cached ~1-year data (pooled OOS Sharpe, Kalman vs MA)
+| config train/test/step (seeds) | NIFTY Kal | NIFTY MA | NIFTY win | BANKNIFTY Kal | BN MA | BN win |
+|---|---|---|---|---|---|---|
+| 120/20/20 (3) | 2.25 | 1.46 | 67% | 0.70 | −0.01 | 57% |
+| 100/30/30 (5) | 2.48 | 1.66 | 75% | 2.63 | −0.21 | 60% |
+| 140/21/21 (5) | **−0.96** | 1.11 | 20% | 3.44 | −0.13 | 50% |
+
+## Read
+- **Clear improvement over the faithful protocol** (which was NO-GO on both).
+- **BANKNIFTY: robust** — Kalman beats MA OOS in all 3 fold geometries.
+- **NIFTY: fragile** — strong in 2/3 but flips negative in the 140/21 geometry
+  (wins only 20% of folds). The result is **config-sensitive**.
+- **Cause = data depth.** ~1 yr → only 4–6 folds; geometry-sensitivity is the
+  expected small-sample symptom. **Suggestive, not conclusive.**
+
+## Next: deeper history (in progress)
+Fetching multi-year NIFTY/BANKNIFTY daily (Kite session, same NSE source) →
+30–80 folds, to settle whether NIFTY's edge is real or a small-sample artifact.
+Result + verdict to be appended here.
