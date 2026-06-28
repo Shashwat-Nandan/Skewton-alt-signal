@@ -142,6 +142,29 @@ daily single-split overfit → daily 1yr looked good → daily 8yr/28-fold MA wi
 intraday 1-seed looked good → intraday 5-seed wash/MA-wins. **No robust Kalman>MA
 edge exists in NIFTY/BANKNIFTY at either resolution.**
 
+### CORRECTION (2026-06-27, post code-review): the deep-history NO-GO was a metric bug
+A high-effort code review found `walk_forward` was AVERAGING per-seed daily P&L
+before computing the pooled Sharpe — variance reduction that inflated Sharpe
+~√N, **asymmetrically**. Fixed to per-seed pooled Sharpe → median over seeds
+(commit c63053b), plus warmup parity and NaN (not −10/0) degenerate handling.
+Re-ran the same deep geometries:
+
+| geometry (folds) | symbol | OLD (buggy) kal vs MA | CORRECTED kal vs MA | win |
+|---|---|---|---|---|
+| cfg1 1yr→1q (28) | NIFTY | 0.28 vs 0.80 | 0.62 vs 0.56 | 39% FAIL |
+| cfg1 (28) | BANKNIFTY | 0.35 vs 0.64 | 0.12 vs 0.22 | 49% FAIL |
+| cfg2 2yr→6mo (12) | NIFTY | 0.10 vs 0.88 | **1.05 vs 0.15** | 56% PASS |
+| cfg2 (12) | BANKNIFTY | 0.44 vs 0.16 | 0.45 vs −0.27 | 58% PASS |
+
+The bug **inflated MA** (its dispersed seeds averaged to low variance) and
+**deflated Kalman** (its dispersed seeds' P&L partly cancelled). So the earlier
+"deep history → MA decisively wins, clean NO-GO" was **largely the metric bug**
+— that conclusion is RETRACTED. Corrected picture: **mixed / geometry-dependent**.
+Kalman wins the longer-train cfg2 (both symbols) and ≈-ties MA on the more-folds
+cfg1 (win-rate <50%). No robust geometry-independent edge, but Kalman is far more
+competitive than the buggy numbers showed — which makes the forward paper A/B the
+right call, not a foregone NO-GO.
+
 ### Decision (user, 2026-06-27): build the paper A/B anyway as a FORWARD test
 Backtests can't model live fills; paper is zero-risk. Building the intraday
 MA-vs-Kalman paper runner to **measure** forward parity, not assume a winner.
