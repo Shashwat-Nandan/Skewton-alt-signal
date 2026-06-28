@@ -56,7 +56,7 @@ def test_unknown_symbol_fails_loud():
 
 
 def test_fetch_daily_closes_is_sorted_deduped_and_shaped():
-    df = f.fetch_daily_closes(_FakeKite(), 260105, date(2026, 1, 1), date(2026, 1, 2))
+    df = f.fetch_closes(_FakeKite(), 260105, date(2026, 1, 1), date(2026, 1, 2))
     assert list(df.columns) == ["date", "close"]      # exactly what the gate reads
     assert len(df) == 2                                # duplicate dropped
     assert list(df["date"]) == [date(2026, 1, 1), date(2026, 1, 2)]  # sorted
@@ -68,4 +68,4 @@ def test_fetch_empty_range_fails_loud():
         def historical_data(self, *a, **k):
             return []
     with pytest.raises(ValueError, match="no candles"):
-        f.fetch_daily_closes(_Empty(), 260105, date(2026, 1, 1), date(2026, 1, 3))
+        f.fetch_closes(_Empty(), 260105, date(2026, 1, 1), date(2026, 1, 3))

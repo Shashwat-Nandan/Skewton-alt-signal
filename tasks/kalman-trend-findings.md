@@ -88,7 +88,62 @@ Re-ran with the anti-overfit discipline the single-split protocol lacked:
 - **Cause = data depth.** ~1 yr → only 4–6 folds; geometry-sensitivity is the
   expected small-sample symptom. **Suggestive, not conclusive.**
 
-## Next: deeper history (in progress)
-Fetching multi-year NIFTY/BANKNIFTY daily (Kite session, same NSE source) →
-30–80 folds, to settle whether NIFTY's edge is real or a small-sample artifact.
-Result + verdict to be appended here.
+## Deep history — the deciding test (8.2 years, 2018-04 → 2026-06, 2035 bars)
+Fetched multi-year NIFTY/BANKNIFTY daily via Kite (`fetch_index_daily.py --days
+3000`) and re-ran the walk-forward with many folds (pooled OOS Sharpe, 3 seeds):
+
+| config train/test/step | folds | NIFTY Kal | NIFTY MA | NIFTY win | BN Kal | BN MA | BN win |
+|---|---|---|---|---|---|---|---|
+| 252/63/63 (1yr→1q) | 28 | 0.28 | **0.80** | 32% | 0.35 | **0.64** | 46% |
+| 504/126/126 (2yr→6mo) | 12 | 0.10 | **0.88** | 25% | **0.44** | 0.16 | 58% |
+
+### VERDICT — NO-GO. Kalman does not beat MA on Indian index daily.
+- **NIFTY: decisive loss.** Kalman loses to MA in BOTH geometries (Sharpe 0.28 vs
+  0.80, 0.10 vs 0.88; wins only 32% / 25% of folds; ~⅓ the P&L). MA captures the
+  2018–2026 bull trend far better.
+- **BANKNIFTY: a wash.** Kalman loses the 28-fold cfg1 (0.35 vs 0.64) and wins the
+  12-fold cfg2 (0.44 vs 0.16) — i.e. coin-flip, not a robust edge. On the
+  higher-fold (more reliable) cfg1 it loses.
+- **The 1-year Option-B "edge" was a small-sample artifact.** With 4–6 folds it
+  looked promising; with 28 folds it disappears. Exactly the failure mode this
+  whole investigation was guarding against.
+
+### Bottom line across all three attempts
+1. Faithful paper protocol (8-param, single split) → overfit, NO-GO.
+2. Option B (4-param + walk-forward), 1 year → promising but data-limited.
+3. **Option B on 8 years → Kalman clearly loses to a simple MA crossover.**
+
+The paper's headline (Kalman ≫ MA OOS, on S&P 500 index futures) **does not transfer
+to NIFTY/BANKNIFTY daily.** Both strategies are profitable in the bull market, but
+MA is the better (and far simpler) trend follower here.
+
+---
+
+# Intraday (5-min) re-test (2026-06-27)
+User hypothesis: the daily-close backtest hides intraday entry/exit dynamics
+where the lower-lag Kalman could win. Fetched 9000 5-min bars each (NIFTY,
+BANKNIFTY; ~6 months) via `fetch_index_daily.py --interval 5minute` and re-ran
+the walk-forward on 5-min bars (windows now in bars; absolute Sharpe mis-
+annualized but the Kalman-vs-MA comparison is unaffected).
+
+| run | NIFTY Kal vs MA | BANKNIFTY Kal vs MA |
+|---|---|---|
+| light (1 seed, 11 folds) | +0.17 vs −0.09 | +0.68 vs +0.36 |
+| **heavy (5 seeds, 22 folds)** | **+0.03 vs −0.04 (wash)** | **+0.27 vs +0.43 (MA wins)** |
+
+**The light single-seed run looked like a reversal (Kalman > MA on both); the
+multi-seed run dissolved it** — NIFTY collapses to a wash (both ≈ flat) and
+BANKNIFTY flips to MA (Kalman wins only 27% of folds). Same small-sample mirage as
+every other favourable cut in this investigation.
+
+### Overall verdict — consistent NO-GO, daily AND intraday
+Every time robustness is added (seeds, folds, history), the Kalman edge evaporates:
+daily single-split overfit → daily 1yr looked good → daily 8yr/28-fold MA wins;
+intraday 1-seed looked good → intraday 5-seed wash/MA-wins. **No robust Kalman>MA
+edge exists in NIFTY/BANKNIFTY at either resolution.**
+
+### Decision (user, 2026-06-27): build the paper A/B anyway as a FORWARD test
+Backtests can't model live fills; paper is zero-risk. Building the intraday
+MA-vs-Kalman paper runner to **measure** forward parity, not assume a winner.
+Phase 1 strategy (`strategies/kalman_trend_following.py`, 13 tests) done; runner
+next. Go in expecting parity.

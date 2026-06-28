@@ -68,22 +68,37 @@ def resolve_index_token(kite, symbol: str, nse_symbol: str | None) -> int:
         f"Some NSE index names: {indices[:25]}")
 
 
-def fetch_daily_closes(kite, token: int, from_date: date, to_date: date) -> pd.DataFrame:
-    """Pull daily candles in chunks; return a (date, close) frame sorted/deduped."""
+# Kite caps history per request by interval; chunk under the cap.
+_INTERVAL_CHUNK_DAYS = {
+    "day": 1800, "minute": 55, "3minute": 90, "5minute": 90,
+    "10minute": 90, "15minute": 180, "30minute": 180, "60minute": 360,
+}
+
+
+def fetch_closes(kite, token: int, from_date: date, to_date: date,
+                 interval: str = "day") -> pd.DataFrame:
+    """Pull candles at `interval` in chunks; return a (ts, close) frame
+    sorted/deduped. The timestamp column is `date` for daily (one row/day) and
+    `datetime` for intraday (so the backtest's `close`-column reader is happy
+    either way)."""
+    chunk_days = _INTERVAL_CHUNK_DAYS.get(interval, 90)
+    is_daily = interval == "day"
     rows = []
     cur = from_date
     while cur <= to_date:
-        chunk_end = min(cur + timedelta(days=_CHUNK_DAYS), to_date)
-        candles = kite.historical_data(token, cur, chunk_end, "day")
+        chunk_end = min(cur + timedelta(days=chunk_days), to_date)
+        candles = kite.historical_data(token, cur, chunk_end, interval)
         for c in candles:
-            d = c["date"]
-            d = d.date() if hasattr(d, "date") else d
-            rows.append((d, float(c["close"])))
+            ts = c["date"]
+            if is_daily:
+                ts = ts.date() if hasattr(ts, "date") else ts
+            rows.append((ts, float(c["close"])))
         cur = chunk_end + timedelta(days=1)
     if not rows:
         raise ValueError("Kite returned no candles for the requested range")
-    df = (pd.DataFrame(rows, columns=["date", "close"])
-          .drop_duplicates("date").sort_values("date").reset_index(drop=True))
+    col = "date" if is_daily else "datetime"
+    df = (pd.DataFrame(rows, columns=[col, "close"])
+          .drop_duplicates(col).sort_values(col).reset_index(drop=True))
     return df
 
 
@@ -97,6 +112,9 @@ def main() -> int:
                     help="lookback in calendar days (ignored if --from-date given)")
     ap.add_argument("--from-date", default=None, help="YYYY-MM-DD")
     ap.add_argument("--to-date", default=None, help="YYYY-MM-DD (default: today)")
+    ap.add_argument("--interval", default="day",
+                    choices=list(_INTERVAL_CHUNK_DAYS),
+                    help="candle interval (day or intraday, e.g. 5minute)")
     ap.add_argument("--config", default="config.ini")
     ap.add_argument("--output", default=None, help="override output path")
     args = ap.parse_args()
@@ -116,17 +134,21 @@ def main() -> int:
 
     kite = KiteAuthManager(args.config).get_kite()
     token = resolve_index_token(kite, args.symbol, args.nse_symbol)
-    df = fetch_daily_closes(kite, token, from_d, to_d)
+    df = fetch_closes(kite, token, from_d, to_d, args.interval)
 
-    out = Path(args.output) if args.output else CACHE / f"{args.symbol}_daily.csv"
+    stem = args.symbol if args.interval == "day" else f"{args.symbol}_{args.interval}"
+    suffix = "daily" if args.interval == "day" else args.interval
+    out = (Path(args.output) if args.output
+           else CACHE / (f"{args.symbol}_daily.csv" if args.interval == "day"
+                         else f"{stem}.csv"))
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
-    print(f"wrote {len(df)} daily closes for {args.symbol} "
-          f"({df['date'].iloc[0]} → {df['date'].iloc[-1]}, "
+    tcol = df.columns[0]
+    print(f"wrote {len(df)} {suffix} bars for {args.symbol} "
+          f"({df[tcol].iloc[0]} → {df[tcol].iloc[-1]}, "
           f"range {df['close'].min():.1f}–{df['close'].max():.1f}) to {out}")
     if len(df) < 60:
-        print(f"WARNING: only {len(df)} bars — the gate needs >= 60 "
-              f"(>= ~250 for a 6mo/6mo split). Increase --days.", file=sys.stderr)
+        print(f"WARNING: only {len(df)} bars — increase --days.", file=sys.stderr)
     return 0
 
 
