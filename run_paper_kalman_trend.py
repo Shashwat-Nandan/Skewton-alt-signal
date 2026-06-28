@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+Paper runner — intraday Kalman-vs-MA trend A/B (forward parity test).
+====================================================================
+Runs TWO `IntradayTrendStrategy` books per instrument (one Kalman, one MA) side
+by side on identical live 5-min bars and sizing, on NIFTY + BANKNIFTY front-month
+futures. The backtests show no robust Kalman>MA edge daily OR intraday
+(tasks/kalman-trend-findings.md); this measures the one thing backtests can't —
+live forward fills — at zero risk (paper only).
+
+Mirrors the other paper runners via runner_common (TOTP auth, holiday/weekend
+gate, 09:15→15:25 loop, shared HALT_* kill switches, atomic crash-safe state,
+hourly heartbeat). Own system, no shared mutable state:
+  - state : data_cache/kalman_trend_runner_state.json
+  - EOD   : data_cache/kalman_trend_eod_<date>.json
+  - log   : logs/paper-kalman-trend-<date>.log
+
+The PURE core (bar aggregation, two-book stepping, EOD A/B report) is unit-
+tested; the Kite-wired main() is host-smoke-test-only (no Kite session in CI).
+
+NOTE: warmup fits the reduced-Kalman + MA params on recent 5-min history at
+startup. Reuse the cached Kite session — never fresh-login while a live runner is
+active. paper/signals only; no live order path.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+
+import optimize_kalman_trend as opt
+from strategies.kalman_trend_following import IntradayTrendStrategy
+
+DATA_CACHE = Path("data_cache")
+STATE_PATH = DATA_CACHE / "kalman_trend_runner_state.json"
+SYMBOLS = ["NIFTY", "BANKNIFTY"]
+LOT_SIZE = {"NIFTY": 75, "BANKNIFTY": 15}   # ₹/point/lot (front-month future)
+BAR_SECONDS = 300                            # 5-min signal bars
+
+logger = logging.getLogger("paper-kalman-trend")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PURE CORE (unit-tested)
+# ──────────────────────────────────────────────────────────────────────────
+class BarAggregator:
+    """Aggregate a stream of (epoch_seconds, price) ticks into fixed-width bars.
+    `add` returns the just-completed bar's close when a bar boundary rolls over,
+    else None. Bar = floor(ts / width)."""
+
+    def __init__(self, width_seconds: int = BAR_SECONDS):
+        self.width = int(width_seconds)
+        self._bucket: Optional[int] = None
+        self._last_price: Optional[float] = None
+
+    def add(self, ts: float, price: float) -> Optional[float]:
+        if not np.isfinite(price):
+            return None
+        bucket = int(ts // self.width)
+        completed = None
+        if self._bucket is not None and bucket != self._bucket:
+            completed = self._last_price          # close of the prior bar
+        self._bucket = bucket
+        self._last_price = float(price)
+        return completed
+
+
+@dataclass
+class InstrumentBooks:
+    """The Kalman + MA books for one instrument, stepped together on the same
+    prices so the A/B is apples-to-apples."""
+    symbol: str
+    kalman: IntradayTrendStrategy
+    ma: IntradayTrendStrategy
+
+    def on_price(self, price: float) -> None:
+        """Intraday tick: let either book hit its stop/target between bars."""
+        self.kalman.check_exit(price)
+        self.ma.check_exit(price)
+
+    def on_bar(self, close: float) -> None:
+        self.kalman.on_bar(close)
+        self.ma.on_bar(close)
+
+    def eod_close(self, price: float) -> None:
+        self.kalman.force_close(price)
+        self.ma.force_close(price)
+
+    def summary(self) -> dict:
+        return {"symbol": self.symbol,
+                "kalman": self.kalman.book_summary(),
+                "ma": self.ma.book_summary()}
+
+    def serialize(self) -> dict:
+        return {"symbol": self.symbol, "kalman": self.kalman.serialize(),
+                "ma": self.ma.serialize()}
+
+    @classmethod
+    def restore(cls, blob: dict) -> "InstrumentBooks":
+        return cls(symbol=blob["symbol"],
+                   kalman=IntradayTrendStrategy.restore(blob["kalman"]),
+                   ma=IntradayTrendStrategy.restore(blob["ma"]))
+
+
+def build_books(symbol: str, kal_params: dict, ma_params: dict) -> InstrumentBooks:
+    """Construct the two books for `symbol` from fitted params."""
+    lot = LOT_SIZE.get(symbol, 1)
+    kal = IntradayTrendStrategy(
+        signal_kind="kalman", filter_params=kal_params["filter_params"],
+        model=kal_params.get("model", 2), mu=kal_params["mu"],
+        stop_ticks=kal_params["stop_ticks"], target_ticks=kal_params["target_ticks"],
+        tick_size=1.0, lot_size=lot)
+    ma = IntradayTrendStrategy(
+        signal_kind="ma", short=ma_params["short"], long=ma_params["long"],
+        offset=ma_params["offset"], stop_ticks=ma_params["stop_ticks"],
+        target_ticks=ma_params["target_ticks"], tick_size=1.0, lot_size=lot)
+    return InstrumentBooks(symbol=symbol, kalman=kal, ma=ma)
+
+
+def eod_report(books: List[InstrumentBooks], today: date) -> dict:
+    """A/B comparison sidecar: per-instrument Kalman vs MA realized ₹ + totals."""
+    per = [b.summary() for b in books]
+    tot_k = sum(b.kalman.realized_rupees() for b in books)
+    tot_m = sum(b.ma.realized_rupees() for b in books)
+    return {
+        "date": today.isoformat(),
+        "system": "kalman_trend_ab",
+        "instruments": per,
+        "total_kalman_rupees": round(tot_k, 2),
+        "total_ma_rupees": round(tot_m, 2),
+        "kalman_minus_ma_rupees": round(tot_k - tot_m, 2),
+    }
+
+
+def fit_params(prices: np.ndarray, *, n_gen: int = 25, seed: int = 0) -> tuple[dict, dict]:
+    """Fit reduced-Kalman + MA params on a recent intraday window (warmup)."""
+    kal = opt.fit_kalman_reduced(prices, tick_size=1.0, n_gen=n_gen, seed=seed)
+    ma = opt.fit_ma_crossover(prices, tick_size=1.0, n_gen=n_gen, seed=seed)
+    return kal, ma
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# State persistence (atomic, mirrors the other runners)
+# ──────────────────────────────────────────────────────────────────────────
+def write_state(books: List[InstrumentBooks]) -> None:
+    payload = {"updated": datetime.now().isoformat(),
+               "instruments": [b.serialize() for b in books]}
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, default=str, indent=2))
+    tmp.replace(STATE_PATH)            # atomic crash-safe swap
+
+
+def load_state() -> Dict[str, dict]:
+    if not STATE_PATH.exists():
+        return {}
+    blob = json.loads(STATE_PATH.read_text())
+    return {b["symbol"]: b for b in blob.get("instruments", [])}
+
+
+def write_eod(books: List[InstrumentBooks], today: date) -> Path:
+    path = DATA_CACHE / f"kalman_trend_eod_{today.isoformat()}.json"
+    path.write_text(json.dumps(eod_report(books, today), default=str, indent=2))
+    return path
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Kite-wired entrypoint (host smoke-test only — no Kite session in CI)
+# ──────────────────────────────────────────────────────────────────────────
+def main() -> int:  # pragma: no cover
+    import time
+
+    from dotenv import load_dotenv
+
+    from kite_auth import KiteAuthManager
+    from runner_common import (
+        HeartbeatTracker,
+        acquire_lock,
+        assert_timezone_ist,
+        install_signal_handlers,
+        is_trading_day,
+        load_holidays,
+        sleep_until,
+    )
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    assert_timezone_ist(logger)
+    today = date.today()
+    holidays = load_holidays(Path("holidays.csv"))
+    ok, why = is_trading_day(today, holidays)
+    if not ok:
+        logger.info("Not a trading day (%s) — exiting.", why)
+        return 0
+
+    install_signal_handlers(logger)
+    lock = acquire_lock(DATA_CACHE / ".kalman_trend.lock", logger)
+    if lock is None:
+        logger.error("Another instance holds the lock — exiting.")
+        return 1
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    kite = KiteAuthManager("config.ini").get_kite()          # reuse cached session
+    nfo = kite.instruments("NFO")
+
+    from fetch_index_daily import resolve_index_token
+    from runner_common import HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH  # noqa: F401
+
+    # Resolve front-month future per symbol + warmup-fit on recent 5-min history.
+    prior = load_state()
+    books: List[InstrumentBooks] = []
+    tradesym: Dict[str, str] = {}
+    for sym in SYMBOLS:
+        fut = _resolve_front_month_future(nfo, sym, today)
+        if fut is None:
+            logger.warning("%s: no front-month future — skipping", sym)
+            continue
+        tradesym[sym] = fut["tradingsymbol"]
+        if sym in prior:
+            books.append(InstrumentBooks.restore(prior[sym]))
+            logger.info("%s: restored books from prior state", sym)
+            continue
+        idx_token = resolve_index_token(kite, sym, None)
+        hist = kite.historical_data(idx_token, _days_ago(40), today, "5minute")
+        prices = np.array([float(c["close"]) for c in hist], float)
+        if len(prices) < 300:
+            logger.warning("%s: only %d warmup bars — skipping", sym, len(prices))
+            continue
+        kal_p, ma_p = fit_params(prices[-1500:])
+        books.append(build_books(sym, kal_p, ma_p))
+        logger.info("%s: warmup-fit on %d bars (kal stop/tgt %.0f/%.0f, "
+                    "ma %d/%d)", sym, len(prices), kal_p["stop_ticks"],
+                    kal_p["target_ticks"], ma_p["short"], ma_p["long"])
+
+    if not books:
+        logger.error("No tradeable instruments — exiting.")
+        return 1
+
+    agg = {b.symbol: BarAggregator(BAR_SECONDS) for b in books}
+    heartbeat = HeartbeatTracker(logger)
+    open_t = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
+    close_t = datetime.now().replace(hour=15, minute=25, second=0, microsecond=0)
+    sleep_until(open_t, logger)
+
+    while datetime.now() < close_t:
+        if HALT_ALL_PATH.exists():
+            logger.warning("HALT_ALL — force-closing and exiting.")
+            break
+        now = time.time()
+        for b in books:
+            px = _last_price(kite, tradesym[b.symbol])
+            if px is None:
+                continue
+            b.on_price(px)                       # intraday stop/target
+            closed = agg[b.symbol].add(now, px)  # roll a 5-min bar?
+            if closed is not None:
+                b.on_bar(closed)                 # signal + entry on the new bar
+        write_state(books)
+        heartbeat.beat()
+        time.sleep(30)
+
+    # EOD: force-close both books at the last price and write the A/B sidecar.
+    for b in books:
+        px = _last_price(kite, tradesym[b.symbol])
+        if px is not None:
+            b.eod_close(px)
+    write_state(books)
+    path = write_eod(books, today)
+    rep = eod_report(books, today)
+    logger.info("EOD A/B: kalman ₹%.0f vs ma ₹%.0f (Δ %.0f) → %s",
+                rep["total_kalman_rupees"], rep["total_ma_rupees"],
+                rep["kalman_minus_ma_rupees"], path.name)
+    return 0
+
+
+def _days_ago(n: int) -> date:  # pragma: no cover
+    from datetime import timedelta
+    return date.today() - timedelta(days=n)
+
+
+def _resolve_front_month_future(nfo, symbol, today):  # pragma: no cover
+    futs = [i for i in nfo if i.get("name") == symbol
+            and i.get("instrument_type") == "FUT"
+            and i.get("expiry") and i["expiry"] >= today]
+    return min(futs, key=lambda i: i["expiry"]) if futs else None
+
+
+def _last_price(kite, tradingsymbol):  # pragma: no cover
+    try:
+        key = f"NFO:{tradingsymbol}"
+        return float(kite.quote([key])[key]["last_price"])
+    except Exception as e:
+        logger.debug("quote failed for %s: %s", tradingsymbol, e)
+        return None
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import sys
+    sys.exit(main())

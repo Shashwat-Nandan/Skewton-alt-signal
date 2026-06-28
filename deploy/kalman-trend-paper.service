@@ -1,0 +1,41 @@
+[Unit]
+Description=Kalman-vs-MA Intraday Trend Paper Runner (forward A/B parity test)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# PAPER ONLY — runs a Kalman book and an MA book side by side on NIFTY+BANKNIFTY
+# 5-min bars. No live order path. Backtests show no robust Kalman>MA edge; this
+# measures forward parity at zero risk (tasks/kalman-trend-findings.md).
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_kalman_trend.py
+# -------------------------------
+
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches the other paper runners)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

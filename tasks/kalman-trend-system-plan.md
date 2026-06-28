@@ -271,7 +271,40 @@ surface.
     / B walk-forward robustness / C match the paper's intraday-futures setting) is
     in the findings doc — recommend A or B.
 
-### Phase 1 — Strategy class
+### Backtest verdict NO-GO → building a FORWARD paper A/B anyway (2026-06-27)
+**Update:** after the daily + intraday NO-GO, the user opted to build the
+intraday **Kalman-vs-MA paper A/B as a forward test** (paper = zero risk; live
+fills are the one thing backtests can't model). Built **fully intraday**:
+- `strategies/kalman_trend_following.py` — `IntradayTrendStrategy`, online, two
+  interchangeable engines (kalman one-step forecast / MA crossover), fixed-tick
+  stop/target with `check_exit` for intraday fills between 5-min bars, warmup,
+  full serialize/restore. 13 tests.
+- `run_paper_kalman_trend.py` — two books per instrument (NIFTY+BANKNIFTY futures)
+  stepped on identical 5-min bars; pure core (BarAggregator, InstrumentBooks,
+  eod_report, warmup `fit_params`) is unit-tested (6 tests); Kite-wired main() is
+  host-smoke-test-only. EOD sidecar `kalman_trend_eod_<date>.json` reports
+  kalman−ma ₹. `deploy/kalman-trend-paper.{service,timer}` authored, NOT installed.
+- [ ] **Host smoke-test (operator):** run once in paper on the VPS (reuse the
+  cached Kite session — no fresh login while a live runner is active).
+- Go in **expecting parity**, to MEASURE forward fills — not assuming a Kalman win.
+
+**The backtest verdict below stands (this is a forward A/B, not a refutation):**
+On 8.2 years of NIFTY/BANKNIFTY daily (2018–2026, 2035 bars, walk-forward, pooled OOS):
+- **Option B** (reduced 4-param fit + walk-forward, `backtest_kalman_trend.py`)
+  removed the single-split overfit. On ~1yr it looked promising (BANKNIFTY 3/3
+  configs beat MA), but that was a 4–6-fold small-sample artifact.
+- **Deep history (28 folds): Kalman LOSES to a plain MA crossover.** NIFTY Kalman
+  Sharpe 0.28/0.10 vs MA 0.80/0.88 (wins 32%/25%); BANKNIFTY a wash (loses the
+  28-fold cfg, wins the 12-fold). Both profitable in the bull market, but MA is
+  the better and far simpler trend follower. Full table in
+  `tasks/kalman-trend-findings.md`.
+- The paper's Kalman≫MA edge (S&P 500 index futures) **does not transfer** to NSE
+  index daily. Artifacts (filter, optimizer, harness, gate — 29 tests, all green)
+  are kept for reference / a possible future re-test on a different instrument
+  class (intraday, or the paper's own futures), but the strategy is **not** worth
+  trading over MA. The Phase 1–4 spec below is retained only as a record of intent.
+
+### Phase 1 — Strategy class  (NOT BUILT — see HALT above)
 - [ ] `strategies/kalman_trend_following.py` — `KalmanTrendStrategy(BaseStrategy)`.
       One `KalmanTrendFilter` per instrument with **optimized params loaded from
       the Phase-2 fit** (a `kalman_trend_params.json`, per-instrument). Daily
