@@ -35,23 +35,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("loop.kalman_trend")
 
-DATA_CACHE = Path(__file__).resolve().parent.parent / "data_cache"
-
-# Sentinels for the seams not yet wired, recorded into STATE.md so a reader can
-# SEE the loop is incomplete (paper §VII: loops that look done but aren't).
+# Sentinel recorded into STATE.md when stage 3 is unwired (no checker injected),
+# so a reader can SEE the loop is incomplete (paper §VII: loops that look done).
 CHECK_DEFERRED = "deferred:phase2"
-RISK_DEFERRED = "deferred:phase4"
 
 
 @dataclass
 class SessionOutcome:
     """Result of one maker+execute session, handed back by the engine."""
 
-    status: str                          # "ok" | "error" | "dry_run"
+    status: str                          # "ok" | "error" | "silent_fail" | "no_session" | "dry_run"
     exit_code: int = 0
     eod: Optional[dict] = None           # the runner's eod_report sidecar, if any
-    checker: str = CHECK_DEFERRED        # set by Phase 2
-    risk: str = RISK_DEFERRED            # set by Phase 4
+    checker: str = CHECK_DEFERRED        # set by check()
+    risk: str = "pending"                # overwritten by risk() every run
     extra: Dict[str, object] = field(default_factory=dict)
 
 
@@ -71,7 +68,17 @@ def kite_engine(today: Optional[date] = None) -> SessionOutcome:  # pragma: no c
     code = runner.main()
     eod_path = runner.DATA_CACHE / f"kalman_trend_eod_{today.isoformat()}.json"
     eod = json.loads(eod_path.read_text()) if eod_path.exists() else None
-    return SessionOutcome(status="ok" if code == 0 else "error", exit_code=code, eod=eod)
+    # Recover the runner's distinct outcomes from its actual contract (do NOT
+    # collapse them — the retro keys incident lessons on 'silent_fail', §VII):
+    #   code 0 + eod  -> ok           (traded; EOD written)
+    #   code 0 + none -> no_session   (non-trading day; returns 0 before any EOD)
+    #   code!=0 + eod -> silent_fail  (all quotes died mid-session; EOD still written)
+    #   code!=0 + none-> error        (lock held / no tradeable instruments)
+    if code == 0:
+        status = "ok" if eod is not None else "no_session"
+    else:
+        status = "silent_fail" if eod is not None else "error"
+    return SessionOutcome(status=status, exit_code=code, eod=eod)
 
 
 def dry_run_engine(today: Optional[date] = None) -> SessionOutcome:
@@ -138,6 +145,10 @@ class LoopOrchestrator:
         """
         if self._checker is None:
             return CHECK_DEFERRED
+        # Nothing was traded → don't burn the (expensive) verifier or fabricate a
+        # holiday verdict; record that it was skipped.
+        if outcome.status in ("no_session", "dry_run"):
+            return f"skipped:{outcome.status}"
         result = self._checker(outcome)
         if result.passed:
             return "pass"
@@ -188,13 +199,37 @@ class LoopOrchestrator:
     def run_session(
         self, engine: Callable[..., SessionOutcome] = kite_engine, today: Optional[date] = None
     ) -> SessionOutcome:
-        """One full pass through the five stages, with memory threaded around it."""
+        """One full pass through the five stages, with memory threaded around it.
+
+        Each downstream stage is isolated: a raising engine, checker, or retro must
+        NEVER prevent write_memory from recording the session. The whole point of
+        the loop is that a failure produces a LOUD record, not a silent gap — a
+        crash after a full trading day that dropped the day's P&L would be the
+        exact silent-failure the paper warns about (§VII; CLAUDE.md Rule 12).
+        """
         prior = self.read_memory()                       # read-first (capture for retro)
-        outcome = engine(today)                          # stages 1 + 2 + 4
-        outcome.checker = self.check(outcome)            # stage 3 (checker)
+
+        try:
+            outcome = engine(today)                      # stages 1 + 2 + 4
+        except Exception as exc:                          # noqa: BLE001 — record & continue
+            logger.exception("loop[%s] engine raised — recording an error session", self.strategy)
+            outcome = SessionOutcome(status="error", exit_code=1,
+                                     extra={"error": repr(exc)})
+
+        try:
+            outcome.checker = self.check(outcome)        # stage 3 (checker)
+        except Exception as exc:                          # noqa: BLE001
+            logger.exception("loop[%s] checker raised — gate not evaluated", self.strategy)
+            outcome.checker = f"ERROR: {exc!r}"
+
         outcome.risk = self.risk(outcome)                # stage 5 (observe kill switch)
-        self.retro(prior, outcome)                       # §IV: lesson IFF notable
-        self.write_memory(outcome)                       # write-last
+
+        try:
+            self.retro(prior, outcome)                   # §IV: lesson IFF notable
+        except Exception:                                 # noqa: BLE001
+            logger.exception("loop[%s] retro raised — lesson not written", self.strategy)
+
+        self.write_memory(outcome)                       # write-last — ALWAYS runs
         logger.info("loop[%s] session done: status=%s checker=%s risk=%s",
                     self.strategy, outcome.status, outcome.checker, outcome.risk)
         return outcome

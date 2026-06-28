@@ -19,15 +19,18 @@ futures trend follower; it is intentionally omitted, not faked. Four gates remai
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from loop_engine import memory
+# Single source for the annualization constant (was a duplicated literal).
+from optimize_kalman_trend import TRADING_DAYS
 
-TRADING_DAYS = 252
+logger = logging.getLogger("loop.kalman_trend.checker")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -91,19 +94,10 @@ class GateThresholds:
     @classmethod
     def from_skill(cls, strategy: str, root: Optional[Path] = None) -> "GateThresholds":
         """Read thresholds out of SKILL.md `## Rules` so the Phase-6 recalibration
-        audit can tighten them in ONE place. Missing keys keep the defaults."""
+        audit can tighten them in ONE place. Missing keys keep the defaults; a
+        present-but-malformed value is logged loudly (memory.parse_rule_floats)."""
         skill = memory.load_skill(strategy, root=root)
-        values = {}
-        for rule in skill.rules:
-            if ":" not in rule:
-                continue
-            key, _, raw = rule.partition(":")
-            key = key.strip()
-            if key in cls.__dataclass_fields__:
-                try:
-                    values[key] = float(raw.strip())
-                except ValueError:
-                    continue
+        values = memory.parse_rule_floats(skill, allowed=set(cls.__dataclass_fields__))
         return cls(**values)
 
 
@@ -208,6 +202,13 @@ def kalman_trend_oos_returns(
                                   n_gen=n_gen, seed=seed)
         kr = bt._fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost)
         seg = closes[b:c]
+        if not np.all(seg > 0):
+            # A zero/negative close (corrupt cache bar) would make pnl/close inf
+            # and poison Sharpe/MDD/t-stat. Skip the fold loudly rather than gate
+            # on garbage (Rule 12).
+            logger.warning("kalman_trend checker: fold [%d:%d] has a non-positive "
+                           "close — skipping fold (bad cache bar?)", b, c)
+            continue
         pooled.append(np.asarray(kr.daily_pnl, float) / seg)   # points → fractional
     return np.concatenate(pooled) if pooled else np.array([], float)
 
@@ -226,23 +227,51 @@ def check_kalman_trend(
     return apply_gates(returns, thresholds, periods_per_year)
 
 
-def default_kalman_trend_checker(symbol: str = "NIFTY"):
+def combine_results(per_symbol: Dict[str, CheckResult]) -> CheckResult:
+    """Aggregate per-symbol verdicts: PASS only if EVERY symbol passes (strict,
+    matching the fail-any-gate philosophy). Gate names are symbol-prefixed so the
+    failing symbol is visible in STATE.md."""
+    gates: List[GateOutcome] = []
+    for sym, res in per_symbol.items():
+        for g in res.gates:
+            gates.append(GateOutcome(f"{sym}.{g.name}", g.value, g.threshold, g.op, g.passed))
+        if not res.gates and res.note:
+            # a symbol that produced no gates (e.g. missing data) fails closed
+            gates.append(GateOutcome(f"{sym}.evaluable", 0.0, 1.0, ">=", False))
+    passed = bool(per_symbol) and all(r.passed for r in per_symbol.values())
+    n_obs = sum(r.n_obs for r in per_symbol.values())
+    notes = "; ".join(f"{s}: {r.note}" for s, r in per_symbol.items() if r.note)
+    return CheckResult(passed=passed, gates=gates, n_obs=n_obs, note=notes)
+
+
+def default_kalman_trend_checker(symbols=("NIFTY", "BANKNIFTY")):
     """Production checker for the orchestrator: an INDEPENDENT daily walk-forward
-    edge gate on the cached closes for `symbol`.
+    edge gate over the cached closes of EVERY traded symbol.
 
     Returns a callable (outcome) -> CheckResult. It deliberately re-derives the
     verdict from a daily backtest it runs itself — a stricter, fully reproducible
-    test of whether the trend method has edge at all — rather than grading the
-    intraday paper A/B's session P&L (which the maker produced). No Kite, no maker
-    reasoning consumed. NIFTY is the default (deepest cached history).
+    test of whether the trend method has edge — rather than grading the intraday
+    A/B's session P&L the maker produced. No Kite, no maker reasoning consumed.
+    A symbol whose daily data is missing FAILS CLOSED (recorded as a failed gate),
+    never silently dropped (§VI-A: a low rejection rate is a warning sign).
 
-    LIMITATION (Rule 1): v1 gates on ONE index as a proxy for the trend method;
-    per-symbol aggregation across NIFTY+BANKNIFTY is a deliberate future refinement.
+    KNOWN LIMITATION (Rule 1): the gate is on the DAILY series while the maker
+    trades INTRADAY 5-min futures — a deliberate independent edge test, not a
+    grade of the exact intraday candidate. A true intraday checker is future work.
     """
     def _check(outcome) -> CheckResult:
         from validate_kalman_trend import load_daily_closes
 
-        _, closes = load_daily_closes(symbol)
-        return check_kalman_trend(closes)
+        per_symbol: Dict[str, CheckResult] = {}
+        for sym in symbols:
+            try:
+                _, closes = load_daily_closes(sym)
+            except (FileNotFoundError, ValueError) as e:
+                logger.error("checker: no daily data for %s (%s) — failing closed", sym, e)
+                per_symbol[sym] = CheckResult(passed=False, gates=[], n_obs=0,
+                                              note=f"no daily data ({e})")
+                continue
+            per_symbol[sym] = check_kalman_trend(closes)
+        return combine_results(per_symbol)
 
     return _check

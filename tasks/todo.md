@@ -168,6 +168,36 @@ DECIDED (AskUserQuestion 2026-06-28):
       NOTE: STATE.md is RUNTIME memory (mutated each session); the committed file
       is only the seed template. read_state tolerates a missing/empty file.
 
+### Code-review fixes (high-effort review, 2026-06-28) — all 10 addressed
+8-angle recall-biased review of the diff. Fixes (63 loop tests pass; ruff clean;
+loop_engine is import-isolated so the full suite is unchanged):
+- [x] #1 `run_session` now isolates engine/checker/retro exceptions so write_memory
+      ALWAYS records the session (a raising checker — e.g. load_daily_closes
+      FileNotFoundError on the host — no longer drops a full trading day silently).
+- [x] #2 risk monitor FAILS CLOSED on an unreadable runner state: `read_book_equities`
+      returns None (not 0.0), so a momentarily-missing file skips the poll instead
+      of faking a ₹0 collapse → spurious HALT trip. Guards float(None) too.
+- [x] #3 corrupt monitor peak-state now trips the kill switch (fail-closed) + logs
+      a RISK MONITOR FAULT, instead of silently reseeding the high-water mark.
+- [x] #4 risk monitor tracks EACH A/B book separately and trips on the worst single
+      book (was summing kalman+ma — not a real equity; doubled/masked drawdown).
+- [x] #5 `kite_engine` recovers the runner's distinct outcomes (ok / no_session /
+      silent_fail / error) from its real contract → the retro's silent_fail incident
+      path is now reachable; checker skipped on no_session/dry_run.
+- [x] #6 SKILL.md threshold parse is lenient on annotations + LOGS LOUDLY on a
+      malformed value (was a silent `except: pass` that hid fat-fingered tunings).
+- [x] #7 STATE.md read-modify-write now holds an fcntl cross-process lock so the
+      orchestrator + separate risk-monitor process can't lost-update each other.
+- [x] #8 de-tautologized the threshold tests (assert NON-default values parsed from
+      a tmp SKILL.md, so they fail if parsing breaks) + malformed/annotated cases.
+- [x] #9 production checker now examines EVERY traded symbol (NIFTY+BANKNIFTY) and
+      fails closed on missing data, not a single-index proxy. (Daily-vs-intraday
+      timeframe mismatch remains a documented known limitation — intraday checker
+      is future work.)
+- [x] #10 deduped: shared `memory.parse_rule_floats`, `TRADING_DAYS` imported from
+      optimize_kalman_trend, dead `DATA_CACHE`/`RISK_DEFERRED` removed. Also fixed a
+      latent multi-line-lesson truncation (append_lesson flattens newlines).
+
 ### Phase 6 — LATER (gated, not in first cut)
 - [ ] Verification-debt recalibration audit (LLM judgment over STATE.md outcomes)
 - [ ] Generalize the orchestrator/checker/memory to other strategies via template

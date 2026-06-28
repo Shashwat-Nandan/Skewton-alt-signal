@@ -95,6 +95,38 @@ def test_missing_skill_is_empty_not_an_error(tmp_path):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# parse_rule_floats — the single shared SKILL.md threshold parser
+# ──────────────────────────────────────────────────────────────────────────
+def test_parse_rule_floats_filters_by_allowed_and_tolerates_annotations():
+    skill = memory.Skill(rules=[
+        "sharpe_min: 1.5",
+        "max_dd_max: 0.08 (was 0.10)",        # annotated → leading token
+        "kill_switch_drawdown_rupees: 20000  # tighten",  # comment → leading token
+        "Some prose rule: not a number",      # allowed-filtered out anyway
+    ])
+    vals = memory.parse_rule_floats(skill, allowed={"sharpe_min", "max_dd_max"})
+    assert vals == {"sharpe_min": 1.5, "max_dd_max": 0.08}
+
+
+def test_parse_rule_floats_warns_on_unparseable_value(caplog):
+    import logging
+    skill = memory.Skill(rules=["sharpe_min: 1.5x"])
+    with caplog.at_level(logging.WARNING):
+        vals = memory.parse_rule_floats(skill, allowed={"sharpe_min"})
+    assert vals == {}                          # not silently 0 / not crashing
+    assert any("unparseable" in r.message for r in caplog.records)
+
+
+def test_append_lesson_flattens_multiline_text(tmp_path):
+    """A multi-line lesson must collapse to ONE bullet — the markdown round-trip
+    only preserves bullet lines, so a raw newline would silently truncate it."""
+    memory.append_lesson("s", "line one\nline two\n  indented", root=tmp_path)
+    lessons = memory.read_state("s", root=tmp_path).lessons
+    assert len(lessons) == 1
+    assert "line one line two indented" in lessons[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Committed seed files must parse (guard against hand-edit drift)
 # ──────────────────────────────────────────────────────────────────────────
 def test_committed_kalman_trend_seed_parses():

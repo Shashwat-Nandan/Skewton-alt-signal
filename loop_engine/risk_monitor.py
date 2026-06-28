@@ -22,7 +22,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from loop_engine import memory
 
@@ -39,70 +39,111 @@ class RiskConfig:
 
     @classmethod
     def from_skill(cls, strategy: str = "kalman_trend", root: Optional[Path] = None) -> "RiskConfig":
-        """Read the kill-switch threshold from SKILL.md `## Rules` (one tunable place)."""
+        """Read the kill-switch threshold from SKILL.md `## Rules` (one tunable place,
+        one shared parser with the checker; a malformed value is logged, not hidden)."""
         skill = memory.load_skill(strategy, root=root)
-        for rule in skill.rules:
-            if ":" not in rule:
-                continue
-            key, _, raw = rule.partition(":")
-            if key.strip() == "kill_switch_drawdown_rupees":
-                try:
-                    return cls(float(raw.strip()))
-                except ValueError:
-                    break
-        return cls()
+        values = memory.parse_rule_floats(skill, allowed={"kill_switch_drawdown_rupees"})
+        return cls(**values)
+
+
+class CorruptMonitorState(Exception):
+    """The monitor's own peak file exists but is unreadable — fail CLOSED."""
 
 
 @dataclass
 class RiskReading:
-    equity: float        # cumulative realized ₹ across all books
-    peak: float          # running peak of equity
-    drawdown: float      # peak - equity (₹, >= 0)
+    equities: Dict[str, float]   # realized ₹ PER book ("SYMBOL:side"); {} if unreadable
+    peaks: Dict[str, float]      # running peak PER book
+    worst_book: Optional[str]    # the book driving the largest drawdown
+    worst_drawdown: float        # max over books of (peak - equity), ₹ (>= 0)
     breached: bool
+    evaluable: bool = True       # False when the runner state could not be read
 
 
-def read_book_equity(runner_state: Path = RUNNER_STATE) -> float:
-    """Sum realized ₹ across every instrument's Kalman+MA book, reading ONLY
-    numbers from the runner state file (realized_points × lot_size). No maker code
-    is imported — the monitor's isolation depends on this."""
+def read_book_equities(runner_state: Path = RUNNER_STATE) -> Optional[Dict[str, float]]:
+    """Realized ₹ PER book ("SYMBOL:kalman"/"SYMBOL:ma"), reading ONLY numbers from
+    the runner state file (realized_points × lot_size). No maker code is imported —
+    the monitor's isolation depends on this.
+
+    Returns None (not {}) when the file is absent/unparseable or a book's numbers
+    are missing/null, so the caller can FAIL CLOSED rather than mistake an
+    unreadable book for a flat ₹0 book (which previously caused both a spurious
+    drawdown-from-peak trip and a float(None) crash).
+
+    The Kalman and MA books are kept SEPARATE, never summed: they are two
+    mutually-exclusive A/B hypotheses on the same instrument, so summing their P&L
+    is not a real account equity (it double-counts or offsets).
+    """
     if not runner_state.exists():
-        return 0.0
-    blob = json.loads(runner_state.read_text())
-    total = 0.0
+        return None
+    try:
+        blob = json.loads(runner_state.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    out: Dict[str, float] = {}
     for inst in blob.get("instruments", []):
+        sym = inst.get("symbol", "?")
         for side in ("kalman", "ma"):
             book = inst.get(side)
-            if book:
-                total += float(book.get("realized_points", 0.0)) * float(book.get("lot_size", 1))
-    return total
+            if not book:
+                continue
+            pts, lot = book.get("realized_points"), book.get("lot_size")
+            if pts is None or lot is None:
+                return None                       # malformed → unknown, fail closed
+            out[f"{sym}:{side}"] = float(pts) * float(lot)
+    return out
 
 
-def _load_peak(monitor_state: Path) -> Optional[float]:
+def _load_peaks(monitor_state: Path) -> Optional[Dict[str, float]]:
+    """None = no prior peaks (legitimate first run). Raises CorruptMonitorState if
+    the file is PRESENT but unreadable — losing the high-water mark silently would
+    let a real drawdown go untripped (Rule 12), so the caller fails closed instead."""
     if not monitor_state.exists():
         return None
     try:
-        return float(json.loads(monitor_state.read_text()).get("peak"))
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return None
+        data = json.loads(monitor_state.read_text())
+        return {str(k): float(v) for k, v in data["peaks"].items()}
+    except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError, OSError) as exc:
+        raise CorruptMonitorState(str(exc)) from exc
 
 
-def _save_peak(monitor_state: Path, peak: float) -> None:
+def _save_peaks(monitor_state: Path, peaks: Dict[str, float]) -> None:
     monitor_state.parent.mkdir(parents=True, exist_ok=True)
     tmp = monitor_state.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"peak": peak}))
+    tmp.write_text(json.dumps({"peaks": peaks}))
     tmp.replace(monitor_state)            # atomic, mirrors the runners
 
 
-def evaluate(equity: float, prior_peak: Optional[float], threshold_rupees: float) -> RiskReading:
-    """Pure: a breach is a drawdown-from-peak of at least `threshold_rupees`.
+def evaluate(
+    equities: Dict[str, float],
+    prior_peaks: Optional[Dict[str, float]],
+    threshold_rupees: float,
+) -> RiskReading:
+    """Pure: breach when ANY single book's drawdown-from-peak ≥ threshold.
 
-    The peak seeds at the first equity reading (a fresh book at 0 cannot be 'down'),
-    so a brand-new monitor never spuriously trips before the book has made a high.
+    Each book's peak seeds at its first reading (a fresh book at 0 cannot be 'down'),
+    so a brand-new monitor never spuriously trips before a book has made a high. The
+    worst book is reported so the incident names the culprit.
     """
-    peak = equity if prior_peak is None else max(prior_peak, equity)
-    drawdown = peak - equity
-    return RiskReading(equity=equity, peak=peak, drawdown=drawdown,
-                       breached=drawdown >= threshold_rupees)
+    peaks = dict(prior_peaks or {})
+    worst_book, worst_dd = None, 0.0
+    for book, eq in equities.items():
+        peak = eq if book not in peaks else max(peaks[book], eq)
+        peaks[book] = peak
+        dd = peak - eq
+        if dd > worst_dd:
+            worst_book, worst_dd = book, dd
+    return RiskReading(equities=equities, peaks=peaks, worst_book=worst_book,
+                       worst_drawdown=worst_dd, breached=worst_dd >= threshold_rupees)
+
+
+def _trip(halt_path: Path, strategy: str, state_root: Optional[Path], msg: str) -> None:
+    """Trip the kill switch + log a hard incident, idempotently (no re-touch / no
+    duplicate lesson while already halted)."""
+    logger.error(msg)
+    if not halt_path.exists():
+        halt_path.touch()
+        memory.append_lesson(strategy, msg, root=state_root)
 
 
 def poll_once(
@@ -114,10 +155,10 @@ def poll_once(
     strategy: str = "kalman_trend",
     state_root: Optional[Path] = None,
 ) -> RiskReading:
-    """One poll: read equity → update peak → trip HALT_NEW_ENTRIES on a breach.
-
-    Idempotent: if the kill switch is already set it is not re-tripped and no
-    duplicate incident lesson is written.
+    """One poll: read per-book equity → update peaks → trip HALT_NEW_ENTRIES on a
+    breach. FAILS CLOSED, never open: an unreadable runner state skips the poll
+    (peaks preserved, no spurious trip), and a corrupt monitor state trips the kill
+    switch. Idempotent on an already-set flag.
     """
     if config is None:
         config = RiskConfig.from_skill(strategy, root=state_root)
@@ -125,17 +166,34 @@ def poll_once(
         from runner_common import HALT_NEW_ENTRIES_PATH
         halt_path = HALT_NEW_ENTRIES_PATH
 
-    equity = read_book_equity(runner_state)
-    reading = evaluate(equity, _load_peak(monitor_state), config.kill_switch_drawdown_rupees)
-    _save_peak(monitor_state, reading.peak)
+    equities = read_book_equities(runner_state)
+    if equities is None:
+        # Cannot read the book → do NOT reseed peaks or invent a ₹0 collapse; just
+        # skip this poll loudly. A persistent miss is visible in the warnings.
+        logger.warning("risk monitor: runner state unreadable at %s — poll skipped "
+                       "(peaks preserved, no trip)", runner_state)
+        return RiskReading(equities={}, peaks={}, worst_book=None,
+                           worst_drawdown=0.0, breached=False, evaluable=False)
 
-    if reading.breached and not halt_path.exists():
-        halt_path.touch()
-        msg = (f"RISK KILL: realized drawdown ₹{reading.drawdown:.0f} ≥ "
-               f"₹{config.kill_switch_drawdown_rupees:.0f} (equity ₹{reading.equity:.0f}, "
-               f"peak ₹{reading.peak:.0f}) — HALT_NEW_ENTRIES tripped")
-        logger.error(msg)
-        memory.append_lesson(strategy, msg, root=state_root)
+    try:
+        prior_peaks = _load_peaks(monitor_state)
+    except CorruptMonitorState as exc:
+        msg = (f"RISK MONITOR FAULT: peak state {monitor_state.name} is corrupt "
+               f"({exc}) — high-water mark lost, FAILING CLOSED, HALT_NEW_ENTRIES tripped")
+        _trip(halt_path, strategy, state_root, msg)
+        return RiskReading(equities=equities, peaks={}, worst_book=None,
+                           worst_drawdown=float("nan"), breached=True)
+
+    reading = evaluate(equities, prior_peaks, config.kill_switch_drawdown_rupees)
+    _save_peaks(monitor_state, reading.peaks)
+
+    if reading.breached:
+        eq = reading.equities.get(reading.worst_book, float("nan"))
+        peak = reading.peaks.get(reading.worst_book, float("nan"))
+        _trip(halt_path, strategy, state_root,
+              f"RISK KILL: book {reading.worst_book} realized drawdown "
+              f"₹{reading.worst_drawdown:.0f} ≥ ₹{config.kill_switch_drawdown_rupees:.0f} "
+              f"(equity ₹{eq:.0f}, peak ₹{peak:.0f}) — HALT_NEW_ENTRIES tripped")
     return reading
 
 
@@ -159,8 +217,11 @@ def main() -> int:  # pragma: no cover  (long-running host process, 1-min cadenc
     close_t = datetime.now().replace(hour=15, minute=25, second=0, microsecond=0)
     while datetime.now() < close_t:
         r = poll_once(config)
-        logger.info("equity ₹%.0f peak ₹%.0f dd ₹%.0f%s",
-                    r.equity, r.peak, r.drawdown, " BREACH" if r.breached else "")
+        if not r.evaluable:
+            logger.info("worst dd unknown (runner state unreadable)")
+        else:
+            logger.info("worst dd ₹%.0f on %s%s", r.worst_drawdown,
+                        r.worst_book or "-", " BREACH" if r.breached else "")
         time.sleep(60)
     return 0
 

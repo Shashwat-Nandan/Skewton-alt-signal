@@ -50,7 +50,10 @@ def build_lesson(
     if status in _INCIDENT_STATUSES and prior_status != status:
         reasons.append(f"session status {prior_status}→{status}")
 
-    if not checker.startswith("deferred"):
+    # Only a REAL verdict (pass / REJECT) is a transition worth a lesson — the
+    # unwired ('deferred'), skipped-session ('skipped'), and stage-error ('ERROR')
+    # states are non-verdicts and must not fabricate "verdict changed" lessons.
+    if not checker.startswith(("deferred", "skipped", "ERROR")):
         prior_checker = prior_last_run.get("checker")
         if checker != prior_checker:
             reasons.append(f"checker verdict {prior_checker}→{checker}")

@@ -29,10 +29,15 @@ SKILL.md is read-only at runtime (humans + later the recalibration audit edit it
 """
 from __future__ import annotations
 
+import fcntl
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date as _date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional, Set
+
+logger = logging.getLogger("loop.memory")
 
 # Repo-root/state/<strategy>/. loop_engine/ is one level under the repo root, so
 # the default state root is a sibling of this package. Tests pass their own root.
@@ -40,6 +45,7 @@ _DEFAULT_ROOT = Path(__file__).resolve().parent.parent / "state"
 
 STATE_FILE = "STATE.md"
 SKILL_FILE = "SKILL.md"
+LOCK_FILE = ".STATE.lock"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -143,16 +149,37 @@ def _write_state(strategy: str, state: LoopState, root: Optional[Path]) -> None:
     path.write_text(_render_state(strategy, state), encoding="utf-8")
 
 
+@contextmanager
+def _state_lock(strategy: str, root: Optional[Path]) -> Iterator[None]:
+    """Hold an exclusive cross-process lock for the WHOLE read-modify-write.
+
+    The orchestrator and the SEPARATE risk-monitor process both mutate the same
+    STATE.md; the atomic per-write is not enough because the modify spans a read
+    then a write. fcntl.flock serializes the two processes so a concurrent
+    append_lesson + write_run_summary cannot lost-update each other (Linux only,
+    matching runner_common.acquire_lock).
+    """
+    lock_path = (root or _DEFAULT_ROOT) / strategy / LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def write_run_summary(strategy: str, root: Optional[Path] = None, **fields: object) -> LoopState:
     """Merge `fields` into the `## Last run` header and persist (write-last).
 
     Lessons are preserved untouched. New keys append in call order; existing keys
     update in place. Values are stringified so the file stays human-readable.
     """
-    state = read_state(strategy, root)
-    for key, value in fields.items():
-        state.last_run[key] = "null" if value is None else str(value)
-    _write_state(strategy, state, root)
+    with _state_lock(strategy, root):
+        state = read_state(strategy, root)
+        for key, value in fields.items():
+            state.last_run[key] = "null" if value is None else str(value)
+        _write_state(strategy, state, root)
     return state
 
 
@@ -165,12 +192,16 @@ def append_lesson(
     """Prepend a dated lesson to `## Lessons` (newest-first, Fig. 3) and persist.
 
     The paper's self-improvement mechanism (§IV): every closed-out session writes
-    what it learned so the next run reads it first.
+    what it learned so the next run reads it first. Newlines are flattened to keep
+    one lesson on one bullet line — the markdown round-trip only preserves bullets,
+    so a multi-line lesson would otherwise be silently truncated on the next read.
     """
-    state = read_state(strategy, root)
-    stamp = (on_date or _date.today()).isoformat()
-    state.lessons.insert(0, f"{stamp}: {text.strip()}")
-    _write_state(strategy, state, root)
+    flat = " ".join(text.split())
+    with _state_lock(strategy, root):
+        state = read_state(strategy, root)
+        stamp = (on_date or _date.today()).isoformat()
+        state.lessons.insert(0, f"{stamp}: {flat}")
+        _write_state(strategy, state, root)
     return state
 
 
@@ -191,3 +222,31 @@ def load_skill(strategy: str, root: Optional[Path] = None) -> Skill:
         lessons=_bullets(sections.get("lessons", [])),
         regime_tags=_bullets(sections.get("regime tags", [])),
     )
+
+
+def parse_rule_floats(skill: Skill, allowed: Optional[Set[str]] = None) -> Dict[str, float]:
+    """Parse `key: number` rules from a SKILL.md into floats — the single source
+    the checker gates and the risk kill-switch both read from (so the "one place
+    to tune" stays one parser).
+
+    Lenient on human annotations: `max_dd_max: 0.08 (was 0.10)` and
+    `kill_switch_drawdown_rupees: 20000  # tighten` both take the leading numeric
+    token. A present-but-unparseable value (e.g. `1.5x`) is logged LOUDLY and
+    skipped so the caller keeps its default visibly, not silently (Rule 12) — the
+    old `except: pass` hid fat-fingered tunings.
+    """
+    out: Dict[str, float] = {}
+    for rule in skill.rules:
+        if ":" not in rule:
+            continue
+        key, _, raw = rule.partition(":")
+        key = key.strip()
+        if allowed is not None and key not in allowed:
+            continue
+        token = raw.strip().split()[0] if raw.strip() else ""
+        try:
+            out[key] = float(token)
+        except ValueError:
+            logger.warning("SKILL.md rule %r has unparseable value %r — ignored, "
+                           "default kept (fix the value to make it bind)", key, raw.strip())
+    return out

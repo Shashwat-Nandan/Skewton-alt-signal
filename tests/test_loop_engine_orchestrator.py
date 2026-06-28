@@ -144,6 +144,57 @@ def test_no_checker_stays_deferred(tmp_path):
     assert outcome.checker == CHECK_DEFERRED
 
 
+def test_raising_engine_still_writes_an_error_summary(tmp_path):
+    """#1 fail-loud: an engine that RAISES (e.g. the runner blows up) must still be
+    recorded as an error session, never crash the loop with no STATE.md write."""
+    def boom(today=None):
+        raise RuntimeError("runner exploded")
+
+    orch = LoopOrchestrator(strategy="kt", state_root=tmp_path,
+                            risk_halt_path=tmp_path / "no_halt")
+    outcome = orch.run_session(engine=boom, today=date(2026, 6, 28))
+
+    assert outcome.status == "error"
+    assert memory.read_state("kt", root=tmp_path).last_run["status"] == "error"
+
+
+def test_raising_checker_does_not_drop_the_session(tmp_path):
+    """#1: a checker that RAISES (e.g. load_daily_closes FileNotFoundError) must
+    not prevent write_memory — the full day's P&L is still recorded."""
+    def bad_checker(outcome):
+        raise FileNotFoundError("no NIFTY data on host")
+
+    orch = LoopOrchestrator(strategy="kt", state_root=tmp_path,
+                            risk_halt_path=tmp_path / "no_halt", checker=bad_checker)
+    outcome = orch.run_session(engine=_fake_engine(k=120.0, m=80.0), today=date(2026, 6, 28))
+
+    last_run = memory.read_state("kt", root=tmp_path).last_run
+    assert outcome.checker.startswith("ERROR")
+    assert last_run["kalman_rupees"] == "120.0"        # session P&L survived
+    assert last_run["status"] == "ok"
+
+
+def test_no_session_status_skips_the_checker(tmp_path):
+    """#5: a non-trading day (engine returns status='no_session') must not run the
+    expensive verifier or fabricate a holiday verdict."""
+    ran = []
+
+    def engine(today=None):
+        return SessionOutcome(status="no_session", exit_code=0, eod=None)
+
+    def checker(outcome):
+        ran.append(True)
+        from loop_engine.checker import CheckResult
+        return CheckResult(passed=True, n_obs=600)
+
+    orch = LoopOrchestrator(strategy="kt", state_root=tmp_path,
+                            risk_halt_path=tmp_path / "no_halt", checker=checker)
+    outcome = orch.run_session(engine=engine, today=date(2026, 6, 28))
+
+    assert outcome.checker == "skipped:no_session"
+    assert ran == []                                   # verifier not invoked
+
+
 def test_dry_run_engine_touches_no_kite_and_zeroes_pnl():
     """The CI/local engine must run without a Kite session and report a zeroed,
     well-formed EOD so the orchestration path is exercisable offline."""

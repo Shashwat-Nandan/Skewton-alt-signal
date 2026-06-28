@@ -100,12 +100,41 @@ def test_nan_statistic_fails_closed():
     assert any(f.startswith("sharpe") for f in res.failures())
 
 
-def test_thresholds_loaded_from_committed_skill():
+def test_thresholds_actually_parsed_from_skill_not_default(tmp_path):
+    """Rule 9: use NON-default values so the test fails if from_skill ever stops
+    reading SKILL.md (the committed values equal the dataclass defaults, which
+    would make a committed-file assertion tautological)."""
+    (tmp_path / "kt").mkdir()
+    (tmp_path / "kt" / "SKILL.md").write_text(
+        "## Rules\n- sharpe_min: 0.7\n- max_dd_max: 0.25\n"
+        "- nw_tstat_min: 1.0\n- oos_months_min: 6\n", encoding="utf-8")
+    t = ck.GateThresholds.from_skill("kt", root=tmp_path)
+    assert (t.sharpe_min, t.max_dd_max, t.nw_tstat_min, t.oos_months_min) == (0.7, 0.25, 1.0, 6.0)
+
+
+def test_committed_skill_thresholds_parse():
     t = ck.GateThresholds.from_skill("kalman_trend")
-    assert t.sharpe_min == 1.5
-    assert t.max_dd_max == 0.10
-    assert t.nw_tstat_min == 2.0
-    assert t.oos_months_min == 24.0
+    assert (t.sharpe_min, t.max_dd_max, t.nw_tstat_min, t.oos_months_min) == (1.5, 0.10, 2.0, 24.0)
+
+
+def test_malformed_threshold_keeps_default_and_warns(tmp_path, caplog):
+    """A fat-fingered value must keep the default LOUDLY (Rule 12), not silently."""
+    import logging
+    (tmp_path / "kt").mkdir()
+    (tmp_path / "kt" / "SKILL.md").write_text(
+        "## Rules\n- sharpe_min: 1.5x\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        t = ck.GateThresholds.from_skill("kt", root=tmp_path)
+    assert t.sharpe_min == 1.5                       # the dataclass default
+    assert any("unparseable" in r.message for r in caplog.records)
+
+
+def test_annotated_threshold_value_is_tolerated(tmp_path):
+    """`0.08 (was 0.10)` / `20000  # tighten` should bind to the leading number."""
+    (tmp_path / "kt").mkdir()
+    (tmp_path / "kt" / "SKILL.md").write_text(
+        "## Rules\n- max_dd_max: 0.08 (was 0.10)\n", encoding="utf-8")
+    assert ck.GateThresholds.from_skill("kt", root=tmp_path).max_dd_max == 0.08
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -153,22 +182,21 @@ def test_adapter_rejects_a_no_trade_candidate(monkeypatch):
     assert not res.passed
 
 
-def test_default_checker_loads_closes_and_gates(monkeypatch):
-    """The production checker factory must pull cached daily closes for the symbol
-    and return a verdict — wired without Kite, gating the real (NO-GO) edge."""
+def test_default_checker_examines_every_symbol(monkeypatch):
+    """The production checker must gate EVERY traded symbol (not a single-index
+    proxy) and combine — wired without Kite, gating the real (NO-GO) edge."""
+    import backtest_kalman_trend as bt
     import loop_engine.checker as ckmod
+    import optimize_kalman_trend as o
     import validate_kalman_trend as vt
 
-    captured = {}
+    seen = []
 
     def _fake_load(symbol):
-        captured["symbol"] = symbol
+        seen.append(symbol)
         return [], np.full(160, 100.0)            # flat → no edge → REJECT
 
     monkeypatch.setattr(vt, "load_daily_closes", _fake_load)
-    # avoid running cmaes: canned no-trade fold → empty returns → killed
-    import backtest_kalman_trend as bt
-    import optimize_kalman_trend as o
 
     class _Flat:
         daily_pnl = np.zeros(30)
@@ -177,7 +205,36 @@ def test_default_checker_loads_closes_and_gates(monkeypatch):
     monkeypatch.setattr(o, "fit_kalman_reduced", lambda *a, **k: {"x": 1})
     monkeypatch.setattr(bt, "_fold_oos", lambda *a, **k: _Flat())
 
-    check = ckmod.default_kalman_trend_checker(symbol="NIFTY")
+    check = ckmod.default_kalman_trend_checker(symbols=("NIFTY", "BANKNIFTY"))
     res = check(outcome=None)
-    assert captured["symbol"] == "NIFTY"
+    assert seen == ["NIFTY", "BANKNIFTY"]         # both examined
     assert not res.passed
+    assert any(g.name.startswith("NIFTY.") for g in res.gates)
+    assert any(g.name.startswith("BANKNIFTY.") for g in res.gates)
+
+
+def test_default_checker_fails_closed_on_missing_symbol_data(monkeypatch):
+    """A symbol whose daily data is missing must FAIL the verdict, not be silently
+    dropped (§VI-A: a low rejection rate is a warning sign, not a pass)."""
+    import backtest_kalman_trend as bt
+    import loop_engine.checker as ckmod
+    import optimize_kalman_trend as o
+    import validate_kalman_trend as vt
+
+    def _load(symbol):
+        if symbol == "BANKNIFTY":
+            raise FileNotFoundError("no BANKNIFTY_daily.csv")
+        return [], np.full(700, 100.0)
+
+    monkeypatch.setattr(vt, "load_daily_closes", _load)
+
+    class _Win:
+        daily_pnl = np.full(30, 1.0)
+        n_trades = 5
+
+    monkeypatch.setattr(o, "fit_kalman_reduced", lambda *a, **k: {"x": 1})
+    monkeypatch.setattr(bt, "_fold_oos", lambda *a, **k: _Win())
+
+    res = ckmod.default_kalman_trend_checker(symbols=("NIFTY", "BANKNIFTY"))(outcome=None)
+    assert not res.passed                          # BANKNIFTY missing → fail closed
+    assert "BANKNIFTY" in res.note
