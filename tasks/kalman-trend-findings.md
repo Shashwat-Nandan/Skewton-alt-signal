@@ -156,6 +156,12 @@ Re-ran the same deep geometries:
 | cfg2 2yr→6mo (12) | NIFTY | 0.10 vs 0.88 | **1.05 vs 0.15** | 56% PASS |
 | cfg2 (12) | BANKNIFTY | 0.44 vs 0.16 | 0.45 vs −0.27 | 58% PASS |
 
+**Re-confirmed 2026-06-28** after the 2nd code-review tightened the verdict
+(fold-win now requires Kalman actually traded; majority-of-seeds-traded guard):
+identical Sharpes, win-rates slightly lower (BANKNIFTY cfg1 49%→39%, cfg2 58%→56%
+— the closed loophole removing spurious no-trade "wins"), and **no PASS/FAIL
+flipped**. The mixed/geometry-dependent conclusion is robust to the fix.
+
 The bug **inflated MA** (its dispersed seeds averaged to low variance) and
 **deflated Kalman** (its dispersed seeds' P&L partly cancelled). So the earlier
 "deep history → MA decisively wins, clean NO-GO" was **largely the metric bug**
