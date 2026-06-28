@@ -193,7 +193,7 @@ loop_engine is import-isolated so the full suite is unchanged):
 - [x] #9 production checker now examines EVERY traded symbol (NIFTY+BANKNIFTY) and
       fails closed on missing data, not a single-index proxy. (Daily-vs-intraday
       timeframe mismatch remains a documented known limitation — intraday checker
-      is future work.)
+      tracked in GitHub issue #61.)
 - [x] #10 deduped: shared `memory.parse_rule_floats`, `TRADING_DAYS` imported from
       optimize_kalman_trend, dead `DATA_CACHE`/`RISK_DEFERRED` removed. Also fixed a
       latent multi-line-lesson truncation (append_lesson flattens newlines).
