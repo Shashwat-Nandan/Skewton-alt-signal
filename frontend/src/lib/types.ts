@@ -337,9 +337,8 @@ export type TrendBook = {
   signal_kind: string; // "kalman" | "ma"
   realized_rupees: number;
   n_trades: number;
-  win_rate: number | null;
-  open_pos: number; // -1 short / 0 flat / +1 long at session end
-  n_bars: number;
+  /** Current live position (-1 short / 0 flat / +1 long), from the runner state file. */
+  open_pos: number;
 };
 
 export type TrendInstrument = {
@@ -356,9 +355,8 @@ export type LoopStatus = {
   status: string | null;
   /** 'pass' | 'REJECT: …' | 'skipped:…' | 'deferred…' */
   checker: string | null;
-  /** 'ok' | 'HALT_NEW_ENTRIES' */
+  /** 'ok' | 'HALT_NEW_ENTRIES' | null (unknown) */
   risk: string | null;
-  kalman_minus_ma_rupees: string | null;
 };
 
 export type KalmanTrendResponse = {

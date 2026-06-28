@@ -44,6 +44,17 @@ def _write_eod(cache: Path, d: date, instruments, *, tot_k=0.0, tot_m=0.0):
     return path
 
 
+def _write_runner_state(cache: Path, positions):
+    """positions = list of (symbol, kalman_pos, ma_pos) → live runner state file."""
+    cache.joinpath("kalman_trend_runner_state.json").write_text(json.dumps({
+        "updated": "2026-06-26T11:00:00",
+        "instruments": [
+            {"symbol": s, "kalman": {"pos": kp}, "ma": {"pos": mp}}
+            for (s, kp, mp) in positions
+        ],
+    }))
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     from tests._helpers import login_client
@@ -67,18 +78,18 @@ END = "2026-06-26"
 
 
 class TestKalmanTrend:
-    def test_surfaces_latest_session_ab_performance_and_positions(self, client):
+    def test_surfaces_latest_session_ab_performance(self, client):
         cache: Path = client._cache
         # An older session too — the endpoint must return the LATEST.
         _write_eod(cache, date(2026, 6, 25), [
             {"symbol": "NIFTY", "kalman": _book("kalman"), "ma": _book("ma")}], tot_k=1.0)
         _write_eod(cache, date(2026, 6, 26), [
             {"symbol": "NIFTY",
-             "kalman": _book("kalman", realized_rupees=900.0, n_trades=4, open_pos=1),
-             "ma": _book("ma", realized_rupees=300.0, n_trades=3, open_pos=0)},
+             "kalman": _book("kalman", realized_rupees=900.0, n_trades=4),
+             "ma": _book("ma", realized_rupees=300.0, n_trades=3)},
             {"symbol": "BANKNIFTY",
-             "kalman": _book("kalman", realized_rupees=-200.0, n_trades=2, open_pos=-1),
-             "ma": _book("ma", realized_rupees=100.0, n_trades=2, open_pos=0)},
+             "kalman": _book("kalman", realized_rupees=-200.0, n_trades=2),
+             "ma": _book("ma", realized_rupees=100.0, n_trades=2)},
         ], tot_k=700.0, tot_m=400.0)
 
         r = client.get(f"/api/kalman-trend?end={END}")
@@ -87,12 +98,49 @@ class TestKalmanTrend:
 
         assert body["latest_date"] == "2026-06-26"
         assert body["n_sessions_recorded"] == 2
-        assert body["total_kalman_rupees"] == 700.0
+        assert body["total_kalman_rupees"] == 700.0   # recomputed: 900 + (−200)
         assert body["kalman_minus_ma_rupees"] == 300.0
 
         nifty = next(i for i in body["instruments"] if i["symbol"] == "NIFTY")
-        assert nifty["kalman"]["open_pos"] == 1 and nifty["ma"]["open_pos"] == 0
         assert nifty["edge_rupees"] == 600.0          # 900 − 300, the A/B's point
+
+    def test_positions_come_from_live_runner_state_not_eod(self, client):
+        """#1: the EOD sidecar force-closes (open_pos always 0); the tab must show
+        the LIVE intraday positions from kalman_trend_runner_state.json."""
+        cache: Path = client._cache
+        # EOD sidecar is flat (as it always is post-force-close)...
+        _write_eod(cache, date(2026, 6, 26), [
+            {"symbol": "NIFTY", "kalman": _book("kalman", open_pos=0), "ma": _book("ma", open_pos=0)}])
+        # ...but the live runner state holds a Kalman long / MA short.
+        _write_runner_state(cache, [("NIFTY", 1, -1)])
+
+        nifty = next(i for i in client.get(f"/api/kalman-trend?end={END}").json()["instruments"]
+                     if i["symbol"] == "NIFTY")
+        assert nifty["kalman"]["open_pos"] == 1
+        assert nifty["ma"]["open_pos"] == -1
+
+    def test_null_fields_do_not_500(self, client):
+        """#3: a sidecar with explicit JSON null instruments/totals must not crash."""
+        cache: Path = client._cache
+        cache.joinpath("kalman_trend_eod_2026-06-26.json").write_text(json.dumps({
+            "date": "2026-06-26", "instruments": None,
+            "total_kalman_rupees": None, "total_ma_rupees": None,
+        }))
+        r = client.get(f"/api/kalman-trend?end={END}")
+        assert r.status_code == 200
+        assert r.json()["instruments"] == []
+
+    def test_totals_recomputed_from_surviving_rows(self, client):
+        """#5: a dropped malformed row must drop from the headline totals too, so
+        the table always sums to the metric cards."""
+        cache: Path = client._cache
+        _write_eod(cache, date(2026, 6, 26), [
+            "not-a-dict",  # dropped
+            {"symbol": "NIFTY", "kalman": _book("kalman", realized_rupees=5.0), "ma": _book("ma")},
+        ], tot_k=999.0, tot_m=0.0)  # writer's bogus total must NOT leak through
+        body = client.get(f"/api/kalman-trend?end={END}").json()
+        assert [i["symbol"] for i in body["instruments"]] == ["NIFTY"]
+        assert body["total_kalman_rupees"] == 5.0     # recomputed from survivor, not 999
 
     def test_surfaces_loop_memory_status_and_lessons(self, client):
         """The loop-specific bits — checker verdict, kill-switch status, lessons —
@@ -111,6 +159,19 @@ class TestKalmanTrend:
         assert body["loop"]["checker"].startswith("REJECT")
         assert body["loop"]["risk"] == "HALT_NEW_ENTRIES"
         assert any("REJECT" in le for le in body["lessons"])
+
+    def test_loop_memory_returned_without_any_eod_sidecar(self, client):
+        """#2 (backend side): loop status + lessons are returned independent of the
+        EOD report, so the UI can show the verdict before the first session."""
+        state_root: Path = client._state_root
+        memory.write_run_summary("kalman_trend", root=state_root,
+                                 status="ok", checker="pass", risk="ok")
+        memory.append_lesson("kalman_trend", "first lesson", root=state_root)
+
+        body = client.get(f"/api/kalman-trend?end={END}").json()
+        assert body["latest_date"] is None            # no EOD yet
+        assert body["loop"]["checker"] == "pass"      # ...but loop memory present
+        assert any("first lesson" in le for le in body["lessons"])
 
     def test_empty_when_no_session_yet(self, client):
         """No sidecar + no STATE.md → a clean empty 200, not a 500."""

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Info, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Info, Shield, ShieldAlert, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import {
   Card,
@@ -37,15 +37,31 @@ function PosBadge({ pos }: { pos: number }) {
   return <Badge variant="outline" className="text-muted-foreground">flat</Badge>;
 }
 
-/** The checker verdict is a string: 'pass' | 'REJECT: …' | 'skipped:…' | 'deferred…'. */
-function CheckerBadge({ verdict }: { verdict: string | null }) {
-  if (!verdict) return <Badge variant="outline" className="text-muted-foreground">—</Badge>;
-  if (verdict === "pass")
-    return <Badge className="bg-emerald-600/15 text-emerald-700 hover:bg-emerald-600/15">pass</Badge>;
+/** Parse the checker verdict string once: 'pass' | 'REJECT: <reason>' | 'skipped:…' | 'deferred…'. */
+function parseChecker(verdict: string | null | undefined): { kind: string; reason: string | null } {
+  if (!verdict) return { kind: "—", reason: null };
+  if (verdict === "pass") return { kind: "pass", reason: null };
   if (verdict.startsWith("REJECT"))
+    return { kind: "REJECT", reason: verdict.replace(/^REJECT:\s*/, "") };
+  return { kind: verdict.split(":")[0], reason: null }; // skipped / deferred / ERROR
+}
+
+function CheckerBadge({ kind }: { kind: string }) {
+  if (kind === "pass")
+    return <Badge className="bg-emerald-600/15 text-emerald-700 hover:bg-emerald-600/15">pass</Badge>;
+  if (kind === "REJECT")
     return <Badge className="bg-rose-600/15 text-rose-700 hover:bg-rose-600/15">REJECT</Badge>;
-  // skipped / deferred / ERROR — a non-verdict
-  return <Badge variant="outline" className="text-muted-foreground">{verdict.split(":")[0]}</Badge>;
+  return <Badge variant="outline" className="text-muted-foreground">{kind}</Badge>;
+}
+
+/** Kill switch: green only when explicitly 'ok'; red on HALT; neutral 'unknown'
+ *  when STATE.md has no risk yet — never assert healthy from absence (fail-loud). */
+function RiskBadge({ risk }: { risk: string | null | undefined }) {
+  if (risk === "HALT_NEW_ENTRIES")
+    return <Badge className="bg-rose-600/15 text-rose-700 hover:bg-rose-600/15">HALT_NEW_ENTRIES</Badge>;
+  if (risk === "ok")
+    return <Badge className="bg-emerald-600/15 text-emerald-700 hover:bg-emerald-600/15">ok</Badge>;
+  return <Badge variant="outline" className="text-muted-foreground">unknown</Badge>;
 }
 
 function MetricCard({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
@@ -77,9 +93,13 @@ export function KalmanTrendPage() {
     );
 
   const instruments = data?.instruments ?? [];
-  const hasData = (data?.latest_date ?? null) !== null;
+  const lessons = data?.lessons ?? [];
+  const hasData = data?.latest_date != null; // EOD sidecar present
   const loop = data?.loop ?? null;
   const halted = loop?.risk === "HALT_NEW_ENTRIES";
+  const checker = parseChecker(loop?.checker);
+  const RiskIcon = halted ? ShieldAlert : loop?.risk === "ok" ? ShieldCheck : Shield;
+  const riskIconClass = halted ? "text-rose-600" : loop?.risk === "ok" ? "text-emerald-600" : "text-muted-foreground";
 
   return (
     <div className="space-y-4">
@@ -94,14 +114,46 @@ export function KalmanTrendPage() {
         </p>
       </div>
 
+      {/* Loop status — rendered whenever STATE.md has a run, independent of the
+          EOD sidecar (the verdict matters even before the first session). */}
+      {loop && (
+        <Card className={cn(halted && "border-rose-300")}>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base flex items-center gap-2">
+              <RiskIcon className={cn("h-4 w-4", riskIconClass)} />
+              Loop status
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-4 text-sm">
+            <div>
+              <div className="text-xs uppercase tracking-wide text-muted-foreground">Checker verdict</div>
+              <div className="mt-1"><CheckerBadge kind={checker.kind} /></div>
+              {checker.reason && <div className="mt-1 text-xs text-muted-foreground">{checker.reason}</div>}
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wide text-muted-foreground">Kill switch</div>
+              <div className="mt-1"><RiskBadge risk={loop.risk} /></div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wide text-muted-foreground">Status</div>
+              <div className="mt-1 font-medium">{loop.status ?? "—"}</div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wide text-muted-foreground">Last run</div>
+              <div className="mt-1 tabular-nums text-muted-foreground">{loop.timestamp ?? "—"}</div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Performance + positions — needs the EOD sidecar. */}
       {!hasData ? (
         <Card>
           <CardContent className="pt-6 text-sm text-muted-foreground">
-            No Kalman-trend session has produced a sidecar yet. Once the
+            No completed session yet. Per-instrument Kalman-vs-MA performance and positions appear
+            after the
             <code className="mx-1 rounded bg-muted px-1">loop-kalman-trend</code>
-            orchestrator completes its first session, the per-instrument Kalman-vs-MA performance,
-            positions, the checker verdict, the kill-switch status, and the compounding lessons
-            appear here.
+            orchestrator finishes its first session (sidecar written at 15:25 IST).
           </CardContent>
         </Card>
       ) : (
@@ -113,45 +165,10 @@ export function KalmanTrendPage() {
             <MetricCard label="Sessions recorded" value={String(data?.n_sessions_recorded ?? 0)} />
           </div>
 
-          {/* Loop-engineering status: the bits the other strategy tabs don't have. */}
-          <Card className={cn(halted && "border-rose-300")}>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-base flex items-center gap-2">
-                {halted ? <ShieldAlert className="h-4 w-4 text-rose-600" /> : <ShieldCheck className="h-4 w-4 text-emerald-600" />}
-                Loop status
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-4 sm:grid-cols-4 text-sm">
-              <div>
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Checker verdict</div>
-                <div className="mt-1"><CheckerBadge verdict={loop?.checker ?? null} /></div>
-                {loop?.checker?.startsWith("REJECT") && (
-                  <div className="mt-1 text-xs text-muted-foreground">{loop.checker.replace(/^REJECT:\s*/, "")}</div>
-                )}
-              </div>
-              <div>
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Kill switch</div>
-                <div className="mt-1">
-                  {halted
-                    ? <Badge className="bg-rose-600/15 text-rose-700 hover:bg-rose-600/15">HALT_NEW_ENTRIES</Badge>
-                    : <Badge className="bg-emerald-600/15 text-emerald-700 hover:bg-emerald-600/15">ok</Badge>}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Status</div>
-                <div className="mt-1 font-medium">{loop?.status ?? "—"}</div>
-              </div>
-              <div>
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Last run</div>
-                <div className="mt-1 tabular-nums text-muted-foreground">{loop?.timestamp ?? "—"}</div>
-              </div>
-            </CardContent>
-          </Card>
-
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-base">
-                Instruments <span className="text-xs font-normal text-muted-foreground">(Kalman vs MA, session end)</span>
+                Instruments <span className="text-xs font-normal text-muted-foreground">(Kalman vs MA; positions are live)</span>
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -185,30 +202,28 @@ export function KalmanTrendPage() {
               </Table>
             </CardContent>
           </Card>
-
-          {/* Compounding lessons — the loop's self-improvement memory (newest first). */}
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-base">
-                Lessons <span className="text-xs font-normal text-muted-foreground">(loop memory, newest first)</span>
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {(data?.lessons ?? []).length === 0 ? (
-                <div className="text-sm text-muted-foreground">No lessons recorded yet.</div>
-              ) : (
-                <ul className="space-y-1.5 text-sm">
-                  {data?.lessons.map((le, idx) => (
-                    <li key={idx} className="flex gap-2">
-                      <span className="text-muted-foreground">•</span>
-                      <span className={cn(le.includes("RISK KILL") && "text-rose-600")}>{le}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </CardContent>
-          </Card>
         </>
+      )}
+
+      {/* Compounding lessons — independent of the EOD sidecar (loop memory). */}
+      {lessons.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">
+              Lessons <span className="text-xs font-normal text-muted-foreground">(loop memory, newest first)</span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="space-y-1.5 text-sm">
+              {lessons.map((le) => (
+                <li key={le} className="flex gap-2">
+                  <span className="text-muted-foreground">•</span>
+                  <span className={cn(le.includes("RISK KILL") && "text-rose-600")}>{le}</span>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
       )}
     </div>
   );

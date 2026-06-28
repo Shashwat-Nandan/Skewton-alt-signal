@@ -51,9 +51,10 @@ class TrendBook(BaseModel):
     signal_kind: str
     realized_rupees: float = 0.0
     n_trades: int = 0
-    win_rate: Optional[float] = None
-    open_pos: int = 0                      # -1 short / 0 flat / +1 long at session end
-    n_bars: int = 0
+    # CURRENT position from the runner's live state file (-1 short / 0 flat / +1
+    # long). NOT from the EOD sidecar — that force-closes at 15:25 so its open_pos
+    # is always 0; the live state shows real intraday exposure during the session.
+    open_pos: int = 0
 
 
 class TrendInstrument(BaseModel):
@@ -70,8 +71,7 @@ class LoopStatus(BaseModel):
     timestamp: Optional[str] = None
     status: Optional[str] = None
     checker: Optional[str] = None          # 'pass' | 'REJECT: …' | 'skipped:…' | 'deferred…'
-    risk: Optional[str] = None             # 'ok' | 'HALT_NEW_ENTRIES'
-    kalman_minus_ma_rupees: Optional[str] = None
+    risk: Optional[str] = None             # 'ok' | 'HALT_NEW_ENTRIES' | None (unknown)
 
 
 class KalmanTrendResponse(BaseModel):
@@ -88,23 +88,54 @@ class KalmanTrendResponse(BaseModel):
     lessons: List[str]                     # newest-first, capped at MAX_LESSONS
 
 
-def _book(blob: Optional[dict], default_kind: str) -> TrendBook:
+def _live_positions(data_cache: Path) -> dict:
+    """Current per-book positions from the runner's LIVE state file. The EOD
+    sidecar force-closes at 15:25 (open_pos always 0 there), so real intraday
+    exposure comes from kalman_trend_runner_state.json instead. Returns
+    {symbol: {"kalman": pos, "ma": pos}}; empty on any read problem."""
+    path = data_cache / "kalman_trend_runner_state.json"
+    if not path.exists():
+        return {}
+    try:
+        blob = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read kalman_trend_runner_state.json: %s", e)
+        return {}
+    out: dict = {}
+    for inst in blob.get("instruments") or []:
+        if not isinstance(inst, dict) or inst.get("symbol") is None:
+            continue
+        sides: dict = {}
+        for side in ("kalman", "ma"):
+            book = inst.get(side)
+            if isinstance(book, dict) and book.get("pos") is not None:
+                try:
+                    sides[side] = int(book["pos"])
+                except (TypeError, ValueError):
+                    pass
+        out[str(inst["symbol"])] = sides
+    return out
+
+
+def _book(blob: Optional[dict], default_kind: str, *, open_pos: int = 0) -> TrendBook:
     blob = blob or {}
     return TrendBook(
         signal_kind=str(blob.get("signal_kind", default_kind)),
-        realized_rupees=float(blob.get("realized_rupees", 0.0)),
-        n_trades=int(blob.get("n_trades", 0)),
-        win_rate=blob.get("win_rate"),
-        open_pos=int(blob.get("open_pos", 0)),
-        n_bars=int(blob.get("n_bars", 0)),
+        # `… or 0.0` so an explicit JSON null coerces to 0 (shows the row at 0)
+        # rather than crashing float(None) and dropping the whole instrument.
+        realized_rupees=float(blob.get("realized_rupees") or 0.0),
+        n_trades=int(blob.get("n_trades") or 0),
+        open_pos=open_pos,
     )
 
 
-def _instrument(rep: dict) -> TrendInstrument:
-    kal, ma = _book(rep.get("kalman"), "kalman"), _book(rep.get("ma"), "ma")
+def _instrument(rep: dict, live: dict) -> TrendInstrument:
+    sym = str(rep.get("symbol", "?"))
+    pos = live.get(sym, {})
+    kal = _book(rep.get("kalman"), "kalman", open_pos=pos.get("kalman", 0))
+    ma = _book(rep.get("ma"), "ma", open_pos=pos.get("ma", 0))
     return TrendInstrument(
-        symbol=str(rep.get("symbol", "?")),
-        kalman=kal, ma=ma,
+        symbol=sym, kalman=kal, ma=ma,
         edge_rupees=round(kal.realized_rupees - ma.realized_rupees, 2),
     )
 
@@ -117,7 +148,6 @@ def _loop_status(last_run: dict) -> Optional[LoopStatus]:
         status=last_run.get("status"),
         checker=last_run.get("checker"),
         risk=last_run.get("risk"),
-        kalman_minus_ma_rupees=last_run.get("kalman_minus_ma_rupees"),
     )
 
 
@@ -156,27 +186,41 @@ def kalman_trend(
         except Exception as e:
             logger.warning("Failed to read %s: %s", path, e)
 
+    report = report or {}                          # guard None / fall-through
+    raw_instruments = report.get("instruments")
+    if not isinstance(raw_instruments, list):      # present-but-null / wrong type
+        raw_instruments = []
+
+    live = _live_positions(DATA_CACHE)             # real intraday positions
     instruments: List[TrendInstrument] = []
-    if report:
-        for rep in report.get("instruments", []):
-            try:
-                instruments.append(_instrument(rep))
-            except (AttributeError, TypeError, ValueError, KeyError) as e:
-                # Skip ONE malformed record without 500ing; a broader except would
-                # let a renamed field silently empty the whole table.
-                logger.warning("Skipping malformed kalman-trend instrument in %s: %s",
-                               latest_date, e)
+    for rep in raw_instruments:
+        try:
+            instruments.append(_instrument(rep, live))
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
+            # Skip ONE malformed record without 500ing; a broader except would
+            # let a renamed field silently empty the whole table.
+            logger.warning("Skipping malformed kalman-trend instrument in %s: %s",
+                           latest_date, e)
     instruments.sort(key=lambda i: i.symbol)
 
+    # Recompute totals from the SURVIVING rows so the headline always sums to the
+    # table — a dropped malformed row drops from both (the writer's precomputed
+    # totals would otherwise still include it). Equal to the sidecar totals when
+    # every row parses.
+    total_k = round(sum(i.kalman.realized_rupees for i in instruments), 2)
+    total_m = round(sum(i.ma.realized_rupees for i in instruments), 2)
+
     # Loop memory (STATE.md) — read through the same parser the loop writes with.
+    # Returned independent of the EOD report so the loop's verdict/lessons show
+    # even before the first session sidecar exists.
     state = memory.read_state(STRATEGY, root=STATE_ROOT)
 
     return KalmanTrendResponse(
         latest_date=latest_date,
         n_sessions_recorded=len(dated),
-        total_kalman_rupees=float(report.get("total_kalman_rupees", 0.0)) if report else 0.0,
-        total_ma_rupees=float(report.get("total_ma_rupees", 0.0)) if report else 0.0,
-        kalman_minus_ma_rupees=float(report.get("kalman_minus_ma_rupees", 0.0)) if report else 0.0,
+        total_kalman_rupees=total_k,
+        total_ma_rupees=total_m,
+        kalman_minus_ma_rupees=round(total_k - total_m, 2),
         instruments=instruments,
         loop=_loop_status(state.last_run),
         lessons=state.lessons[:MAX_LESSONS],
