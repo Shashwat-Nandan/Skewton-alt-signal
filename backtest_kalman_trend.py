@@ -76,13 +76,11 @@ def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: i
     # inflates Sharpe ~√N, asymmetrically between the books). Mirrors the
     # per-seed-then-median basis validate_kalman_trend uses.
     seed_kal_sharpe, seed_ma_sharpe = [], []
-    fold_wins = 0
-    n_pairs = 0
-    kal_trades_total = 0
-    oos_days = 0
+    fold_wins = n_pairs = kal_trades_total = seeds_traded = 0
     kal_pnl_total = ma_pnl_total = 0.0
     for seed in seeds:
         kal_pnls, ma_pnls = [], []
+        seed_kal_trades = 0
         for a in starts:
             b, c = a + train_len, a + train_len + test_len
             train = closes[a:b]
@@ -94,34 +92,38 @@ def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: i
             mr = _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost)
             kal_pnls.append(kr.daily_pnl)
             ma_pnls.append(mr.daily_pnl)
-            # a fold-win requires Kalman to STRICTLY out-P&L MA (a no-trade tie,
-            # 0 > 0, is False → not a win).
-            fold_wins += int(kr.daily_pnl.sum() > mr.daily_pnl.sum())
+            ks, ms = float(kr.daily_pnl.sum()), float(mr.daily_pnl.sum())
+            # A fold-win requires Kalman to have ACTUALLY TRADED and strictly
+            # out-P&L'd MA. Without the n_trades guard a no-trade Kalman (sum 0)
+            # "wins" any fold where MA merely lost (0 > negative) — that loophole
+            # let a mostly-inert Kalman pass the gate.
+            fold_wins += int(kr.n_trades > 0 and ks > ms)
             n_pairs += 1
             kal_trades_total += kr.n_trades
-            kal_pnl_total += float(kr.daily_pnl.sum())
-            ma_pnl_total += float(mr.daily_pnl.sum())
+            seed_kal_trades += kr.n_trades
+            kal_pnl_total += ks
+            ma_pnl_total += ms
         seed_kal_sharpe.append(_pooled_sharpe(np.concatenate(kal_pnls)))
         seed_ma_sharpe.append(_pooled_sharpe(np.concatenate(ma_pnls)))
-        oos_days = len(np.concatenate(kal_pnls))
+        seeds_traded += int(seed_kal_trades > 0)
 
     kal_sharpe = _nan_median(seed_kal_sharpe)
     ma_sharpe = _nan_median(seed_ma_sharpe)
     fold_win_rate = fold_wins / n_pairs
-    # PASS requires: Kalman actually traded enough to mean something, a finite
-    # median Sharpe, a STRICT win over MA, and a majority of fold-wins. A
-    # degenerate no-trade run (NaN Sharpe / 0 wins) can no longer PASS.
-    passed = (kal_trades_total >= o.MIN_VERDICT_TRADES
-              and np.isfinite(kal_sharpe)
-              and (not np.isfinite(ma_sharpe) or kal_sharpe > ma_sharpe)
-              and fold_win_rate > 0.5)
+    # Shared GO/NO-GO policy, PLUS a guard that a MAJORITY of seeds actually
+    # traded — else _nan_median would silently report the one trading seed's
+    # Sharpe for a strategy inert on the rest.
+    passed = (o.verdict_passed(kal_sharpe, ma_sharpe, kal_trades_total, fold_win_rate)
+              and seeds_traded > len(seeds) / 2)
     return {
         "symbol": symbol, "n_bars": n, "n_folds": len(starts),
-        "oos_days": oos_days,
+        "oos_days": len(starts) * test_len,
         "kal_pooled_sharpe": kal_sharpe, "ma_pooled_sharpe": ma_sharpe,
-        "kal_pooled_pnl": round(kal_pnl_total / len(seeds), 2),
-        "ma_pooled_pnl": round(ma_pnl_total / len(seeds), 2),
-        "kal_trades": kal_trades_total,
+        # mean per-seed OOS P&L (matches the per-seed Sharpe basis, not a summed
+        # total — so it's the typical single strategy's P&L, not N strategies').
+        "kal_pnl_per_seed": round(kal_pnl_total / len(seeds), 2),
+        "ma_pnl_per_seed": round(ma_pnl_total / len(seeds), 2),
+        "kal_trades": kal_trades_total, "seeds_traded": seeds_traded,
         "fold_win_rate": fold_win_rate,
         "passed": bool(passed),
     }
@@ -166,13 +168,13 @@ def main() -> int:
     print(f"\nKalman trend walk-forward (reduced 4-param fit; train {args.train_len}"
           f"/test {args.test_len}/step {args.step}; {args.seeds} seeds; POOLED OOS)\n")
     hdr = (f"{'symbol':<10}{'bars':>6}{'folds':>6}{'oosDays':>8}{'kalOOS_Sh':>10}"
-           f"{'maOOS_Sh':>10}{'kalPnl':>10}{'maPnl':>10}{'foldWin':>9}{'  verdict'}")
+           f"{'maOOS_Sh':>10}{'kalPnl/sd':>10}{'maPnl/sd':>10}{'foldWin':>9}{'  verdict'}")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
         print(f"{r['symbol']:<10}{r['n_bars']:>6}{r['n_folds']:>6}{r['oos_days']:>8}"
               f"{r['kal_pooled_sharpe']:>10.2f}{r['ma_pooled_sharpe']:>10.2f}"
-              f"{r['kal_pooled_pnl']:>10.0f}{r['ma_pooled_pnl']:>10.0f}"
+              f"{r['kal_pnl_per_seed']:>10.0f}{r['ma_pnl_per_seed']:>10.0f}"
               f"{r['fold_win_rate']:>9.0%}"
               f"{'   PASS' if r['passed'] else '   FAIL'}")
     print()

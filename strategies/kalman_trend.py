@@ -58,9 +58,16 @@ so the decision for day t+1 uses only data through day t — no look-ahead.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
+
+# Bars to let the filter converge before its signal is acted on. Single source of
+# truth — both the live IntradayTrendStrategy.warmup_bars default and the
+# backtest's kalman_direction warmup import THIS, so the fit and the live book
+# can't silently desync (which would re-open the phantom-early-entry gap).
+WARMUP_BARS = 5
 
 # Eigenvalue floor below which a covariance is treated as indefinite (invalid).
 # Q in Table 1's parameterization is NOT guaranteed PSD (det = p1²(p3²−p2²) can
@@ -108,6 +115,10 @@ def _repair_psd(M: np.ndarray) -> np.ndarray:
     M = 0.5 * (M + M.T)
     w, V = np.linalg.eigh(M)
     if _PSD_REPAIR_TOL <= w.min() < 0.0:
+        # Surface the repair (Rule 12) — with the Joseph-form update this should
+        # be rare; a recurring warning means the covariance is genuinely degrading.
+        warnings.warn(f"repairing PSD drift in restored covariance "
+                      f"(min eigenvalue {w.min():.2e})", RuntimeWarning, stacklevel=2)
         M = (V * np.clip(w, 0.0, None)) @ V.T
         M = 0.5 * (M + M.T)
     return M
@@ -250,14 +261,25 @@ class KalmanTrendFilter:
                 "H/P/R); filter cannot update")
         std_innov = v / np.sqrt(F_inn)
 
-        # Measurement update: x_{t|t}, P_{t|t}.
-        K = (P_pred @ self.H) / F_inn          # Kalman gain, (2,)
+        # Measurement update: x_{t|t}, P_{t|t}. Joseph stabilized form
+        # P = (I−KH) P (I−KH)ᵀ + K R Kᵀ — PSD-preserving by construction (a sum
+        # of two PSD terms), unlike the short form P − K(HP) which loses PSD-ness
+        # to float error over a long session and could later fail restart.
+        K = (P_pred @ self.H) / F_inn          # Kalman gain, (n,)
         x_filt = x_pred + K * v
-        P_filt = P_pred - np.outer(K, self.H @ P_pred)
-        P_filt = 0.5 * (P_filt + P_filt.T)     # curb float drift
+        ImKH = np.eye(len(self.H)) - np.outer(K, self.H)
+        P_filt = ImKH @ P_pred @ ImKH.T + self.R * np.outer(K, K)
+        P_filt = 0.5 * (P_filt + P_filt.T)     # curb residual float asymmetry
 
         # Time update (prediction): x_{t+1|t}, P_{t+1|t}.
         x_next = self.F @ x_filt + self.c
+        if not np.all(np.isfinite(x_next)):
+            # A sufficiently explosive transition (spectral radius >> 1) overflows
+            # the state; fail loud rather than emit garbage. (The Joseph-form
+            # covariance update keeps P PSD, so this state finiteness check is now
+            # the divergence guard.)
+            raise ValueError("filter state diverged to non-finite "
+                             "(explosive transition?)")
         P_next = self.F @ P_filt @ self.F.T + self.Q
         P_next = 0.5 * (P_next + P_next.T)
 

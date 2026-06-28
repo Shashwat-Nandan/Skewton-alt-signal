@@ -229,8 +229,16 @@ def main() -> int:  # pragma: no cover
             continue
         tradesym[sym] = fut["tradingsymbol"]
         if sym in prior:
-            books.append(InstrumentBooks.restore(prior[sym]))
-            logger.info("%s: restored books from prior state", sym)
+            b = InstrumentBooks.restore(prior[sym])
+            # The prior state is from yesterday's close → today's first bar spans
+            # the overnight gap. Inflate now so the gap is absorbed as a level
+            # jump, not one bar of velocity (the daily-restart path is the ONLY
+            # real day boundary — the loop's midnight branch never fires in a
+            # single-session process).
+            b.on_session_start()
+            books.append(b)
+            logger.info("%s: restored books from prior state (session-start "
+                        "inflate applied for the overnight gap)", sym)
             continue
         hist = kite.historical_data(int(fut["instrument_token"]),
                                     _days_ago(40), today, "5minute")
@@ -251,6 +259,11 @@ def main() -> int:  # pragma: no cover
 
     agg = {b.symbol: BarAggregator(BAR_SECONDS) for b in books}
     heartbeat = HeartbeatTracker(SILENT_FAIL_THRESHOLD, SILENT_FAIL_PATH, logger)
+    # Per-symbol consecutive quote failures: the global heartbeat only trips when
+    # EVERY book fails (n_errored == n_ran), so one persistently-dead symbol would
+    # otherwise be a silent no-trade book while the other keeps the session alive.
+    quote_fails = {b.symbol: 0 for b in books}
+    PER_SYMBOL_FAIL_WARN = 10
     session_day = today        # for overnight-gap detection across midnight runs
     open_t = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
     close_t = datetime.now().replace(hour=15, minute=25, second=0, microsecond=0)
@@ -275,8 +288,14 @@ def main() -> int:  # pragma: no cover
             ran += 1
             px = _last_price(kite, tradesym[b.symbol])
             if px is None:
-                errored += 1            # surfaced via the heartbeat below
+                errored += 1            # feeds the all-books heartbeat below
+                quote_fails[b.symbol] += 1
+                if quote_fails[b.symbol] == PER_SYMBOL_FAIL_WARN:
+                    logger.warning("%s: %d consecutive quote failures — this book "
+                                   "is dead while others run (check %s)",
+                                   b.symbol, PER_SYMBOL_FAIL_WARN, tradesym[b.symbol])
                 continue
+            quote_fails[b.symbol] = 0
             b.on_price(px)                       # intraday stop/target
             closed = agg[b.symbol].add(now, px)  # roll a 5-min bar?
             if closed is not None:

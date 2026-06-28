@@ -145,6 +145,31 @@ def test_sharpe_is_nan_not_sentinel_when_undefined():
     assert np.isnan(o._sharpe(np.zeros(10), n_trades=5))   # traded but flat
 
 
+def test_simulate_too_short_is_nan_not_sentinel():
+    """The n<2 early-return must honour the NaN contract, not the old -10.0."""
+    res = o.simulate([100.0], [1], stop_ticks=10, target_ticks=10)
+    assert np.isnan(res.sharpe)
+
+
+def test_beats_requires_kalman_traded_and_strict():
+    """`beats` is the shared win rule. A no-trade Kalman (NaN) must NOT beat even
+    a LOSING MA — that loophole (0 > negative) let an inert Kalman score wins."""
+    assert o.beats(1.0, 0.5) is True
+    assert o.beats(0.5, 1.0) is False
+    assert o.beats(0.5, 0.5) is False                 # strict, not >=
+    assert o.beats(float("nan"), -5.0) is False       # ← the #1 core: inert kal
+    assert o.beats(1.0, float("nan")) is True         # kal traded, MA didn't
+    assert o.beats(float("nan"), float("nan")) is False
+
+
+def test_verdict_passed_policy():
+    assert o.verdict_passed(1.0, 0.5, kal_trades=5, win_rate=0.6) is True
+    assert o.verdict_passed(1.0, 0.5, kal_trades=1, win_rate=0.6) is False  # trades
+    assert o.verdict_passed(1.0, 0.5, kal_trades=5, win_rate=0.5) is False  # win>0.5
+    assert o.verdict_passed(0.5, 0.5, kal_trades=5, win_rate=0.9) is False  # tie
+    assert o.verdict_passed(float("nan"), -5.0, 5, 0.9) is False            # inert
+
+
 def test_reduced_fit_is_smaller_and_model2_and_evaluable():
     """The reduced fit (Option B) must expose ONE filter knob on model 2 and
     round-trip through evaluate() — fewer params is the whole anti-overfit point,

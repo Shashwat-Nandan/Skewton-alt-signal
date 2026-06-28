@@ -17,7 +17,16 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from strategies.kalman_trend import WARMUP_BARS
 from strategies.kalman_trend_following import IntradayTrendStrategy
+
+
+def test_warmup_bars_default_is_the_shared_constant():
+    """Fit/live parity must be ENFORCED, not just commented: the strategy's
+    warmup default has to BE the shared WARMUP_BARS the backtest uses."""
+    s = IntradayTrendStrategy(signal_kind="ma", short=2, long=4,
+                              stop_ticks=1, target_ticks=1)
+    assert s.warmup_bars == WARMUP_BARS
 
 # benign model-2 filter (p1=0,p2=0,p3=vel_std, R, P0_lvl, P0_vel) for prices ~100s
 KAL_P = [0.0, 0.0, 1.0, 100.0, 10000.0, 100.0]

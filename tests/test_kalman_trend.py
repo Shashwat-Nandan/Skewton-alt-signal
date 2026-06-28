@@ -188,6 +188,20 @@ def test_from_params_validation():
         KalmanTrendFilter.from_params(p, model=4, init_price=100.0)
 
 
+def test_covariance_stays_psd_over_long_run():
+    """Joseph-form update must keep P positive-semidefinite over a long session
+    so restart never fails — the short form P−K(HP) drifts indefinite."""
+    rng = np.random.default_rng(2)
+    prices = 100 + np.cumsum(rng.normal(0, 1.0, 2000))
+    f = _model1_filter(prices[0], q_level=1e-2, q_vel=1e-4, R=1.0, P0=100.0)
+    for z in prices:
+        f.update(float(z))
+        assert np.linalg.eigvalsh(0.5 * (f.P + f.P.T)).min() >= -1e-12
+    # and the drifted state still round-trips through deserialize without repair
+    g = KalmanTrendFilter.deserialize(f.serialize())
+    assert np.isfinite(g.update(float(prices[-1] + 1)).prediction)
+
+
 def test_inflate_uncertainty_scales_P():
     f = _model1_filter(100.0)
     f.update(100.0)
@@ -235,16 +249,18 @@ def test_model4_zero_control_equals_model3():
         assert f3.update(float(z)) == f4.update(float(z))
 
 
-def test_paper_table2_optimum_diverges():
+def test_paper_table2_optimum_is_unusable():
     """Documents a real finding (Rule 12): the paper's reported optimal vector
-    (Table 2) specifies an explosive transition Φ=[[24.8,0],[0,11.8]] — the
-    position state grows ~24.8x per bar — so the filter diverges and the
-    innovation variance goes non-positive. The filter must FAIL LOUD on this,
-    not silently emit garbage. (The OCR'd 15-d optimum is almost certainly
-    mis-transcribed; our correctness gate reproduces the paper's *qualitative*
-    claim — Kalman beats MA crossover OOS — not this exact vector.)"""
+    (Table 2) specifies Φ=[[24.8,0],[0,11.8]], which multiplies the position
+    ~24.8x/bar. The Joseph-form filter no longer DIVERGES numerically on it (the
+    old short-form 'divergence' was a covariance breakdown), but it is still an
+    UNUSABLE model — its one-step predictions wander orders of magnitude off the
+    actual ~2500 price. The OCR'd 15-d optimum is almost certainly mis-
+    transcribed, and the fits never use model 3/4 anyway
+    (test_fit_kalman_rejects_unstable_models)."""
     table2 = [24.8, 0.0, 11.8, 46.2, 77.5, 67.0, 100.0, 0.0, 0.0, 0.0, 100.0]
     filt = KalmanTrendFilter.from_params(table2, model=3, init_price=2500.0)
-    with pytest.raises(ValueError):
-        for z in 2500 + np.cumsum(np.random.default_rng(0).normal(0, 5, 50)):
-            filt.update(float(z))
+    prices = 2500 + np.cumsum(np.random.default_rng(0).normal(0, 5, 200))
+    preds = np.array([filt.update(float(z)).prediction for z in prices])
+    assert np.all(np.isfinite(preds))          # stable (Joseph form), but…
+    assert np.max(np.abs(preds)) > 1e6         # …predictions detached from price

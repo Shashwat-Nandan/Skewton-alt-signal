@@ -29,16 +29,28 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from strategies.kalman_trend import KalmanTrendFilter
+from strategies.kalman_trend import WARMUP_BARS, KalmanTrendFilter
 
 TRADING_DAYS = 252
-# Bars to let the filter/MA converge before trading. MUST match
-# IntradayTrendStrategy.warmup_bars so the backtest optimizes the SAME rule the
-# live paper book trades (else the fit books phantom entries the runner skips).
-WARMUP_BARS = 5
+# WARMUP_BARS is imported (single source of truth) so the backtest optimizes the
+# SAME rule the live IntradayTrendStrategy trades — see strategies/kalman_trend.py.
 # Minimum trades for a verdict to mean anything — below this the OOS Sharpe is
 # one-trade noise and "Kalman beats MA" is not a real claim.
 MIN_VERDICT_TRADES = 3
+
+
+def beats(kal: float, ma: float) -> bool:
+    """True iff the Kalman metric strictly beats MA. NaN-aware: a NaN kal (no
+    edge measured / no trades) never beats; a finite kal beats a NaN ma (MA
+    didn't even trade). One definition, shared by both gate harnesses."""
+    return bool(np.isfinite(kal) and (not np.isfinite(ma) or kal > ma))
+
+
+def verdict_passed(kal: float, ma: float, kal_trades: int, win_rate: float) -> bool:
+    """The single GO/NO-GO policy, shared by validate and backtest so the two
+    can't drift: Kalman traded enough to matter, has a finite metric, STRICTLY
+    beats MA, and wins a majority of (seed/fold) comparisons."""
+    return bool(kal_trades >= MIN_VERDICT_TRADES and beats(kal, ma) and win_rate > 0.5)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -56,7 +68,14 @@ def kalman_direction(prices, p, *, model: int, mu: float,
     µ=0 dead-band would book a phantom entry.
 
     Raises (ValueError/NotImplementedError) if the filter params diverge, so the
-    optimizer can assign bad fitness and steer away."""
+    optimizer can assign bad fitness and steer away.
+
+    Note (gap handling): this runs the filter over a CONTINUOUS price series with
+    no session-boundary reset. That is exact for the daily gates (daily bars have
+    no intraday gap). For INTRADAY bars concatenated across days it does NOT apply
+    the live runner's overnight-gap inflation (IntradayTrendStrategy.on_session_
+    start) — a known fit-vs-live gap for the intraday research backtest only; the
+    daily GO/NO-GO is unaffected."""
     prices = np.asarray(prices, float)
     filt = KalmanTrendFilter.from_params(p, model=model, init_price=float(prices[0]))
     direction = np.zeros(len(prices))
@@ -123,7 +142,7 @@ def simulate(
     direction = np.asarray(direction, float)
     n = len(prices)
     if n < 2:
-        return SimResult(np.zeros(n), 0, 0.0, -10.0)
+        return SimResult(np.zeros(n), 0, 0.0, float("nan"))   # undefined, not a sentinel
     stop_d = abs(stop_ticks) * tick_size
     target_d = abs(target_ticks) * tick_size
 
@@ -314,7 +333,7 @@ def fit_kalman_trend(
         "mu": float(best_x[5]),
         "stop_ticks": float(best_x[6]),
         "target_ticks": float(best_x[7]),
-        "train_sharpe": res.sharpe,
+        "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
         "l1_norm_normalized": float(np.sum(np.abs(best_x[:5]) / fhi)),
         "n_trades": res.n_trades,
     }
@@ -367,7 +386,7 @@ def fit_ma_crossover(
     return {
         "short": int(round(short)), "long": int(round(long)),
         "offset": float(offset), "stop_ticks": float(stop),
-        "target_ticks": float(target), "train_sharpe": res.sharpe,
+        "target_ticks": float(target), "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
         "n_trades": res.n_trades,
     }
 
@@ -432,7 +451,7 @@ def fit_kalman_reduced(
     return {
         "model": 2, "filter_params": p.tolist(), "s_vel": float(best_x[0]),
         "mu": float(best_x[1]), "stop_ticks": float(best_x[2]),
-        "target_ticks": float(best_x[3]), "train_sharpe": res.sharpe,
+        "target_ticks": float(best_x[3]), "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
         "n_trades": res.n_trades,
     }
 

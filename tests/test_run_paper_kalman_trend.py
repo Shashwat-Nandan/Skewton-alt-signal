@@ -69,6 +69,19 @@ def test_eod_report_totals_and_delta():
     assert rep["instruments"][0]["symbol"] == "NIFTY"
 
 
+def test_restored_book_can_inflate_for_overnight_gap():
+    """The runner calls on_session_start() after restore() so a book resumed the
+    next morning absorbs the overnight gap. Verify the restored Kalman filter's
+    covariance inflates (the daily-restart path is the only real day boundary)."""
+    b = r.build_books("NIFTY", KAL, MA)
+    for p in 100 + 0.5 * np.arange(30):
+        b.on_bar(float(p))
+    rb = r.InstrumentBooks.restore(b.serialize())
+    P_before = rb.kalman._filter.P.max()
+    rb.on_session_start()
+    assert rb.kalman._filter.P.max() > P_before
+
+
 def test_instrument_books_serialize_restore_identity():
     b = r.build_books("BANKNIFTY", KAL, MA)
     for p in 50000 + 5 * np.arange(40):

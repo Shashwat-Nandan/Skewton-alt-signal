@@ -113,20 +113,13 @@ def run_symbol(symbol: str, closes: np.ndarray, *, n_gen: int, l1_lambda: float,
         kal_tests.append(kr.sharpe)
         ma_tests.append(mr.sharpe)
         kal_trades_total += kr.n_trades
-        # a win requires Kalman to STRICTLY beat MA AND to actually have traded
-        # (a finite Sharpe). A no-trade tie (both NaN, or -10==-10 under the old
-        # sentinel) is no longer a win.
-        wins += int(np.isfinite(kr.sharpe)
-                    and (not np.isfinite(mr.sharpe) or kr.sharpe > mr.sharpe))
+        wins += int(o.beats(kr.sharpe, mr.sharpe))   # requires kal traded + strict
     kal_med = (float(np.nanmedian(kal_tests))
                if np.any(np.isfinite(kal_tests)) else float("nan"))
     ma_med = (float(np.nanmedian(ma_tests))
               if np.any(np.isfinite(ma_tests)) else float("nan"))
     win_rate = wins / len(seeds)
-    passed = (kal_trades_total >= o.MIN_VERDICT_TRADES
-              and np.isfinite(kal_med)
-              and (not np.isfinite(ma_med) or kal_med > ma_med)
-              and win_rate > 0.5)
+    passed = o.verdict_passed(kal_med, ma_med, kal_trades_total, win_rate)
     return {
         "symbol": symbol, "n_bars": n, "n_seeds": len(seeds),
         "kal_test_median": kal_med, "ma_test_median": ma_med,

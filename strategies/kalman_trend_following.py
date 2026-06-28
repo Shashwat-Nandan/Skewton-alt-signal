@@ -30,7 +30,7 @@ from typing import Literal, Optional
 
 import numpy as np
 
-from strategies.kalman_trend import KalmanTrendFilter
+from strategies.kalman_trend import WARMUP_BARS, KalmanTrendFilter
 
 SignalKind = Literal["kalman", "ma"]
 
@@ -56,10 +56,11 @@ class IntradayTrendStrategy:
     cost_per_unit: float = 0.0          # per side, in price points
     lot_size: int = 1                   # ₹ per point per lot (for reporting)
     allow_short: bool = True
-    warmup_bars: int = 5                # let the filter converge before trading;
-                                        # also avoids the t=0 transient where the
-                                        # prediction equals the price and a 0
-                                        # dead-band would fire a spurious entry
+    warmup_bars: int = WARMUP_BARS      # shared with the backtest (one source of
+                                        # truth) so the fit and live book gate
+                                        # entries identically; also avoids the t=0
+                                        # transient where prediction == price and
+                                        # a 0 dead-band would fire a spurious entry
     # kalman params (model-2 p-vector from the fit) — required if kind="kalman"
     filter_params: Optional[list] = None
     model: int = 2
