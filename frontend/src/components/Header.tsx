@@ -24,6 +24,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/arbitrage", label: "Arbitrage", icon: Scale },
   { to: "/buy-on-gap", label: "Buy-on-Gap", icon: TrendingDown },
   { to: "/kalman-pairs", label: "Kalman Pairs", icon: Sigma },
+  { to: "/kalman-trend", label: "Kalman Trend (loop)", icon: Activity },
 ];
 
 export function Header() {

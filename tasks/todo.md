@@ -198,6 +198,25 @@ loop_engine is import-isolated so the full suite is unchanged):
       optimize_kalman_trend, dead `DATA_CACHE`/`RISK_DEFERRED` removed. Also fixed a
       latent multi-line-lesson truncation (append_lesson flattens newlines).
 
+### Dashboard tab — Kalman-trend / loop (2026-06-28)
+Built on this branch per request. Mirrors the kalman_pairs router+tab pattern.
+- [x] `backend/routers/kalman_trend.py` (`/api/kalman-trend`): newest
+      `kalman_trend_eod_<date>.json` → per-instrument Kalman-vs-MA performance +
+      positions + edge; PLUS loop memory (checker verdict / kill-switch / status /
+      lessons) read via `loop_engine.memory.read_state` (same parser the loop
+      writes with). Registered in `backend/main.py` (gated).
+- [x] `tests/test_kalman_trend_router.py` (5): latest-session A/B + positions,
+      loop status+lessons surfaced, empty-200, bad-date 400, malformed-row skipped.
+- [x] Frontend: `pages/KalmanTrendPage.tsx` (+ types/api/App route/Header nav).
+      Metric cards, a Loop-status card (checker badge, HALT badge, status,
+      last-run), the Kalman-vs-MA instruments table, and the newest-first lessons
+      feed. tsc clean, `npm run build` OK.
+- [x] 88 tests pass (router + backend sanity + loop suite); ruff clean.
+- [ ] VISIBLE ONLY AFTER: (a) the host smoke-test runs the loop (no kalman_trend
+      data on any box yet → shows the empty state until then), and (b) the operator
+      REDEPLOYS — dashboard-backend has no auto-deploy (restart the service) and the
+      frontend must be rebuilt on the host. Until then the tab 404s/empties on prod.
+
 ### Phase 6 — LATER (gated, not in first cut)
 - [ ] Verification-debt recalibration audit (LLM judgment over STATE.md outcomes)
 - [ ] Generalize the orchestrator/checker/memory to other strategies via template

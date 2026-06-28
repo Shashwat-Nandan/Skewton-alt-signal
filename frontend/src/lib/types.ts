@@ -331,6 +331,49 @@ export type KalmanPairsResponse = {
   pairs: KalmanPair[];
 };
 
+// ── Kalman trend (loop-engineering pilot: Kalman-vs-MA A/B + loop memory) ──
+
+export type TrendBook = {
+  signal_kind: string; // "kalman" | "ma"
+  realized_rupees: number;
+  n_trades: number;
+  win_rate: number | null;
+  open_pos: number; // -1 short / 0 flat / +1 long at session end
+  n_bars: number;
+};
+
+export type TrendInstrument = {
+  symbol: string;
+  kalman: TrendBook;
+  ma: TrendBook;
+  /** Kalman − MA realized ₹ for this instrument (the A/B's whole point). */
+  edge_rupees: number;
+};
+
+/** The loop's last-run header, read from STATE.md (values are strings as stored). */
+export type LoopStatus = {
+  timestamp: string | null;
+  status: string | null;
+  /** 'pass' | 'REJECT: …' | 'skipped:…' | 'deferred…' */
+  checker: string | null;
+  /** 'ok' | 'HALT_NEW_ENTRIES' */
+  risk: string | null;
+  kalman_minus_ma_rupees: string | null;
+};
+
+export type KalmanTrendResponse = {
+  latest_date: string | null;
+  n_sessions_recorded: number;
+  total_kalman_rupees: number;
+  total_ma_rupees: number;
+  /** Kalman − MA realized ₹ for the LATEST session (not cumulative). */
+  kalman_minus_ma_rupees: number;
+  instruments: TrendInstrument[];
+  /** Loop-engineering memory (null when STATE.md has no run yet). */
+  loop: LoopStatus | null;
+  lessons: string[]; // newest-first
+};
+
 // ── Equity Swing ──
 
 export type EquityPosition = {

@@ -9,6 +9,7 @@ import { BuyOnGapPage } from "@/pages/BuyOnGapPage";
 import { DashboardLoginPage } from "@/pages/DashboardLoginPage";
 import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { KalmanPairsPage } from "@/pages/KalmanPairsPage";
+import { KalmanTrendPage } from "@/pages/KalmanTrendPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
 import { PositionsPage } from "@/pages/PositionsPage";
@@ -71,6 +72,7 @@ export default function App() {
           <Route path="/arbitrage" element={<ArbitragePage />} />
           <Route path="/buy-on-gap" element={<BuyOnGapPage />} />
           <Route path="/kalman-pairs" element={<KalmanPairsPage />} />
+          <Route path="/kalman-trend" element={<KalmanTrendPage />} />
           <Route path="/equity-swing" element={<EquitySwingPage />} />
         </Routes>
       </main>
