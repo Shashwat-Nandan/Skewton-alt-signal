@@ -1,0 +1,17 @@
+[Unit]
+Description=Fire loop-kalman-trend.service Mon–Fri at 09:17 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:17 IST — same slot the superseded kalman-trend-paper.timer used (it staggers
+# the TOTP login after buy-on-gap 09:14 / kalman-pairs 09:16 so the logins don't
+# collide on the shared .kite_session.json). The orchestrator's wrapped runner
+# sleeps until the 09:15 open internally, so firing a couple of minutes late just
+# reuses the already-cached session.
+OnCalendar=Mon..Fri *-*-* 09:17:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=60
+Unit=loop-kalman-trend.service
+
+[Install]
+WantedBy=timers.target

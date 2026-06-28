@@ -1,0 +1,47 @@
+[Unit]
+Description=Loop-Engineering Orchestrator — kalman_trend (read-memory → maker+execute → check → retro → write-memory)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# PAPER ONLY. The orchestrator wraps run_paper_kalman_trend.py (the existing paper
+# runner) via kite_engine: it reads STATE.md first, runs the intraday A/B session
+# (09:15→15:25), then runs the independent deterministic checker, writes a retro
+# lesson IFF notable, and persists the run summary. No live order path.
+#
+# SUPERSEDES kalman-trend-paper.service — DO NOT run both: kite_engine calls the
+# runner, which takes a single-instance lock, so a second runner would just exit.
+# When enabling this, disable the old unit:
+#   sudo systemctl disable --now kalman-trend-paper.timer
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m loop_engine.orchestrator
+# -------------------------------
+
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches the other paper runners)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

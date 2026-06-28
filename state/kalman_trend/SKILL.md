@@ -1,0 +1,48 @@
+# SKILL.md — kalman_trend
+
+Procedure manual for the Kalman-trend loop, read at the start of every session
+(paper §II-B). Hard rules and accumulated lessons live here; the per-signal
+checker reads its gate thresholds from `## Rules` so the Phase-6 recalibration
+audit can tighten them in one place. Seeded 2026-06-28 from
+`tasks/kalman-trend-findings.md` and `run_paper_kalman_trend.py`.
+
+## Goal
+Run an intraday Kalman-vs-MA trend A/B (forward parity) on NIFTY + BANKNIFTY
+front-month futures, paper-only, and use it as the maker–checker testbed for the
+loop-engineering orchestrator. The strategy is NOT a proven edge: faithful
+backtest replication is NO-GO vs an MA crossover. The point of this loop is to
+measure forward fills at zero risk and to exercise independent verification — not
+to assert alpha.
+
+## Rules
+- Paper-only. No live order path; never call broker.send for this strategy.
+- Position size capped per the runner's existing sizing; do not raise it here.
+- Reuse the cached Kite session — never fresh-login while a live runner is active
+  (Zerodha invalidates the prior token and breaks the live pair runner).
+- Honour the shared HALT_ALL / HALT_NEW_ENTRIES kill switches in data_cache/.
+- Checker gate thresholds (Phase 2, deterministic — Rule 5):
+  - sharpe_min: 1.5
+  - max_dd_max: 0.10
+  - nw_tstat_min: 2.0
+  - oos_months_min: 24
+- A candidate that fails ANY gate is killed and the rejection is logged to
+  STATE.md. A low rejection rate is a warning sign (verifier looseness), not a
+  win (paper §VI-A).
+- Risk monitor (Phase 4, isolated process): trips HALT_NEW_ENTRIES when the paper
+  book's realized-P&L drawdown-from-peak breaches (NOT the paper's flatten-all —
+  this repo has no such primitive and HALT_ALL would trap open positions):
+  - kill_switch_drawdown_rupees: 20000
+
+## Lessons
+- Faithful single-split 8-param CMA-ES fit overfits: train Sharpe 2–5, OOS is
+  seed luck (NIFTY median 0.20 vs MA 0.93). Do not promote on a single seed.
+- Same scar as buy-on-gap (train 2.71 → test −0.83): in-sample Sharpe
+  maximization on a thin window is not edge. Aggregate seeds/folds before judging.
+- Reduced 4-param walk-forward fit (the anti-overfit discipline) is the only
+  config that showed any Kalman>MA win-rate; treat it as the candidate generator,
+  not the single-split protocol.
+
+## Regime tags
+- trend: the strategy is built to make money here; this is its design regime.
+- chop: trend follower bleeds in range-bound/whipsaw regimes — expect rejections.
+- gap/event: backtest does not model intraday gap fills faithfully; low trust.

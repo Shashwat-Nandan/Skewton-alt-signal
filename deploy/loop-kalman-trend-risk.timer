@@ -1,0 +1,16 @@
+[Unit]
+Description=Fire loop-kalman-trend-risk.service Mon–Fri at 09:17 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:17 IST alongside the orchestrator. The monitor needs no Kite session (it
+# reads the runner state file only), so it does not contend for the TOTP login.
+# It polls until 15:25 internally; firing a minute early just sees a fresh book
+# at 0 (which cannot trip — the peak seeds at the first reading).
+OnCalendar=Mon..Fri *-*-* 09:17:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=30
+Unit=loop-kalman-trend-risk.service
+
+[Install]
+WantedBy=timers.target

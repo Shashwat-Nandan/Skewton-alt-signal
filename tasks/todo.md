@@ -1,3 +1,184 @@
+# Loop-Engineering Orchestrator — Self-Improving Loop (PLAN, 2026-06-28)
+
+Source: "Loop Engineering for Self-Improving Hedge Funds" (research note v1.0,
+Drive 16yhjlbcGCm2BBA_OMc97tF05XbxDR3RB; PDF in scratchpad). The note is an
+ARCHITECTURE/manifesto, not a strategy: 6 primitives (automation, skill, state,
+verifier, worktree, connector) + a 5-stage loop (ingest → maker → checker →
+execute → risk-monitor) + a compounding memory layer, with maker–checker
+separation as the central claim ("verification rigor is the scarce resource").
+
+DECIDED (AskUserQuestion 2026-06-28):
+  - Scope = **new unified loop orchestrator** (the paper's Appendix `loop.py`
+    skeleton, made real) wrapping existing components — NOT a from-scratch rebuild.
+  - Pilot = **kalman-trend** (current branch plan/kalman-trend-following).
+
+## Surfaced conflicts / assumptions (Rule 1, 5, 7 — read before building)
+
+1. **Maker is deterministic here, so the per-signal checker must be too (Rule 5).**
+   The paper assumes an LLM maker + stronger-LLM checker. In this repo the maker
+   is the deterministic Kalman strategy and the gates (Sharpe / MDD / Newey–West
+   t-stat) are deterministic inequalities. Rule 5 forbids using the model for
+   deterministic transforms. → per-signal checker = plain-code verifier (mirrors
+   `verify_pair_paper.py`). LLM is reserved ONLY for the judgment layer the paper
+   also names: the periodic verification-debt audit + lesson synthesis (Phase 6).
+
+2. **Reuse, don't fork (Rule 7/8).** The orchestrator WRAPS existing pieces; it
+   does not reimplement them: ingest=`fetch_bars.py`/`fetch-bars.timer`,
+   maker=`strategies/kalman_trend_following.py` via `run_paper_kalman_trend.py`,
+   connector=`kite_auth.py`, session-control=`runner_common.py`. Where the paper's
+   skeleton overlaps existing systemd timers, the timer is the source of truth;
+   the orchestrator calls into the runner rather than re-scheduling it.
+
+3. **Paper-only, no live order path.** kalman-trend has no live path and backtest
+   is NO-GO vs MA. Keep execution paper/signal-only this whole plan. No `cap=0.02`
+   `broker.send` from the paper's Fig. 4.
+
+4. **Memory layer is the real new value.** Today lessons are human-maintained in
+   `tasks/lessons.md` and state is scattered (results.tsv / best_params.json /
+   *_eod_*.json). The paper wants a per-strategy STATE.md (read-first / write-last)
+   + SKILL.md (goal/rules/lessons/regime tags). This is additive, not a migration.
+
+## Proposed layout (additive; nothing existing moves)
+
+    loop_engine/
+      __init__.py
+      orchestrator.py     # the 5-stage chain, paper Fig.4 made real (paper-only)
+      checker.py          # deterministic verifier: 5 gates over a trailing backtest
+      memory.py           # STATE.md / SKILL.md read-first/write-last + retro append
+      risk_monitor.py     # isolated drawdown poll → HALT flag (reuses runner_common)
+    state/kalman_trend/
+      STATE.md            # loop memory (last run, positions, rolling Sharpe, lessons)
+      SKILL.md            # goal / rules / lessons / regime-tags schema
+
+## Phases (each ends with a checkpoint — Rule 10)
+
+### Phase 0 — Scaffolding + memory schema  ✅ DONE 2026-06-28
+- [x] Create `loop_engine/` package + `state/kalman_trend/` dir
+- [x] `memory.py`: `read_state()`, `append_lesson()`, `write_run_summary()` over
+      STATE.md; `load_skill()` over SKILL.md (parse goal/rules/lessons/regime)
+- [x] Seed `SKILL.md` from existing kalman-trend rules + `tasks/kalman-trend-findings.md`
+- [x] Seed `STATE.md` skeleton (Fig. 3 format)
+- [x] Unit tests: round-trip read/append, read-first/write-last ordering
+      (`tests/test_loop_engine_memory.py`, 7 tests, the load-bearing one =
+      write_run_summary must NOT wipe accumulated lessons). All pass; ruff clean.
+
+### Phase 1 — Five-stage orchestrator skeleton  ✅ DONE 2026-06-28
+- [x] `orchestrator.py` wrapping the existing kalman-trend runner as stages 1,2,4
+      (`kite_engine` calls `run_paper_kalman_trend.main()` + reads its EOD sidecar;
+      no reimplementation). Stages 3/5 are explicit deferred seams.
+- [x] Stage boundaries call existing code (no reimplementation)
+- [x] read-first (`read_memory`: surfaces goal + top lesson + prior run) /
+      write-last (`write_memory`: `write_run_summary`, preserves lessons)
+- [x] Dry-run mode (`dry_run_engine`, `--dry-run` CLI) for CI; kite_engine for host
+- [x] Tests `tests/test_loop_engine_orchestrator.py` (5 tests): write-last +
+      lessons-survive, deferred seams recorded, errored session still summarised
+      (Rule 12), dry-run touches no Kite. 12/12 loop tests pass; ruff clean.
+
+### Phase 2 — Independent checker (deterministic, the paper's "entire edge")  ✅ DONE 2026-06-28
+- [x] `checker.py`: pure deterministic stats (annualized Sharpe, max-drawdown,
+      Newey–West HAC t-stat) + `apply_gates`. 4 gates (Sharpe / MDD / NW-t /
+      OOS-months). NOTE: the paper's 5th gate `sector_expo<0.30` is OMITTED as
+      N/A for a single-instrument futures trend follower (Rule 1, documented).
+- [x] Adapter `check_kalman_trend` runs ITS OWN walk-forward backtest (reuses
+      `backtest_kalman_trend._fold_oos` + `optimize_kalman_trend`, no reimpl) and
+      converts points-PnL → fractional returns; consumes only the candidate, never
+      the maker's fit reasoning.
+- [x] Thresholds read from SKILL.md `## Rules` via `GateThresholds.from_skill`
+      (one place for the Phase-6 recalibration audit to tune).
+- [x] Fail-closed: NaN statistic / no-trade candidate is REJECTED (Rule 12).
+      Verdict recorded into STATE.md by the orchestrator; lesson-writing is
+      Phase 3's job (no per-session lesson spam).
+- [x] Wired into orchestrator `check()` (injected checker; default still deferred).
+- [x] Tests `tests/test_loop_engine_checker.py` (13): stats vs hand-calc,
+      known-good passes / known-bad rejected naming the gate, short-history fails
+      OOS gate, adapter pooling + no-trade reject; +3 orchestrator wiring tests.
+      28 loop tests pass; ruff clean.
+- [x] REAL-DATA SANITY: on cached NIFTY daily (2035 closes) the verdict is the
+      honest REJECT — sharpe 0.41<1.5, MDD 0.28>0.10, NW-t 1.06<2.0 all fail
+      (only OOS-span passes). The verifier correctly kills the NO-GO candidate.
+
+### Phase 3 — Compounding retro (self-improvement mechanism §IV)  ✅ DONE 2026-06-28
+- [x] `retro.py`: `build_lesson` / `run_retro` — append a lesson to STATE.md IFF
+      the session is notable (checker verdict transition, or first-time incident
+      status), with P&L context. Deterministic only (Rule 5); LLM synthesis is
+      the deferred Phase-6 audit.
+- [x] SELECTIVE by design (paper §IV "what rule, if any"): a stable strategy that
+      keeps getting the same verdict yields ONE transition lesson then silence —
+      no per-session spam that would drown load-bearing constraints.
+- [x] Wired into `run_session` (prior state captured at read-first, retro runs
+      before write-last). Deferred checker never manufactures lessons (Phase-1
+      behaviour preserved).
+- [x] Tests `tests/test_loop_engine_retro.py` (11): transition→1 lesson,
+      unchanged→0, deferred→0, incident-once, recovery→2nd lesson read-first,
+      integrated two-session compounding. 37 loop tests pass; ruff clean.
+- [x] Reconciled the Phase-2 "no spam" test → narrowed to verdict-recorded +
+      prior-lesson-preserved (spam policy now owned by the Phase-3 retro tests).
+
+### Phase 4 — Isolated risk monitor (§III-E, §VII-D)  ✅ DONE 2026-06-28
+- [x] `risk_monitor.py`: standalone process. Reads realized P&L from the runner
+      state file as PLAIN NUMBERS (`read_book_equity`) — never imports the maker,
+      so it cannot inherit the maker's drift (§VII-D isolation). `evaluate` =
+      drawdown-from-peak; `poll_once` trips the kill switch + logs an incident.
+- [x] Kill switch = HALT_NEW_ENTRIES (Rule 7 reuse), NOT the paper's flatten-all:
+      this repo has no flatten primitive and HALT_ALL would trap open positions
+      from exiting. Documented in SKILL.md + module docstring (Rule 1 deviation).
+- [x] Fresh book at 0 cannot trip (peak seeds at first reading); trip is
+      idempotent (no duplicate halt / lesson while still breached).
+- [x] Orchestrator `risk()` OBSERVES the flag only (never runs the monitor inline
+      — that IS the §VII-D anti-pattern). Threshold in SKILL.md (`RiskConfig.from_skill`).
+- [x] Tests `tests/test_loop_engine_risk_monitor.py` (10): equity sum, no-false-
+      trip-at-zero, breach→halt+incident, idempotent, threshold-from-skill;
+      +orchestrator observes-flag test. 47 loop tests pass; ruff clean.
+
+### Phase 5 — Deploy wiring + verification
+- [x] systemd units for the ORCHESTRATOR (`deploy/loop-kalman-trend.{service,timer}`,
+      09:17 IST) — wraps run_paper_kalman_trend via kite_engine; SUPERSEDES
+      kalman-trend-paper.service (kite_engine calls the runner, which holds a
+      single-instance lock → never run both; the service comment + this note say so).
+- [x] systemd units for the ISOLATED RISK MONITOR
+      (`deploy/loop-kalman-trend-risk.{service,timer}`, 09:17, separate process,
+      no Kite → no TOTP collision). §VII-D: deliberately NOT inside the orchestrator.
+- [x] Wired a real production checker into `orchestrator.main()`
+      (`default_kalman_trend_checker`: independent DAILY walk-forward edge gate on
+      cached NIFTY closes; v1 single-index proxy, multi-symbol = future refinement).
+      Dry-run path stays checker-less (no data access offline). +1 test → 48 loop
+      tests pass; ruff clean. Dry-run CLI smoke green (risk=ok wired).
+- [x] Full repo suite: 989 passed, 1 FAILED. The failure
+      (`test_backtest.py::...test_minute_resolution_collapses_ticks`) is
+      PRE-EXISTING and UNRELATED: it reads captured tape data whose timestamps are
+      degenerate (all `1970-01-01 05:30:00`, epoch 0) so 1min/5min resampling
+      collapse to the same 166 rows — a data condition, not code. This work edits
+      NO existing source (additive only) and nothing it adds is imported by
+      test_backtest.py. All 48 loop_engine tests pass; ruff clean.
+- [ ] HOST SMOKE-TEST (operator — needs a cached Kite session; cannot run in CI):
+      0. Deploy current code to /opt and `systemctl daemon-reload`.
+      1. Disable the old unit: `sudo systemctl disable --now kalman-trend-paper.timer`.
+      2. Enable new: `sudo systemctl enable --now loop-kalman-trend.timer
+         loop-kalman-trend-risk.timer`.
+      3. Manual one-shot during market hours (REUSE the cached session — do NOT
+         fresh-login while the live pair runner is active, see no-auth-while-live):
+         `sudo systemctl start loop-kalman-trend.service` and watch
+         `journalctl -fu loop-kalman-trend.service` for: read-first goal+top-lesson
+         log → intraday A/B session → "CHECK REJECT/PASS" verdict → "session done".
+      4. Confirm `state/kalman_trend/STATE.md` Last-run updated (checker/risk fields)
+         and a transition lesson appended on the FIRST real verdict (then silent).
+      5. Confirm `loop-kalman-trend-risk.service` logs "equity/peak/dd" lines; to
+         test the kill switch, lower kill_switch_drawdown_rupees in SKILL.md and
+         watch HALT_NEW_ENTRIES get touched + a RISK KILL lesson appended.
+      NOTE: STATE.md is RUNTIME memory (mutated each session); the committed file
+      is only the seed template. read_state tolerates a missing/empty file.
+
+### Phase 6 — LATER (gated, not in first cut)
+- [ ] Verification-debt recalibration audit (LLM judgment over STATE.md outcomes)
+- [ ] Generalize the orchestrator/checker/memory to other strategies via template
+
+## Status
+Paper-only scope + LLM-out-of-hot-path CONFIRMED by user 2026-06-28.
+Phase 0 DONE (memory layer + seed files + tests). Next: Phase 1 (orchestrator
+skeleton wrapping the kalman-trend runner). PDF saved to scratchpad.
+
+---
+
 # Kalman-Filter Trend-Following System (PLAN, 2026-06-27)
 
 New, independent single-instrument trend follower from Benhamou, "Kalman filter
