@@ -31,18 +31,26 @@ import optimize_kalman_trend as o
 from validate_kalman_trend import TICK_SIZE, load_daily_closes
 
 
+def _nan_median(xs) -> float:
+    """Median ignoring NaN; NaN if every entry is NaN (no all-NaN warning)."""
+    xs = np.asarray(xs, float)
+    return float(np.nanmedian(xs)) if np.any(np.isfinite(xs)) else float("nan")
+
+
 def _pooled_sharpe(pnl: np.ndarray) -> float:
+    """Annualized Sharpe of a pooled daily-P&L series, NaN when undefined (no
+    variation, e.g. nothing traded) — same contract as optimize._sharpe so the
+    two harnesses agree on the degenerate case instead of one saying 0.0 and the
+    other -10.0."""
     sd = float(np.std(pnl))
-    return float(np.mean(pnl) / sd * np.sqrt(o.TRADING_DAYS)) if sd > 0 else 0.0
+    return float(np.mean(pnl) / sd * np.sqrt(o.TRADING_DAYS)) if sd > 0 else float("nan")
 
 
-def _fold_oos(closes, a, b, c, *, kind, params, cost) -> np.ndarray:
-    """OOS daily P&L on the test slice [b:c]; the signal is warmed up from the
+def _fold_oos(closes, a, b, c, *, kind, params, cost) -> o.SimResult:
+    """OOS SimResult on the test slice [b:c]; the signal is warmed up from the
     train start a (params were fit on [a:b] only — causal, no look-ahead).
-
-    Returns the daily-P&L ARRAY (not a per-window Sharpe): on a 20-bar window a
-    per-window Sharpe is dominated by the no-trade penalty, so we POOL the daily
-    P&L across folds and take one Sharpe on the concatenation instead."""
+    Returns the full SimResult (daily P&L + n_trades) so the caller can both
+    pool the P&L and require a real trade count for the verdict."""
     seg = closes[a:c]
     if kind == "kalman":
         direction = o.kalman_direction(seg, params["filter_params"],
@@ -53,7 +61,7 @@ def _fold_oos(closes, a, b, c, *, kind, params, cost) -> np.ndarray:
     test_dir = direction[b - a:]
     return o.simulate(closes[b:c], test_dir, stop_ticks=params["stop_ticks"],
                       target_ticks=params["target_ticks"], tick_size=TICK_SIZE,
-                      cost_per_unit=cost).daily_pnl
+                      cost_per_unit=cost)
 
 
 def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: int,
@@ -63,38 +71,59 @@ def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: i
     if not starts:
         raise ValueError(f"{symbol}: {n} bars too short for train {train_len} + "
                          f"test {test_len}")
-    kal_pool, ma_pool, wins = [], [], 0
-    for a in starts:
-        b, c = a + train_len, a + train_len + test_len
-        train = closes[a:b]
-        # average the OOS daily P&L over seeds (each seed = one fitted strategy)
-        kal_fold = np.zeros(c - b)
-        ma_fold = np.zeros(c - b)
-        for seed in seeds:
+    # Per-SEED pooled Sharpe, then median over seeds (NOT an element-wise average
+    # of seed P&L streams — averaging ~uncorrelated streams shrinks std ~1/√N and
+    # inflates Sharpe ~√N, asymmetrically between the books). Mirrors the
+    # per-seed-then-median basis validate_kalman_trend uses.
+    seed_kal_sharpe, seed_ma_sharpe = [], []
+    fold_wins = 0
+    n_pairs = 0
+    kal_trades_total = 0
+    oos_days = 0
+    kal_pnl_total = ma_pnl_total = 0.0
+    for seed in seeds:
+        kal_pnls, ma_pnls = [], []
+        for a in starts:
+            b, c = a + train_len, a + train_len + test_len
+            train = closes[a:b]
             kp = o.fit_kalman_reduced(train, tick_size=TICK_SIZE, cost_per_unit=cost,
                                       n_gen=n_gen, seed=seed)
             mp = o.fit_ma_crossover(train, tick_size=TICK_SIZE, cost_per_unit=cost,
                                     n_gen=n_gen, seed=seed)
-            kal_fold += _fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost)
-            ma_fold += _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost)
-        kal_fold /= len(seeds)
-        ma_fold /= len(seeds)
-        wins += int(kal_fold.sum() >= ma_fold.sum())   # per-fold total OOS P&L
-        kal_pool.append(kal_fold)
-        ma_pool.append(ma_fold)
+            kr = _fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost)
+            mr = _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost)
+            kal_pnls.append(kr.daily_pnl)
+            ma_pnls.append(mr.daily_pnl)
+            # a fold-win requires Kalman to STRICTLY out-P&L MA (a no-trade tie,
+            # 0 > 0, is False → not a win).
+            fold_wins += int(kr.daily_pnl.sum() > mr.daily_pnl.sum())
+            n_pairs += 1
+            kal_trades_total += kr.n_trades
+            kal_pnl_total += float(kr.daily_pnl.sum())
+            ma_pnl_total += float(mr.daily_pnl.sum())
+        seed_kal_sharpe.append(_pooled_sharpe(np.concatenate(kal_pnls)))
+        seed_ma_sharpe.append(_pooled_sharpe(np.concatenate(ma_pnls)))
+        oos_days = len(np.concatenate(kal_pnls))
 
-    kal_pool = np.concatenate(kal_pool)
-    ma_pool = np.concatenate(ma_pool)
-    n_folds = len(starts)
-    kal_sharpe = _pooled_sharpe(kal_pool)
-    ma_sharpe = _pooled_sharpe(ma_pool)
+    kal_sharpe = _nan_median(seed_kal_sharpe)
+    ma_sharpe = _nan_median(seed_ma_sharpe)
+    fold_win_rate = fold_wins / n_pairs
+    # PASS requires: Kalman actually traded enough to mean something, a finite
+    # median Sharpe, a STRICT win over MA, and a majority of fold-wins. A
+    # degenerate no-trade run (NaN Sharpe / 0 wins) can no longer PASS.
+    passed = (kal_trades_total >= o.MIN_VERDICT_TRADES
+              and np.isfinite(kal_sharpe)
+              and (not np.isfinite(ma_sharpe) or kal_sharpe > ma_sharpe)
+              and fold_win_rate > 0.5)
     return {
-        "symbol": symbol, "n_bars": n, "n_folds": n_folds,
-        "oos_days": len(kal_pool),
+        "symbol": symbol, "n_bars": n, "n_folds": len(starts),
+        "oos_days": oos_days,
         "kal_pooled_sharpe": kal_sharpe, "ma_pooled_sharpe": ma_sharpe,
-        "kal_pooled_pnl": float(kal_pool.sum()), "ma_pooled_pnl": float(ma_pool.sum()),
-        "fold_win_rate": wins / n_folds,
-        "passed": kal_sharpe >= ma_sharpe and wins / n_folds >= 0.5,
+        "kal_pooled_pnl": round(kal_pnl_total / len(seeds), 2),
+        "ma_pooled_pnl": round(ma_pnl_total / len(seeds), 2),
+        "kal_trades": kal_trades_total,
+        "fold_win_rate": fold_win_rate,
+        "passed": bool(passed),
     }
 
 

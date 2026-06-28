@@ -32,23 +32,38 @@ import numpy as np
 from strategies.kalman_trend import KalmanTrendFilter
 
 TRADING_DAYS = 252
+# Bars to let the filter/MA converge before trading. MUST match
+# IntradayTrendStrategy.warmup_bars so the backtest optimizes the SAME rule the
+# live paper book trades (else the fit books phantom entries the runner skips).
+WARMUP_BARS = 5
+# Minimum trades for a verdict to mean anything — below this the OOS Sharpe is
+# one-trade noise and "Kalman beats MA" is not a real claim.
+MIN_VERDICT_TRADES = 3
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Signals (causal — decided at close t from observations ≤ t)
 # ──────────────────────────────────────────────────────────────────────────
-def kalman_direction(prices, p, *, model: int, mu: float) -> np.ndarray:
+def kalman_direction(prices, p, *, model: int, mu: float,
+                     warmup: int = WARMUP_BARS) -> np.ndarray:
     """Algorithm 4: +1/-1/0 per bar from the Kalman one-step forecast vs the
     current close with a dead-band µ. The forecast returned by update(close_t)
     is H x_{t+1|t} (uses data ≤ t), compared against close_t — strictly causal.
 
+    The first `warmup` bars produce NO signal (the filter still updates) — this
+    matches IntradayTrendStrategy.warmup_bars so the fit and the live book trade
+    the same rule, and avoids the t=0 transient where prediction == price and a
+    µ=0 dead-band would book a phantom entry.
+
     Raises (ValueError/NotImplementedError) if the filter params diverge, so the
-    optimizer can assign bad fitness and steer away (finding #2 in the plan)."""
+    optimizer can assign bad fitness and steer away."""
     prices = np.asarray(prices, float)
     filt = KalmanTrendFilter.from_params(p, model=model, init_price=float(prices[0]))
     direction = np.zeros(len(prices))
     for t, c in enumerate(prices):
         step = filt.update(float(c))      # forecast of close_{t+1}, data ≤ t
+        if t < warmup:
+            continue
         if step.prediction >= c + mu:
             direction[t] = 1.0
         elif step.prediction <= c - mu:
@@ -56,10 +71,12 @@ def kalman_direction(prices, p, *, model: int, mu: float) -> np.ndarray:
     return direction
 
 
-def ma_direction(prices, *, short: int, long: int, offset: float) -> np.ndarray:
+def ma_direction(prices, *, short: int, long: int, offset: float,
+                 warmup: int = WARMUP_BARS) -> np.ndarray:
     """Algorithm 5: SMA(short) vs SMA(long) crossover with a dead-band offset.
-    Causal — each SMA at t uses closes ≤ t. Bars before the long window is full
-    produce no signal (0)."""
+    Causal — each SMA at t uses closes ≤ t. No signal until BOTH the long window
+    is full and `warmup` bars have passed (parity with the live book, where the
+    long window dominates so warmup is usually inert)."""
     prices = np.asarray(prices, float)
     short, long = int(round(short)), int(round(long))
     if short < 1 or long < 1:
@@ -67,7 +84,7 @@ def ma_direction(prices, *, short: int, long: int, offset: float) -> np.ndarray:
     n = len(prices)
     direction = np.zeros(n)
     for t in range(n):
-        if t + 1 < long:
+        if t + 1 < long or t < warmup:
             continue
         sma_s = prices[t - short + 1:t + 1].mean()
         sma_l = prices[t - long + 1:t + 1].mean()
@@ -148,14 +165,17 @@ def simulate(
 
 
 def _sharpe(daily_pnl: np.ndarray, n_trades: int) -> float:
-    """Annualized Sharpe of the daily P&L. Returns a strongly negative value for
-    degenerate cases (no variation / too few trades) so the optimizer avoids
-    no-trade corners."""
-    if n_trades < 2:
-        return -10.0
+    """Annualized Sharpe of the daily P&L, or NaN when undefined (no trades / no
+    variation). NaN — not a magic -10.0 — so 'no edge to measure' is distinct
+    from 'a measured, terrible Sharpe' (a real -9 strategy used to collide with
+    the old sentinel). Callers: the optimizer maps NaN→worst fitness (run_cmaes
+    handles non-finite); the verdicts treat NaN as 'did not beat' (a NaN never
+    satisfies `>` against a finite value)."""
+    if n_trades < 1:
+        return float("nan")
     sd = float(np.std(daily_pnl))
     if not (sd > 0):
-        return -10.0
+        return float("nan")
     return float(np.mean(daily_pnl) / sd * np.sqrt(TRADING_DAYS))
 
 

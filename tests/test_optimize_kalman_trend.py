@@ -123,6 +123,28 @@ def test_fit_kalman_rejects_unstable_models():
         o.fit_kalman_trend(100 + np.arange(50.0), model=3)
 
 
+def test_kalman_direction_warmup_matches_live():
+    """kalman_direction must suppress signals for the first `warmup` bars so the
+    backtest/fit trade the SAME rule as the live IntradayTrendStrategy (which
+    skips warmup_bars entries) — otherwise the fit books phantom early entries
+    the runner never takes."""
+    prices = 100 + 0.8 * np.arange(60)
+    d = o.kalman_direction(prices, [0.5, 0.0, 0.05, 1.0, 50.0], model=1, mu=0.0,
+                           warmup=10)
+    assert (d[:10] == 0).all()
+    assert d[10:].sum() > 0
+    # default warmup is the shared WARMUP_BARS constant, not 0
+    d0 = o.kalman_direction(prices, [0.5, 0.0, 0.05, 1.0, 50.0], model=1, mu=0.0)
+    assert (d0[:o.WARMUP_BARS] == 0).all()
+
+
+def test_sharpe_is_nan_not_sentinel_when_undefined():
+    """No-trade / no-variation Sharpe is NaN (undefined), not a magic -10.0 that
+    a genuinely-bad -9 strategy could collide with."""
+    assert np.isnan(o._sharpe(np.zeros(10), n_trades=0))
+    assert np.isnan(o._sharpe(np.zeros(10), n_trades=5))   # traded but flat
+
+
 def test_reduced_fit_is_smaller_and_model2_and_evaluable():
     """The reduced fit (Option B) must expose ONE filter knob on model 2 and
     round-trip through evaluate() — fewer params is the whole anti-overfit point,

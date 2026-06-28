@@ -126,10 +126,22 @@ class IntradayTrendStrategy:
         """EOD / kill-switch close at `price` (no stop/target level)."""
         return self._close(price, "force_close") if self.pos != 0 else None
 
+    def on_session_start(self) -> None:
+        """Call at each new trading day before the first bar. The intraday filter
+        is fed bars concatenated across days, so the ~18h overnight gap would
+        otherwise be absorbed as one 5-min step (a spurious velocity spike → a
+        false signal at the open). Inflating the filter's covariance lets the
+        first bar correct the level via a high gain instead. (No-op for the MA
+        engine, whose window self-gates.)"""
+        if self._filter is not None:
+            self._filter.inflate_uncertainty()
+
     # ── signal + entry, once per completed signal bar ─────────────────
-    def on_bar(self, price: float) -> dict:
+    def on_bar(self, price: float, *, allow_entry: bool = True) -> dict:
         """Advance one signal bar: check stop/target at this bar, update the
-        signal engine causally, and enter if flat. Returns an event dict."""
+        signal engine causally, and enter if flat. `allow_entry=False` (e.g. the
+        HALT_NEW_ENTRIES kill switch) still updates the signal and manages exits
+        but opens no new position. Returns an event dict."""
         if not np.isfinite(price):
             raise ValueError(f"non-finite price {price}")
         exit_rec = self.check_exit(price)
@@ -137,7 +149,8 @@ class IntradayTrendStrategy:
         self.n_bars += 1
 
         entered = None
-        if (self.pos == 0 and direction != 0 and self.n_bars > self.warmup_bars
+        if (allow_entry and self.pos == 0 and direction != 0
+                and self.n_bars > self.warmup_bars
                 and (self.allow_short or direction > 0)):
             self.pos = direction
             self.entry_price = price

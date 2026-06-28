@@ -149,6 +149,41 @@ def test_serialize_restore_is_identity_through_subsequent_bars():
     assert restored.realized_points == pytest.approx(s.realized_points)
 
 
+def test_allow_entry_false_blocks_new_entry_but_still_exits():
+    """HALT_NEW_ENTRIES path: allow_entry=False must open no new position but
+    still manage an existing one to its stop/target."""
+    s = _kal(stop_ticks=10, target_ticks=40)
+    for p in 100 + 0.5 * np.arange(30):       # would normally go long
+        s.on_bar(float(p), allow_entry=False)
+    assert s.pos == 0 and s.trades == []      # entries blocked
+    # open with entries allowed, then verify a blocked bar still exits
+    s2 = _kal(stop_ticks=10, target_ticks=40)
+    for p in 100 + 0.5 * np.arange(30):
+        s2.on_bar(float(p))
+    assert s2.pos == 1
+    ev = s2.on_bar(float(s2.stop_price - 1.0), allow_entry=False)
+    assert ev["exit"] is not None and s2.pos == 0
+
+
+def test_on_session_start_inflates_filter_uncertainty():
+    """Overnight-gap mitigation: a new session inflates the filter covariance so
+    the gap is absorbed via a high gain, not read as one bar of velocity."""
+    s = _kal()
+    for p in 100 + 0.5 * np.arange(20):
+        s.on_bar(float(p))
+    P_before = s._filter.P.copy()
+    s.on_session_start()
+    assert s._filter.P.max() > P_before.max()
+
+
+def test_on_session_start_noop_for_ma():
+    s = IntradayTrendStrategy(signal_kind="ma", short=3, long=8, offset=0.0,
+                              stop_ticks=20, target_ticks=40)
+    for p in 100 + 0.4 * np.arange(20):
+        s.on_bar(float(p))
+    s.on_session_start()                       # must not raise (no filter)
+
+
 def test_ma_serialize_restore_identity():
     s = IntradayTrendStrategy(signal_kind="ma", short=3, long=8, offset=0.0,
                               stop_ticks=20, target_ticks=40)

@@ -188,6 +188,35 @@ def test_from_params_validation():
         KalmanTrendFilter.from_params(p, model=4, init_price=100.0)
 
 
+def test_inflate_uncertainty_scales_P():
+    f = _model1_filter(100.0)
+    f.update(100.0)
+    f.update(101.0)
+    P0 = f.P.copy()
+    f.inflate_uncertainty(100.0)
+    assert np.allclose(f.P, P0 * 100.0)
+
+
+def test_deserialize_repairs_tiny_psd_drift():
+    """The short-form covariance update can drift slightly indefinite over a long
+    session; restart must repair tiny drift, not crash."""
+    f = _model1_filter(100.0)
+    f.update(100.0)
+    blob = f.serialize()
+    blob["P"] = [[1.0, 0.0], [0.0, -1e-9]]      # drifted just below the PSD floor
+    g = KalmanTrendFilter.deserialize(blob)     # must NOT raise (repaired)
+    assert np.isfinite(g.update(101.0).prediction)
+
+
+def test_deserialize_still_rejects_real_corruption():
+    f = _model1_filter(100.0)
+    f.update(100.0)
+    blob = f.serialize()
+    blob["P"] = [[1.0, 0.0], [0.0, -5.0]]       # genuine corruption, not drift
+    with pytest.raises(ValueError, match="PSD"):
+        KalmanTrendFilter.deserialize(blob)
+
+
 def test_model4_zero_control_equals_model3():
     """model 4 with p12..p15 == 0 must behave exactly like model 3 (its optimum
     drives the control term to zero — Table 2). Uses benign, stable params: the

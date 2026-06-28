@@ -96,6 +96,23 @@ def _check_psd(M: np.ndarray, name: str) -> None:
         raise ValueError(f"{name} is not PSD (min eigenvalue {w.min():.3e}):\n{M}")
 
 
+# Tolerance below which a negative eigenvalue is treated as float drift to be
+# repaired (the short-form covariance update loses PSD-ness by ~1e-9 over a long
+# session); anything more negative is genuine corruption and is left to fail loud.
+_PSD_REPAIR_TOL = -1e-6
+
+
+def _repair_psd(M: np.ndarray) -> np.ndarray:
+    """Symmetrize and clamp TINY negative eigenvalues (drift) to 0; pass real
+    corruption through unchanged so the constructor's _check_psd still rejects it."""
+    M = 0.5 * (M + M.T)
+    w, V = np.linalg.eigh(M)
+    if _PSD_REPAIR_TOL <= w.min() < 0.0:
+        M = (V * np.clip(w, 0.0, None)) @ V.T
+        M = 0.5 * (M + M.T)
+    return M
+
+
 class KalmanTrendFilter:
     """Online Kalman filter tracking (position, velocity) of one price series.
 
@@ -259,6 +276,16 @@ class KalmanTrendFilter:
             std_innovation=std_innov,
         )
 
+    def inflate_uncertainty(self, factor: float = 100.0) -> None:
+        """Scale up the predicted state covariance P — call across a discontinuity
+        (e.g. an overnight gap for an intraday filter) so the next observation
+        gets a high Kalman gain and the jump is absorbed into the level instead
+        of being read as one bar of velocity. `factor` controls how much trust to
+        drop; the covariance is re-symmetrized to stay clean."""
+        if not (np.isfinite(factor) and factor > 0):
+            raise ValueError(f"inflate factor must be finite and > 0, got {factor}")
+        self.P = 0.5 * (self.P + self.P.T) * factor
+
     # ──────────────────────────────────────────────────────────────────
     # State serialization (for runner restart — needs the FULL state, not
     # just the level, or restarting resets the filter's uncertainty).
@@ -284,7 +311,11 @@ class KalmanTrendFilter:
             Q=np.asarray(blob["Q"], float),
             R=float(blob["R"]),
             x0=np.asarray(blob["x"], float),
-            P0=np.asarray(blob["P"], float),
+            # Repair tiny PSD drift accumulated by the short-form covariance
+            # update over a long session, so restart-from-state doesn't crash on
+            # a P that drifted to e.g. min-eig -3e-9 (genuine corruption still
+            # fails loud via the constructor's _check_psd).
+            P0=_repair_psd(np.asarray(blob["P"], float)),
             c=np.asarray(blob.get("c", [0.0, 0.0]), float),
             model=blob.get("model"),
         )

@@ -23,7 +23,19 @@ def test_pooled_sharpe_matches_manual():
     pnl = np.array([1.0, -0.5, 2.0, 0.0, 1.5, -1.0])
     expect = pnl.mean() / pnl.std() * np.sqrt(252)
     assert b._pooled_sharpe(pnl) == expect
-    assert b._pooled_sharpe(np.zeros(5)) == 0.0   # no variation → 0, not NaN/inf
+    # zero-variance (e.g. nothing traded) is UNDEFINED → NaN, not 0.0. Returning
+    # 0.0 made a no-trade run tie 0>=0 and falsely PASS the gate; NaN can't.
+    assert np.isnan(b._pooled_sharpe(np.zeros(5)))
+
+
+def test_no_trade_walkforward_does_not_falsely_pass():
+    """A flat series where nothing trades must NOT report PASS. Previously both
+    books pooled all-zero P&L → 0>=0 and 100% fold-win → false GO (Rule 12)."""
+    flat = np.full(900, 100.0)        # zero variation → no trades, no signal
+    r = b.walk_forward("FLAT", flat, train_len=200, test_len=60, step=60,
+                       seeds=[0], n_gen=10, cost=1.0)
+    assert r["kal_trades"] == 0
+    assert r["passed"] is False
 
 
 def test_walk_forward_scores_only_nonoverlapping_test_windows():

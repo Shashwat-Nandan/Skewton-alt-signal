@@ -38,6 +38,7 @@ from strategies.kalman_trend_following import IntradayTrendStrategy
 
 DATA_CACHE = Path("data_cache")
 STATE_PATH = DATA_CACHE / "kalman_trend_runner_state.json"
+SILENT_FAIL_PATH = DATA_CACHE / "SILENT_FAIL_kalman_trend"
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 LOT_SIZE = {"NIFTY": 75, "BANKNIFTY": 15}   # ₹/point/lot (front-month future)
 BAR_SECONDS = 300                            # 5-min signal bars
@@ -83,9 +84,13 @@ class InstrumentBooks:
         self.kalman.check_exit(price)
         self.ma.check_exit(price)
 
-    def on_bar(self, close: float) -> None:
-        self.kalman.on_bar(close)
-        self.ma.on_bar(close)
+    def on_bar(self, close: float, *, allow_entry: bool = True) -> None:
+        self.kalman.on_bar(close, allow_entry=allow_entry)
+        self.ma.on_bar(close, allow_entry=allow_entry)
+
+    def on_session_start(self) -> None:
+        self.kalman.on_session_start()
+        self.ma.on_session_start()
 
     def eod_close(self, price: float) -> None:
         self.kalman.force_close(price)
@@ -178,6 +183,7 @@ def main() -> int:  # pragma: no cover
 
     from kite_auth import KiteAuthManager
     from runner_common import (
+        SILENT_FAIL_THRESHOLD,
         HeartbeatTracker,
         acquire_lock,
         assert_timezone_ist,
@@ -207,10 +213,12 @@ def main() -> int:  # pragma: no cover
     kite = KiteAuthManager("config.ini").get_kite()          # reuse cached session
     nfo = kite.instruments("NFO")
 
-    from fetch_index_daily import resolve_index_token
-    from runner_common import HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH  # noqa: F401
+    from runner_common import HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH
 
-    # Resolve front-month future per symbol + warmup-fit on recent 5-min history.
+    # Resolve front-month future per symbol + warmup-fit on recent 5-min history
+    # OF THE FUTURE WE TRADE (not the spot index — the future carries a basis and
+    # a different move scale, and the fitted stop/target/µ + filter noise are all
+    # scaled to the series they were fit on).
     prior = load_state()
     books: List[InstrumentBooks] = []
     tradesym: Dict[str, str] = {}
@@ -224,15 +232,16 @@ def main() -> int:  # pragma: no cover
             books.append(InstrumentBooks.restore(prior[sym]))
             logger.info("%s: restored books from prior state", sym)
             continue
-        idx_token = resolve_index_token(kite, sym, None)
-        hist = kite.historical_data(idx_token, _days_ago(40), today, "5minute")
+        hist = kite.historical_data(int(fut["instrument_token"]),
+                                    _days_ago(40), today, "5minute")
         prices = np.array([float(c["close"]) for c in hist], float)
         if len(prices) < 300:
-            logger.warning("%s: only %d warmup bars — skipping", sym, len(prices))
+            logger.warning("%s: only %d warmup bars on the future — skipping",
+                           sym, len(prices))
             continue
         kal_p, ma_p = fit_params(prices[-1500:])
         books.append(build_books(sym, kal_p, ma_p))
-        logger.info("%s: warmup-fit on %d bars (kal stop/tgt %.0f/%.0f, "
+        logger.info("%s: warmup-fit on %d future bars (kal stop/tgt %.0f/%.0f, "
                     "ma %d/%d)", sym, len(prices), kal_p["stop_ticks"],
                     kal_p["target_ticks"], ma_p["short"], ma_p["long"])
 
@@ -241,26 +250,45 @@ def main() -> int:  # pragma: no cover
         return 1
 
     agg = {b.symbol: BarAggregator(BAR_SECONDS) for b in books}
-    heartbeat = HeartbeatTracker(logger)
+    heartbeat = HeartbeatTracker(SILENT_FAIL_THRESHOLD, SILENT_FAIL_PATH, logger)
+    session_day = today        # for overnight-gap detection across midnight runs
     open_t = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
     close_t = datetime.now().replace(hour=15, minute=25, second=0, microsecond=0)
     sleep_until(open_t, logger)
 
+    silent_dead = False
     while datetime.now() < close_t:
         if HALT_ALL_PATH.exists():
             logger.warning("HALT_ALL — force-closing and exiting.")
             break
+        # new trading day across a long-lived process → inflate filter uncertainty
+        # so the overnight gap isn't read as one bar of velocity.
+        d_now = date.today()
+        if d_now != session_day:
+            for b in books:
+                b.on_session_start()
+            session_day = d_now
+        allow_entry = not HALT_NEW_ENTRIES_PATH.exists()
         now = time.time()
+        ran = errored = 0
         for b in books:
+            ran += 1
             px = _last_price(kite, tradesym[b.symbol])
             if px is None:
+                errored += 1            # surfaced via the heartbeat below
                 continue
             b.on_price(px)                       # intraday stop/target
             closed = agg[b.symbol].add(now, px)  # roll a 5-min bar?
             if closed is not None:
-                b.on_bar(closed)                 # signal + entry on the new bar
+                b.on_bar(closed, allow_entry=allow_entry)
         write_state(books)
-        heartbeat.beat()
+        # Loud-failure detector: if every book's quote fails for SILENT_FAIL
+        # consecutive ticks (token expiry / API down), break and exit non-zero
+        # instead of a silent no-trade session reporting success.
+        if heartbeat.record_tick(ran, errored):
+            logger.error("Silent-fail threshold hit (all quotes failing) — exiting.")
+            silent_dead = True
+            break
         time.sleep(30)
 
     # EOD: force-close both books at the last price and write the A/B sidecar.
@@ -274,7 +302,7 @@ def main() -> int:  # pragma: no cover
     logger.info("EOD A/B: kalman ₹%.0f vs ma ₹%.0f (Δ %.0f) → %s",
                 rep["total_kalman_rupees"], rep["total_ma_rupees"],
                 rep["kalman_minus_ma_rupees"], path.name)
-    return 0
+    return 1 if silent_dead else 0
 
 
 def _days_ago(n: int) -> date:  # pragma: no cover
