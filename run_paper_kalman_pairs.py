@@ -360,7 +360,11 @@ def _expiry_by_tradingsymbol(nfo: List[dict]) -> Dict[str, date]:
                 continue
         elif hasattr(exp, "date"):
             exp = exp.date()
-        if exp is not None:
+        # Only a REAL date lands in the map. A pd.NaT (its .date() is NaT, not a
+        # date) or any other junk is dropped, so a leg with a malformed/empty
+        # expiry shows as OFF the chain → stranded+raised by flatten_expiring_legs
+        # rather than silently mapped to a value that fails `exp <= today`.
+        if isinstance(exp, date):
             out[ts] = exp
     return out
 
@@ -467,6 +471,35 @@ def flatten_expiring_legs(strategies, nfo: List[dict], today: date,
             f"{len(stranded)} pair(s) hold legs that could not be auto-flattened "
             f"on/after expiry: {', '.join(stranded)}. State+EOD are persisted; "
             "runner exits non-zero so notify-failure@ alerts the operator (H18).")
+
+
+def _calendar_days_until_next_trading_day(today: date, holidays: set) -> int:
+    """Calendar days until the next NSE trading day (today excluded), capped at 10
+    (parity with run_paper_pairs)."""
+    d = today
+    for step in range(1, 11):
+        d = d + timedelta(days=1)
+        if d.weekday() < 5 and d not in holidays:
+            return step
+    return 10
+
+
+def warn_if_long_break(strategies, today: date, holidays: set,
+                       log: logging.Logger) -> None:
+    """M-R1 parity: this runner does NOT flatten non-expiring positions at session
+    end, so an open book sits unmonitored across a long weekend / holiday block.
+    Warn when the next trading day is ≥3 calendar days away and any pair is open,
+    so the operator can square off manually before the break."""
+    if not holidays:
+        return
+    gap = _calendar_days_until_next_trading_day(today, holidays)
+    open_pairs = [f"{s.symbol_a}/{s.symbol_b}" for s in strategies
+                  if s.state.position != "FLAT"]
+    if gap >= 3 and open_pairs:
+        log.warning("M-R1: next trading day is %d calendar days away and %d "
+                    "pair(s) hold open positions: %s — they will sit unmonitored "
+                    "across the break; consider squaring off manually.",
+                    gap, len(open_pairs), ", ".join(open_pairs))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -645,6 +678,7 @@ def main() -> int:
         expiry_error = e
         log.exception("expiry flatten could not complete; persisting state+EOD "
                       "before exiting non-zero so the operator is alerted")
+    warn_if_long_break(strategies, today, holidays, log)
     step_filters_on_close(strategies, today, log)
     write_state_file(strategies, log)
     write_eod_sidecar(strategies, today, log)

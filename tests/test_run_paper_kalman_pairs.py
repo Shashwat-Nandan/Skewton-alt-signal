@@ -315,3 +315,61 @@ def test_flatten_strands_rolled_leg_it_cannot_square(tmp_path):
     with pytest.raises(RuntimeError):
         R.flatten_expiring_legs([s], _nfo(), date(2026, 1, 29), R.logger)
     assert s.state.position != "FLAT"  # surfaced for manual square-off, not silent
+
+
+def test_malformed_expiry_strands_leg_not_silently_carried(tmp_path):
+    """A held leg whose NFO row has a junk/empty expiry must NOT silently slip the
+    flatten: _expiry_by_tradingsymbol drops it (not a real date), so it shows as
+    off-chain → stranded+raise, rather than mapping to a value that fails
+    `<= today` and carrying the contract (finding 6)."""
+    import pytest
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    bad = [{"name": "AAA", "instrument_type": "FUT", "tradingsymbol": "AAA26JANFUT",
+            "expiry": "", "lot_size": 50, "instrument_token": 1},          # junk
+           {"name": "BBB", "instrument_type": "FUT", "tradingsymbol": "BBB26JANFUT",
+            "expiry": "2026-01-29", "lot_size": 40, "instrument_token": 3}]
+    with pytest.raises(RuntimeError):
+        R.flatten_expiring_legs([s], bad, date(2026, 1, 29), R.logger)
+    assert s.state.position != "FLAT"
+
+
+def test_expiry_by_tradingsymbol_drops_non_dates():
+    """Map only well-formed expiries; junk/empty strings are dropped (so the leg
+    later reads as off-chain, the safe fail-loud path)."""
+    m = R._expiry_by_tradingsymbol([
+        {"tradingsymbol": "AAA26JANFUT", "expiry": "2026-01-29"},
+        {"tradingsymbol": "BAD1", "expiry": ""},
+        {"tradingsymbol": "BAD2", "expiry": "not-a-date"},
+        {"tradingsymbol": "NOEXP"},
+    ])
+    assert m == {"AAA26JANFUT": date(2026, 1, 29)}
+
+
+def test_warn_if_long_break_warns_on_open_book_before_gap(tmp_path, caplog):
+    """M-R1: an open book before a ≥3-day market break must emit a WARNING (this
+    runner carries non-expiring positions, so they sit unmonitored across it)."""
+    import logging
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    # Fri 2026-01-30, Mon 2026-02-02 is a holiday → next trading day is Tue
+    # 2026-02-03, 4 calendar days away (≥3) with an open book → warn.
+    with caplog.at_level(logging.WARNING, logger="kalman_pairs"):
+        R.warn_if_long_break([s], date(2026, 1, 30), {date(2026, 2, 2)}, R.logger)
+    assert any("M-R1" in r.message for r in caplog.records)
+
+
+def test_warn_if_long_break_silent_when_flat_or_short_gap(tmp_path, caplog):
+    """No false alarm: a flat book, or a normal overnight gap, must not warn."""
+    import logging
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    # (1) Flat book before the same long weekend → no warning.
+    s.state.position = "FLAT"
+    with caplog.at_level(logging.WARNING, logger="kalman_pairs"):
+        R.warn_if_long_break([s], date(2026, 1, 30), {date(2026, 2, 2)}, R.logger)
+    assert not any("M-R1" in r.message for r in caplog.records)
+    caplog.clear()
+    # (2) Open book but only a normal overnight gap (Thu 01-29 → Fri 01-30, gap 1);
+    # holidays non-empty so warn_if_long_break doesn't early-return.
+    s.state.position = "LONG_SPREAD"
+    with caplog.at_level(logging.WARNING, logger="kalman_pairs"):
+        R.warn_if_long_break([s], date(2026, 1, 29), {date(2026, 1, 1)}, R.logger)
+    assert not any("M-R1" in r.message for r in caplog.records)
