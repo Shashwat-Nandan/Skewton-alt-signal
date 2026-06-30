@@ -66,10 +66,13 @@ def test_5min_replay_steps_filter_once_per_day_and_trades_intraday():
     assert np.isfinite(r["net_pnl"])
 
 
-def test_5min_replay_gate_blocks_when_on():
-    """With the ADF gate ON and a deliberately non-stationary day-to-day path, the
-    5-min replay should trade strictly less than with the gate OFF — proving the
-    daily-updated gate actually feeds the intraday entry decision."""
+def test_5min_replay_gate_wired_and_baseline_trades():
+    """The ADF gate must be WIRED into the 5-min entry path: gate-ON never books
+    MORE round trips than gate-OFF. Asserting the gate-OFF baseline actually
+    trades (>0) makes this non-vacuous — without it the test would pass on the
+    on==off==0 trap (a replay that never trades, or a gate that always blocks).
+    Strict blocking on a non-stationary residual is covered at the unit level by
+    test_regime_gate_blocks_entry_on_nonstationary_residual."""
     pa, pb = _cointegrated_daily()
     bars = _intraday_bars(days=6, base_b=float(pb[-1]))
     off = run_replay_5min("PA", "PB", 50, 50, pa, pb, bars, label="momentum",
@@ -77,6 +80,7 @@ def test_5min_replay_gate_blocks_when_on():
     on = run_replay_5min("PA", "PB", 50, 50, pa, pb, bars, label="momentum",
                          model="momentum", alpha=1e-6,
                          config_path=_cfg(adf_gate_p=0.05, adf_gate_window=60))
+    assert off["n_round_trips"] > 0, "gate-OFF baseline must trade, else vacuous"
     assert on["n_round_trips"] <= off["n_round_trips"]
 
 

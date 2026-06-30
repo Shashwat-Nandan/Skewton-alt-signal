@@ -96,6 +96,10 @@ def main():
             "lookback_days": args.lookback_days,
             "max_holding_days": args.max_holding_days, "lots_per_leg": 1,
             "max_leg_notional": args.max_leg_notional, "exit_debounce_ticks": 1,
+            # Gate OFF: this sweep isolates the effect of entry/exit/alpha, so the
+            # always-on strategy default (adf_gate_p=0.05) must NOT confound the
+            # grid — every cell would otherwise also have entries gate-suppressed.
+            "adf_gate_p": 0,
         })
         rows = []
         for (a, b, la, lb, tra, trb, tea, teb, dates) in pairs:

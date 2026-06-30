@@ -68,20 +68,24 @@ def get_cached_kite(config_path: str):
     return auth.kite
 
 
-def front_month_fut_token(kite, symbol: str) -> Optional[Tuple[int, str]]:
-    """Resolve the nearest non-expired NFO front-month future for `symbol`.
-    Returns (instrument_token, tradingsymbol) or None."""
+def front_month_fut_token(nfo_instruments, symbol: str) -> Optional[Tuple[int, str]]:
+    """Resolve the nearest non-expired NFO front-month future for `symbol` from a
+    pre-fetched NFO instrument dump. Returns (instrument_token, tradingsymbol) or
+    None. Takes the dump (not a kite handle) so the caller fetches it ONCE for the
+    whole universe instead of per symbol."""
     today = datetime.now().date()
-    futs = [
-        i for i in kite.instruments("NFO")
-        if i.get("name") == symbol and i.get("instrument_type") == "FUT"
-    ]
-    futs = [f for f in futs if _as_date(f.get("expiry")) and _as_date(f["expiry"]) >= today]
+    futs = []
+    for i in nfo_instruments:
+        if i.get("name") != symbol or i.get("instrument_type") != "FUT":
+            continue
+        exp = _as_date(i.get("expiry"))
+        if exp and exp >= today:
+            futs.append((exp, i))
     if not futs:
         logger.warning("%s: no live NFO future found", symbol)
         return None
-    futs.sort(key=lambda f: _as_date(f["expiry"]))
-    front = futs[0]
+    futs.sort(key=lambda t: t[0])
+    front = futs[0][1]
     return int(front["instrument_token"]), front["tradingsymbol"]
 
 
@@ -98,12 +102,16 @@ def _as_date(v):
         return None
 
 
-def fetch_5min_continuous(kite, token: int, days: int) -> List[dict]:
+def fetch_5min_continuous(kite, token: int, days: int) -> Tuple[List[dict], int]:
     """5-minute CONTINUOUS futures candles over the last `days`, chunked under the
-    Kite 60-day cap. continuous=True roll-stitches across monthly expiries."""
+    Kite 60-day cap. continuous=True roll-stitches across monthly expiries.
+    Returns (candles, n_failed_chunks): a failed chunk leaves a HOLE in the series,
+    so the caller must surface a non-zero failure count rather than treat a partial
+    fetch as complete (Rule 12)."""
     to_d = datetime.now()
     from_d = to_d - timedelta(days=days)
     out: List[dict] = []
+    failed = 0
     cur = from_d
     while cur < to_d:
         chunk_end = min(cur + timedelta(days=KITE_CHUNK_DAYS), to_d)
@@ -116,10 +124,11 @@ def fetch_5min_continuous(kite, token: int, days: int) -> List[dict]:
             logger.warning("fetch failed token=%d %s→%s: %s",
                            token, cur.date(), chunk_end.date(), e)
             candles = []
+            failed += 1
         out.extend(candles)
         time.sleep(KITE_RATE_LIMIT_DELAY)
         cur = chunk_end + timedelta(days=1)
-    return out
+    return out, failed
 
 
 def write_csv(symbol: str, candles: List[dict], out_dir: Path) -> int:
@@ -159,23 +168,35 @@ def main() -> int:
 
     kite = get_cached_kite(args.config)
     out_dir = Path(args.out_dir)
-    ok = skipped = 0
+    # Fetch the NFO instrument master ONCE (it's multi-MB) and resolve every
+    # front-month token from it, rather than re-downloading it per symbol.
+    nfo = kite.instruments("NFO")
+    ok = skipped = partial = 0
     for sym in symbols:
-        resolved = front_month_fut_token(kite, sym)
+        resolved = front_month_fut_token(nfo, sym)
         if not resolved:
             skipped += 1
             continue
         token, tsym = resolved
-        candles = fetch_5min_continuous(kite, token, args.days)
+        candles, failed_chunks = fetch_5min_continuous(kite, token, args.days)
         if not candles:
             logger.warning("%s (%s): no candles returned", sym, tsym)
             skipped += 1
             continue
         n = write_csv(sym, candles, out_dir)
-        logger.info("%s (%s): wrote %d 5-min bars", sym, tsym, n)
-        ok += 1
-    logger.info("Done: %d symbols written, %d skipped → %s", ok, skipped, out_dir)
-    return 0 if ok else 1
+        if failed_chunks:
+            # Fail loud: the CSV has a hole — do NOT report it as a clean write.
+            logger.warning("%s (%s): wrote %d 5-min bars but %d chunk(s) FAILED — "
+                           "CSV is INCOMPLETE; re-run to backfill the gap",
+                           sym, tsym, n, failed_chunks)
+            partial += 1
+        else:
+            logger.info("%s (%s): wrote %d 5-min bars", sym, tsym, n)
+            ok += 1
+    logger.info("Done: %d complete, %d PARTIAL (gaps), %d skipped → %s",
+                ok, partial, skipped, out_dir)
+    # Non-zero exit if anything is incomplete, so a wrapper notices the gaps.
+    return 0 if (ok and not partial and not skipped) else 1
 
 
 if __name__ == "__main__":

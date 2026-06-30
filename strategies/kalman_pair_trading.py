@@ -367,12 +367,24 @@ class KalmanPairStrategy(BaseStrategy):
         recent = self._raw_spread_history[-self.adf_gate_window:]
         if len(recent) < 30:
             self._last_adf_p = None
+            # Fail loud (Rule 12): None → fail-closed → ALL entries blocked. A
+            # short window silently disabling a pair must be visible, not buried
+            # in a per-scan INFO. Fires until the window fills (~30 daily closes).
+            logger.warning(
+                "[%s/%s] regime gate: only %d raw residuals (<30) — fail-closed, "
+                "ALL new entries blocked until the window fills",
+                self.symbol_a, self.symbol_b, len(recent),
+            )
             return
         from statsmodels.tsa.stattools import adfuller
         try:
             self._last_adf_p = float(adfuller(recent, maxlag=1, autolag=None)[1])
-        except Exception:
+        except Exception as e:
             self._last_adf_p = None
+            logger.warning(
+                "[%s/%s] regime gate: ADF failed (%s) — fail-closed, new entries "
+                "blocked this session", self.symbol_a, self.symbol_b, e,
+            )
 
     def _gate_blocks_entry(self) -> bool:
         """True if the regime gate should suppress a new entry. Off when

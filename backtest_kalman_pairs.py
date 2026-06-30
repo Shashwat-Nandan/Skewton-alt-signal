@@ -25,9 +25,15 @@ The go/no-go question (CLAUDE.md Rule 12 — be explicit if the answer is "no"):
 does Kalman produce a more stationary spread AND better net-of-cost P&L than
 static β on Indian F&O pairs? The book's edge is on US ETFs; it may not transfer.
 
+Timeframe (issue #63 — all backtests on 5-min): --timeframe defaults to "5min",
+which replays entry/exit on 5-min bars and needs data_cache/stf_5min/ (populated
+by fetch_5min_stf.py on the host). The legacy daily go/no-go report is still
+available via --timeframe daily and needs no extra data.
+
 Usage:
-    python backtest_kalman_pairs.py
-    python backtest_kalman_pairs.py --top 15 --train-fraction 0.5
+    python backtest_kalman_pairs.py --timeframe daily              # daily report (no host data needed)
+    python backtest_kalman_pairs.py --timeframe daily --top 15 --train-fraction 0.5
+    python backtest_kalman_pairs.py                                # 5-min (needs data_cache/stf_5min/)
     python backtest_kalman_pairs.py --csv-out data_cache/kalman_bt.csv
 """
 from __future__ import annotations
@@ -206,6 +212,7 @@ def run_replay_5min(symbol_a, symbol_b, lot_a, lot_b, train_a, train_b, bars,
     last_ca = last_cb = None
     for _day, day_bars in bars.groupby(bars.index.date):
         n_days += 1
+        day_ca = day_cb = None        # day's last VALID (positive) close
         for tsx, row in day_bars.iterrows():
             ca, cb = float(row[symbol_a]), float(row[symbol_b])
             quote[ts_a], quote[ts_b] = ca, cb
@@ -221,9 +228,17 @@ def run_replay_5min(symbol_a, symbol_b, lot_a, lot_b, train_a, train_b, bars,
                 logger.warning("%s/%s [%s] bar %s failed: %s",
                                symbol_a, symbol_b, label, tsx, ex)
             equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
-            last_ca, last_cb = ca, cb
-        # End of day: advance the Kalman filter on the day's close (D1).
-        spreads.append(strat.step_daily_close(last_ca, last_cb))
+            # Only positive closes are valid (Kite returns 0.0 for halted/illiquid
+            # futures; dropna keeps a 0.0). A 0.0 last bar must not reach
+            # step_daily_close, which raises on non-positive prices (would abort
+            # the whole replay — the "a bad bar must not abort" guarantee).
+            if ca > 0 and cb > 0:
+                day_ca, day_cb = ca, cb
+                last_ca, last_cb = ca, cb
+        # End of day: advance the filter on the day's last VALID close (D1). Skip
+        # days with no valid bar (fully halted) rather than crash.
+        if day_ca is not None:
+            spreads.append(strat.step_daily_close(day_ca, day_cb))
 
     if strat.state.position != "FLAT" and last_ca is not None:
         prices = {symbol_a: last_ca, symbol_b: last_cb}

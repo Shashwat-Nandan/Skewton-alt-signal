@@ -363,6 +363,24 @@ def test_regime_gate_opens_on_stationary_residual():
     assert len(strat.scan_and_propose()) == 2
 
 
+def test_regime_gate_open_via_real_seed_on_cointegrated_data():
+    """Production default is gate ON. A NORMALLY-constructed strategy seeded from
+    cointegrated training (the REAL _seed_spread_history → innovation path, no
+    injection) must leave the gate OPEN — _last_adf_p computable (not None) and
+    entries permitted. Guards the fail-closed deploy risk: if the seeded raw
+    window were unassessable (None → fail-closed), the strategy would silently
+    never trade, and every other entry test disables the gate so none would catch
+    it."""
+    strat, quotes = _make()                 # default _training() is cointegrated
+    strat.adf_gate_p = 0.05                  # production default
+    strat._refresh_regime_adf()              # recompute from the REAL seeded window
+    assert strat._last_adf_p is not None, "seeded window must be assessable, not fail-closed"
+    assert not strat._gate_blocks_entry()
+    pa, pb = _push_z(strat, 3.0)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    assert len(strat.scan_and_propose()) == 2
+
+
 def test_zero_crossing_exit_closes_on_overshoot_past_mean():
     """Exit is entry-side aware (book exit-at-mean, §15.5.1), NOT a symmetric
     |z|≤exit_z band: a LONG entered deep-negative must CLOSE when the spread
