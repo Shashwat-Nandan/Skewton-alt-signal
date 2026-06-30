@@ -373,3 +373,66 @@ def test_warn_if_long_break_silent_when_flat_or_short_gap(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="kalman_pairs"):
         R.warn_if_long_break([s], date(2026, 1, 29), {date(2026, 1, 1)}, R.logger)
     assert not any("M-R1" in r.message for r in caplog.records)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Entry suppression near expiry (issue #70) — don't OPEN a position so close to
+# front-month expiry it has no room to revert; held positions still exit/flatten.
+# (A near-expiry guard, not a max-hold guarantee — see entry_suppressed's note.)
+# ──────────────────────────────────────────────────────────────────
+def test_entry_suppressed_near_front_month_expiry():
+    """NEW entries are suppressed when the front-month future is within the cutoff
+    of expiry; outside the cutoff, on a disabled cutoff, or for an undatable
+    (off-chain) leg they are not. The earlier-expiring leg drives the decision."""
+    class _S:  # plain (id-hashable) stub; entry_suppressed only reads tradingsymbol_a/b
+        def __init__(self, ta, tb):
+            self.symbol_a, self.symbol_b = "AAA", "BBB"
+            self.tradingsymbol_a, self.tradingsymbol_b = ta, tb
+
+    nfo = _nfo()  # AAA26JANFUT/BBB26JANFUT exp 2026-01-29; AAA26FEBFUT exp 02-26
+    es = R.entry_suppressed
+    jan = _S("AAA26JANFUT", "BBB26JANFUT")
+    feb = _S("AAA26FEBFUT", "AAA26FEBFUT")
+    # 2 days before JAN expiry, cutoff 3 → JAN pair suppressed, FEB pair not.
+    sup = es([jan, feb], nfo, date(2026, 1, 27), 3)
+    assert jan in sup and feb not in sup
+    # Exactly `cutoff` days out counts as within → suppressed.
+    assert jan in es([jan], nfo, date(2026, 1, 26), 3)
+    # 4 days out is outside the cutoff → not suppressed.
+    assert jan not in es([jan], nfo, date(2026, 1, 25), 3)
+    # cutoff 0 disables entirely.
+    assert es([jan], nfo, date(2026, 1, 28), 0) == set()
+    # The earlier-expiring leg (JAN) drives a mixed-month pair → suppressed.
+    mixed = _S("AAA26JANFUT", "AAA26FEBFUT")
+    assert mixed in es([mixed], nfo, date(2026, 1, 28), 3)
+    # An off-chain tradingsymbol can't be dated → not suppressed (handled elsewhere).
+    off = _S("X26JANFUT", "Y26JANFUT")
+    assert off not in es([off], nfo, date(2026, 1, 28), 3)
+
+
+def test_tick_one_halt_new_suppresses_entry_but_allows_exit():
+    """The suppression rides the existing halt_new path: with halt_new=True
+    tick_one must NOT scan for entries but MUST still rehedge/exit — that's why
+    entry-suppression is safe for a held near-expiry position (issue #70)."""
+    calls = []
+
+    class _Spy:
+        symbol_a, symbol_b = "AAA", "BBB"
+
+        def scan_and_propose(self):
+            calls.append("scan")
+            return []
+
+        def check_and_rehedge(self):
+            calls.append("rehedge")
+            return []
+
+        def execute_proposals(self, props):
+            calls.append("execute")
+
+    s = _Spy()
+    R.tick_one(s, R.logger, halt_new=True)
+    assert "scan" not in calls and "rehedge" in calls   # entries blocked, exits run
+    calls.clear()
+    R.tick_one(s, R.logger, halt_new=False)
+    assert "scan" in calls and "rehedge" in calls        # both run when not halted

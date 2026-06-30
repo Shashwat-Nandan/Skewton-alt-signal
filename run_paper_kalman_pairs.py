@@ -503,6 +503,43 @@ def warn_if_long_break(strategies, today: date, holidays: set,
 
 
 # ──────────────────────────────────────────────────────────────────
+# Entry suppression near expiry (issue #70)
+# ──────────────────────────────────────────────────────────────────
+# Don't OPEN a new position when the front-month future is within `cutoff_days`
+# of expiry: a trade opened that close to expiry has almost no room to revert
+# before the contract dies and gets expiry-flattened — churn/cost for no edge.
+# NOTE this is a near-expiry guard, NOT a "the trade can complete its max-hold"
+# guarantee: max_holding_days (default 7 TRADING days ≈ 9-11 calendar days) far
+# exceeds the default 3-calendar-day cutoff, so a trade opened 4-10 days out can
+# still be cut short by expiry. Guaranteeing max-hold would need cutoff ≈
+# max_holding_days in calendar days; the small default is a deliberately light
+# touch (operator-tunable via --entry-cutoff-days).
+# We suppress the ENTRY rather than roll the contract — the signal (γ / z-window)
+# is trained on the FRONT-month STF panel (screen_pairs.load_front_month_panel),
+# so trading the next month would measure a next-month quote against a front-month
+# mean/std (calendar-basis contamination). Held positions are untouched:
+# suppression rides the existing `halt_new` path, which blocks scan_and_propose
+# (entries) but still runs check_and_rehedge (exits/rehedge), so an open
+# near-expiry pair keeps exiting and is squared by flatten_expiring_legs.
+def entry_suppressed(strategies, nfo: List[dict], today: date,
+                     cutoff_days: int) -> set:
+    """Set of strategies whose front-month future (the contract they'd enter on)
+    expires within `cutoff_days` calendar days of today — NEW entries suppressed.
+    cutoff_days <= 0 disables. A leg whose contract isn't on the chain is ignored
+    (can't date it); the expiry-flatten path handles already-expired contracts."""
+    if cutoff_days <= 0:
+        return set()
+    expiry_by_ts = _expiry_by_tradingsymbol(nfo)
+    out = set()
+    for s in strategies:
+        exps = [expiry_by_ts.get(s.tradingsymbol_a), expiry_by_ts.get(s.tradingsymbol_b)]
+        exps = [e for e in exps if e is not None]
+        if exps and (min(exps) - today).days <= cutoff_days:
+            out.add(s)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────
 # Tick + halt
 # ──────────────────────────────────────────────────────────────────
 def tick_one(strategy, log: logging.Logger, *, halt_new: bool) -> bool:
@@ -585,6 +622,10 @@ def main() -> int:
     # (ADF p ≤ adf-gate-p) over the last adf-gate-window days. 0 disables it.
     p.add_argument("--adf-gate-p", type=float, default=0.05)
     p.add_argument("--adf-gate-window", type=int, default=60)
+    p.add_argument("--entry-cutoff-days", type=int, default=3,
+                   help="suppress NEW entries when the front-month future is "
+                        "within this many calendar days of expiry (issue #70); "
+                        "0 disables. Held positions still exit/flatten normally.")
     p.add_argument("--candidates", default=str(CANDIDATES_PATH))
     p.add_argument("--force", action="store_true",
                    help="run even on a weekend/holiday (testing)")
@@ -647,6 +688,14 @@ def main() -> int:
         log.info("Sleeping until market open %s", open_ts.strftime("%H:%M"))
         sleep_until(open_ts, log)
 
+    # Entry suppression near front-month expiry (issue #70). Expiries are static
+    # for the session, so resolve the suppressed set once. Held pairs still exit.
+    entry_block = entry_suppressed(strategies, nfo, today, args.entry_cutoff_days)
+    if args.entry_cutoff_days > 0:
+        log.info("Entry cutoff armed: %dd before front-month expiry; suppressed "
+                 "today: %s", args.entry_cutoff_days,
+                 ", ".join(f"{s.symbol_a}/{s.symbol_b}" for s in entry_block) or "none")
+
     heartbeat = HeartbeatTracker(SILENT_FAIL_THRESHOLD, SILENT_FAIL_PATH, log)
     log.info("Entering tick loop (%d pairs) until %s", len(strategies),
              end_ts.strftime("%H:%M"))
@@ -656,7 +705,7 @@ def main() -> int:
         errored = 0
         if not halt_all:
             for s in strategies:
-                if tick_one(s, log, halt_new=halt_new):
+                if tick_one(s, log, halt_new=halt_new or s in entry_block):
                     errored += 1
         ran = 0 if halt_all else len(strategies)
         if heartbeat.record_tick(ran, errored):
