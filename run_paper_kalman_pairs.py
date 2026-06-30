@@ -384,7 +384,10 @@ def legs_expire_on(strategy, expiry_by_ts: Dict[str, date], today: date,
 
 def flatten_one(strategy, log: logging.Logger, reason: str = "EXPIRY") -> None:
     """Force-close an open pair via the strategy's own exit builder (parity with
-    run_paper_pairs.flatten_one). No-op when already flat or quotes are missing."""
+    run_paper_pairs.flatten_one). No-op (logs) when already flat or quotes are
+    missing — the caller MUST re-check the position to surface a flatten that did
+    not complete (a missing quote, a swallowed execution error, or a rolled leg
+    the strategy's fill path can't re-map all leave the book non-FLAT)."""
     label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if strategy.state.position == "FLAT" or not strategy.state.legs:
         return
@@ -413,7 +416,12 @@ def flatten_expiring_legs(strategies, nfo: List[dict], today: date,
         auto-flatten at the last quote.
       • A held leg OFF the chain (already delisted) → cannot be quoted to
         auto-flatten; log CRITICAL and RAISE so the operator squares off
-        manually (the runner persists state+EOD first — see main())."""
+        manually (the runner persists state+EOD first — see main()).
+      • An on-chain leg that flatten_one could NOT square (unquotable, a mid-fill
+        error swallowed by flatten_one, or a rolled leg whose contract no longer
+        matches the strategy's front-month so its fill path can't re-map it) →
+        re-checked and stranded too, so a silent no-op, a half-closed book, or a
+        mis-priced rolled leg never passes as success."""
     open_pairs = [s for s in strategies
                   if s.state.position != "FLAT" and s.state.legs]
     if not open_pairs:
@@ -440,6 +448,17 @@ def flatten_expiring_legs(strategies, nfo: List[dict], today: date,
             if legs_expire_on(s, expiry_by_ts, today, log):
                 log.info("[%s] expiry flatten — leg expires on/before today", label)
                 flatten_one(s, log, reason="EXPIRY")
+                # flatten_one logs-and-returns on an unquotable leg and swallows
+                # execution errors, so a no-op or a HALF-closed book would
+                # otherwise pass silently. Re-verify the pair actually reached
+                # FLAT; if not, strand it so the runner raises (H18) instead of
+                # carrying an open/naked leg into settlement.
+                if s.state.position != "FLAT" or s.state.legs:
+                    log.critical("[%s] expiry flatten did NOT reach FLAT (pos=%s, "
+                                 "%d leg(s) left) — could not square off; OPERATOR "
+                                 "must close manually before settlement.", label,
+                                 s.state.position, len(s.state.legs))
+                    stranded.append(label)
         except Exception as e:
             log.exception("[%s] expiry check/flatten failed: %s", label, e)
             stranded.append(label)

@@ -283,3 +283,35 @@ def test_flatten_expiring_raises_on_empty_nfo_with_open_book(tmp_path):
     s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
     with pytest.raises(RuntimeError):
         R.flatten_expiring_legs([s], [], date(2026, 1, 29), R.logger)
+
+
+def test_flatten_strands_pair_when_leg_unquotable(tmp_path):
+    """Silent-carry guard: if an expiring leg can't be quoted at the close (an
+    illiquid contract returns last_price=0), flatten_one is a no-op — so the
+    runner must re-check the book, find it still open, STRAND it and RAISE rather
+    than exit clean and carry the contract into settlement."""
+    import pytest
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    s._quote_fn = lambda ts: 0.0  # halted/illiquid → rejected as no-quote
+    with pytest.raises(RuntimeError):
+        R.flatten_expiring_legs([s], _nfo(), date(2026, 1, 29), R.logger)
+    assert s.state.position == "LONG_SPREAD"  # left open, surfaced for the operator
+
+
+def test_flatten_strands_rolled_leg_it_cannot_square(tmp_path):
+    """A rolled leg (held contract no longer the front month) must NOT be silently
+    mis-flattened. The strategy's fill path resolves a leg by matching the front-
+    month tradingsymbol, so it can't re-map a rolled leg and the book won't reach
+    FLAT — the re-check must STRAND it (raise) for manual square-off rather than
+    book the exit at the wrong contract's price (finding 3)."""
+    import pytest
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    # Front month rolled to FEB while the open legs still hold the JAN contracts;
+    # both contracts are quotable (so the flatten is attempted, not a no-op).
+    s.tradingsymbol_a, s.tradingsymbol_b = "AAA26FEBFUT", "BBB26FEBFUT"
+    px = {"AAA26JANFUT": 178.0, "BBB26JANFUT": 100.0,
+          "AAA26FEBFUT": 181.0, "BBB26FEBFUT": 102.0}
+    s._quote_fn = lambda ts: px.get(ts)
+    with pytest.raises(RuntimeError):
+        R.flatten_expiring_legs([s], _nfo(), date(2026, 1, 29), R.logger)
+    assert s.state.position != "FLAT"  # surfaced for manual square-off, not silent
