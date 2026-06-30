@@ -325,6 +325,109 @@ def screen_pairs(
     return df
 
 
+def _npd(ya: np.ndarray, yb: np.ndarray) -> float:
+    """Normalized Price Distance (Gatev et al. 2006; Palomar §15.4.1):
+    Σ(p̃_a − p̃_b)² with p̃ = p / p₀. Lower = the two normalized price paths track
+    more closely = a better pairs-trading candidate (the book's cheap prescreen)."""
+    pa = ya / ya[0]
+    pb = yb / yb[0]
+    return float(np.sum((pa - pb) ** 2))
+
+
+def screen_pairs_book(
+    panel: pd.DataFrame,
+    p_threshold: float = 0.05,
+    npd_prescreen_keep: int = 150,
+    min_hedge_ratio: float = 0.1,
+    max_hedge_ratio: float = 10.0,
+    rank_by: str = "npd",
+) -> pd.DataFrame:
+    """Pair selection per Palomar Ch.15 §15.4 — the KALMAN system's selection,
+    deliberately distinct from `screen_pairs`' composite ranking (which the static
+    system uses; left untouched). Three steps, matching the book:
+      1. PRESCREEN by Normalized Price Distance (§15.4.1) — keep the
+         `npd_prescreen_keep` pairs whose normalized price paths track closest.
+         The book uses NPD, not correlation ("it is the cointegration that matters,
+         and not the correlation", p. 411).
+      2. GATE by the cointegration test (Engle–Granger, §15.4.2): keep p<p_threshold.
+      3. RANK by `rank_by`: "npd" (book — price-path proximity) or "composite"
+         (the static system's p-value/half-life/vol score). The A/B showed pure
+         NPD ranking over-trades low-vol pairs on NIFTY, so "composite" keeps the
+         book's NPD DISCOVERY but the vol-aware ranking that beats costs.
+    Output columns match `screen_pairs` (downstream unchanged) plus `npd`;
+    rank_score follows `rank_by` so existing `.sort_values('rank_score')`
+    consumers get the chosen order. See tasks/kalman-pairs-rebase-plan.md."""
+    symbols = panel.columns.tolist()
+    # 1. NPD prescreen over all pairs (cheap), keep the closest-tracking ones.
+    npds = []
+    for a, b in combinations(symbols, 2):
+        ya, yb = panel[a].values, panel[b].values
+        if len(ya) == 0 or ya[0] <= 0 or yb[0] <= 0:
+            continue
+        npds.append((a, b, _npd(ya, yb)))
+    npds.sort(key=lambda t: t[2])
+    candidates = npds[:npd_prescreen_keep]
+    logger.info("screen_pairs_book: NPD prescreen kept %d of %d pairs",
+                len(candidates), len(npds))
+
+    results = []
+    for a0, b0, npd in candidates:
+        # Same Error-Ratio direction choice as screen_pairs (parity).
+        sa, sb = panel[a0].values, panel[b0].values
+        fit_ab, fit_ba = _fit(sa, sb), _fit(sb, sa)
+        if _error_ratio(fit_ab) <= _error_ratio(fit_ba):
+            a, b, fit = a0, b0, fit_ab
+        else:
+            a, b, fit = b0, a0, fit_ba
+        ya, yb = panel[a].values, panel[b].values
+        # 2. Cointegration gate.
+        try:
+            _, p_value, _ = coint(ya, yb)
+        except Exception as e:
+            logger.debug("coint failed for %s/%s: %s", a, b, e)
+            continue
+        if p_value > p_threshold:
+            continue
+        beta = float(fit.params[1])
+        if not min_hedge_ratio <= abs(beta) <= max_hedge_ratio:
+            continue
+        spread = ya - beta * yb
+        spread_mean, spread_std = float(np.mean(spread)), float(np.std(spread))
+        avg_leg_price = (float(np.mean(ya)) + abs(beta) * float(np.mean(yb))) / 2.0
+        if avg_leg_price <= 0:
+            continue
+        latest_spread = float(spread[-1])
+        results.append({
+            "symbol_a": a, "symbol_b": b,
+            "correlation": float(np.corrcoef(ya, yb)[0, 1]),
+            "hedge_ratio": beta, "intercept": float(fit.params[0]),
+            "error_ratio": _error_ratio(fit), "coint_pvalue": float(p_value),
+            "half_life_days": _half_life(spread),
+            "spread_vol_pct": spread_std / avg_leg_price * 100,
+            "spread_mean": spread_mean, "spread_std": spread_std,
+            "latest_spread": latest_spread,
+            "latest_z_score": ((latest_spread - spread_mean) / spread_std
+                               if spread_std > 0 else None),
+            "last_close_a": float(ya[-1]), "last_close_b": float(yb[-1]),
+            "last_data_date": panel.index[-1].strftime("%Y-%m-%d"),
+            "n_obs": len(panel), "npd": npd,
+        })
+    if not results:
+        logger.warning("screen_pairs_book: no pairs passed NPD prescreen + "
+                       "coint p<%.3f", p_threshold)
+        return pd.DataFrame()
+    df = pd.DataFrame(results)
+    if rank_by == "composite":
+        # Same composite as screen_pairs: low p-value + low half-life + high vol.
+        p_rank = df["coint_pvalue"].rank(pct=True)
+        hl_rank = df["half_life_days"].rank(pct=True)
+        vol_rank = (-df["spread_vol_pct"]).rank(pct=True)
+        df["rank_score"] = (p_rank + hl_rank + vol_rank) / 3.0
+    else:
+        df["rank_score"] = df["npd"]            # rank by NPD ascending
+    return df.sort_values("rank_score").reset_index(drop=True)
+
+
 def screen_pairs_persistent(
     panel: pd.DataFrame,
     *,

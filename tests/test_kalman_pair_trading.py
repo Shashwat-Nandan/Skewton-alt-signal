@@ -29,10 +29,12 @@ def _training(n=300, gamma=0.7, mu=5.0, seed=1):
     return pa, pb
 
 
-def _make(quote_a=None, quote_b=None, *, mode="paper", model="basic", **kw):
+def _make(quote_a=None, quote_b=None, *, mode="paper", model="basic",
+          training=None, **kw):
     """Build a strategy with an injected quote_fn. config.ini provides the
-    [kalman_pair_trading] section with max_leg_notional for paper mode."""
-    pa, pb = _training()
+    [kalman_pair_trading] section with max_leg_notional for paper mode.
+    `training` overrides the default cointegrated window (e.g. for gate tests)."""
+    pa, pb = training if training is not None else _training()
     quotes = {"PA_FUT": quote_a, "PB_FUT": quote_b}
     strat = KalmanPairStrategy(
         kite=None, mode=mode,
@@ -60,9 +62,13 @@ def _cap_config(monkeypatch):
             # min_edge_multiplier=0 disables the cost-hurdle so the band/state
             # tests exercise the threshold logic in isolation; the hurdle has
             # its own dedicated test below.
+            # adf_gate_p=0 disables the regime gate so the band/state tests
+            # exercise the threshold logic in isolation; the gate has its own
+            # dedicated tests below.
             "kalman_pair_trading": {"max_leg_notional": "5000000",
                                     "exit_debounce_ticks": "1",
-                                    "min_edge_multiplier": "0"},
+                                    "min_edge_multiplier": "0",
+                                    "adf_gate_p": "0"},
         })
         return []
     monkeypatch.setattr(configparser.ConfigParser, "read", fake_read)
@@ -122,17 +128,18 @@ def test_regime_break_above_max_entry_z_refuses():
 
 def test_full_entry_then_mean_revert_exit_cycle():
     """End-to-end paper cycle: a deep-z entry opens a 2-leg position; when the
-    spread reverts inside exit_z the position closes and books a trade. Verifies
-    state transitions, not just that methods return lists."""
+    spread reverts to the mean (book exit-at-0, exit_z default 0) the position
+    closes and books a trade. Verifies state transitions, not just that methods
+    return lists."""
     strat, quotes = _make()
-    pa, pb = _push_z(strat, 2.5)
+    pa, pb = _push_z(strat, 2.5)        # z≥entry_z → SHORT_SPREAD
     quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
     strat.execute_proposals(strat.scan_and_propose())
-    assert strat.state.position in ("LONG_SPREAD", "SHORT_SPREAD")
+    assert strat.state.position == "SHORT_SPREAD"
     assert len(strat.state.legs) == 2
 
-    # Spread reverts into the exit band → MEAN_REVERT close.
-    pa, pb = _push_z(strat, 0.1)
+    # Spread reverts to/through the mean → MEAN_REVERT close (SHORT unwinds at z≤0).
+    pa, pb = _push_z(strat, -0.2)
     quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
     strat.execute_proposals(strat.check_and_rehedge())
     assert strat.state.position == "FLAT"
@@ -151,7 +158,7 @@ def test_closed_trade_pnl_includes_entry_costs():
     pa, pb = _push_z(strat, 2.5)
     quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
     strat.execute_proposals(strat.scan_and_propose())
-    pa, pb = _push_z(strat, 0.1)
+    pa, pb = _push_z(strat, -0.2)       # revert through the mean → SHORT unwinds
     quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
     strat.execute_proposals(strat.check_and_rehedge())
     assert strat.state.position == "FLAT"
@@ -316,6 +323,63 @@ def test_cost_hurdle_blocks_marginal_entry():
 
     strat.min_edge_multiplier = 0.0          # disabled → same signal fires
     assert len(strat.scan_and_propose()) == 2
+
+
+def test_regime_gate_blocks_entry_on_nonstationary_residual():
+    """The ADF regime gate must suppress entries when the recent RAW residual
+    window is non-stationary (the pair isn't currently reverting) — the lever the
+    s₀-sweep showed dominates the threshold. We drive the gate's contract directly
+    with a random-walk window: a deep-z signal that fires with the gate off must
+    be REFUSED with it on. The gate reads the RAW residual series on purpose;
+    gating the Kalman normalized spread (stationary by construction) is inert.
+    See tasks/kalman-pairs-rebase-plan.md."""
+    strat, quotes = _make()
+    strat.adf_gate_p = 0.05               # enable the gate
+    rng = np.random.default_rng(7)
+    # Unit-root (random walk) raw window → ADF cannot reject → gate closed.
+    strat._raw_spread_history = list(np.cumsum(rng.normal(0, 1.0, 120)))
+    strat._refresh_regime_adf()
+    assert strat._gate_blocks_entry()
+    pa, pb = _push_z(strat, 3.0)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    assert strat.scan_and_propose() == []   # blocked by the regime gate
+
+    strat.adf_gate_p = 0.0                # gate off → the same signal fires
+    assert len(strat.scan_and_propose()) == 2
+
+
+def test_regime_gate_opens_on_stationary_residual():
+    """Mirror of the block test: a stationary (white-noise) raw window means the
+    spread IS reverting, so the gate stays OPEN and a deep-z entry fires. Without
+    this the block test could pass by always blocking."""
+    strat, quotes = _make()
+    strat.adf_gate_p = 0.05
+    rng = np.random.default_rng(7)
+    strat._raw_spread_history = list(rng.normal(0, 1.0, 120))   # stationary
+    strat._refresh_regime_adf()
+    assert not strat._gate_blocks_entry()
+    pa, pb = _push_z(strat, 3.0)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    assert len(strat.scan_and_propose()) == 2
+
+
+def test_zero_crossing_exit_closes_on_overshoot_past_mean():
+    """Exit is entry-side aware (book exit-at-mean, §15.5.1), NOT a symmetric
+    |z|≤exit_z band: a LONG entered deep-negative must CLOSE when the spread
+    overshoots to strongly positive (it has reverted past the mean → take profit),
+    instead of holding a now-reversed position until the far-side stop. A
+    symmetric band would miss the overshoot and ride the reversal into a loss."""
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, -2.5)         # deep negative z → LONG_SPREAD
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.scan_and_propose())
+    assert strat.state.position == "LONG_SPREAD"
+    # Overshoot well past the mean to the opposite side (|z| > exit_z, z > 0).
+    pa, pb = _push_z(strat, 3.0)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.check_and_rehedge())
+    assert strat.state.position == "FLAT"
+    assert strat.state.closed_trades[-1]["exit_reason"] == "MEAN_REVERT"
 
 
 def test_paper_mode_requires_notional_cap(monkeypatch):

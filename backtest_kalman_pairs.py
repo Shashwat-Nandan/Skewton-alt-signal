@@ -46,13 +46,16 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backtest_pairs import load_lot_sizes
-from screen_pairs import NIFTY_50, _half_life, load_front_month_panel, screen_pairs
+from screen_pairs import (
+    NIFTY_50, _half_life, load_front_month_panel, screen_pairs, screen_pairs_book,
+)
 from strategies.kalman_pair_trading import KalmanPairStrategy
 
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./data_cache")
 CANDIDATES_PATH = CACHE_DIR / "pair_candidates.csv"
+STF_5MIN_DIR = CACHE_DIR / "stf_5min"   # per-symbol 5-min CSVs (fetch_5min_stf.py)
 
 # (label, model, alpha). α≈0 is the frozen-γ (static-β) limit.
 CONFIGS = [
@@ -157,6 +160,95 @@ def run_replay(symbol_a, symbol_b, lot_a, lot_b,
     }
 
 
+def load_5min_panel(symbols, directory: Path = STF_5MIN_DIR) -> "pd.DataFrame":
+    """Wide close panel (index=5-min datetime, columns=symbol) from the per-symbol
+    CSVs written by fetch_5min_stf.py. Sorted; per-pair alignment is via dropna."""
+    frames = {}
+    for s in symbols:
+        p = directory / f"{s}.csv"
+        if not p.exists():
+            continue
+        ser = pd.read_csv(p, parse_dates=["date"]).set_index("date")["close"]
+        frames[s] = ser
+    if not frames:
+        return pd.DataFrame()
+    return pd.DataFrame(frames).sort_index()
+
+
+def run_replay_5min(symbol_a, symbol_b, lot_a, lot_b, train_a, train_b, bars,
+                    *, label, model, alpha, config_path) -> Optional[dict]:
+    """5-minute replay (timeframe rule, issue #63). Seeds the filter on the DAILY
+    training window (D1 — the filter still updates once per day), then makes
+    entry/exit decisions on EACH 5-min bar and advances the filter once per day on
+    that day's last bar's close. This mirrors the live runner (intraday decisions
+    against live quotes, daily filter update) — the path the daily backtest never
+    exercised. `bars` is a DataFrame indexed by 5-min datetime, columns
+    [symbol_a, symbol_b]."""
+    ts_a, ts_b = f"{symbol_a}_FUT", f"{symbol_b}_FUT"
+    quote = {ts_a: None, ts_b: None}
+    cur = [bars.index[0].to_pydatetime()]
+    try:
+        strat = KalmanPairStrategy(
+            kite=None, config_path=config_path, mode="paper",
+            symbol_a=symbol_a, symbol_b=symbol_b,
+            tradingsymbol_a=ts_a, tradingsymbol_b=ts_b,
+            lot_size_a=lot_a, lot_size_b=lot_b,
+            training_a=train_a, training_b=train_b, model=model, alpha=alpha,
+            quote_fn=lambda t: quote.get(t),
+            clock=lambda: cur[0],            # the current 5-min bar's timestamp
+        )
+    except ValueError as e:
+        logger.warning("%s/%s [%s] skipped: %s", symbol_a, symbol_b, label, e)
+        return None
+
+    spreads, equity = [], []
+    n_days = 0
+    last_ca = last_cb = None
+    for _day, day_bars in bars.groupby(bars.index.date):
+        n_days += 1
+        for tsx, row in day_bars.iterrows():
+            ca, cb = float(row[symbol_a]), float(row[symbol_b])
+            quote[ts_a], quote[ts_b] = ca, cb
+            cur[0] = tsx.to_pydatetime()
+            try:
+                e = strat.scan_and_propose()
+                if e:
+                    strat.execute_proposals(e)
+                r = strat.check_and_rehedge()
+                if r:
+                    strat.execute_proposals(r)
+            except Exception as ex:        # a bad bar must not abort the replay
+                logger.warning("%s/%s [%s] bar %s failed: %s",
+                               symbol_a, symbol_b, label, tsx, ex)
+            equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
+            last_ca, last_cb = ca, cb
+        # End of day: advance the Kalman filter on the day's close (D1).
+        spreads.append(strat.step_daily_close(last_ca, last_cb))
+
+    if strat.state.position != "FLAT" and last_ca is not None:
+        prices = {symbol_a: last_ca, symbol_b: last_cb}
+        strat._update_unrealized(prices)
+        props = strat._build_exit_proposals("EOD_CLOSE", 0.0, prices)
+        if props:
+            strat.execute_proposals(props)
+        equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
+
+    sp = np.asarray(spreads, dtype=float)
+    return {
+        "pair": f"{symbol_a}/{symbol_b}", "config": label, "n_days": n_days,
+        "n_round_trips": len(strat.state.closed_trades),
+        "net_pnl": strat.state.realized_pnl + strat.state.unrealized_pnl,
+        "costs": strat.state.total_transaction_costs,
+        "gross_pnl": (strat.state.realized_pnl + strat.state.unrealized_pnl
+                      + strat.state.total_transaction_costs),
+        "win_rate_pct": _win_rate(strat.state.closed_trades),
+        "max_drawdown": _max_drawdown(np.asarray(equity)),
+        "spread_var": float(np.var(sp)) if sp.size else float("nan"),
+        "half_life": _half_life(sp) if sp.size > 10 else float("nan"),
+        "final_gamma": strat._gamma_today,
+    }
+
+
 def backtest_pair(a, b, train_panel, test_panel, lot_sizes, *, configs,
                   config_path) -> List[dict]:
     """Seed the filter on the TRAIN-slice prices, book P&L only on the
@@ -196,7 +288,8 @@ def print_report(rows: List[dict], args):
     print(f"\nKalman pair backtest — top={args.top}, "
           f"train_fraction={args.train_fraction} (OUT-OF-SAMPLE), "
           f"entry={args.entry_z} exit={args.exit_z} stop={args.stop_z} "
-          f"lookback={args.lookback_days}d max-hold={args.max_holding_days}d")
+          f"lookback={args.lookback_days}d max-hold={args.max_holding_days}d "
+          f"adf-gate={'off' if args.adf_gate_p <= 0 else f'p<{args.adf_gate_p}/{args.adf_gate_window}d'}")
     print("=" * 96)
 
     # Per-config aggregate — the headline go/no-go comparison. Spread-var is
@@ -236,16 +329,31 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--train-fraction", type=float, default=0.5)
-    ap.add_argument("--entry-z", dest="entry_z", type=float, default=2.0)
-    ap.add_argument("--exit-z", dest="exit_z", type=float, default=0.75)
+    # Defaults re-based on Palomar Ch.15 (book s₀=1, exit at mean, 6-mo lookback)
+    # + the ADF regime gate. Was entry 2.0 / exit 0.75 / lookback 60.
+    ap.add_argument("--entry-z", dest="entry_z", type=float, default=1.0)
+    ap.add_argument("--exit-z", dest="exit_z", type=float, default=0.0)
     ap.add_argument("--stop-z", dest="stop_z", type=float, default=4.0)
-    ap.add_argument("--lookback-days", dest="lookback_days", type=int, default=60)
+    ap.add_argument("--lookback-days", dest="lookback_days", type=int, default=126)
     ap.add_argument("--max-holding-days", dest="max_holding_days", type=int, default=7)
     ap.add_argument("--lots-per-leg", dest="lots_per_leg", type=int, default=1)
     ap.add_argument("--max-leg-notional", dest="max_leg_notional", type=float,
                     default=2_000_000)
     ap.add_argument("--min-edge-multiplier", dest="min_edge_multiplier",
                     type=float, default=1.5)
+    ap.add_argument("--adf-gate-p", dest="adf_gate_p", type=float, default=0.05)
+    ap.add_argument("--adf-gate-window", dest="adf_gate_window", type=int, default=60)
+    # Pair selection: "book" = NPD prescreen + cointegration gate (Palomar §15.4,
+    # the Kalman system's selection); "composite" = the static system's
+    # p-value/half-life/vol rank. A/B them on the holdout.
+    # "book" = NPD prescreen + NPD rank; "book-composite" = NPD prescreen +
+    # composite rank (the hybrid); "composite" = correlation prescreen + composite.
+    ap.add_argument("--selection", choices=("book", "book-composite", "composite"),
+                    default="composite")
+    # Timeframe (issue #63): "5min" replays entry/exit on 5-min bars (filter still
+    # daily, D1) using data_cache/stf_5min/ from fetch_5min_stf.py; "daily" uses
+    # bhavcopy closes (one decision/day) and is the legacy path.
+    ap.add_argument("--timeframe", choices=("daily", "5min"), default="5min")
     ap.add_argument("--csv-out", dest="csv_out", default=None)
     args = ap.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
@@ -260,21 +368,26 @@ def main():
         "lots_per_leg": args.lots_per_leg,
         "max_leg_notional": args.max_leg_notional,
         "min_edge_multiplier": args.min_edge_multiplier,
-        # Daily bar = one tick, so exit on the first in-band bar (the 2-tick
-        # debounce is an intraday-noise filter; see backtest_pairs rationale).
-        "exit_debounce_ticks": 1,
+        "adf_gate_p": args.adf_gate_p, "adf_gate_window": args.adf_gate_window,
+        # Daily: one bar = one tick → exit on the first in-band bar. 5-min: keep
+        # the 2-tick debounce (it's an intraday-noise filter, its actual purpose).
+        "exit_debounce_ticks": 1 if args.timeframe == "daily" else 2,
     })
+    lot_sizes = load_lot_sizes(NIFTY_50)
 
+    if args.timeframe == "5min":
+        return _main_5min(args, config_path, lot_sizes)
+
+    # ── daily path (legacy) ──
     # Screen on the TRAIN slice, backtest on the holdout — pair selection is
     # out-of-sample (using the pre-screened pair_candidates.csv, which was
     # screened on RECENT data, would leak future cointegration into the test).
     panel = load_front_month_panel(NIFTY_50, min_coverage=0.50)
-    lot_sizes = load_lot_sizes(NIFTY_50)
     cut = int(len(panel) * args.train_fraction)
     train_panel, test_panel = panel.iloc[:cut], panel.iloc[cut:]
     print(f"Screening {len(train_panel)} train days for cointegrated pairs "
-          f"(holdout = {len(test_panel)} days)...")
-    screened = screen_pairs(train_panel, p_threshold=0.05, min_correlation=0.5)
+          f"(selection={args.selection}, holdout = {len(test_panel)} days)...")
+    screened = _screen(args.selection, train_panel)
     if screened.empty:
         print("No cointegrated pairs found on the train slice.")
         return 0
@@ -286,6 +399,67 @@ def main():
             row["symbol_a"], row["symbol_b"], train_panel, test_panel,
             lot_sizes, configs=CONFIGS, config_path=config_path,
         ))
+    print_report(rows, args)
+    return 0
+
+
+def _screen(selection: str, train_panel):
+    if selection == "book":
+        return screen_pairs_book(train_panel, p_threshold=0.05, rank_by="npd")
+    if selection == "book-composite":
+        return screen_pairs_book(train_panel, p_threshold=0.05, rank_by="composite")
+    return screen_pairs(train_panel, p_threshold=0.05, min_correlation=0.5)
+
+
+def _main_5min(args, config_path, lot_sizes) -> int:
+    """5-min replay: seed/screen on DAILY bhavcopy BEFORE the 5-min window, replay
+    entry/exit on the 5-min bars. Selection stays out-of-sample (screened on the
+    pre-window daily slice). Needs data_cache/stf_5min/ (fetch_5min_stf.py)."""
+    panel5 = load_5min_panel(NIFTY_50)
+    if panel5.empty:
+        print("No 5-min data in data_cache/stf_5min/ — run fetch_5min_stf.py on "
+              "the host (live Kite session) first. See issue #63.")
+        return 1
+    t0 = panel5.index.min().date()
+    daily = load_front_month_panel(NIFTY_50, min_coverage=0.50)
+    train_panel = daily[daily.index.date < t0]
+    print(f"5-min replay: {len(panel5)} bars over "
+          f"{panel5.index.min().date()}→{panel5.index.max().date()}; "
+          f"screening {len(train_panel)} daily train days before the window "
+          f"(selection={args.selection})...")
+    if len(train_panel) < 60:
+        print(f"Daily training slice before {t0} too short ({len(train_panel)}).")
+        return 1
+    screened = _screen(args.selection, train_panel)
+    if screened.empty:
+        print("No cointegrated pairs on the pre-window daily slice.")
+        return 0
+
+    rows: List[dict] = []
+    n_pairs = 0
+    for _, row in screened.iterrows():
+        a, b = row["symbol_a"], row["symbol_b"]
+        if a not in panel5.columns or b not in panel5.columns:
+            continue
+        if a not in lot_sizes or b not in lot_sizes:
+            continue
+        bars = panel5[[a, b]].dropna()
+        tr = train_panel[[a, b]].dropna()
+        if len(bars) < 100 or len(tr) < 60:
+            continue
+        n_pairs += 1
+        if n_pairs > args.top:
+            break
+        for label, model, alpha in CONFIGS:
+            r = run_replay_5min(a, b, int(lot_sizes[a]), int(lot_sizes[b]),
+                                tr[a].values, tr[b].values, bars,
+                                label=label, model=model, alpha=alpha,
+                                config_path=config_path)
+            if r:
+                rows.append(r)
+    if not rows:
+        print("No pairs had both legs in the 5-min data + a daily train slice.")
+        return 0
     print_report(rows, args)
     return 0
 

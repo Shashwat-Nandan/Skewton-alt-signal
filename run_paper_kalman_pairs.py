@@ -389,6 +389,8 @@ def _write_config(args) -> str:
         "lots_per_leg": str(args.lots_per_leg),
         "max_leg_notional": str(args.max_leg_notional),
         "min_edge_multiplier": str(args.min_edge_multiplier),
+        "adf_gate_p": str(args.adf_gate_p),
+        "adf_gate_window": str(args.adf_gate_window),
     }
     out = DATA_CACHE / "config_kalman_derived.ini"
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
@@ -400,14 +402,24 @@ def _write_config(args) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description="Kalman pair-trading paper runner")
     p.add_argument("--top", type=int, default=10)
-    p.add_argument("--entry-z", type=float, default=2.0)
-    p.add_argument("--exit-z", type=float, default=0.75)
+    # Defaults re-based on Palomar Ch.15 (thresholded strategy, book s₀=1, exit at
+    # the mean, 6-month z-lookback) + the ADF regime gate — see
+    # tasks/kalman-pairs-rebase-plan.md. Was entry 2.0 / exit 0.75 / lookback 60.
+    p.add_argument("--entry-z", type=float, default=1.0)
+    p.add_argument("--exit-z", type=float, default=0.0)
+    # stop_z=4.0: a tighter stop exits mean-reversion winners before they revert
+    # (backtest in-regime +290k @4.0 vs +8k @2.5); the regime gate handles
+    # adverse-regime protection. See tasks/kalman-pairs-rebase-plan.md.
     p.add_argument("--stop-z", type=float, default=4.0)
-    p.add_argument("--lookback", type=int, default=60, dest="lookback_days")
+    p.add_argument("--lookback", type=int, default=126, dest="lookback_days")
     p.add_argument("--max-hold", type=int, default=7, dest="max_holding_days")
     p.add_argument("--lots-per-leg", type=int, default=1)
     p.add_argument("--max-leg-notional", type=float, default=1_000_000)
     p.add_argument("--min-edge-multiplier", type=float, default=1.5)
+    # Regime gate: only enter when the raw cointegration residual is stationary
+    # (ADF p ≤ adf-gate-p) over the last adf-gate-window days. 0 disables it.
+    p.add_argument("--adf-gate-p", type=float, default=0.05)
+    p.add_argument("--adf-gate-window", type=int, default=60)
     p.add_argument("--candidates", default=str(CANDIDATES_PATH))
     p.add_argument("--force", action="store_true",
                    help="run even on a weekend/holiday (testing)")
