@@ -338,6 +338,171 @@ def step_filters_on_close(strategies, today: date, log: logging.Logger) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Expiry-day flatten (parity with run_paper_pairs.end_of_session step 1)
+# ──────────────────────────────────────────────────────────────────
+# This Kalman runner is a SEPARATE runner and originally shipped WITHOUT the
+# static runner's expiry-day force-flatten — so it carried open STF legs through
+# contract expiry (a contract dragged into cash settlement is the worst outcome).
+# We mirror the static path, but resolve expiry from the runner's already-fetched
+# NFO list instead of re-querying: map each open leg's tradingsymbol → expiry and
+# square off any pair whose leg expires today, BEFORE state/EOD persistence.
+def _expiry_by_tradingsymbol(nfo: List[dict]) -> Dict[str, date]:
+    out: Dict[str, date] = {}
+    for row in nfo:
+        ts = row.get("tradingsymbol")
+        if not ts:
+            continue
+        exp = row.get("expiry")
+        if isinstance(exp, str):
+            try:
+                exp = datetime.strptime(exp[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+        elif hasattr(exp, "date"):
+            exp = exp.date()
+        # Only a REAL date lands in the map. A pd.NaT (its .date() is NaT, not a
+        # date) or any other junk is dropped, so a leg with a malformed/empty
+        # expiry shows as OFF the chain → stranded+raised by flatten_expiring_legs
+        # rather than silently mapped to a value that fails `exp <= today`.
+        if isinstance(exp, date):
+            out[ts] = exp
+    return out
+
+
+def legs_expire_on(strategy, expiry_by_ts: Dict[str, date], today: date,
+                   log: logging.Logger) -> bool:
+    """True if any on-chain open leg's futures contract expires on OR BEFORE
+    today. The static runner checks `== today`; we harden to `<= today` so a
+    MISSED expiry day (runner didn't run / crashed at the close) still squares
+    off the next session instead of carrying the expired contract indefinitely —
+    as long as the contract is still on the chain (off-chain legs are handled by
+    `flatten_expiring_legs`, since they can no longer be quoted to flatten)."""
+    legs = getattr(strategy.state, "legs", None)
+    if not legs:
+        return False
+    return any(
+        (exp := expiry_by_ts.get(leg.tradingsymbol)) is not None and exp <= today
+        for leg in legs
+    )
+
+
+def flatten_one(strategy, log: logging.Logger, reason: str = "EXPIRY") -> None:
+    """Force-close an open pair via the strategy's own exit builder (parity with
+    run_paper_pairs.flatten_one). No-op (logs) when already flat or quotes are
+    missing — the caller MUST re-check the position to surface a flatten that did
+    not complete (a missing quote, a swallowed execution error, or a rolled leg
+    the strategy's fill path can't re-map all leave the book non-FLAT)."""
+    label = f"{strategy.symbol_a}/{strategy.symbol_b}"
+    if strategy.state.position == "FLAT" or not strategy.state.legs:
+        return
+    try:
+        _, prices = strategy._observe_spread()
+        if not prices:
+            log.warning("[%s] flatten: could not fetch quotes; leaving position "
+                        "open", label)
+            return
+        strategy._update_unrealized(prices)
+        close_props = strategy._build_exit_proposals(reason, 0.0, prices)
+        if close_props:
+            log.info("[%s] flattening %d leg(s) (%s)", label, len(close_props), reason)
+            strategy.execute_proposals(close_props)
+    except Exception as e:
+        log.exception("[%s] flatten failed: %s", label, e)
+
+
+def flatten_expiring_legs(strategies, nfo: List[dict], today: date,
+                          log: logging.Logger) -> None:
+    """Square off any pair whose futures leg expires on/before today, before
+    persist+EOD. H18 parity — surface, never silently carry into settlement:
+
+      • NFO list empty/unusable while a book is open → RAISE.
+      • A held leg STILL on the chain and expired/expiring (exp <= today) →
+        auto-flatten at the last quote.
+      • A held leg OFF the chain (already delisted) → cannot be quoted to
+        auto-flatten; log CRITICAL and RAISE so the operator squares off
+        manually (the runner persists state+EOD first — see main()).
+      • An on-chain leg that flatten_one could NOT square (unquotable, a mid-fill
+        error swallowed by flatten_one, or a rolled leg whose contract no longer
+        matches the strategy's front-month so its fill path can't re-map it) →
+        re-checked and stranded too, so a silent no-op, a half-closed book, or a
+        mis-priced rolled leg never passes as success."""
+    open_pairs = [s for s in strategies
+                  if s.state.position != "FLAT" and s.state.legs]
+    if not open_pairs:
+        return
+    expiry_by_ts = _expiry_by_tradingsymbol(nfo)
+    if not expiry_by_ts:
+        raise RuntimeError(
+            "NFO instrument list is empty/unusable — cannot verify whether held "
+            "legs expire today. Refusing to silently carry positions into "
+            "possible cash settlement (H18).")
+    stranded: List[str] = []
+    for s in open_pairs:
+        label = f"{s.symbol_a}/{s.symbol_b}"
+        off_chain = [leg.tradingsymbol for leg in s.state.legs
+                     if leg.tradingsymbol not in expiry_by_ts]
+        if off_chain:
+            log.critical("[%s] held leg(s) %s are OFF the NFO chain — already "
+                         "delisted/expired; cannot quote to auto-flatten. "
+                         "OPERATOR: square off manually.", label,
+                         ", ".join(off_chain))
+            stranded.append(label)
+            continue
+        try:
+            if legs_expire_on(s, expiry_by_ts, today, log):
+                log.info("[%s] expiry flatten — leg expires on/before today", label)
+                flatten_one(s, log, reason="EXPIRY")
+                # flatten_one logs-and-returns on an unquotable leg and swallows
+                # execution errors, so a no-op or a HALF-closed book would
+                # otherwise pass silently. Re-verify the pair actually reached
+                # FLAT; if not, strand it so the runner raises (H18) instead of
+                # carrying an open/naked leg into settlement.
+                if s.state.position != "FLAT" or s.state.legs:
+                    log.critical("[%s] expiry flatten did NOT reach FLAT (pos=%s, "
+                                 "%d leg(s) left) — could not square off; OPERATOR "
+                                 "must close manually before settlement.", label,
+                                 s.state.position, len(s.state.legs))
+                    stranded.append(label)
+        except Exception as e:
+            log.exception("[%s] expiry check/flatten failed: %s", label, e)
+            stranded.append(label)
+    if stranded:
+        raise RuntimeError(
+            f"{len(stranded)} pair(s) hold legs that could not be auto-flattened "
+            f"on/after expiry: {', '.join(stranded)}. State+EOD are persisted; "
+            "runner exits non-zero so notify-failure@ alerts the operator (H18).")
+
+
+def _calendar_days_until_next_trading_day(today: date, holidays: set) -> int:
+    """Calendar days until the next NSE trading day (today excluded), capped at 10
+    (parity with run_paper_pairs)."""
+    d = today
+    for step in range(1, 11):
+        d = d + timedelta(days=1)
+        if d.weekday() < 5 and d not in holidays:
+            return step
+    return 10
+
+
+def warn_if_long_break(strategies, today: date, holidays: set,
+                       log: logging.Logger) -> None:
+    """M-R1 parity: this runner does NOT flatten non-expiring positions at session
+    end, so an open book sits unmonitored across a long weekend / holiday block.
+    Warn when the next trading day is ≥3 calendar days away and any pair is open,
+    so the operator can square off manually before the break."""
+    if not holidays:
+        return
+    gap = _calendar_days_until_next_trading_day(today, holidays)
+    open_pairs = [f"{s.symbol_a}/{s.symbol_b}" for s in strategies
+                  if s.state.position != "FLAT"]
+    if gap >= 3 and open_pairs:
+        log.warning("M-R1: next trading day is %d calendar days away and %d "
+                    "pair(s) hold open positions: %s — they will sit unmonitored "
+                    "across the break; consider squaring off manually.",
+                    gap, len(open_pairs), ", ".join(open_pairs))
+
+
+# ──────────────────────────────────────────────────────────────────
 # Tick + halt
 # ──────────────────────────────────────────────────────────────────
 def tick_one(strategy, log: logging.Logger, *, halt_new: bool) -> bool:
@@ -500,11 +665,25 @@ def main() -> int:
         write_state_file(strategies, log, archive=False)  # crash-safe intraday persist
         sleep_until(min(datetime.now() + timedelta(seconds=TICK_SECONDS), end_ts), log)
 
-    # Session close: advance each filter one daily step, then persist + EOD.
-    log.info("Session end — stepping filters on close.")
+    # Session close: flatten any expiring/expired leg first (so state + EOD
+    # reflect the post-flatten book and we never carry an STF into settlement),
+    # then advance each filter one daily step, then persist + EOD. H18: if the
+    # flatten can't fully verify/square a book it raises — we still persist
+    # state+EOD (so the next runner isn't blind) BEFORE re-raising non-zero.
+    log.info("Session end — expiry flatten, then stepping filters on close.")
+    expiry_error: Optional[Exception] = None
+    try:
+        flatten_expiring_legs(strategies, nfo, today, log)
+    except Exception as e:
+        expiry_error = e
+        log.exception("expiry flatten could not complete; persisting state+EOD "
+                      "before exiting non-zero so the operator is alerted")
+    warn_if_long_break(strategies, today, holidays, log)
     step_filters_on_close(strategies, today, log)
     write_state_file(strategies, log)
     write_eod_sidecar(strategies, today, log)
+    if expiry_error is not None:
+        raise expiry_error
     log.info("Kalman paper session complete.")
     return 0
 
