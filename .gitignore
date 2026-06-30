@@ -29,3 +29,9 @@ claude_example.py
 
 # OS
 .DS_Store
+
+# Loop-engine runtime memory (regenerable; durable knowledge lives in SKILL.md).
+# Tracking it meant a git reset/checkout could clobber the loop's accumulated
+# lessons (happened 2026-06-30). SKILL.md (rules/goal/lessons) stays tracked.
+state/*/STATE.md
+state/*/.STATE.lock
