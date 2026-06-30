@@ -506,15 +506,21 @@ def warn_if_long_break(strategies, today: date, holidays: set,
 # Entry suppression near expiry (issue #70)
 # ──────────────────────────────────────────────────────────────────
 # Don't OPEN a new position when the front-month future is within `cutoff_days`
-# of expiry: such a position can't complete its max-holding window before the
-# contract dies and would just be expiry-flattened. We suppress the ENTRY rather
-# than roll the contract — the signal (γ / z-window) is trained on the FRONT-month
-# STF panel (screen_pairs.load_front_month_panel), so trading the next month would
-# measure a next-month quote against a front-month mean/std (calendar-basis
-# contamination). Held positions are untouched: suppression rides the existing
-# `halt_new` path, which blocks scan_and_propose (entries) but still runs
-# check_and_rehedge (exits/rehedge), so an open near-expiry pair keeps exiting and
-# is squared by flatten_expiring_legs at the close.
+# of expiry: a trade opened that close to expiry has almost no room to revert
+# before the contract dies and gets expiry-flattened — churn/cost for no edge.
+# NOTE this is a near-expiry guard, NOT a "the trade can complete its max-hold"
+# guarantee: max_holding_days (default 7 TRADING days ≈ 9-11 calendar days) far
+# exceeds the default 3-calendar-day cutoff, so a trade opened 4-10 days out can
+# still be cut short by expiry. Guaranteeing max-hold would need cutoff ≈
+# max_holding_days in calendar days; the small default is a deliberately light
+# touch (operator-tunable via --entry-cutoff-days).
+# We suppress the ENTRY rather than roll the contract — the signal (γ / z-window)
+# is trained on the FRONT-month STF panel (screen_pairs.load_front_month_panel),
+# so trading the next month would measure a next-month quote against a front-month
+# mean/std (calendar-basis contamination). Held positions are untouched:
+# suppression rides the existing `halt_new` path, which blocks scan_and_propose
+# (entries) but still runs check_and_rehedge (exits/rehedge), so an open
+# near-expiry pair keeps exiting and is squared by flatten_expiring_legs.
 def entry_suppressed(strategies, nfo: List[dict], today: date,
                      cutoff_days: int) -> set:
     """Set of strategies whose front-month future (the contract they'd enter on)
@@ -685,10 +691,10 @@ def main() -> int:
     # Entry suppression near front-month expiry (issue #70). Expiries are static
     # for the session, so resolve the suppressed set once. Held pairs still exit.
     entry_block = entry_suppressed(strategies, nfo, today, args.entry_cutoff_days)
-    if entry_block:
-        log.info("Entry-suppressed (front month within %dd of expiry): %s",
-                 args.entry_cutoff_days,
-                 ", ".join(f"{s.symbol_a}/{s.symbol_b}" for s in entry_block))
+    if args.entry_cutoff_days > 0:
+        log.info("Entry cutoff armed: %dd before front-month expiry; suppressed "
+                 "today: %s", args.entry_cutoff_days,
+                 ", ".join(f"{s.symbol_a}/{s.symbol_b}" for s in entry_block) or "none")
 
     heartbeat = HeartbeatTracker(SILENT_FAIL_THRESHOLD, SILENT_FAIL_PATH, log)
     log.info("Entering tick loop (%d pairs) until %s", len(strategies),

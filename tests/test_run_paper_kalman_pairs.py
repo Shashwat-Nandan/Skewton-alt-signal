@@ -376,8 +376,9 @@ def test_warn_if_long_break_silent_when_flat_or_short_gap(tmp_path, caplog):
 
 
 # ──────────────────────────────────────────────────────────────────
-# Entry suppression near expiry (issue #70) — don't OPEN a position the front
-# month can't carry to max-hold; held positions still exit/flatten.
+# Entry suppression near expiry (issue #70) — don't OPEN a position so close to
+# front-month expiry it has no room to revert; held positions still exit/flatten.
+# (A near-expiry guard, not a max-hold guarantee — see entry_suppressed's note.)
 # ──────────────────────────────────────────────────────────────────
 def test_entry_suppressed_near_front_month_expiry():
     """NEW entries are suppressed when the front-month future is within the cutoff
