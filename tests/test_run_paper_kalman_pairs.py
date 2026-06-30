@@ -201,3 +201,85 @@ def test_eod_sidecar_shape(tmp_path, monkeypatch):
     for k in ("pair", "hedge_ratio", "position", "realized_pnl",
               "session_realized_delta", "gamma_filter"):
         assert k in rep
+
+
+# ──────────────────────────────────────────────────────────────────
+# Expiry-day flatten — the gap was: this runner carried open STF legs through
+# contract expiry (the static runner force-flattens; this one originally didn't).
+# These tests are the A/B that the fix flattens ON expiry day and ONLY then.
+# ──────────────────────────────────────────────────────────────────
+def _entered_strategy(tmp_path, today):
+    """One AAA/BBB strategy driven into a real LONG_SPREAD entry, so it holds
+    genuine legs (AAA26JANFUT / BBB26JANFUT, both expiring 2026-01-29)."""
+    pairs = pd.DataFrame({"symbol_a": ["AAA"], "symbol_b": ["BBB"]})
+    kite = FakeKite({"NFO:AAA26JANFUT": 178.0, "NFO:BBB26JANFUT": 100.0})
+    s = R.build_strategies(pairs, _panel(), _nfo(), kite, _config(tmp_path),
+                           today, R.logger)[0]
+    spread, prices = s._observe_spread()
+    props = s._build_entry_proposals("LONG_SPREAD", -1.5, spread, prices)
+    assert props, "entry should propose legs (min_edge_multiplier=0 in test cfg)"
+    s.execute_proposals(props)
+    assert s.state.position == "LONG_SPREAD" and len(s.state.legs) == 2
+    return s, kite
+
+
+def test_flatten_expiring_legs_squares_off_on_expiry_day(tmp_path):
+    """A/B (expiry side): on the leg's last trading day the session-close expiry
+    flatten squares the pair off — closing the bug where the Kalman runner
+    carried single-stock-futures legs into cash settlement."""
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    R.flatten_expiring_legs([s], _nfo(), date(2026, 1, 29), R.logger)  # 26JAN expiry
+    assert s.state.position == "FLAT" and not s.state.legs
+    assert s.state.closed_trades, "a closed trade should be recorded on flatten"
+
+
+def test_flatten_expiring_legs_holds_when_not_expiry(tmp_path):
+    """A/B (control side): on a non-expiry day the same path leaves the position
+    untouched — the flatten fires ONLY on the contract's last trading day, so it
+    can't square off healthy positions early."""
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    R.flatten_expiring_legs([s], _nfo(), date(2026, 1, 15), R.logger)
+    assert s.state.position == "LONG_SPREAD" and len(s.state.legs) == 2
+
+
+def test_old_close_path_carried_expiring_leg(tmp_path):
+    """Regression anchor: the OLD close path (step_filters_on_close alone) does
+    NOT flatten an expiring leg — this is exactly the gap the fix closes, so if a
+    future refactor drops the flatten call this test documents the pre-fix bug."""
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    R.step_filters_on_close([s], date(2026, 1, 29), R.logger)
+    assert s.state.position == "LONG_SPREAD"  # carried into expiry (the bug)
+
+
+def test_flatten_on_missed_expiry_day(tmp_path):
+    """Hardening (<= today): if the runner MISSED the expiry close (didn't run /
+    crashed) and the contract is still on the chain the next session, the leg
+    (expiry 26JAN) is still squared off — `== today` would have carried it."""
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    # today is AFTER 26JAN expiry (2026-01-29) but AAA26JANFUT is still listed.
+    R.flatten_expiring_legs([s], _nfo(), date(2026, 2, 10), R.logger)
+    assert s.state.position == "FLAT" and not s.state.legs
+
+
+def test_flatten_raises_on_off_chain_held_leg(tmp_path):
+    """Hardening (off-chain): a held leg that has dropped off the NFO chain can't
+    be quoted to auto-flatten, so the runner RAISES (operator-alert) rather than
+    silently carrying it — the exact state the JUN pairs land in next session."""
+    import pytest
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    # NFO no longer lists the 26JAN legs (only a later contract) → legs off-chain.
+    feb_only = [{"name": "AAA", "instrument_type": "FUT",
+                 "tradingsymbol": "AAA26FEBFUT", "expiry": "2026-02-26",
+                 "lot_size": 50, "instrument_token": 2}]
+    with pytest.raises(RuntimeError):
+        R.flatten_expiring_legs([s], feb_only, date(2026, 2, 10), R.logger)
+    assert s.state.position == "LONG_SPREAD"  # left open for manual square-off
+
+
+def test_flatten_expiring_raises_on_empty_nfo_with_open_book(tmp_path):
+    """H18 parity: an open book plus an unusable NFO list must RAISE rather than
+    silently return — carrying a contract into settlement is the worst outcome."""
+    import pytest
+    s, _ = _entered_strategy(tmp_path, date(2026, 1, 1))
+    with pytest.raises(RuntimeError):
+        R.flatten_expiring_legs([s], [], date(2026, 1, 29), R.logger)
