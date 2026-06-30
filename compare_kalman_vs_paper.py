@@ -86,6 +86,10 @@ def main():
         "entry_z": 2.0, "exit_z": 0.75, "stop_z": 4.0, "lookback_days": 60,
         "max_holding_days": 7, "lots_per_leg": 1, "max_leg_notional": 2_000_000,
         "exit_debounce_ticks": 1, "min_edge_multiplier": 1.5,
+        # Gate OFF: this comparison pre-dates the regime gate and reconciles the
+        # static-vs-Kalman book on the OLD thresholds; the always-on strategy
+        # default (adf_gate_p=0.05) would silently confound it.
+        "adf_gate_p": 0,
     })
 
     print(f"{'pair':<22}{'actual':>12}{'daily static':>13}{'daily Kalman':>13}")

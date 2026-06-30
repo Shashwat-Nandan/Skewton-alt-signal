@@ -120,13 +120,32 @@ class KalmanPairStrategy(BaseStrategy):
         self.lot_size_a, self.lot_size_b = int(lot_size_a), int(lot_size_b)
         self.model = model
 
-        # Risk band — same defaults/rationale as the static pair system.
-        self.entry_z = float(cfg.get("entry_z", 2.0))
-        self.exit_z = float(cfg.get("exit_z", 0.75))
+        # Risk band — re-based on Palomar Ch.15 §15.5.1 (the book's "thresholded
+        # strategy"): enter at |z|=s₀ (entry_z, book s₀=1), unwind when z reverts
+        # to the mean (exit_z=0). This deliberately diverges from the static pair
+        # system's swept entry_z=2.0/exit_z=0.75 — see tasks/kalman-pairs-rebase-
+        # plan.md. The book's literal s₀=1 only profits in a mean-reverting regime,
+        # so it is paired with the ADF regime gate below.
+        self.entry_z = float(cfg.get("entry_z", 1.0))
+        self.exit_z = float(cfg.get("exit_z", 0.0))
+        # stop_z=4.0 (not tighter): mean-reverting spreads overshoot to 2–3σ
+        # before reverting, so a tight stop exits winners at the worst point and
+        # craters the in-regime edge (backtest: in-regime momentum +290k @4.0 vs
+        # +8k @2.5, and no better on the downside). The regime gate, not the stop,
+        # does the adverse-regime protection. See tasks/kalman-pairs-rebase-plan.md.
         self.stop_z = float(cfg.get("stop_z", 4.0))
         self.max_entry_z = float(cfg.get("max_entry_z", 5.0))
         self.safety_buffer = float(cfg.get("safety_buffer", 0.75))
-        self.lookback_days = int(cfg.get("lookback_days", 60))
+        # Book z-score lookback is 6 months (§15.6.4); ~126 trading days.
+        self.lookback_days = int(cfg.get("lookback_days", 126))
+        # Regime gate (the lever the s₀-sweep showed actually matters): only enter
+        # when the RAW cointegration residual (the filter innovation series, log
+        # pa − γ_pred·log pb − μ_pred) is currently stationary by an ADF test over
+        # the last adf_gate_window days. The Kalman *normalized* spread is
+        # stationary by construction, so gating on IT is inert — gate on the raw
+        # residual instead. adf_gate_p=0 disables the gate.
+        self.adf_gate_p = float(cfg.get("adf_gate_p", 0.05))
+        self.adf_gate_window = int(cfg.get("adf_gate_window", 60))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
         self.exit_debounce_ticks = max(1, int(cfg.get("exit_debounce_ticks", 2)))
         self.max_holding_days = int(cfg.get("max_holding_days", 7))
@@ -161,9 +180,16 @@ class KalmanPairStrategy(BaseStrategy):
         )
         # Daily Kalman spreads — the rolling z-score window (D3). Seeded by
         # replaying the filter over the training window so the z-score has a
-        # distribution from day one.
+        # distribution from day one. _raw_spread_history is the parallel series
+        # of RAW residuals (filter innovations) the ADF regime gate tests; both
+        # are seeded together in _seed_spread_history.
         self._spread_history: List[float] = []
+        self._raw_spread_history: List[float] = []
         self._seed_spread_history(log_a, log_b)
+        # Cached ADF p-value of the recent raw-residual window (refreshed daily in
+        # step_daily_close; computed once here so the gate works from day one).
+        self._last_adf_p: Optional[float] = None
+        self._refresh_regime_adf()
         # Predicted state to use for TODAY's intraday decisions (α_{t+1|t} after
         # the latest daily update). Captured here and in step_daily_close.
         self._mu_today = float(self._filter.a[0])
@@ -207,9 +233,12 @@ class KalmanPairStrategy(BaseStrategy):
         log_b = np.asarray(log_b, float)
         burn = self._SEED_BURN_IN if len(log_a) > 2 * self._SEED_BURN_IN else 0
         for i, (a, b) in enumerate(zip(log_a, log_b)):
-            spread = clone.update(float(a), float(b)).spread
+            step = clone.update(float(a), float(b))
             if i >= burn:
-                self._spread_history.append(spread)
+                self._spread_history.append(step.spread)
+                # step.innovation = y1 − γ_pred·y2 − μ_pred — the raw (un-
+                # normalized) cointegration residual the ADF gate tests.
+                self._raw_spread_history.append(step.innovation)
 
     @property
     def hedge_ratio(self) -> float:
@@ -230,6 +259,11 @@ class KalmanPairStrategy(BaseStrategy):
             raise ValueError("prices must be positive (log-price model)")
         step = self._filter.update(float(np.log(close_a)), float(np.log(close_b)))
         self._spread_history.append(step.spread)
+        self._raw_spread_history.append(step.innovation)
+        # Refresh the regime gate's ADF p-value once per day (the raw-residual
+        # window only changes on the daily close; recomputing it intraday would
+        # be wasted work — see _gate_blocks_entry).
+        self._refresh_regime_adf()
         # α_{t+1|t} — the predicted state for the NEXT day's intraday decisions.
         self._mu_today = float(self._filter.a[0])
         self._gamma_today = float(self._filter.a[1])
@@ -315,6 +349,52 @@ class KalmanPairStrategy(BaseStrategy):
         return (spread - mean) / std
 
     # ──────────────────────────────────────────────────────────────────
+    # Regime gate (Palomar re-base): the s₀-sweep showed regime, not the
+    # threshold, is the lever — book s₀=1 is best in a mean-reverting regime
+    # and worst in an adverse one. Only enter when the RAW cointegration
+    # residual is currently stationary (ADF), so the spread is actually
+    # reverting. Gating on the Kalman *normalized* spread is inert (it is
+    # stationary by construction). See tasks/kalman-pairs-rebase-plan.md.
+    # ──────────────────────────────────────────────────────────────────
+    def _refresh_regime_adf(self) -> None:
+        """Recompute the cached ADF p-value of the recent raw-residual window.
+        Sets _last_adf_p to None when the window is too short or the test errors
+        (NaN/constant series) — a None p-value blocks entry when the gate is on
+        (fail closed: don't trade a pair whose regime we can't assess)."""
+        if self.adf_gate_p <= 0:
+            self._last_adf_p = None
+            return
+        recent = self._raw_spread_history[-self.adf_gate_window:]
+        if len(recent) < 30:
+            self._last_adf_p = None
+            # Fail loud (Rule 12): None → fail-closed → ALL entries blocked. A
+            # short window silently disabling a pair must be visible, not buried
+            # in a per-scan INFO. Fires until the window fills (~30 daily closes).
+            logger.warning(
+                "[%s/%s] regime gate: only %d raw residuals (<30) — fail-closed, "
+                "ALL new entries blocked until the window fills",
+                self.symbol_a, self.symbol_b, len(recent),
+            )
+            return
+        from statsmodels.tsa.stattools import adfuller
+        try:
+            self._last_adf_p = float(adfuller(recent, maxlag=1, autolag=None)[1])
+        except Exception as e:
+            self._last_adf_p = None
+            logger.warning(
+                "[%s/%s] regime gate: ADF failed (%s) — fail-closed, new entries "
+                "blocked this session", self.symbol_a, self.symbol_b, e,
+            )
+
+    def _gate_blocks_entry(self) -> bool:
+        """True if the regime gate should suppress a new entry. Off when
+        adf_gate_p<=0. Fail closed: a missing p-value (short/degenerate window)
+        blocks the entry rather than waving it through."""
+        if self.adf_gate_p <= 0:
+            return False
+        return self._last_adf_p is None or self._last_adf_p > self.adf_gate_p
+
+    # ──────────────────────────────────────────────────────────────────
     # Strategy interface
     # ──────────────────────────────────────────────────────────────────
     def scan_and_propose(self) -> List[TradeProposal]:
@@ -325,6 +405,15 @@ class KalmanPairStrategy(BaseStrategy):
         if z is None:
             return []
         if abs(z) >= self.max_entry_z:   # regime break, not a signal
+            return []
+        if abs(z) < self.entry_z:        # inside the band — no signal either side
+            return []
+        # Regime gate: |z| has crossed s₀, but only act if the raw cointegration
+        # residual is currently stationary (the pair is actually reverting).
+        if self._gate_blocks_entry():
+            logger.info("[%s/%s] entry skipped: regime gate (ADF p=%s > %.3f)",
+                        self.symbol_a, self.symbol_b, self._last_adf_p,
+                        self.adf_gate_p)
             return []
         if z <= -self.entry_z:
             return self._build_entry_proposals("LONG_SPREAD", z, spread, prices)
@@ -350,7 +439,15 @@ class KalmanPairStrategy(BaseStrategy):
                 return self._build_exit_proposals("MAX_HOLD", z or 0.0, prices)
         if z is None:
             return []
-        if abs(z) <= self.exit_z:
+        # Book's thresholded exit (§15.5.1): unwind when the spread reverts to the
+        # mean. Entry-side aware (not a symmetric |z|<=exit_z band) so an overshoot
+        # PAST the mean also closes — taking profit — rather than holding a now-
+        # reversed position until the stop fires on the far side. With exit_z=0
+        # this is a pure zero-crossing (the book's exit-at-0); exit_z>0 locks in
+        # slightly before the mean.
+        reverted = (z >= -self.exit_z) if self.state.position == "LONG_SPREAD" \
+            else (z <= self.exit_z)
+        if reverted:
             self.state.mean_revert_streak += 1
             if self.state.mean_revert_streak >= self.exit_debounce_ticks:
                 return self._build_exit_proposals("MEAN_REVERT", z, prices)
@@ -411,6 +508,10 @@ class KalmanPairStrategy(BaseStrategy):
             "position": self.state.position,
             "current_z": z,
             "entry_z": self.state.entry_z,
+            # Regime gate visibility: the ADF p-value of the raw residual window
+            # and whether the gate currently permits new entries.
+            "regime_adf_p": self._last_adf_p,
+            "regime_gate_open": (not self._gate_blocks_entry()),
             "realized_pnl": self.state.realized_pnl,
             "unrealized_pnl": self.state.unrealized_pnl,
             "transaction_costs": self.state.total_transaction_costs,
@@ -712,6 +813,7 @@ class KalmanPairStrategy(BaseStrategy):
             "model": self.model,
             "filter": self._filter.serialize(),
             "spread_history": list(self._spread_history),
+            "raw_spread_history": list(self._raw_spread_history),
             "mu_today": self._mu_today,
             "gamma_today": self._gamma_today,
             "last_step_date": (self._last_step_date.isoformat()
@@ -757,6 +859,12 @@ class KalmanPairStrategy(BaseStrategy):
             )
         self._filter = KalmanPairFilter.deserialize(blob["filter"])
         self._spread_history = list(blob.get("spread_history", []))
+        # Fall back to the training-seeded raw history for state files written
+        # before the regime gate existed (keeps the gate functional after an
+        # upgrade restart rather than blocking all entries for 30 sessions).
+        self._raw_spread_history = list(
+            blob.get("raw_spread_history") or self._raw_spread_history
+        )
         self._mu_today = float(blob.get("mu_today", self._filter.a[0]))
         self._gamma_today = float(blob.get("gamma_today", self._filter.a[1]))
         lsd = blob.get("last_step_date")
@@ -785,6 +893,8 @@ class KalmanPairStrategy(BaseStrategy):
         )
         self._session_start_realized = self.state.realized_pnl
         self._session_start_unrealized = self.state.unrealized_pnl
+        # Recompute the regime gate from the restored raw-residual window.
+        self._refresh_regime_adf()
 
     @staticmethod
     def _serialise_trade(trade: Dict) -> Dict:
