@@ -15,6 +15,7 @@ If no data file is provided, generates synthetic data for a smoke test.
 """
 
 import argparse
+import contextlib
 import logging
 import math
 from datetime import datetime, timedelta
@@ -276,6 +277,53 @@ def _find_instruments_csv(date_iso: str, underlying: str = "NIFTY") -> Optional[
     return candidates[-1] if candidates else None
 
 
+@contextlib.contextmanager
+def _open_tape(date_iso: str):
+    """Yield a text stream over ticks-<date>.jsonl, transparently
+    decompressing the .jsonl.zst archive when only that exists.
+
+    tick-retention.sh keeps just the newest KEEP_RAW (8) sessions raw and
+    zstd-compresses the rest — without this, list_captured_sessions /
+    load_captured_tape could never replay more than ~a week of tape, which
+    capped the autoresearch fitness window at 5 sessions (the 2026-06-27
+    flat-plateau sweep). Decompression shells out to the system `zstd`
+    binary that tick-retention.sh already hard-depends on; no pip dep.
+
+    Prefers the raw file when both exist. Raises FileNotFoundError when
+    neither exists, RuntimeError when zstd exits non-zero (corrupt
+    archive must not silently truncate a replay — Rule 12)."""
+    import io
+    import subprocess
+    raw = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
+    if raw.exists():
+        with raw.open() as f:
+            yield f
+        return
+    zst = raw.with_name(raw.name + ".zst")
+    if not zst.exists():
+        raise FileNotFoundError(f"Tick capture not found: {raw}[.zst]")
+    proc = subprocess.Popen(
+        ["zstd", "-dc", str(zst)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    consumed_ok = False
+    try:
+        yield io.TextIOWrapper(proc.stdout, encoding="utf-8")
+        consumed_ok = True
+    finally:
+        proc.stdout.close()
+        stderr = proc.stderr.read().decode(errors="replace")
+        proc.stderr.close()
+        rc = proc.wait()
+        # Raise only on a clean read that zstd itself failed — if the
+        # consumer raised, closing stdout EPIPEs zstd and a non-zero rc
+        # is expected noise that must not mask the original error.
+        if consumed_ok and rc != 0:
+            raise RuntimeError(
+                f"zstd -dc {zst} exited {rc}: {stderr.strip()}"
+            )
+
+
 def load_captured_tape(
     date_iso: str, underlying: str = "NIFTY",
     resolution: str = "1min",
@@ -286,7 +334,8 @@ def load_captured_tape(
 
     Args:
         date_iso: ISO date string ('2026-05-22'); reads
-            data_cache/ticks/ticks-<date>.jsonl
+            data_cache/ticks/ticks-<date>.jsonl, or the .jsonl.zst
+            archive tick-retention.sh leaves behind (see _open_tape)
         underlying: NIFTY / BANKNIFTY / etc; chooses the instrument
             master CSV to join against
         resolution: pandas offset alias for downsampling ('1min',
@@ -299,9 +348,6 @@ def load_captured_tape(
     Raises FileNotFoundError if either the tick file or the instruments
     master is absent — fail loud rather than silently degrade (Rule 12)."""
     import json
-    tick_file = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
-    if not tick_file.exists():
-        raise FileNotFoundError(f"Tick capture not found: {tick_file}")
 
     instr_csv = _find_instruments_csv(date_iso, underlying)
     if instr_csv is None:
@@ -318,7 +364,7 @@ def load_captured_tape(
     # the spot token which isn't in the NFO instrument master).
     rows = []
     header_token_to_symbol = {}
-    with tick_file.open() as f:
+    with _open_tape(date_iso) as f:
         header = json.loads(f.readline())
         for entry in header.get("instruments", []):
             header_token_to_symbol[int(entry["token"])] = entry["tradingsymbol"]
@@ -424,11 +470,18 @@ def load_captured_tape(
 
 
 def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
-    """Return ISO date strings for which tick captures exist."""
+    """Return ISO date strings for which tick captures exist — raw
+    .jsonl or the .jsonl.zst archives tick-retention.sh produces (a date
+    with both counts once; _open_tape prefers the raw file)."""
     ticks_dir = Path("data_cache") / "ticks"
     if not ticks_dir.exists():
         return []
-    return sorted(p.stem.replace("ticks-", "") for p in ticks_dir.glob("ticks-*.jsonl"))
+    dates = {
+        p.name.replace("ticks-", "").replace(".jsonl.zst", "").replace(".jsonl", "")
+        for pattern in ("ticks-*.jsonl", "ticks-*.jsonl.zst")
+        for p in ticks_dir.glob(pattern)
+    }
+    return sorted(dates)
 
 
 def load_iv_skew_seed(

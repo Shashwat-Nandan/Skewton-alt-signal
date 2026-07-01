@@ -83,12 +83,16 @@ def main():
     parser = argparse.ArgumentParser(description="Run autoresearch optimization")
     parser.add_argument("--experiments", type=int, default=50,
                         help="Number of experiments to run (default: 50)")
-    parser.add_argument("--metric", type=str, default="sharpe_ratio",
+    parser.add_argument("--metric", type=str, default=None,
                         choices=["sharpe_ratio", "net_pnl", "calmar_ratio",
                                  "sortino_ratio", "gamma_theta_ratio"],
-                        help="Primary metric to optimize (default: sharpe_ratio). "
-                             "gamma_theta_ratio is the Phase 2.4 Taleb-framework "
-                             "efficiency metric (realized scalp / realized theta).")
+                        help="Primary metric to optimize. Default: the "
+                             "[autoresearch] metric from config.ini (net_pnl on "
+                             "this host) — a hardcoded sharpe_ratio default here "
+                             "used to silently override the config for manual "
+                             "runs. gamma_theta_ratio is the Phase 2.4 Taleb-"
+                             "framework efficiency metric, DECOUPLED from money "
+                             "(2026-06-14) — don't optimize it alone.")
     parser.add_argument("--eval-cycles", type=int, default=3,
                         help="Backtest replays per experiment (default: 3)")
     parser.add_argument("--days", type=int, default=5,
@@ -138,9 +142,12 @@ def main():
     dummy_kite = MockKite(dummy_data, args.underlying)
     hedger = TalebKarpathyStrategy(dummy_kite, config_path="config.ini", mode="paper")
 
-    # Override autoresearch config for this run
+    # Override autoresearch config for this run. --metric omitted keeps
+    # the loop's config-derived metric ([autoresearch] metric).
     loop = HedgeResearchLoop(hedger, config_path="config.ini")
-    loop.primary_metric = args.metric
+    if args.metric is not None:
+        loop.primary_metric = args.metric
+    args.metric = loop.primary_metric
     loop.eval_cycles = args.eval_cycles
 
     # Pre-screen training windows. A window where the seed params produce 0
@@ -294,10 +301,15 @@ def main():
     loop.best_metric_value = loop.baseline_metric
     loop._log_experiment(0, "BASELINE", 0, 0, loop.baseline_metric, True, loop.baseline_params)
     logger.info("[0/%d] Baseline %s = %.6f", args.experiments, args.metric, loop.baseline_metric)
+    # loop.baseline_metric drifts upward as mutations are accepted; keep
+    # the seed's score for the sweep-quality verdict below.
+    seed_baseline = loop.baseline_metric
 
     # Experiments
+    experiment_results = []
     for i in range(1, args.experiments + 1):
         result = loop.run_single_experiment()
+        experiment_results.append(result)
         status = "ACCEPTED" if result["accepted"] else "rejected"
         logger.info("[%d/%d] %s %s=%.6f (mutated %s: %.4f -> %.4f) best=%.6f",
                     i, args.experiments, status,
@@ -321,8 +333,54 @@ def main():
             print(f"    {k:<30s} = {v}")
     print(f"\n  Results log:    {loop.results_file}")
 
+    # ── Sweep quality (Rule 12: an uninformative sweep must say so) ──
+    # The 2026-06-20 run accepted 0/40 mutations and 06-27 scored 29/40
+    # experiments at one identical fitness — yet both wrote candidate
+    # files indistinguishable from a real optimization result. Score the
+    # sweep itself and stamp the verdict into the candidate JSON so the
+    # manual promotion step can't mistake an echo of the seed params for
+    # an optimized winner.
+    from collections import Counter
+    fitness_counts = Counter(
+        round(r["metric_value"], 6) for r in experiment_results
+    )
+    plateau_value, plateau_n = (
+        fitness_counts.most_common(1)[0] if fitness_counts else (0.0, 0)
+    )
+    n_accepted = sum(1 for r in experiment_results if r["accepted"])
+    plateau_share = plateau_n / len(experiment_results) if experiment_results else 0.0
+    warnings = []
+    if n_accepted == 0:
+        warnings.append("0 mutations accepted — candidate is the seed params")
+    if loop.best_metric_value <= seed_baseline:
+        warnings.append("best never beat the seed baseline")
+    if plateau_share > 0.5:
+        warnings.append(
+            f"{plateau_share:.0%} of experiments scored an identical fitness "
+            f"({plateau_value:.6f}) — landscape flat on this replay window"
+        )
+    sweep_quality = {
+        "experiments": len(experiment_results),
+        "accepted": n_accepted,
+        "distinct_fitness": len(fitness_counts),
+        "plateau_share": round(plateau_share, 3),
+        "seed_baseline": seed_baseline,
+        "best": loop.best_metric_value,
+        "informative": not warnings,
+        "warnings": warnings,
+    }
+    print("\n  Sweep quality:")
+    print(f"    accepted:         {n_accepted}/{len(experiment_results)}")
+    print(f"    distinct fitness: {len(fitness_counts)}")
+    print(f"    plateau share:    {plateau_share:.0%}")
+    if warnings:
+        print("\n  ⚠️  SWEEP UNINFORMATIVE — do NOT promote this candidate:")
+        for w in warnings:
+            print(f"      - {w}")
+        logger.warning("SWEEP UNINFORMATIVE: %s", "; ".join(warnings))
+
     # Save best params
-    loop._save_best_params(out_file=args.out)
+    loop._save_best_params(out_file=args.out, sweep_quality=sweep_quality)
     print(f"  Best params:    {args.out}")
     print("=" * 60)
 

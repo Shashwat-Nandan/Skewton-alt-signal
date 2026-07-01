@@ -20,7 +20,15 @@ KEEP_CANDIDATES="${KEEP_CANDIDATES:-8}"
 
 PROJECT_DIR="${PROJECT_DIR:-/opt/taleb-karpathy-kite}"
 DAYS="${AUTORESEARCH_DAYS:-30}"
-EXPERIMENTS="${AUTORESEARCH_EXPERIMENTS:-40}"
+# 2026-07-02: 40→25 experiments alongside --eval-cycles 5→15 below.
+# Affordable because autoresearch_loop now parses each session's multi-GB
+# JSONL once per sweep (tape cache), not once per experiment: ~30 min to
+# parse 15 sessions + a few min of backtest per experiment ≈ 4 h, well
+# inside the unit's TimeoutStartSec=10h (pre-cache, 25×15 re-parses would
+# have blown it). Most of the old 40 were wasted on a flat landscape
+# anyway (06-27: 29/40 identical fitness, 2 accepted).
+EXPERIMENTS="${AUTORESEARCH_EXPERIMENTS:-25}"
+EVAL_CYCLES="${AUTORESEARCH_EVAL_CYCLES:-15}"
 UNDERLYING="${AUTORESEARCH_UNDERLYING:-NIFTY}"
 
 cd "$PROJECT_DIR"
@@ -47,6 +55,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo "Project:       $PROJECT_DIR"
   echo "Days:          $DAYS"
   echo "Experiments:   $EXPERIMENTS"
+  echo "Eval cycles:   $EVAL_CYCLES"
   echo "Underlying:    $UNDERLYING"
   echo
 
@@ -83,17 +92,23 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # penalty + drawdown veto make it risk-aware; zero-trade sessions score ₹0
   # (not the ratio penalty) so the optimizer can choose to trade less rather
   # than be pushed to overtrade.
-  # 2026-06-14: --eval-cycles 5 (was 3). eval_cycles does double duty — it's
-  # both the cycles-per-experiment AND the size of the most-recent-sessions
-  # window (replay_sessions = captured[-eval_cycles:]). 5 → replay the full
-  # trading week (Mon–Fri), one cycle each, for a less thin / less recency-
-  # biased fitness sample. Costs ~+67% runtime (~3.5h → ~6h for 40 experiments).
-  echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, captured-tape replay)..."
+  # 2026-06-14: eval_cycles does double duty — it's both the cycles-per-
+  # experiment AND the size of the most-recent-sessions window
+  # (replay_sessions = captured[-eval_cycles:]).
+  # 2026-07-02: 5→15 sessions (~3 trading weeks, spans an expiry cycle).
+  # On a 5-session window most tunables never flip a single entry/routing/
+  # rehedge decision, so mutations tie at identical fitness and the hill-
+  # climber starves (06-20: 0/40 accepted; 06-27: 29/40 identical). 15
+  # sessions became reachable once list_captured_sessions/_open_tape
+  # learned to read the .jsonl.zst archives tick-retention.sh keeps for
+  # 90 days (only 8 sessions stay raw). Experiment budget cut above pays
+  # the runtime bill.
+  echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, $EVAL_CYCLES-session tape replay)..."
   "$PY" run_autoresearch.py \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
       --metric net_pnl \
-      --eval-cycles 5 \
+      --eval-cycles "$EVAL_CYCLES" \
       --window-days 5 \
       --out "$CANDIDATE"
 

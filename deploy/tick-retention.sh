@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Tick-capture retention (audit 2026-06-10 task 1.5 / H-8).
 #
-# Policy (operator decision 2026-06-11, amended for the autoresearch
-# constraint): keep the newest KEEP_RAW ticks-*.jsonl uncompressed,
-# zstd-compress the rest, delete .zst archives older than
-# KEEP_ARCHIVE_DAYS. Raw retention is COUNT-based, not age-based:
-# autoresearch_loop replays the most recent eval_cycles (=5) sessions via
-# list_captured_sessions(), which globs *.jsonl only — a date cutoff
-# could leave <5 raw sessions across holiday gaps. 8 files ≈ 5 trading
-# sessions + margin.
+# Policy (operator decision 2026-06-11): keep the newest KEEP_RAW
+# ticks-*.jsonl uncompressed, zstd-compress the rest, delete .zst
+# archives older than KEEP_ARCHIVE_DAYS.
+#
+# 2026-07-02: backtest.list_captured_sessions / _open_tape now read the
+# .zst archives directly (`zstd -dc`), so compressing a session no longer
+# hides it from autoresearch — the replay window is bounded by
+# KEEP_ARCHIVE_DAYS, not KEEP_RAW. KEEP_RAW stays count-based to spare
+# the most-replayed (recent) sessions the per-run decompression cost.
 #
 # Safety: an original is removed ONLY after `zstd -t` verifies its
 # archive. The newest files (including today's open capture) are never
-# touched. Replaying an archived day: `zstd -d ticks-<date>.jsonl.zst`
-# first — backtest.load_captured_tape reads plain JSONL only.
+# touched.
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/opt/taleb-karpathy-kite}"

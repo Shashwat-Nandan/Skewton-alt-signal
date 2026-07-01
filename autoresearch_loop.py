@@ -456,7 +456,21 @@ class HedgeResearchLoop:
                     # Cycle over the captured sessions in order, wrapping
                     # if eval_cycles > len(replay_sessions).
                     session_date = replay_sessions[cycle % len(replay_sessions)]
-                    data = load_captured_tape(session_date, underlying)
+                    # Parse each session ONCE per sweep, not once per
+                    # experiment: the raw JSONL runs to several GB per
+                    # session (~3 min to parse) while the resampled frame
+                    # is ~10 MB. Without this cache a 25-experiment ×
+                    # 15-session sweep spends >10 h re-reading identical
+                    # files and blows the unit's TimeoutStartSec. copy()
+                    # hands each cycle its own frame so a backtest can't
+                    # poison the cache in place.
+                    if not hasattr(self, "_tape_cache"):
+                        self._tape_cache = {}
+                    if session_date not in self._tape_cache:
+                        self._tape_cache[session_date] = load_captured_tape(
+                            session_date, underlying,
+                        )
+                    data = self._tape_cache[session_date].copy()
                     logger.debug("    session %s rows=%d", session_date, len(data))
                 else:
                     data = generate_synthetic_data(
@@ -571,8 +585,14 @@ class HedgeResearchLoop:
                 f"{params.get('entry_iv_percentile_max', 0):.0f}\n"
             )
 
-    def _save_best_params(self, out_file: str = "best_params.json"):
+    def _save_best_params(self, out_file: str = "best_params.json",
+                          sweep_quality: Dict = None):
         """Save best parameters to a JSON file for easy loading.
+
+        `sweep_quality` (optional) is the run's self-assessment from
+        run_autoresearch.py — accepted count, plateau share, informative
+        verdict. Stamped into the output so the manual promotion step can
+        reject an uninformative sweep from the candidate file alone.
 
         Preserves out-of-schema fields (e.g. `_migrations` semantic-shift
         history) from the canonical best_params.json so they survive each
@@ -590,8 +610,11 @@ class HedgeResearchLoop:
             with open("best_params.json") as f:
                 existing = json.load(f)
             for k, v in existing.items():
+                # sweep_quality is per-run — a stale one preserved from a
+                # promoted candidate would mislabel THIS run's output.
                 if k not in ("best_params", "best_metric",
-                             "total_experiments", "timestamp"):
+                             "total_experiments", "timestamp",
+                             "sweep_quality"):
                     preserved[k] = v
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -602,6 +625,8 @@ class HedgeResearchLoop:
             "timestamp": datetime.now().isoformat(),
             **preserved,
         }
+        if sweep_quality is not None:
+            output["sweep_quality"] = sweep_quality
         # Atomic: write a sibling temp then rename. Path.replace is an
         # atomic os.replace on the same filesystem.
         out_path = Path(out_file)
