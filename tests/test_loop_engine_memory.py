@@ -129,15 +129,15 @@ def test_append_lesson_flattens_multiline_text(tmp_path):
 # ──────────────────────────────────────────────────────────────────────────
 # Committed seed files must parse (guard against hand-edit drift)
 # ──────────────────────────────────────────────────────────────────────────
-def test_committed_kalman_trend_seed_parses():
-    """The real state/kalman_trend/*.md shipped in Phase 0 must parse — a broken
-    hand-edit should fail here, not silently zero the loop's memory at runtime."""
-    state = memory.read_state("kalman_trend")
-    assert state.last_run.get("status")              # header survived
-    assert any("NO-GO" in lesson for lesson in state.lessons)
-
+def test_committed_kalman_trend_skill_parses():
+    """The committed state/kalman_trend/SKILL.md — the loop's DURABLE memory (goal,
+    gate thresholds, lessons) — must parse: a broken hand-edit should fail here, not
+    silently zero the loop's rules at runtime. STATE.md is deliberately NOT checked:
+    it's runtime-only memory (gitignored), regenerated each session, and absent in a
+    fresh checkout; `read_state` tolerating that (empty LoopState) is the contract."""
     skill = memory.load_skill("kalman_trend")
     assert skill.goal                                # non-empty goal
+    assert "NO-GO" in skill.goal                     # the honest "not a proven edge" framing
     # the checker reads its gate thresholds out of Rules — they must be present
     assert any("sharpe_min" in rule for rule in skill.rules)
     assert any(tag.startswith("trend") for tag in skill.regime_tags)
