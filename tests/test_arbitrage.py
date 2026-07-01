@@ -825,6 +825,47 @@ class TestStatePersistence:
                 "total_transaction_costs": 0.0,
             })
 
+    def test_restore_old_format_reconstructs_opening_cost_attribution(self):
+        # Migration: an OLD-format state file has baseline_* keys and NO per-trade
+        # realized/costs. Restore must reconstruct each still-open calendar's
+        # opening-cost attribution from its legs — otherwise its eventual closed
+        # row over-states net P&L by the opening costs. Legs are open (nothing
+        # realized yet), so realized-so-far == -(opening costs).
+        from strategies.taleb_karpathy import estimate_transaction_cost
+
+        dst = _make_strategy()
+        old_blob = {
+            "strategy": dst.name,
+            "realized_pnl": -30.0,
+            "unrealized_pnl": 0.0,
+            "total_transaction_costs": 30.0,
+            "closed_trades": [],
+            "open_calendars": [{
+                "symbol": "AAA",
+                "position": "SHORT_CALENDAR",
+                "entry_time": "2026-04-15T10:00:00",
+                "entry_carry_diff": 0.03,
+                "baseline_realized": -30.0,   # old-format keys, no realized/costs
+                "baseline_costs": 30.0,
+                "legs": [
+                    {"symbol": "AAA", "tradingsymbol": "AAA26APRFUT",
+                     "expiry": "2026-04-30", "lot_size": 50, "quantity": -1,
+                     "entry_price": 101.0, "current_price": 101.0},
+                    {"symbol": "AAA", "tradingsymbol": "AAA26MAYFUT",
+                     "expiry": "2026-05-28", "lot_size": 50, "quantity": 1,
+                     "entry_price": 102.0, "current_price": 102.0},
+                ],
+            }],
+        }
+        dst.restore_state(old_blob)
+        t = dst.state.open_calendars["AAA"]
+        expected = (
+            estimate_transaction_cost(101.0, 1, 50, "SELL", instrument_type="FUT")
+            + estimate_transaction_cost(102.0, 1, 50, "BUY", instrument_type="FUT")
+        )
+        assert t.costs == pytest.approx(expected)
+        assert t.realized == pytest.approx(-expected)
+
 
 # ──────────────────────────────────────────────────────────
 # unrealized_pnl stays consistent with the open book (no phantom MTM)

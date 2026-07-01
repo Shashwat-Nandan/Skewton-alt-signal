@@ -487,13 +487,28 @@ class ArbitrageStrategy(BaseStrategy):
                     )
                     for l in tblob.get("legs", [])
                 ],
-                # Old-format state (baseline_* keys) restores these at 0.0 — a
-                # calendar open across that one upgrade boundary loses only its
-                # pre-restore opening-cost attribution on its eventual closed row;
-                # global totals are unaffected.
-                realized=float(tblob.get("realized", 0.0)),
-                costs=float(tblob.get("costs", 0.0)),
             )
+            if "realized" in tblob or "costs" in tblob:
+                trade.realized = float(tblob.get("realized", 0.0))
+                trade.costs = float(tblob.get("costs", 0.0))
+            else:
+                # Old-format state (baseline_* keys, no per-trade accumulators):
+                # reconstruct the opening-cost attribution from the still-open
+                # legs so a calendar carried across this one upgrade boundary
+                # doesn't lose it (its closed row would otherwise over-state net
+                # P&L). The legs are open → nothing is realized yet, so realized
+                # so far == -(opening costs). Same estimate_transaction_cost inputs
+                # as the original opening fills, so it matches exactly.
+                from strategies.taleb_karpathy import estimate_transaction_cost
+                open_costs = sum(
+                    estimate_transaction_cost(
+                        leg.entry_price, abs(leg.quantity), leg.lot_size,
+                        "BUY" if leg.quantity > 0 else "SELL", instrument_type="FUT",
+                    )
+                    for leg in trade.legs
+                )
+                trade.costs = open_costs
+                trade.realized = -open_costs
             open_calendars[trade.symbol] = trade
         self.state.open_calendars = open_calendars
         # Session start = this restore point, so session_*_delta measures only
