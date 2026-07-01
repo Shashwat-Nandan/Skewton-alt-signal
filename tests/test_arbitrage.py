@@ -554,6 +554,40 @@ class TestPerTradePnL:
             s.state.realized_pnl - (aaa["realized_pnl"] + bbb["realized_pnl"])
         ) < 1e-6
 
+    def test_overlapping_trades_record_independent_realized_pnl(self):
+        # OVERLAP case (the 2026-07-01 arbitrage session: many spreads open on the
+        # SAME tick). Open AAA and BBB *both* first, THEN close them. The old
+        # global-counter-minus-baseline approach contaminated each row with the
+        # OTHER trade's realized+costs booked during its lifetime — BBB's row
+        # absorbed AAA's +₹200, inflating BBB's gross to ₹600. Local per-trade
+        # accumulation keeps each row its own (AAA=200 gross, BBB=400 gross).
+        s = _make_strategy(mode="paper", universe=["AAA", "BBB"])
+        s._ts_to_name = {
+            "AAA26APRFUT": "AAA", "AAA26MAYFUT": "AAA",
+            "BBB26APRFUT": "BBB", "BBB26MAYFUT": "BBB",
+        }
+        # Open BOTH (now overlapping), then close AAA (+200 gross), then BBB (+400).
+        s._apply_fill(self._prop("AAA26APRFUT", "BUY", price=100.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "SELL", price=101.0))
+        s._apply_fill(self._prop("BBB26APRFUT", "BUY", price=100.0))
+        s._apply_fill(self._prop("BBB26MAYFUT", "SELL", price=101.0))
+        s._apply_fill(self._prop("AAA26APRFUT", "SELL", price=101.0))
+        s._apply_fill(self._prop("AAA26MAYFUT", "BUY", price=100.0))
+        s._apply_fill(self._prop("BBB26APRFUT", "SELL", price=102.0))
+        s._apply_fill(self._prop("BBB26MAYFUT", "BUY", price=99.0))
+
+        assert len(s.state.closed_trades) == 2
+        aaa, bbb = s.state.closed_trades
+        assert aaa["symbol"] == "AAA" and bbb["symbol"] == "BBB"
+        # Each row's GROSS (realized + its own costs) must be its OWN spread move.
+        # The overlap bug inflated BBB's gross to 600 (absorbing AAA's +200).
+        assert abs((aaa["realized_pnl"] + aaa["transaction_costs"]) - 200.0) < 1e-6
+        assert abs((bbb["realized_pnl"] + bbb["transaction_costs"]) - 400.0) < 1e-6
+        # Rows must not double-count: their sum equals the global realized total.
+        assert abs(
+            s.state.realized_pnl - (aaa["realized_pnl"] + bbb["realized_pnl"])
+        ) < 1e-6
+
 
 # ──────────────────────────────────────────────────────────
 # Per-symbol dividend yield
@@ -709,8 +743,8 @@ class TestStatePersistence:
                             expiry="2026-05-28", lot_size=50, quantity=1,
                             entry_price=102.0, current_price=102.4),
             ],
-            _baseline_realized=-21.0,
-            _baseline_costs=21.0,
+            realized=-21.0,
+            costs=21.0,
         )
         s.state.open_calendars = {"AAA": trade}
         s.state.realized_pnl = -42.0
@@ -745,15 +779,15 @@ class TestStatePersistence:
         assert dst.state.total_transaction_costs == 42.0
 
         # Open spread fully reconstructed, including signed leg quantities and
-        # the per-trade baselines (without which closed_trades would record the
-        # running cumulative instead of the trade delta at close).
+        # the per-trade realized/costs accumulators (without which closed_trades
+        # would lose this trade's own P&L attribution at close).
         assert set(dst.state.open_calendars) == {"AAA"}
         t = dst.state.open_calendars["AAA"]
         assert t.position == "SHORT_CALENDAR"
         assert t.entry_time == datetime(2026, 4, 15, 10, 0)
         assert t.entry_carry_diff == pytest.approx(0.031)
-        assert t._baseline_realized == -21.0
-        assert t._baseline_costs == 21.0
+        assert t.realized == -21.0
+        assert t.costs == 21.0
         assert [(l.tradingsymbol, l.quantity, l.entry_price) for l in t.legs] == [
             ("AAA26APRFUT", -1, 101.0),
             ("AAA26MAYFUT", 1, 102.0),
@@ -790,6 +824,47 @@ class TestStatePersistence:
                 "unrealized_pnl": 0.0,
                 "total_transaction_costs": 0.0,
             })
+
+    def test_restore_old_format_reconstructs_opening_cost_attribution(self):
+        # Migration: an OLD-format state file has baseline_* keys and NO per-trade
+        # realized/costs. Restore must reconstruct each still-open calendar's
+        # opening-cost attribution from its legs — otherwise its eventual closed
+        # row over-states net P&L by the opening costs. Legs are open (nothing
+        # realized yet), so realized-so-far == -(opening costs).
+        from strategies.taleb_karpathy import estimate_transaction_cost
+
+        dst = _make_strategy()
+        old_blob = {
+            "strategy": dst.name,
+            "realized_pnl": -30.0,
+            "unrealized_pnl": 0.0,
+            "total_transaction_costs": 30.0,
+            "closed_trades": [],
+            "open_calendars": [{
+                "symbol": "AAA",
+                "position": "SHORT_CALENDAR",
+                "entry_time": "2026-04-15T10:00:00",
+                "entry_carry_diff": 0.03,
+                "baseline_realized": -30.0,   # old-format keys, no realized/costs
+                "baseline_costs": 30.0,
+                "legs": [
+                    {"symbol": "AAA", "tradingsymbol": "AAA26APRFUT",
+                     "expiry": "2026-04-30", "lot_size": 50, "quantity": -1,
+                     "entry_price": 101.0, "current_price": 101.0},
+                    {"symbol": "AAA", "tradingsymbol": "AAA26MAYFUT",
+                     "expiry": "2026-05-28", "lot_size": 50, "quantity": 1,
+                     "entry_price": 102.0, "current_price": 102.0},
+                ],
+            }],
+        }
+        dst.restore_state(old_blob)
+        t = dst.state.open_calendars["AAA"]
+        expected = (
+            estimate_transaction_cost(101.0, 1, 50, "SELL", instrument_type="FUT")
+            + estimate_transaction_cost(102.0, 1, 50, "BUY", instrument_type="FUT")
+        )
+        assert t.costs == pytest.approx(expected)
+        assert t.realized == pytest.approx(-expected)
 
 
 # ──────────────────────────────────────────────────────────

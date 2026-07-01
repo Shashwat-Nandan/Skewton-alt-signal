@@ -74,13 +74,16 @@ class CalendarTrade:
     entry_time: datetime
     entry_carry_diff: float   # implied carry minus fair carry (annualized, fraction)
     legs: List[CalendarLeg] = field(default_factory=list)
-    # Snapshot of state.realized_pnl / state.total_transaction_costs at the
-    # moment the trade opened (before its first fill is applied). Used to
-    # compute *per-trade* realized P&L and costs at archive time — without
-    # these baselines, closed_trades records the running cumulative totals
-    # and every closed trade looks more profitable than the last.
-    _baseline_realized: float = 0.0
-    _baseline_costs: float = 0.0
+    # Per-trade realized P&L (net of costs) and gross transaction costs,
+    # accumulated LOCALLY as THIS trade's own legs fill/close. Recorded onto the
+    # closed_trades row at archive time so each row is its OWN P&L. The prior
+    # approach diffed the GLOBAL running counters against a per-trade baseline
+    # (state.realized_pnl − baseline), which only isolates a trade when trades
+    # DON'T overlap — with concurrently-open calendars (the normal case: many
+    # spreads open on the same tick) each row absorbed every OTHER trade's
+    # realized/costs booked during its lifetime.
+    realized: float = 0.0
+    costs: float = 0.0
 
 
 @dataclass
@@ -430,8 +433,8 @@ class ArbitrageStrategy(BaseStrategy):
                     "position": t.position,
                     "entry_time": t.entry_time.isoformat(),
                     "entry_carry_diff": t.entry_carry_diff,
-                    "baseline_realized": t._baseline_realized,
-                    "baseline_costs": t._baseline_costs,
+                    "realized": t.realized,
+                    "costs": t.costs,
                     "legs": [
                         {
                             "symbol": l.symbol,
@@ -484,9 +487,28 @@ class ArbitrageStrategy(BaseStrategy):
                     )
                     for l in tblob.get("legs", [])
                 ],
-                _baseline_realized=float(tblob.get("baseline_realized", 0.0)),
-                _baseline_costs=float(tblob.get("baseline_costs", 0.0)),
             )
+            if "realized" in tblob or "costs" in tblob:
+                trade.realized = float(tblob.get("realized", 0.0))
+                trade.costs = float(tblob.get("costs", 0.0))
+            else:
+                # Old-format state (baseline_* keys, no per-trade accumulators):
+                # reconstruct the opening-cost attribution from the still-open
+                # legs so a calendar carried across this one upgrade boundary
+                # doesn't lose it (its closed row would otherwise over-state net
+                # P&L). The legs are open → nothing is realized yet, so realized
+                # so far == -(opening costs). Same estimate_transaction_cost inputs
+                # as the original opening fills, so it matches exactly.
+                from strategies.taleb_karpathy import estimate_transaction_cost
+                open_costs = sum(
+                    estimate_transaction_cost(
+                        leg.entry_price, abs(leg.quantity), leg.lot_size,
+                        "BUY" if leg.quantity > 0 else "SELL", instrument_type="FUT",
+                    )
+                    for leg in trade.legs
+                )
+                trade.costs = open_costs
+                trade.realized = -open_costs
             open_calendars[trade.symbol] = trade
         self.state.open_calendars = open_calendars
         # Session start = this restore point, so session_*_delta measures only
@@ -969,22 +991,22 @@ class ArbitrageStrategy(BaseStrategy):
 
         trade = self.state.open_calendars.get(symbol)
         if trade is None:
-            # Opening leg — create the trade record on the first fill.
-            # Snapshot the running totals BEFORE this fill's cost is booked so
-            # the per-trade delta we record at close excludes pre-existing P&L.
+            # Opening leg — create the trade record on the first fill. Its
+            # realized/costs start at 0 and accumulate from THIS trade's own
+            # fills below (not diffed against a shared global counter).
             trade = CalendarTrade(
                 symbol=symbol,
                 position="LONG_CALENDAR",   # finalized after both legs in
                 entry_time=self._clock(),
                 entry_carry_diff=self.state.pending_entry_diff.pop(symbol, 0.0),
                 legs=[],
-                _baseline_realized=self.state.realized_pnl,
-                _baseline_costs=self.state.total_transaction_costs,
             )
             self.state.open_calendars[symbol] = trade
 
         self.state.total_transaction_costs += cost
         self.state.realized_pnl -= cost
+        trade.costs += cost           # this trade's own gross costs
+        trade.realized -= cost        # net-of-cost, mirrors state.realized_pnl
 
         existing = next((l for l in trade.legs if l.tradingsymbol == prop.tradingsymbol), None)
         if existing is None:
@@ -1003,11 +1025,13 @@ class ArbitrageStrategy(BaseStrategy):
             if new_qty == 0:
                 realized = (fill_price - existing.entry_price) * old_qty * existing.lot_size
                 self.state.realized_pnl += realized
+                trade.realized += realized      # attribute to THIS trade
                 trade.legs.remove(existing)
             elif old_qty * signed_qty < 0:
                 closed_qty = min(abs(old_qty), abs(signed_qty)) * (1 if old_qty > 0 else -1)
                 realized = (fill_price - existing.entry_price) * closed_qty * existing.lot_size
                 self.state.realized_pnl += realized
+                trade.realized += realized      # attribute to THIS trade
                 existing.quantity = new_qty
             else:
                 existing.entry_price = (
@@ -1023,19 +1047,17 @@ class ArbitrageStrategy(BaseStrategy):
             trade.position = "SHORT_CALENDAR" if near_leg.quantity > 0 else "LONG_CALENDAR"
 
         # If the trade is now empty, archive and remove. realized_pnl /
-        # transaction_costs are deltas vs the baselines snapshotted at open,
-        # so each closed_trades row is independently meaningful (sweeps and
-        # autoresearch loss functions consume these directly).
+        # transaction_costs are THIS trade's own locally-accumulated totals, so
+        # each closed_trades row is independently meaningful even when calendars
+        # overlap (sweeps and autoresearch loss functions consume these directly).
         if not trade.legs:
             self.state.closed_trades.append({
                 "symbol": symbol,
                 "exit_time": self._clock(),
                 "entry_time": trade.entry_time,
                 "entry_carry_diff": trade.entry_carry_diff,
-                "realized_pnl": self.state.realized_pnl - trade._baseline_realized,
-                "transaction_costs": (
-                    self.state.total_transaction_costs - trade._baseline_costs
-                ),
+                "realized_pnl": trade.realized,
+                "transaction_costs": trade.costs,
                 "position": trade.position,
             })
             del self.state.open_calendars[symbol]
