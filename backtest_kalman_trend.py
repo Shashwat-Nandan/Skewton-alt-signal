@@ -143,6 +143,23 @@ def main() -> int:
     args = ap.parse_args()
     seeds = list(range(args.seeds))
 
+    # Timeframe (issue #63): default multi-symbol run is daily closes. A --csv
+    # naming a 5-min series (e.g. NIFTY_5minute.csv) is already compliant, so
+    # only warn when the source is daily. Infer from the FILENAME STEM (not the
+    # whole path — a "minute_bars/" dir must not silence the warning for a daily
+    # file) and require an intraday token while excluding daily/eod, so the guard
+    # fails safe (over-warn) rather than silently passing a daily run as 5-min.
+    from pathlib import Path
+    from backtest_timeframe import warn_coarse_timeframe
+    _stem = Path(args.csv).stem.lower() if args.csv else ""
+    _is_5min = (("5min" in _stem or "1min" in _stem)
+                and not ("daily" in _stem or "eod" in _stem))
+    _tf = "5min" if _is_5min else "daily"
+    warn_coarse_timeframe(_tf, backtest="backtest_kalman_trend",
+                          reason="daily-close trend follower — only the index "
+                          "sleeve has 5-min history; pass --csv "
+                          "data_cache/NIFTY_5minute.csv for a 5-min run (issue #63)")
+
     if args.csv:
         import pandas as pd
         from pathlib import Path

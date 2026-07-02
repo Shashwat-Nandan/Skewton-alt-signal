@@ -50,6 +50,7 @@ from strategies.calendar_meanreversion import (
     SpreadHistory,
     VolumeHistory,
 )
+from backtest_timeframe import warn_coarse_timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,12 @@ def main() -> int:
                         "or both (STF,IDF). For IDF you almost certainly want to raise "
                         "--max-leg-notional (NIFTY ≈ ₹1.6M/lot, BANKNIFTY ≈ ₹1.7M/lot).")
     args = p.parse_args()
+
+    warn_coarse_timeframe("daily", backtest="backtest_calendar_meanreversion",
+                          logger=logger,
+                          reason="no 5-min single-stock-futures data — daily "
+                          "bhavcopy only; run fetch_5min_stf.py on the host to "
+                          "build a 5-min STF corpus (issue #63)")
 
     universe = (
         [s.strip().upper() for s in args.universe.split(",") if s.strip()]

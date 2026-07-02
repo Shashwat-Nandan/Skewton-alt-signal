@@ -39,6 +39,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from strategies.arbitrage import ArbitrageState, ArbitrageStrategy
+from backtest_timeframe import warn_coarse_timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +504,11 @@ def main() -> int:
     p.add_argument("--save-curve", type=str, default=None,
                    help="Optional: write daily P&L curve to this CSV")
     args = p.parse_args()
+
+    warn_coarse_timeframe("daily", backtest="backtest_arbitrage", logger=logger,
+                          reason="no 5-min single-stock-futures data — daily "
+                          "bhavcopy only; run fetch_5min_stf.py on the host to "
+                          "build a 5-min STF corpus (issue #63)")
 
     universe = (
         [s.strip().upper() for s in args.universe.split(",") if s.strip()]

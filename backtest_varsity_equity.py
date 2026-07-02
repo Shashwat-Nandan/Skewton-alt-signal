@@ -55,6 +55,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from strategies._eq_data import load_equity_panel, load_universe
+from backtest_timeframe import warn_coarse_timeframe
 from strategies.varsity_equity_swing import (
     EquityPosition,
     PENDING_GAP_ATR_THRESHOLD,
@@ -380,6 +381,10 @@ def main():
     p.add_argument("--report-json", default=None)
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
+
+    warn_coarse_timeframe("daily", backtest="backtest_varsity_equity",
+                          reason="no 5-min equity data exists — daily EOD panel "
+                          "only; stand up forward 5-min capture (issue #63)")
 
     universe = load_universe(Path(args.universe))
     panel = load_equity_panel(universe=universe, source=args.source)
