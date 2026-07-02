@@ -36,6 +36,36 @@ def test_build_books_sets_lot_size_and_engines():
     assert b.kalman.lot_size == 75 and b.ma.lot_size == 75   # NIFTY lot
 
 
+def test_build_books_applies_transaction_cost():
+    """Issue #77: both books must carry the per-side cost, else the churny Kalman
+    book is flattered vs MA by booking cost-free fills. A zero here means the EOD
+    ₹ A/B is non-comparable to the backtest (which charges 2.5/side)."""
+    b = r.build_books("NIFTY", KAL, MA)
+    assert b.kalman.cost_per_unit == r.COST_PER_UNIT_POINTS
+    assert b.ma.cost_per_unit == r.COST_PER_UNIT_POINTS
+    assert r.COST_PER_UNIT_POINTS > 0
+
+
+def test_set_cost_overrides_restored_zero_cost():
+    """A book serialized before #77 carries cost_per_unit=0.0; restore() preserves
+    it, so the runner must re-assert the current cost or a persisted book keeps
+    booking cost-free fills forever. This is the subsequent-day path (fresh warmup
+    only happens when state is absent)."""
+    b = r.build_books("NIFTY", KAL, MA)
+    blob = b.serialize()
+    blob["kalman"]["cost_per_unit"] = 0.0        # simulate a pre-#77 persisted book
+    blob["ma"]["cost_per_unit"] = 0.0
+    rb = r.InstrumentBooks.restore(blob)
+    assert rb.kalman.cost_per_unit == 0.0 and rb.ma.cost_per_unit == 0.0  # stale
+    rb.set_cost(r.COST_PER_UNIT_POINTS)
+    assert rb.kalman.cost_per_unit == r.COST_PER_UNIT_POINTS
+    assert rb.ma.cost_per_unit == r.COST_PER_UNIT_POINTS
+    # and it actually bites: a +10pt gross trade now nets (10 - 2*cost) points
+    rb.kalman.pos, rb.kalman.entry_price = 1, 100.0
+    rb.kalman.force_close(110.0)
+    assert rb.kalman.realized_points == 10 - 2 * r.COST_PER_UNIT_POINTS
+
+
 def test_both_books_step_on_same_bars_and_intraday_exit():
     b = r.build_books("NIFTY", KAL, MA)
     for p in 100 + 0.5 * np.arange(40):       # uptrend → both books go long
@@ -57,15 +87,18 @@ def test_eod_close_flattens_both():
 
 def test_eod_report_totals_and_delta():
     b = r.build_books("NIFTY", KAL, MA)
-    # give the kalman book a +10pt trade and the MA book a -4pt trade
+    # build_books charges COST_PER_UNIT_POINTS/side (round-trip 2×) per issue #77,
+    # so each closed trade nets `gross - 2*cost` points before ×lot.
+    rt = 2 * r.COST_PER_UNIT_POINTS
+    # give the kalman book a +10pt gross trade and the MA book a -4pt gross trade
     b.kalman.pos, b.kalman.entry_price = 1, 100.0
-    b.kalman.force_close(110.0)               # +10 pts × 75 = ₹750
+    b.kalman.force_close(110.0)               # (10 - rt) pts × 75
     b.ma.pos, b.ma.entry_price = 1, 100.0
-    b.ma.force_close(96.0)                     # -4 pts × 75 = -₹300
+    b.ma.force_close(96.0)                     # (-4 - rt) pts × 75
     rep = r.eod_report([b], date(2026, 6, 27))
-    assert rep["total_kalman_rupees"] == 750.0
-    assert rep["total_ma_rupees"] == -300.0
-    assert rep["kalman_minus_ma_rupees"] == 1050.0
+    assert rep["total_kalman_rupees"] == round((10 - rt) * 75, 2)
+    assert rep["total_ma_rupees"] == round((-4 - rt) * 75, 2)
+    assert rep["kalman_minus_ma_rupees"] == round((14) * 75, 2)  # cost cancels in the delta
     assert rep["instruments"][0]["symbol"] == "NIFTY"
 
 

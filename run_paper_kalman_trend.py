@@ -42,6 +42,13 @@ SILENT_FAIL_PATH = DATA_CACHE / "SILENT_FAIL_kalman_trend"
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 LOT_SIZE = {"NIFTY": 75, "BANKNIFTY": 15}   # ₹/point/lot (front-month future)
 BAR_SECONDS = 300                            # 5-min signal bars
+# Per-side transaction cost in price POINTS, charged round-trip (`_close`
+# subtracts 2×). Mirrors backtest_kalman_trend.py's `--cost` default (2.5) so the
+# forward paper A/B is cost-consistent with the backtest that graded the strategy
+# NO-GO — without it the ~30-trade/day Kalman book is flattered vs the 1-4-trade
+# MA book by omitting costs entirely (issue #77). Flat across instruments to match
+# the backtest; per-instrument realism is a possible follow-up.
+COST_PER_UNIT_POINTS = 2.5
 
 logger = logging.getLogger("paper-kalman-trend")
 
@@ -92,6 +99,15 @@ class InstrumentBooks:
         self.kalman.on_session_start()
         self.ma.on_session_start()
 
+    def set_cost(self, cost_per_unit: float) -> None:
+        """Apply the current per-side cost to both books. Books RESTORED from
+        prior state carry whatever `cost_per_unit` was serialized — including the
+        stale 0.0 written before issue #77 — so the runner re-asserts the current
+        cost after restore, else a persisted book would keep booking cost-free
+        fills indefinitely (build_books already sets it for fresh warmups)."""
+        self.kalman.cost_per_unit = cost_per_unit
+        self.ma.cost_per_unit = cost_per_unit
+
     def eod_close(self, price: float) -> None:
         self.kalman.force_close(price)
         self.ma.force_close(price)
@@ -119,11 +135,12 @@ def build_books(symbol: str, kal_params: dict, ma_params: dict) -> InstrumentBoo
         signal_kind="kalman", filter_params=kal_params["filter_params"],
         model=kal_params.get("model", 2), mu=kal_params["mu"],
         stop_ticks=kal_params["stop_ticks"], target_ticks=kal_params["target_ticks"],
-        tick_size=1.0, lot_size=lot)
+        tick_size=1.0, lot_size=lot, cost_per_unit=COST_PER_UNIT_POINTS)
     ma = IntradayTrendStrategy(
         signal_kind="ma", short=ma_params["short"], long=ma_params["long"],
         offset=ma_params["offset"], stop_ticks=ma_params["stop_ticks"],
-        target_ticks=ma_params["target_ticks"], tick_size=1.0, lot_size=lot)
+        target_ticks=ma_params["target_ticks"], tick_size=1.0, lot_size=lot,
+        cost_per_unit=COST_PER_UNIT_POINTS)
     return InstrumentBooks(symbol=symbol, kalman=kal, ma=ma)
 
 
@@ -230,6 +247,9 @@ def main() -> int:  # pragma: no cover
         tradesym[sym] = fut["tradingsymbol"]
         if sym in prior:
             b = InstrumentBooks.restore(prior[sym])
+            # Re-assert cost: a book serialized before #77 carries cost_per_unit=0.0
+            # and restore() faithfully preserves it, so override to the current cost.
+            b.set_cost(COST_PER_UNIT_POINTS)
             # The prior state is from yesterday's close → today's first bar spans
             # the overnight gap. Inflate now so the gap is absorbed as a level
             # jump, not one bar of velocity (the daily-restart path is the ONLY
