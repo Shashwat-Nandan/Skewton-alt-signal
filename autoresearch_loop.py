@@ -29,7 +29,7 @@ import logging
 import configparser
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -137,6 +137,13 @@ class HedgeResearchLoop:
         self.baseline_metric = None
         self.best_params = copy.deepcopy(hedger.tunable_params)
         self.best_metric_value = float("-inf")
+        # One {"accepted", "metric_value"} record per experiment — the
+        # input to sweep_quality(), shared by every driver of this loop.
+        self._experiment_records = []
+        # session_date -> parsed tape frame; filled in _run_experiment.
+        self._tape_cache = {}
+        # Replay window, pinned on first _run_experiment (None = not yet).
+        self._replay_sessions = None
 
         self._init_results_file()
         self._setup_logging()
@@ -169,6 +176,9 @@ class HedgeResearchLoop:
             params=self.baseline_params,
         )
         logger.info("[Experiment 0] Baseline %s: %.4f", self.primary_metric, self.baseline_metric)
+        # baseline_metric drifts upward as mutations are accepted; keep the
+        # seed's score for the sweep-quality verdict at save time.
+        seed_baseline = self.baseline_metric
 
         # ── Main loop ──
         try:
@@ -193,6 +203,9 @@ class HedgeResearchLoop:
 
                 # 3. Decide: keep or discard
                 accepted = self._evaluate_experiment(metric_value)
+                self._experiment_records.append(
+                    {"accepted": accepted, "metric_value": metric_value},
+                )
 
                 if accepted:
                     logger.info("  ✅ ACCEPTED — new params are better!")
@@ -230,7 +243,14 @@ class HedgeResearchLoop:
             logger.info("Best params: %s", json.dumps(self.best_params, indent=2))
             logger.info("Results saved to: %s", self.results_file)
             logger.info("=" * 60)
-            self._save_best_params()
+            # Stamp the quality verdict here too — before this, the
+            # LOOP-FOREVER path wrote the canonical best_params.json
+            # permanently verdict-less (and the preservation exclusion in
+            # _save_best_params strips any stale one), so 'no sweep_quality'
+            # was ambiguous between pre-feature files and this path.
+            self._save_best_params(
+                sweep_quality=self.sweep_quality(seed_baseline),
+            )
 
     def run_single_experiment(self) -> dict:
         """
@@ -243,6 +263,9 @@ class HedgeResearchLoop:
         mutated_params, param_name, old_val, new_val = self._propose_mutation()
         metric_value = self._run_experiment(mutated_params)
         accepted = self._evaluate_experiment(metric_value)
+        self._experiment_records.append(
+            {"accepted": accepted, "metric_value": metric_value},
+        )
 
         if accepted:
             self.baseline_params = copy.deepcopy(mutated_params)
@@ -402,30 +425,45 @@ class HedgeResearchLoop:
             load_iv_skew_seed,
         )
 
-        # Apply params to hedger so the backtest picks them up
-        original_params = copy.deepcopy(self.hedger.tunable_params)
-        self.hedger.tunable_params = copy.deepcopy(params)
-
         underlying = getattr(self.hedger, "underlying", "NIFTY")
-        captured = list_captured_sessions(underlying)
-        # Pick the most recent N sessions matching eval_cycles. Replaying
-        # the SAME N sessions across all experiments keeps the metric
-        # comparable — a different per-cycle seed (as the old synthetic
-        # path used) made fitness landscapes noisy enough that the
-        # one-at-a-time hill-climber couldn't separate signal from luck.
-        replay_sessions = captured[-self.eval_cycles:] if captured else []
+        # Pin the replay window ONCE per loop instance: the most recent N
+        # sessions matching eval_cycles. Replaying the SAME N sessions
+        # across all experiments keeps the metric comparable — a different
+        # per-cycle seed (as the old synthetic path used) made fitness
+        # landscapes noisy enough that the one-at-a-time hill-climber
+        # couldn't separate signal from luck. Re-listing per experiment
+        # also let the window SHIFT mid-sweep (a Persistent=true catch-up
+        # run on a trading day would pull in — and permanently cache — the
+        # half-written live capture file).
+        if self._replay_sessions is None:
+            captured = list_captured_sessions(underlying)
+            self._replay_sessions = captured[-self.eval_cycles:] if captured else []
+            if self._replay_sessions:
+                logger.info(
+                    "Replaying %d captured sessions: %s",
+                    len(self._replay_sessions), self._replay_sessions,
+                )
+                if len(self._replay_sessions) < self.eval_cycles:
+                    logger.warning(
+                        "Only %d captured sessions for eval_cycles=%d — "
+                        "each session replays once per experiment "
+                        "(no wrap-around double-counting).",
+                        len(self._replay_sessions), self.eval_cycles,
+                    )
+            else:
+                logger.info(
+                    "No captured tape in data_cache/ticks/ — falling back "
+                    "to synthetic GBM (Ch 15 properties absent; tuning on "
+                    "this is structurally limited)."
+                )
+        replay_sessions = self._replay_sessions
         use_tape = len(replay_sessions) >= 1
-        if use_tape:
-            logger.info(
-                "Replaying %d captured sessions: %s",
-                len(replay_sessions), replay_sessions,
-            )
-        else:
-            logger.info(
-                "No captured tape in data_cache/ticks/ — falling back "
-                "to synthetic GBM (Ch 15 properties absent; tuning on "
-                "this is structurally limited)."
-            )
+        # Each session replays exactly once per experiment. The slice above
+        # already caps the window at eval_cycles; when FEWER sessions exist,
+        # repeating some (the old `cycle % len` wrap) would bias the mean
+        # toward the duplicated days and shrink the variance penalty's std —
+        # score what exists instead.
+        n_cycles = len(replay_sessions) if use_tape else self.eval_cycles
 
         # Seed each backtest's IV/skew rolling history from the persisted
         # live history so the IV-percentile and skew gates leave warmup.
@@ -446,81 +484,106 @@ class HedgeResearchLoop:
                 len(self._iv_seed), len(self._skew_seed), drop,
             )
 
-        cycle_metrics = []
+        # Apply params to hedger so the backtest picks them up. Restore in
+        # `finally`: the old restore sat after the cycle loop, so the
+        # early -999999 return (and any propagating tape error) leaked the
+        # rejected mutation into the hedger for the rest of the process.
+        original_params = copy.deepcopy(self.hedger.tunable_params)
+        self.hedger.tunable_params = copy.deepcopy(params)
+        try:
+            cycle_metrics = []
 
-        for cycle in range(self.eval_cycles):
-            logger.debug("  Cycle %d/%d", cycle + 1, self.eval_cycles)
+            for cycle in range(n_cycles):
+                logger.debug("  Cycle %d/%d", cycle + 1, n_cycles)
 
-            try:
                 if use_tape:
-                    # Cycle over the captured sessions in order, wrapping
-                    # if eval_cycles > len(replay_sessions).
-                    session_date = replay_sessions[cycle % len(replay_sessions)]
-                    data = load_captured_tape(session_date, underlying)
+                    session_date = replay_sessions[cycle]
+                    # Parse each session ONCE per sweep, not once per
+                    # experiment: the raw JSONL runs to several GB per
+                    # session (~3 min to parse) while the resampled frame
+                    # is ~10 MB. Without this cache a 25-experiment ×
+                    # 15-session sweep spends >10 h re-reading identical
+                    # files and blows the unit's TimeoutStartSec.
+                    #
+                    # The load sits OUTSIDE the try below on purpose: a
+                    # session that fails to LOAD (corrupt archive, missing
+                    # zstd binary) is an infrastructure failure shared by
+                    # every experiment, not a property of the mutated
+                    # params — scoring it -999999 would silently flatten
+                    # the entire sweep. Let it propagate and kill the run
+                    # with the real error instead.
+                    if session_date not in self._tape_cache:
+                        self._tape_cache[session_date] = load_captured_tape(
+                            session_date, underlying,
+                        )
+                    # copy() hands each cycle its own frame — defense in
+                    # depth alongside run_backtest's own input copy.
+                    data = self._tape_cache[session_date].copy()
                     logger.debug("    session %s rows=%d", session_date, len(data))
-                else:
-                    data = generate_synthetic_data(
-                        underlying=underlying, days=10, ticks_per_day=12,
-                    )
-                results = run_backtest(
-                    data, underlying=underlying,
-                    config_path=getattr(self, "_config_path", "config.ini"),
-                    tunable_params=params,
-                    seed_iv_history=self._iv_seed,
-                    seed_skew_history=self._skew_seed,
-                )
-                metrics = results["metrics"]
-                if metrics.get("total_trades", 0) == 0:
-                    # P&L objective: no trades = ₹0, a real outcome — don't
-                    # penalize (penalizing pushes overtrading). Ratio
-                    # objective: no trades is undefined → penalty.
-                    if self.primary_metric in PNL_METRICS:
-                        logger.debug("  Cycle %d: 0 trades — net P&L 0.0", cycle + 1)
-                        metrics = {**metrics, self.primary_metric: 0.0}
-                    else:
-                        logger.debug("  Cycle %d: 0 trades — penalty %.0f",
-                                     cycle + 1, ZERO_TRADE_PENALTY)
-                        metrics = {**metrics, self.primary_metric: ZERO_TRADE_PENALTY}
-                cycle_metrics.append(metrics)
 
-            except Exception as e:
-                logger.warning("  Cycle %d failed: %s", cycle + 1, e)
+                try:
+                    if not use_tape:
+                        data = generate_synthetic_data(
+                            underlying=underlying, days=10, ticks_per_day=12,
+                        )
+                    results = run_backtest(
+                        data, underlying=underlying,
+                        config_path=getattr(self, "_config_path", "config.ini"),
+                        tunable_params=params,
+                        seed_iv_history=self._iv_seed,
+                        seed_skew_history=self._skew_seed,
+                    )
+                    metrics = results["metrics"]
+                    if metrics.get("total_trades", 0) == 0:
+                        # P&L objective: no trades = ₹0, a real outcome — don't
+                        # penalize (penalizing pushes overtrading). Ratio
+                        # objective: no trades is undefined → penalty.
+                        if self.primary_metric in PNL_METRICS:
+                            logger.debug("  Cycle %d: 0 trades — net P&L 0.0", cycle + 1)
+                            metrics = {**metrics, self.primary_metric: 0.0}
+                        else:
+                            logger.debug("  Cycle %d: 0 trades — penalty %.0f",
+                                         cycle + 1, ZERO_TRADE_PENALTY)
+                            metrics = {**metrics, self.primary_metric: ZERO_TRADE_PENALTY}
+                    cycle_metrics.append(metrics)
+
+                except Exception as e:
+                    logger.warning("  Cycle %d failed: %s", cycle + 1, e)
+                    return -999999.0
+
+            if not cycle_metrics:
                 return -999999.0
 
-        # Restore original params
-        self.hedger.tunable_params = original_params
+            primary_values = [m.get(self.primary_metric, 0) for m in cycle_metrics]
+            avg_metric = float(np.mean(primary_values))
 
-        if not cycle_metrics:
-            return -999999.0
+            # Phase 2.4: variance penalty. A single-cycle win shouldn't be
+            # rewarded as much as a consistent winner — particularly when
+            # primary_metric is gamma_theta_ratio (high single-day numerator
+            # variance is common). penalty_factor is the coefficient on the
+            # std-dev term; 0.5 means "subtract half a stddev from the mean".
+            # The autoresearch [section] can tune this if needed; default
+            # is moderate enough that a wide-but-fat-positive distribution
+            # still wins over an unstable spike.
+            if len(primary_values) >= 2:
+                penalty = float(np.std(primary_values))
+                penalty_factor = self.config.getfloat(
+                    "autoresearch", "variance_penalty", fallback=0.5,
+                )
+                avg_metric -= penalty_factor * penalty
 
-        primary_values = [m.get(self.primary_metric, 0) for m in cycle_metrics]
-        avg_metric = float(np.mean(primary_values))
+            # Also check drawdown constraint (convert absolute drawdown to % of capital)
+            total_capital = self.hedger.immutable_params.get("total_capital", 500000)
+            max_dd = max(m.get("max_drawdown", 0) for m in cycle_metrics)
+            max_dd_pct = (max_dd / total_capital) * 100 if total_capital > 0 else 0
+            if max_dd_pct > self.max_dd_threshold:
+                logger.info("  Max drawdown %.2f%% (₹%.0f) exceeds threshold %.2f%%. Penalizing.",
+                            max_dd_pct, max_dd, self.max_dd_threshold)
+                avg_metric = -999999.0  # Reject any param set that blows drawdown
 
-        # Phase 2.4: variance penalty. A single-cycle win shouldn't be
-        # rewarded as much as a consistent winner — particularly when
-        # primary_metric is gamma_theta_ratio (high single-day numerator
-        # variance is common). penalty_factor is the coefficient on the
-        # std-dev term; 0.5 means "subtract half a stddev from the mean".
-        # The autoresearch [section] can tune this if needed; default
-        # is moderate enough that a wide-but-fat-positive distribution
-        # still wins over an unstable spike.
-        if len(primary_values) >= 2:
-            penalty = float(np.std(primary_values))
-            penalty_factor = self.config.getfloat(
-                "autoresearch", "variance_penalty", fallback=0.5,
-            )
-            avg_metric -= penalty_factor * penalty
-
-        # Also check drawdown constraint (convert absolute drawdown to % of capital)
-        total_capital = self.hedger.immutable_params.get("total_capital", 500000)
-        max_dd = max(m.get("max_drawdown", 0) for m in cycle_metrics)
-        max_dd_pct = (max_dd / total_capital) * 100 if total_capital > 0 else 0
-        if max_dd_pct > self.max_dd_threshold:
-            logger.info("  Max drawdown %.2f%% (₹%.0f) exceeds threshold %.2f%%. Penalizing.",
-                        max_dd_pct, max_dd, self.max_dd_threshold)
-            avg_metric = -999999.0  # Reject any param set that blows drawdown
-
-        return avg_metric
+            return avg_metric
+        finally:
+            self.hedger.tunable_params = original_params
 
     def _evaluate_experiment(self, metric_value: float) -> bool:
         """
@@ -571,8 +634,58 @@ class HedgeResearchLoop:
                 f"{params.get('entry_iv_percentile_max', 0):.0f}\n"
             )
 
-    def _save_best_params(self, out_file: str = "best_params.json"):
+    def sweep_quality(self, seed_baseline: float) -> Dict:
+        """Score the sweep itself (Rule 12): the 2026-06-20 run accepted
+        0/40 mutations and 06-27 scored 29/40 experiments at one identical
+        fitness, yet both wrote candidate files indistinguishable from a
+        real optimization result. Every writer of a params file stamps
+        this verdict so the manual promotion step can reject an
+        uninformative sweep from the candidate file alone.
+
+        Computed from the records run()/run_single_experiment accumulate,
+        so both entrypoints (the weekly run_autoresearch.py sweep and
+        run.py's LOOP-FOREVER mode) share one definition.
+        """
+        from collections import Counter
+        records = self._experiment_records
+        fitness_counts = Counter(round(r["metric_value"], 6) for r in records)
+        plateau_share = (
+            max(fitness_counts.values()) / len(records) if records else 0.0
+        )
+        n_accepted = sum(1 for r in records if r["accepted"])
+        warnings = []
+        if n_accepted == 0:
+            warnings.append("0 mutations accepted — candidate is the seed params")
+        elif self.best_metric_value <= seed_baseline:
+            # Unreachable while acceptance is strictly-better-than-baseline;
+            # kept as a tripwire should the acceptance rule ever admit ties.
+            warnings.append("best never beat the seed baseline")
+        if plateau_share > 0.5:
+            plateau_value = fitness_counts.most_common(1)[0][0]
+            warnings.append(
+                f"{plateau_share:.0%} of experiments scored an identical "
+                f"fitness ({plateau_value:.6f}) — landscape flat on this "
+                f"replay window"
+            )
+        return {
+            "experiments": len(records),
+            "accepted": n_accepted,
+            "distinct_fitness": len(fitness_counts),
+            "plateau_share": round(plateau_share, 3),
+            "seed_baseline": seed_baseline,
+            "best": self.best_metric_value,
+            "informative": not warnings,
+            "warnings": warnings,
+        }
+
+    def _save_best_params(self, out_file: str = "best_params.json",
+                          sweep_quality: Optional[Dict] = None):
         """Save best parameters to a JSON file for easy loading.
+
+        `sweep_quality` (optional) is the run's self-assessment from
+        run_autoresearch.py — accepted count, plateau share, informative
+        verdict. Stamped into the output so the manual promotion step can
+        reject an uninformative sweep from the candidate file alone.
 
         Preserves out-of-schema fields (e.g. `_migrations` semantic-shift
         history) from the canonical best_params.json so they survive each
@@ -590,8 +703,11 @@ class HedgeResearchLoop:
             with open("best_params.json") as f:
                 existing = json.load(f)
             for k, v in existing.items():
+                # sweep_quality is per-run — a stale one preserved from a
+                # promoted candidate would mislabel THIS run's output.
                 if k not in ("best_params", "best_metric",
-                             "total_experiments", "timestamp"):
+                             "total_experiments", "timestamp",
+                             "sweep_quality"):
                     preserved[k] = v
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -602,6 +718,8 @@ class HedgeResearchLoop:
             "timestamp": datetime.now().isoformat(),
             **preserved,
         }
+        if sweep_quality is not None:
+            output["sweep_quality"] = sweep_quality
         # Atomic: write a sibling temp then rename. Path.replace is an
         # atomic os.replace on the same filesystem.
         out_path = Path(out_file)

@@ -33,6 +33,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Metrics run_backtest actually emits. Also validates the config-derived
+# metric (argparse `choices` only checks CLI values): a typo'd
+# [autoresearch] metric would otherwise score every cycle via
+# metrics.get(typo, 0) == 0.0 — an hours-long flat sweep whose root cause
+# is never named.
+VALID_METRICS = ("sharpe_ratio", "net_pnl", "calmar_ratio",
+                 "sortino_ratio", "gamma_theta_ratio")
+
 
 def _split_data_into_windows(
     data: pd.DataFrame, window_days: int = 5, holdout_days: int = 0,
@@ -83,14 +91,22 @@ def main():
     parser = argparse.ArgumentParser(description="Run autoresearch optimization")
     parser.add_argument("--experiments", type=int, default=50,
                         help="Number of experiments to run (default: 50)")
-    parser.add_argument("--metric", type=str, default="sharpe_ratio",
-                        choices=["sharpe_ratio", "net_pnl", "calmar_ratio",
-                                 "sortino_ratio", "gamma_theta_ratio"],
-                        help="Primary metric to optimize (default: sharpe_ratio). "
-                             "gamma_theta_ratio is the Phase 2.4 Taleb-framework "
-                             "efficiency metric (realized scalp / realized theta).")
-    parser.add_argument("--eval-cycles", type=int, default=3,
-                        help="Backtest replays per experiment (default: 3)")
+    parser.add_argument("--metric", type=str, default=None,
+                        choices=list(VALID_METRICS),
+                        help="Primary metric to optimize. Default: the "
+                             "[autoresearch] metric from config.ini (net_pnl on "
+                             "this host) — a hardcoded sharpe_ratio default here "
+                             "used to silently override the config for manual "
+                             "runs. gamma_theta_ratio is the Phase 2.4 Taleb-"
+                             "framework efficiency metric, DECOUPLED from money "
+                             "(2026-06-14) — don't optimize it alone.")
+    parser.add_argument("--eval-cycles", type=int, default=None,
+                        help="Backtest replays per experiment — on the "
+                             "captured-tape path this IS the replay-window "
+                             "size. Default: [autoresearch] "
+                             "eval_cycles_per_experiment from config.ini "
+                             "(a hardcoded default of 3 used to silently "
+                             "clobber the config for manual runs).")
     parser.add_argument("--days", type=int, default=5,
                         help="Days per synthetic replay (default: 5)")
     parser.add_argument("--seed", type=int, default=None,
@@ -138,10 +154,21 @@ def main():
     dummy_kite = MockKite(dummy_data, args.underlying)
     hedger = TalebKarpathyStrategy(dummy_kite, config_path="config.ini", mode="paper")
 
-    # Override autoresearch config for this run
+    # Override autoresearch config for this run. --metric / --eval-cycles
+    # omitted keep the loop's config-derived values ([autoresearch]
+    # metric / eval_cycles_per_experiment).
     loop = HedgeResearchLoop(hedger, config_path="config.ini")
-    loop.primary_metric = args.metric
-    loop.eval_cycles = args.eval_cycles
+    if args.metric is not None:
+        loop.primary_metric = args.metric
+    args.metric = loop.primary_metric
+    if args.metric not in VALID_METRICS:
+        parser.error(
+            f"[autoresearch] metric = {args.metric!r} in config.ini is not "
+            f"one of {sorted(VALID_METRICS)} — fix the config or pass --metric."
+        )
+    if args.eval_cycles is not None:
+        loop.eval_cycles = args.eval_cycles
+    args.eval_cycles = loop.eval_cycles
 
     # Pre-screen training windows. A window where the seed params produce 0
     # trades gives the optimizer no gradient — every mutation will tie at the
@@ -210,6 +237,14 @@ def main():
             import copy as cp
             original_params = cp.deepcopy(loop.hedger.tunable_params)
             loop.hedger.tunable_params = cp.deepcopy(params)
+            try:
+                return _patched_run_inner(params)
+            finally:
+                # Mirror _run_experiment's try/finally: the -999999 early
+                # returns below must not leak the mutation into the hedger.
+                loop.hedger.tunable_params = original_params
+
+        def _patched_run_inner(params):
             cycle_metrics = []
 
             if historical_windows:
@@ -251,7 +286,6 @@ def main():
                         logger.warning("Cycle %d failed: %s", cycle + 1, e)
                         return -999999.0
 
-            loop.hedger.tunable_params = original_params
             if not cycle_metrics:
                 return -999999.0
             values = [m.get(loop.primary_metric, 0) for m in cycle_metrics]
@@ -294,6 +328,9 @@ def main():
     loop.best_metric_value = loop.baseline_metric
     loop._log_experiment(0, "BASELINE", 0, 0, loop.baseline_metric, True, loop.baseline_params)
     logger.info("[0/%d] Baseline %s = %.6f", args.experiments, args.metric, loop.baseline_metric)
+    # loop.baseline_metric drifts upward as mutations are accepted; keep
+    # the seed's score for the sweep-quality verdict below.
+    seed_baseline = loop.baseline_metric
 
     # Experiments
     for i in range(1, args.experiments + 1):
@@ -321,8 +358,24 @@ def main():
             print(f"    {k:<30s} = {v}")
     print(f"\n  Results log:    {loop.results_file}")
 
+    # ── Sweep quality (Rule 12: an uninformative sweep must say so) ──
+    # Computed by the loop itself (HedgeResearchLoop.sweep_quality — see
+    # its docstring for the 06-20/06-27 provenance) so this driver and the
+    # LOOP-FOREVER path in run.py share one definition.
+    sweep_quality = loop.sweep_quality(seed_baseline)
+    print("\n  Sweep quality:")
+    print(f"    accepted:         {sweep_quality['accepted']}/{sweep_quality['experiments']}")
+    print(f"    distinct fitness: {sweep_quality['distinct_fitness']}")
+    print(f"    plateau share:    {sweep_quality['plateau_share']:.0%}")
+    if sweep_quality["warnings"]:
+        print("\n  ⚠️  SWEEP UNINFORMATIVE — do NOT promote this candidate:")
+        for w in sweep_quality["warnings"]:
+            print(f"      - {w}")
+        logger.warning("SWEEP UNINFORMATIVE: %s",
+                       "; ".join(sweep_quality["warnings"]))
+
     # Save best params
-    loop._save_best_params(out_file=args.out)
+    loop._save_best_params(out_file=args.out, sweep_quality=sweep_quality)
     print(f"  Best params:    {args.out}")
     print("=" * 60)
 
@@ -331,62 +384,81 @@ def main():
     # prime the rolling windows the same way the fitness eval does — otherwise
     # _compute_iv_percentile sees <30 obs, returns the neutral 50.0, and the
     # validation is as degenerate as the metric it's checking.
-    val_seed_iv, val_seed_skew = None, None
-    if args.validation_data:
-        val_data = pd.read_csv(args.validation_data, parse_dates=["timestamp"])
-        val_label = (f"separate validation set ({args.validation_data}, "
-                     f"{val_data['timestamp'].min().date()} — "
-                     f"{val_data['timestamp'].max().date()}, "
-                     f"never seen during training)")
-    elif holdout_data is not None and len(holdout_data) > 0:
-        val_data = holdout_data
-        val_label = (f"hold-out ({val_data['timestamp'].min().date()} — "
-                     f"{val_data['timestamp'].max().date()}, "
-                     f"never seen during training)")
-    elif historical_data is not None:
-        # Fallback: not enough data for holdout, use full dataset (warn user)
-        val_data = historical_data
-        val_label = "full dataset (WARNING: no true hold-out, insufficient data)"
-    else:
-        # No CSV: prefer a real captured-tape session over synthetic GBM. The
-        # fitness eval trains on the last `eval_cycles` sessions, so the most
-        # recent session OUTSIDE that window is a genuine hold-out. Falls back
-        # to synthetic only when there isn't enough tape for one.
-        from backtest import list_captured_sessions, load_captured_tape, load_iv_skew_seed
-        captured = list_captured_sessions(args.underlying)
-        if len(captured) > loop.eval_cycles:
-            val_date = captured[-(loop.eval_cycles + 1)]
-            val_data = load_captured_tape(val_date, args.underlying)
-            # Reuse the seed the fitness eval built (same drop_recent); compute
-            # it if the run never took the tape path. NOTE (Rule 12): the seed
-            # is NOT timestamp-filtered against val_date, so it can include
-            # post-val_date IV — adequate for a relative sanity check, not a
-            # look-ahead-clean absolute claim. Same caveat as load_iv_skew_seed.
-            val_seed_iv = getattr(loop, "_iv_seed", None)
-            val_seed_skew = getattr(loop, "_skew_seed", None)
-            if val_seed_iv is None:
-                drop = loop.config.getint("autoresearch", "iv_seed_drop_recent", fallback=0)
-                val_seed_iv, val_seed_skew = load_iv_skew_seed(args.underlying, drop_recent=drop)
-            val_label = (f"captured-tape hold-out ({val_date}, not in the "
-                         f"{loop.eval_cycles}-session fitness window)")
+    #
+    # The whole section is best-effort: the candidate is already saved above,
+    # and an exception here (e.g. a corrupt .zst hold-out archive — always an
+    # archive now that the hold-out sits outside the KEEP_RAW window) would
+    # otherwise abort the wrapper's `set -euo pipefail` block AFTER the run's
+    # real product succeeded, marking the ~4h oneshot FAILED and skipping
+    # candidate pruning.
+    try:
+        val_seed_iv, val_seed_skew = None, None
+        if args.validation_data:
+            val_data = pd.read_csv(args.validation_data, parse_dates=["timestamp"])
+            val_label = (f"separate validation set ({args.validation_data}, "
+                         f"{val_data['timestamp'].min().date()} — "
+                         f"{val_data['timestamp'].max().date()}, "
+                         f"never seen during training)")
+        elif holdout_data is not None and len(holdout_data) > 0:
+            val_data = holdout_data
+            val_label = (f"hold-out ({val_data['timestamp'].min().date()} — "
+                         f"{val_data['timestamp'].max().date()}, "
+                         f"never seen during training)")
+        elif historical_data is not None:
+            # Fallback: not enough data for holdout, use full dataset (warn user)
+            val_data = historical_data
+            val_label = "full dataset (WARNING: no true hold-out, insufficient data)"
         else:
-            np.random.seed(42)
-            val_data = generate_synthetic_data(days=10, ticks_per_day=12)
-            val_label = (f"synthetic (seed=42, 10 days) — only {len(captured)} "
-                         f"tape session(s), need >{loop.eval_cycles} for a hold-out")
+            # No CSV: prefer a real captured-tape session over synthetic GBM.
+            # The fitness eval trains on the loop's pinned replay window, so
+            # the most recent session OUTSIDE that window is a genuine
+            # hold-out. Falls back to synthetic only when there isn't enough
+            # tape for one.
+            from backtest import list_captured_sessions, load_captured_tape, load_iv_skew_seed
+            captured = list_captured_sessions(args.underlying)
+            window = set(loop._replay_sessions or captured[-loop.eval_cycles:])
+            outside = [d for d in captured if d not in window]
+            if outside:
+                val_date = outside[-1]
+                val_data = load_captured_tape(val_date, args.underlying)
+                # Reuse the seed the fitness eval built (same drop_recent); compute
+                # it if the run never took the tape path. NOTE (Rule 12): the seed
+                # is NOT timestamp-filtered against val_date, so it can include
+                # post-val_date IV — adequate for a relative sanity check, not a
+                # look-ahead-clean absolute claim. Same caveat as load_iv_skew_seed.
+                val_seed_iv = getattr(loop, "_iv_seed", None)
+                val_seed_skew = getattr(loop, "_skew_seed", None)
+                if val_seed_iv is None:
+                    drop = loop.config.getint("autoresearch", "iv_seed_drop_recent", fallback=0)
+                    val_seed_iv, val_seed_skew = load_iv_skew_seed(args.underlying, drop_recent=drop)
+                age = len(captured) - captured.index(val_date)
+                val_label = (f"captured-tape hold-out ({val_date}, {age} sessions "
+                             f"back — most recent session outside the "
+                             f"{len(window)}-session fitness window)")
+            else:
+                np.random.seed(42)
+                val_data = generate_synthetic_data(days=10, ticks_per_day=12)
+                val_label = (f"synthetic (seed=42, 10 days) — all {len(captured)} "
+                             f"tape session(s) are inside the fitness window, "
+                             f"no hold-out exists")
 
-    print(f"\n  Validation run ({val_label})...")
-    val_results = run_backtest(
-        val_data, underlying=args.underlying, tunable_params=loop.best_params,
-        seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
-    )
-    vm = val_results["metrics"]
-    print(f"    Net P/L:      {vm['net_pnl']:>12,.2f}")
-    print(f"    Sharpe:       {vm['sharpe_ratio']:>12.4f}")
-    print(f"    Calmar:       {vm['calmar_ratio']:>12.4f}")
-    print(f"    Sortino:      {vm['sortino_ratio']:>12.4f}")
-    print(f"    Max DD:       {vm['max_drawdown']:>12,.2f}")
-    print(f"    Trades:       {vm['total_trades']}")
+        print(f"\n  Validation run ({val_label})...")
+        val_results = run_backtest(
+            val_data, underlying=args.underlying, tunable_params=loop.best_params,
+            seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
+        )
+        vm = val_results["metrics"]
+        print(f"    Net P/L:      {vm['net_pnl']:>12,.2f}")
+        print(f"    Sharpe:       {vm['sharpe_ratio']:>12.4f}")
+        print(f"    Calmar:       {vm['calmar_ratio']:>12.4f}")
+        print(f"    Sortino:      {vm['sortino_ratio']:>12.4f}")
+        print(f"    Max DD:       {vm['max_drawdown']:>12,.2f}")
+        print(f"    Trades:       {vm['total_trades']}")
+    except Exception as e:
+        logger.warning("Validation run failed: %s", e)
+        print(f"\n  WARNING: validation run failed ({e}) — skipping. The "
+              f"candidate at {args.out} and its sweep_quality verdict are "
+              "unaffected.")
     print("=" * 60)
 
 

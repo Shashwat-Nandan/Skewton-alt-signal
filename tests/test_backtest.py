@@ -272,6 +272,68 @@ class TestCapturedTapeReplay:
         )
 
 
+class TestZstTapeArchives:
+    """2026-07-02: tick-retention.sh keeps only the newest 8 sessions as
+    raw .jsonl and zstd-compresses the rest. list_captured_sessions used
+    to glob *.jsonl only, capping the autoresearch replay window at ~a
+    week — the 06-20/06-27 flat-plateau sweeps. Archives must be listed
+    and streamable, and a corrupt archive must fail loud (Rule 12), not
+    truncate a replay into a fake 0-trade session."""
+
+    @pytest.fixture
+    def ticks_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / "data_cache" / "ticks"
+        d.mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+        return d
+
+    @pytest.fixture
+    def zstd_bin(self):
+        import shutil
+        path = shutil.which("zstd")
+        if not path:
+            pytest.skip("system zstd binary not available")
+        return path
+
+    def test_listing_includes_archives_and_dedupes(self, ticks_dir):
+        (ticks_dir / "ticks-2026-01-05.jsonl").write_text("{}\n")
+        (ticks_dir / "ticks-2026-01-06.jsonl.zst").write_bytes(b"")
+        # Same date in both forms must count once.
+        (ticks_dir / "ticks-2026-01-07.jsonl").write_text("{}\n")
+        (ticks_dir / "ticks-2026-01-07.jsonl.zst").write_bytes(b"")
+        assert list_captured_sessions() == [
+            "2026-01-05", "2026-01-06", "2026-01-07",
+        ]
+
+    def test_open_tape_prefers_raw_over_archive(self, ticks_dir):
+        (ticks_dir / "ticks-2026-01-07.jsonl").write_text('{"src": "raw"}\n')
+        (ticks_dir / "ticks-2026-01-07.jsonl.zst").write_bytes(b"not zstd")
+        with backtest._open_tape("2026-01-07") as f:
+            assert "raw" in f.readline()
+
+    def test_open_tape_streams_archive(self, ticks_dir, zstd_bin):
+        import subprocess
+        raw = ticks_dir / "ticks-2026-01-06.jsonl"
+        raw.write_text('{"line": 1}\n{"line": 2}\n')
+        subprocess.run(
+            [zstd_bin, "-q", str(raw), "-o", f"{raw}.zst"], check=True,
+        )
+        raw.unlink()
+        with backtest._open_tape("2026-01-06") as f:
+            assert f.read().splitlines() == ['{"line": 1}', '{"line": 2}']
+
+    def test_open_tape_corrupt_archive_fails_loud(self, ticks_dir, zstd_bin):
+        (ticks_dir / "ticks-2026-01-06.jsonl.zst").write_bytes(b"garbage")
+        with pytest.raises(RuntimeError, match="zstd"):
+            with backtest._open_tape("2026-01-06") as f:
+                f.read()
+
+    def test_open_tape_missing_raises(self, ticks_dir):
+        with pytest.raises(FileNotFoundError):
+            with backtest._open_tape("2099-01-01"):
+                pass
+
+
 # ── Fix B (2026-05-31): IV/skew seeding so autoresearch tunables can bind ──
 # Diagnosis: a captured-tape replay fires one entry scan per session; without
 # a primed IV history _compute_iv_percentile sees <30 obs → neutral 50.0, so

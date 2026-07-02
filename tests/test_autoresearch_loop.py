@@ -151,6 +151,8 @@ def _run_loop(eval_cycles=1, primary="gamma_theta_ratio",
         config=cfg, eval_cycles=eval_cycles, primary_metric=primary,
         max_dd_threshold=max_dd_threshold, hedger=hedger,
         _iv_seed=[], _skew_seed=[], _config_path="config.ini",
+        # normally set by __init__ (bypassed by _loop's __new__)
+        _experiment_records=[], _tape_cache={}, _replay_sessions=None,
     )
 
 
@@ -255,3 +257,230 @@ class TestRunExperiment:
         before = copy.deepcopy(loop.hedger.tunable_params)
         loop._run_experiment({"gamma_scalp_band_pct": 9.9})
         assert loop.hedger.tunable_params == before   # mutation didn't leak
+
+
+# ── _save_best_params sweep_quality stamping (2026-07-02) ──
+
+class TestSaveBestParamsSweepQuality:
+    """The 06-20/06-27 sweeps were uninformative (0–2 accepts, flat
+    plateau) yet wrote candidate files indistinguishable from real
+    optimization output. run_autoresearch now stamps a per-run
+    `sweep_quality` verdict into the candidate; these pin that it (a) is
+    written, (b) never leaks from the canonical file into a run that
+    didn't produce one, and (c) doesn't break `_migrations` preservation."""
+
+    def _saving_loop(self):
+        return _loop(
+            best_params={"gamma_scalp_band_pct": 1.5},
+            primary_metric="net_pnl",
+            best_metric_value=-42.0,
+            experiment_number=3,
+        )
+
+    def test_sweep_quality_written_to_candidate(self, tmp_path, monkeypatch):
+        import json
+        monkeypatch.chdir(tmp_path)
+        quality = {"informative": False, "accepted": 0,
+                   "warnings": ["0 mutations accepted"]}
+        self._saving_loop()._save_best_params(
+            out_file="cand.json", sweep_quality=quality,
+        )
+        out = json.loads((tmp_path / "cand.json").read_text())
+        assert out["sweep_quality"] == quality
+
+    def test_stale_sweep_quality_not_preserved_from_canonical(
+            self, tmp_path, monkeypatch):
+        # A promoted candidate carries its sweep_quality into
+        # best_params.json; the NEXT run must not inherit that verdict.
+        import json
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "best_params.json").write_text(json.dumps({
+            "best_params": {"old": 1},
+            "sweep_quality": {"informative": True, "accepted": 9},
+            "_migrations": [{"date": "2026-06-07", "note": "history"}],
+        }))
+        self._saving_loop()._save_best_params(out_file="cand.json")
+        out = json.loads((tmp_path / "cand.json").read_text())
+        assert "sweep_quality" not in out
+        # _migrations preservation must survive the new exclusion.
+        assert out["_migrations"] == [{"date": "2026-06-07", "note": "history"}]
+
+
+# ── Tape cache across experiments (2026-07-02) ──
+
+class TestTapeCache:
+    """A 15-session replay window is only affordable because each
+    session's multi-GB JSONL is parsed once per sweep, not once per
+    experiment (~3 min/parse × 25 experiments would blow the unit's
+    10 h timeout). Pin that _run_experiment reuses the cache across
+    calls and hands each cycle a copy (a backtest mutating its frame
+    must not poison later experiments)."""
+
+    def _patch_tape(self, monkeypatch, sessions):
+        import pandas as pd
+        loads = {"n": 0}
+
+        def fake_load(date_iso, underlying):
+            loads["n"] += 1
+            return pd.DataFrame({"session": [date_iso]})
+
+        monkeypatch.setattr("backtest.list_captured_sessions",
+                            lambda u: list(sessions))
+        monkeypatch.setattr("backtest.load_captured_tape", fake_load)
+        monkeypatch.setattr("backtest.load_iv_skew_seed",
+                            lambda u, drop_recent=0: ([], []))
+        monkeypatch.setattr(
+            "backtest.run_backtest",
+            lambda *a, **k: {"metrics": {
+                "gamma_theta_ratio": 1.0, "total_trades": 3,
+                "max_drawdown": 0,
+            }},
+        )
+        return loads
+
+    def test_sessions_parsed_once_across_experiments(self, monkeypatch):
+        loads = self._patch_tape(
+            monkeypatch, ["2026-01-01", "2026-01-02"],
+        )
+        loop = _run_loop(eval_cycles=2)
+        loop._run_experiment({"gamma_scalp_band_pct": 1.1})
+        loop._run_experiment({"gamma_scalp_band_pct": 1.2})
+        assert loads["n"] == 2   # once per session, NOT once per cycle
+
+    def test_cycles_get_independent_copies(self, monkeypatch):
+        self._patch_tape(monkeypatch, ["2026-01-01"])
+        seen = []
+        monkeypatch.setattr(
+            "backtest.run_backtest",
+            lambda data, **k: (seen.append(data), {"metrics": {
+                "gamma_theta_ratio": 1.0, "total_trades": 3,
+                "max_drawdown": 0,
+            }})[1],
+        )
+        loop = _run_loop(eval_cycles=1)
+        loop._run_experiment({"gamma_scalp_band_pct": 1.1})
+        loop._run_experiment({"gamma_scalp_band_pct": 1.2})
+        assert seen[0] is not seen[1]
+        assert seen[0] is not loop._tape_cache["2026-01-01"]
+        # Identity alone would still pass under a shallow copy (distinct
+        # objects, shared buffers) — mutate what the backtest received and
+        # pin that the CACHED frame is untouched, which is the actual
+        # poisoning-protection contract.
+        seen[0].loc[0, "session"] = "poisoned"
+        assert loop._tape_cache["2026-01-01"].loc[0, "session"] == "2026-01-01"
+
+    def test_load_failure_propagates_and_restores_params(self, monkeypatch):
+        # A session that fails to LOAD (corrupt archive, missing zstd
+        # binary) is an infrastructure failure shared by every experiment.
+        # Scoring it -999999 flattened entire sweeps (baseline included)
+        # with the root cause buried in per-cycle warnings — it must raise.
+        self._patch_tape(monkeypatch, ["2026-01-01"])
+
+        def broken_load(date_iso, underlying):
+            raise RuntimeError("zstd -dc ticks-2026-01-01.jsonl.zst exited 1")
+
+        monkeypatch.setattr("backtest.load_captured_tape", broken_load)
+        loop = _run_loop(eval_cycles=1)
+        before = copy.deepcopy(loop.hedger.tunable_params)
+        with pytest.raises(RuntimeError, match="zstd"):
+            loop._run_experiment({"gamma_scalp_band_pct": 9.9})
+        # ...and the propagating error must not leak the mutation into the
+        # hedger (the try/finally restore).
+        assert loop.hedger.tunable_params == before
+
+    def test_backtest_failure_restores_params(self, monkeypatch):
+        # The -999999 early return used to skip the post-loop restore,
+        # leaking the rejected mutation into the hedger permanently.
+        self._patch_tape(monkeypatch, ["2026-01-01"])
+
+        def broken_backtest(*a, **k):
+            raise ValueError("bad params blew up the backtest")
+
+        monkeypatch.setattr("backtest.run_backtest", broken_backtest)
+        loop = _run_loop(eval_cycles=1)
+        before = copy.deepcopy(loop.hedger.tunable_params)
+        assert loop._run_experiment({"gamma_scalp_band_pct": 9.9}) == -999999.0
+        assert loop.hedger.tunable_params == before
+
+    def test_thin_host_replays_each_session_once_not_wrapped(self, monkeypatch):
+        # eval_cycles=5 but only 2 sessions: the old `cycle % len` wrap
+        # replayed sessions 2-3x each, biasing the mean toward duplicated
+        # days and shrinking the variance penalty's std. Each session must
+        # score exactly once.
+        loads = self._patch_tape(monkeypatch, ["2026-01-01", "2026-01-02"])
+        runs = {"n": 0}
+
+        def counting_backtest(*a, **k):
+            runs["n"] += 1
+            return {"metrics": {"gamma_theta_ratio": 1.0, "total_trades": 3,
+                                "max_drawdown": 0}}
+
+        monkeypatch.setattr("backtest.run_backtest", counting_backtest)
+        loop = _run_loop(eval_cycles=5)
+        loop._run_experiment({"gamma_scalp_band_pct": 1.1})
+        assert runs["n"] == 2      # one backtest per session, no wrap
+        assert loads["n"] == 2
+
+    def test_replay_window_pinned_across_experiments(self, monkeypatch):
+        # The window is snapshotted on first use: sessions appearing
+        # mid-sweep (e.g. a live capture file on a Persistent=true
+        # catch-up run) must NOT shift the window, which is what keeps
+        # fitness comparable across experiments.
+        current = ["2026-01-01", "2026-01-02"]
+        loads = self._patch_tape(monkeypatch, current)
+        monkeypatch.setattr("backtest.list_captured_sessions",
+                            lambda u: list(current))
+        loop = _run_loop(eval_cycles=2)
+        loop._run_experiment({"gamma_scalp_band_pct": 1.1})
+        current.append("2026-01-03")   # new session lands mid-sweep
+        loop._run_experiment({"gamma_scalp_band_pct": 1.2})
+        assert loop._replay_sessions == ["2026-01-01", "2026-01-02"]
+        assert loads["n"] == 2         # the new session was never parsed
+
+
+# ── sweep_quality() — the shared verdict (2026-07-02 review fix) ──
+
+class TestSweepQualityMethod:
+    """One definition for both entrypoints: run_autoresearch.py's weekly
+    sweep and run.py's LOOP-FOREVER mode (whose Ctrl+C save used to write
+    best_params.json permanently verdict-less)."""
+
+    def _loop_with(self, records, best, seed=-100.0):
+        return _loop(_experiment_records=records, best_metric_value=best)
+
+    def test_zero_accepts_flags_uninformative(self):
+        q = self._loop_with(
+            [{"accepted": False, "metric_value": -100.0}] * 3, best=-100.0,
+        ).sweep_quality(seed_baseline=-100.0)
+        assert q["informative"] is False
+        assert q["accepted"] == 0
+        # 0-accepts implies best==seed; that must be reported as ONE
+        # warning, not two co-firing restatements of the same fact.
+        assert sum("accepted" in w or "seed baseline" in w
+                   for w in q["warnings"]) == 1
+
+    def test_flat_plateau_flagged(self):
+        records = [{"accepted": False, "metric_value": -2137.055408}] * 8 \
+            + [{"accepted": True, "metric_value": -2000.0}] * 2
+        q = self._loop_with(records, best=-2000.0).sweep_quality(-2137.055408)
+        assert q["informative"] is False
+        assert any("identical fitness" in w for w in q["warnings"])
+        assert q["plateau_share"] == 0.8
+
+    def test_healthy_sweep_is_informative(self):
+        records = [
+            {"accepted": True, "metric_value": -90.0},
+            {"accepted": False, "metric_value": -120.0},
+            {"accepted": True, "metric_value": -50.0},
+        ]
+        q = self._loop_with(records, best=-50.0).sweep_quality(-100.0)
+        assert q["informative"] is True
+        assert q["warnings"] == []
+        assert q["accepted"] == 2
+        assert q["best"] == -50.0
+        assert q["seed_baseline"] == -100.0
+
+    def test_empty_records_do_not_crash(self):
+        q = self._loop_with([], best=float("-inf")).sweep_quality(0.0)
+        assert q["experiments"] == 0
+        assert q["informative"] is False
