@@ -336,8 +336,11 @@ class TestZstTapeArchives:
 
 # ── Fix B (2026-05-31): IV/skew seeding so autoresearch tunables can bind ──
 # Diagnosis: a captured-tape replay fires one entry scan per session; without
-# a primed IV history _compute_iv_percentile sees <30 obs → neutral 50.0, so
-# the IV-percentile / regime tunables were inert in the weekly sweep.
+# a primed IV history _compute_iv_percentile can't rank a percentile (<30 obs
+# → warmup), so the IV-percentile / regime tunables were inert in the weekly
+# sweep. (Pre-#75 that warmup path returned a neutral 50.0; it now returns
+# None and the scan skips — the seed lets it leave warmup and produce a real
+# percentile either way.)
 
 class TestLoadIVSkewSeed:
     def test_truncation_drops_most_recent_k(self, tmp_path, monkeypatch):
@@ -409,7 +412,14 @@ class TestRunBacktestSeeding:
     def test_seed_primes_both_windows(self, monkeypatch):
         seen = self._spy_first_call_lengths(monkeypatch)
         data = generate_synthetic_data(days=2, ticks_per_day=12)
+        # Neutralize the IV-percentile band so the scan deterministically
+        # reaches _compute_skew_percentile: generate_synthetic_data draws
+        # unseeded np.random noise, so the seeded ATM IV's percentile lands
+        # in/out of the promoted best_params band [8,43] at random — without
+        # this override the skew observation (and thus the test) is flaky.
         run_backtest(data, underlying="NIFTY",
+                     tunable_params={"entry_iv_percentile_min": 0.0,
+                                     "entry_iv_percentile_max": 100.0},
                      seed_iv_history=[0.15] * 40,
                      seed_skew_history=[0.01] * 35)
         # The single entry scan saw the full seeded prefix → can leave the
@@ -418,17 +428,25 @@ class TestRunBacktestSeeding:
         assert seen["skew"] == 35
 
     def test_default_wipes_both_no_skew_leak(self, monkeypatch):
-        seen = self._spy_first_call_lengths(monkeypatch)
         data = generate_synthetic_data(days=2, ticks_per_day=12)
-        # No seed: both windows must START empty even though __init__ loaded
-        # the live persisted history. Pre-fix, _skew_history started non-empty
-        # (leak); this pins the symmetry.
-        # Neutralize the IV-percentile entry gate so the scan deterministically
-        # reaches _compute_skew_percentile regardless of best_params.json — a
-        # tighter promoted entry_iv_percentile_max would otherwise short-circuit
-        # on the cold-start neutral IV (50.0) before skew is ever computed.
-        run_backtest(data, underlying="NIFTY", tunable_params={
-            "entry_iv_percentile_min": 0.0, "entry_iv_percentile_max": 100.0,
-        })
-        assert seen["iv"] == 0
-        assert seen["skew"] == 0
+        band = {"entry_iv_percentile_min": 0.0, "entry_iv_percentile_max": 100.0}
+
+        # (1) IV default-wipe: with no seed, _atm_iv_history must START empty
+        # even though __init__ loaded the live persisted history. The first
+        # _compute_iv_percentile call sees length 0 (recorded before its own
+        # append). Post-#75 that cold-start call returns None and the scan
+        # short-circuits BEFORE _compute_skew_percentile — so skew can't be
+        # observed here, which is why the skew-leak guard needs its own run.
+        seen_iv = self._spy_first_call_lengths(monkeypatch)
+        run_backtest(data, underlying="NIFTY", tunable_params=dict(band))
+        assert seen_iv["iv"] == 0
+        assert "skew" not in seen_iv  # None IV short-circuits before skew
+
+        # (2) Skew default-wipe (the leak this test is named for): seed only
+        # the IV window (≥30 obs) so the gate passes and the scan reaches
+        # _compute_skew_percentile with NO skew seed. Pre-fix, _skew_history
+        # started non-empty (leaked from the live JSON) — pin that it's empty.
+        seen_skew = self._spy_first_call_lengths(monkeypatch)
+        run_backtest(data, underlying="NIFTY", tunable_params=dict(band),
+                     seed_iv_history=[0.15] * 40)
+        assert seen_skew["skew"] == 0

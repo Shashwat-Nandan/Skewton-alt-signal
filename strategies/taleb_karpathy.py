@@ -504,6 +504,13 @@ class TalebKarpathyStrategy(BaseStrategy):
         primary = self._primary_expiry_slice(chain)
 
         iv_percentile = self._compute_iv_percentile(primary, spot)
+        if iv_percentile is None:
+            # ATM quote gap / unsolvable IV / warmup — cannot assess the vol
+            # regime this tick. Skip rather than trade blind or block on a
+            # fabricated neutral 50.0 (issue #75). Distinct from the
+            # mid-range "outside band" log below so the two are separable.
+            logger.info("IV percentile not computable this tick — waiting.")
+            return []
         iv_min = self.tunable_params["entry_iv_percentile_min"]
         iv_max = self.tunable_params["entry_iv_percentile_max"]
         if not (iv_min <= iv_percentile <= iv_max):
@@ -2059,6 +2066,15 @@ class TalebKarpathyStrategy(BaseStrategy):
         its own recent history (rolling window). This is the standard
         approach — compare current vol regime against past observations,
         not against the cross-sectional smile at the same tick.
+
+        Returns None when the percentile cannot be computed this tick —
+        an ATM quote gap, an unsolvable IV, or a rolling window still in
+        warmup (<30 obs). The caller must treat None as "not ready" and
+        skip the scan; it must NOT be conflated with a genuine mid-range
+        reading. Returning a neutral 50.0 for these cases (the pre-#75
+        behaviour) made the IV-band tunables degenerate to a binary
+        "does [min,max] contain 50" switch and let autoresearch accept
+        band mutations that only zeroed trades on compute-failure ticks.
         """
         strikes = chain["strike"].unique()
         atm_strike = strikes[np.argmin(np.abs(strikes - spot))]
@@ -2066,7 +2082,8 @@ class TalebKarpathyStrategy(BaseStrategy):
         # Compute ATM IV
         atm_ce = chain[(chain["strike"] == atm_strike) & (chain["instrument_type"] == "CE")]
         if atm_ce.empty:
-            return 50.0
+            logger.debug("IV percentile: no ATM CE row at strike %s — not ready", atm_strike)
+            return None
         try:
             symbol = atm_ce.iloc[0]["tradingsymbol"]
             q = self.kite.quote([f"NFO:{symbol}"])
@@ -2074,13 +2091,17 @@ class TalebKarpathyStrategy(BaseStrategy):
             expiry_str = str(atm_ce.iloc[0]["expiry"])
             T = time_to_expiry(expiry_str, self._clock())
             if T <= 0 or atm_price <= 0:
-                return 50.0
+                logger.debug("IV percentile: T=%.4f atm_price=%s — not ready", T, atm_price)
+                return None
             atm_iv = implied_volatility_bisect(atm_price, spot, atm_strike, T, 0.065, "CE")
-        except Exception:
-            return 50.0
+        except Exception as e:
+            logger.debug("IV percentile: ATM quote/IV solve failed for %s (%s) — not ready",
+                         atm_ce.iloc[0]["tradingsymbol"], e)
+            return None
 
         if not (0.01 < atm_iv < 3.0):
-            return 50.0
+            logger.debug("IV percentile: back-solved IV %.4f out of (0.01,3.0) — not ready", atm_iv)
+            return None
 
         # Append to rolling history and compute percentile against it
         self._atm_iv_history.append(atm_iv)
@@ -2089,9 +2110,12 @@ class TalebKarpathyStrategy(BaseStrategy):
         self._save_iv_history()
 
         # Below ~30 observations the rolling window is too thin for a
-        # meaningful percentile; return neutral so the filter doesn't bite.
+        # meaningful percentile. Return None (not ready) — a fabricated
+        # neutral 50.0 would either block (band excludes 50) or wave the
+        # trade through (band includes 50) on no real evidence.
         if len(self._atm_iv_history) < 30:
-            return 50.0
+            logger.debug("IV percentile: warmup (%d/30 obs) — not ready", len(self._atm_iv_history))
+            return None
 
         from scipy.stats import percentileofscore
         return percentileofscore(self._atm_iv_history, atm_iv)

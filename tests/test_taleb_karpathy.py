@@ -1593,6 +1593,90 @@ class TestRVIVGate:
 
         assert len(result) == 1
 
+    def test_uncomputable_iv_percentile_skips_scan(self, mock_hedger):
+        # Issue #75: when _compute_iv_percentile can't compute (None), the
+        # scan must skip — NOT trade blind and NOT block on a fabricated 50.
+        # Band is [0,100] here, so a None that leaked through as a real
+        # value would pass the gate and produce a trade; asserting [] pins
+        # the None short-circuit.
+        mock_hedger._compute_iv_percentile = MagicMock(return_value=None)
+        mock_hedger.proposer.propose_delta_neutral = MagicMock(
+            return_value=[self._make_proposal()],
+        )
+
+        result = mock_hedger.scan_and_propose()
+
+        assert result == []
+
+
+class TestIVPercentileNotReady:
+    """Issue #75: _compute_iv_percentile must return None — not a fabricated
+    neutral 50.0 — when it cannot compute the percentile (ATM quote gap,
+    unsolvable IV, warmup). A neutral 50.0 conflates "couldn't compute" with
+    "genuinely mid-range": it makes the IV-band tunables degenerate to a
+    binary "does [min,max] contain 50" switch in autoresearch, and either
+    blocks (band excludes 50) or waves trades through (band includes 50) on
+    no real evidence. The caller must treat None as "skip this scan"."""
+
+    def _bare(self):
+        from datetime import datetime
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite = MagicMock()
+        h.underlying = "NIFTY"
+        h._clock = lambda: datetime(2026, 3, 29, 10, 0)
+        h._atm_iv_history = []
+        h._iv_history_max_size = 500
+        h._persist_iv_history = False  # _save_iv_history is a no-op
+        return h
+
+    def _chain(self):
+        import pandas as pd
+        return pd.DataFrame({
+            "strike": [22000, 22000],
+            "instrument_type": ["CE", "PE"],
+            "tradingsymbol": ["NIFTY26403CE22000", "NIFTY26403PE22000"],
+            "expiry": ["2026-04-03", "2026-04-03"],
+        })
+
+    def _resolving_quote(self, price=150.0):
+        return lambda syms: {s: {"last_price": price} for s in syms}
+
+    def test_quote_gap_returns_none(self):
+        """Kite returns no row for the ATM symbol (bucket gap): None, not 50."""
+        h = self._bare()
+        h._atm_iv_history = [0.15] * 60  # past warmup, so 50 can't come from warmup
+        h.kite.quote = MagicMock(return_value={})  # empty: KeyError path
+        assert h._compute_iv_percentile(self._chain(), 22000.0) is None
+
+    def test_missing_atm_ce_returns_none(self):
+        import pandas as pd
+        h = self._bare()
+        h._atm_iv_history = [0.15] * 60
+        pe_only = pd.DataFrame({
+            "strike": [22000], "instrument_type": ["PE"],
+            "tradingsymbol": ["NIFTY26403PE22000"], "expiry": ["2026-04-03"],
+        })
+        assert h._compute_iv_percentile(pe_only, 22000.0) is None
+
+    def test_warmup_returns_none_not_neutral_50(self):
+        """<30 obs cannot rank a percentile — must be None, never 50."""
+        h = self._bare()
+        h._atm_iv_history = [0.15] * 5
+        h.kite.quote = MagicMock(side_effect=self._resolving_quote())
+        assert h._compute_iv_percentile(self._chain(), 22000.0) is None
+
+    def test_computes_real_percentile_when_ready(self):
+        """With ≥30 obs and a resolvable quote, returns a real float — and it
+        is a genuine rank, not the fabricated 50.0 sentinel. Seed the history
+        BELOW the current ATM IV so the true percentile is high (~100), which
+        would be indistinguishable from a bug only if it returned 50."""
+        h = self._bare()
+        h._atm_iv_history = [0.05] * 40  # all far below the ~ATM IV we'll solve
+        h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
+        pct = h._compute_iv_percentile(self._chain(), 22000.0)
+        assert pct is not None
+        assert pct > 50.0  # current IV ranks above a low-vol history
+
 
 # ───────────────────────────────────────────────────────────────────
 # Spot-fetch regression — incident 2026-05-04
