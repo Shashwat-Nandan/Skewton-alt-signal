@@ -29,8 +29,9 @@ lucky step, candidate ≈ seed params. 06-20: 0/40 accepted. Root causes:
       → embedded as `sweep_quality` in the candidate JSON + loud WARNING when
       uninformative (0 accepts / best==baseline / plateau >50%)
 - [x] deploy/run_weekly_autoresearch.sh: `--eval-cycles 15` (≈3 weeks of tape
-      incl. expiry days), experiments 40→25 (~77 s/session-cycle ⇒ ≈8 h,
-      inside the 10 h unit timeout)
+      incl. expiry days), experiments 40→25 (with the tape cache: ~30-45 min
+      first-parse + 20-40 s/cycle ⇒ ≈3-5 h, well inside the 10 h unit
+      timeout; the earlier ~77 s/cycle ⇒ 8 h figure was pre-cache)
 - [x] stale-comment sweep: tick-retention.sh + tick_capture.py no longer say
       "replay reads .jsonl only"
 - [x] tests: zst listing/dedupe + zst tape load (skip w/o zstd binary),
@@ -52,6 +53,39 @@ Shipped on branch fix-autoresearch-sweep-informative:
   stamped sweep_quality into the candidate JSON, preserved _migrations
 - tests: 23 autoresearch + tape suite green; new coverage for zst listing/
   streaming/corruption, sweep_quality stamping, tape cache reuse+isolation
+
+### Code-review fix round (2026-07-02, /code-review high → 10 findings)
+
+All 10 applied on the same branch:
+1. Validation section wrapped in try/except (candidate already saved; a
+   corrupt .zst hold-out was failing the whole oneshot under pipefail) +
+   hold-out now picked as "most recent session OUTSIDE the pinned window"
+   with its age printed.
+2. Tape-load failures (corrupt archive / missing zstd) now PROPAGATE out of
+   _run_experiment instead of scoring −999999 — one bad file no longer
+   silently flattens the whole sweep with the cause buried in warnings.
+3. hedger.tunable_params restore moved to try/finally (the −999999 early
+   return leaked rejected mutations into the hedger).
+4. --eval-cycles got the same config fallback as --metric (argparse default
+   3 silently clobbered eval_cycles_per_experiment=5).
+5. Resolved metric validated against VALID_METRICS (config typo used to
+   produce an hours-long all-tie sweep with the cause never named).
+6. sweep_quality moved into HedgeResearchLoop.sweep_quality(); run()'s
+   Ctrl+C save now stamps it too (was permanently verdict-less), and the
+   0-accept / best≤seed warnings no longer co-fire for the same fact.
+7. Replay window pinned once per loop instance (mid-sweep session-list
+   shifts — incl. the Persistent=true catch-up race caching a half-written
+   live capture — can no longer occur).
+8. Thin hosts (<eval_cycles sessions) replay each session once with a loud
+   warning instead of silently wrap-around double-counting.
+9. Cache-copy test now mutates and asserts the cached frame unchanged
+   (identity-only assertions passed under a shallow copy).
+10. load_captured_tape probes the tape before the instrument-master read
+    (missing-session errors were mis-attributed to missing instruments).
+Plus: Optional[Dict] annotation, stray blank line reverted, stale ≈8 h
+estimate corrected. REFUTED by verification (no change): zstd stderr
+deadlock (measured ≤2 KB), stale instrument masters (0 missing tokens
+ground-truthed), raw-vs-zst encoding (PEP 540 UTF-8 mode + ASCII data).
 
 FOLLOW-UP (found while verifying, NOT fixed here): IV percentile is still
 pinned at the neutral 50.0 during replay entry scans even with the 500-obs

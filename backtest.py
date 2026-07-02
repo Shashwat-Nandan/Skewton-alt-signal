@@ -349,6 +349,15 @@ def load_captured_tape(
     master is absent — fail loud rather than silently degrade (Rule 12)."""
     import json
 
+    # Probe the tape BEFORE the instrument-master lookup so a missing
+    # session is attributed to the missing session — the master error's
+    # remediation (fetch instruments) would be wrong, and the master is a
+    # multi-MB read that shouldn't run first. _open_tape re-checks when it
+    # actually opens.
+    tick_base = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
+    if not tick_base.exists() and not tick_base.with_name(tick_base.name + ".zst").exists():
+        raise FileNotFoundError(f"Tick capture not found: {tick_base}[.zst]")
+
     instr_csv = _find_instruments_csv(date_iso, underlying)
     if instr_csv is None:
         raise FileNotFoundError(

@@ -222,7 +222,6 @@ class TestCapturedTapeReplay:
             "collapse buckets"
         )
 
-
     def test_real_futures_surfaced_in_mockkite_instruments(self, captured_sessions):
         """Code-review fix #7: load_captured_tape emits real FUT rows
         (e.g. NIFTY26MAYFUT) and MockKite.instruments must return them
