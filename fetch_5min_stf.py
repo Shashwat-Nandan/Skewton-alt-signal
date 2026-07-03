@@ -1,15 +1,26 @@
 """
 5-minute single-stock-futures (STF) fetcher for the Kalman pairs backtest.
 ================================================================================
-Pulls 5-minute CONTINUOUS front-month futures candles for the pair universe via
-Kite's historical API and writes one CSV per symbol to data_cache/stf_5min/.
-The Kalman pairs backtest's 5-min replay mode (backtest_kalman_pairs.py
---timeframe 5min) loads these.
+Pulls 5-minute front-month futures candles for the pair universe via Kite's
+historical API and writes one BACK-ADJUSTED CONTINUOUS series per symbol to
+data_cache/stf_5min/. The Kalman pairs backtest's 5-min replay mode
+(backtest_kalman_pairs.py --timeframe 5min) loads these.
 
-WHY this exists (vs fetch_bars.py): fetch_bars.py pulls 30-min NSE *cash* bars
-for the Market Profile feature. The pairs system trades single-stock *futures*,
-so we need 5-min NFO front-month data, roll-stitched across monthly expiries —
-which Kite gives us directly via `continuous=True`, avoiding manual stitching.
+WHY per-contract, not continuous=True (rewrite 2026-07-02): Kite's `continuous=True`
+(back-adjusted continuous futures) is ONLY supported for day/week/month intervals,
+NOT intraday — an intraday continuous request is rejected with "invalid interval
+for continuous data". So we fetch each front-month contract's OWN 5-min bars
+(`continuous=False`) and roll-stitch across expiries OURSELVES, back-adjusting so
+the join has no price gap.
+
+Data reality (Kite): the instruments() dump lists only LIVE contracts (expired
+ones are dropped), and intraday history is capped ~60-90 days. So a single run can
+only reach the CURRENT front-month contract's ~2 months of history (it's the only
+contract that has been the front month within that window). The roll-stitch
+therefore happens ACROSS RUNS: run this periodically, and when the front month
+rolls (old contract expires, next becomes front) the saved history is rebased to
+the new contract's level via their overlap. Run it monthly-plus to grow the corpus
+forward AND capture each roll's overlap.
 
 SESSION SAFETY (standing rule): this REUSES the cached Kite session and NEVER
 fresh-logs-in. If the cached token is missing or rejected server-side it ABORTS
@@ -20,20 +31,18 @@ RUN ON THE HOST: the valid cached session lives where the runners run. Run this
 after market close, reusing that session:
     python fetch_5min_stf.py --days 90
     python fetch_5min_stf.py --symbols RELIANCE,INFY --days 60
-
-Kite caps intraday history at ~60-90 days, so the corpus is shallow; run it
-periodically (or via a timer) to grow it forward.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
@@ -43,6 +52,7 @@ logger = logging.getLogger("fetch_5min_stf")
 KITE_RATE_LIMIT_DELAY = 0.35      # ~3 req/s, matches fetch_bars.py
 KITE_CHUNK_DAYS = 55              # under the 60-day per-request intraday cap
 OUT_DIR = HERE / "data_cache" / "stf_5min"
+CSV_HEADER = ["date", "open", "high", "low", "close", "volume", "contract"]
 
 
 def get_cached_kite(config_path: str):
@@ -68,9 +78,9 @@ def get_cached_kite(config_path: str):
     return auth.kite
 
 
-def front_month_fut_token(nfo_instruments, symbol: str) -> Optional[Tuple[int, str]]:
+def front_month_contract(nfo_instruments, symbol: str) -> Optional[Dict]:
     """Resolve the nearest non-expired NFO front-month future for `symbol` from a
-    pre-fetched NFO instrument dump. Returns (instrument_token, tradingsymbol) or
+    pre-fetched NFO instrument dump. Returns {token, tradingsymbol, expiry} or
     None. Takes the dump (not a kite handle) so the caller fetches it ONCE for the
     whole universe instead of per symbol."""
     today = datetime.now().date()
@@ -85,8 +95,9 @@ def front_month_fut_token(nfo_instruments, symbol: str) -> Optional[Tuple[int, s
         logger.warning("%s: no live NFO future found", symbol)
         return None
     futs.sort(key=lambda t: t[0])
-    front = futs[0][1]
-    return int(front["instrument_token"]), front["tradingsymbol"]
+    exp, front = futs[0]
+    return {"token": int(front["instrument_token"]),
+            "tradingsymbol": front["tradingsymbol"], "expiry": exp}
 
 
 def _as_date(v):
@@ -102,12 +113,12 @@ def _as_date(v):
         return None
 
 
-def fetch_5min_continuous(kite, token: int, days: int) -> Tuple[List[dict], int]:
-    """5-minute CONTINUOUS futures candles over the last `days`, chunked under the
-    Kite 60-day cap. continuous=True roll-stitches across monthly expiries.
-    Returns (candles, n_failed_chunks): a failed chunk leaves a HOLE in the series,
-    so the caller must surface a non-zero failure count rather than treat a partial
-    fetch as complete (Rule 12)."""
+def fetch_5min_contract(kite, token: int, days: int) -> Tuple[List[dict], int]:
+    """5-minute candles for ONE contract token over the last `days`, chunked under
+    the Kite 60-day cap. continuous=False (per-contract; Kite rejects continuous
+    intraday). Returns (candles, n_failed_chunks): a failed chunk leaves a HOLE in
+    the series, so the caller must surface a non-zero failure count rather than
+    treat a partial fetch as complete (Rule 12)."""
     to_d = datetime.now()
     from_d = to_d - timedelta(days=days)
     out: List[dict] = []
@@ -118,7 +129,7 @@ def fetch_5min_continuous(kite, token: int, days: int) -> Tuple[List[dict], int]
         try:
             candles = kite.historical_data(
                 token, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"),
-                "5minute", continuous=True,
+                "5minute", continuous=False,
             )
         except Exception as e:
             logger.warning("fetch failed token=%d %s→%s: %s",
@@ -131,21 +142,124 @@ def fetch_5min_continuous(kite, token: int, days: int) -> Tuple[List[dict], int]
     return out, failed
 
 
-def write_csv(symbol: str, candles: List[dict], out_dir: Path) -> int:
-    """Write date,open,high,low,close,volume sorted+de-duped on timestamp."""
-    rows = {}
+def rows_from_candles(candles: List[dict], contract: str) -> Dict[str, list]:
+    """Candles → {ts_iso: [open, high, low, close, volume, contract]}, de-duped on
+    timestamp (later chunk wins)."""
+    rows: Dict[str, list] = {}
     for c in candles:
         ts = c.get("date")
         ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-        rows[ts_iso] = (ts_iso, c["open"], c["high"], c["low"], c["close"],
-                        int(c.get("volume", 0) or 0))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{symbol}.csv"
+        rows[ts_iso] = [float(c["open"]), float(c["high"]), float(c["low"]),
+                        float(c["close"]), int(c.get("volume", 0) or 0), contract]
+    return rows
+
+
+def load_existing(path: Path) -> Dict[str, list]:
+    """Read a previously-written CSV into {ts_iso: [o,h,l,c,v,contract]}. Returns
+    {} if absent. Legacy rows without a `contract` column default to ""."""
+    if not path.exists():
+        return {}
+    rows: Dict[str, list] = {}
+    with open(path, newline="") as f:
+        r = csv.DictReader(f)
+        for d in r:
+            rows[d["date"]] = [float(d["open"]), float(d["high"]), float(d["low"]),
+                               float(d["close"]), int(float(d.get("volume") or 0)),
+                               d.get("contract") or ""]
+    return rows
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), start=1)}
+_FUT_RE = re.compile(r"(\d{2})([A-Z]{3})FUT$")
+
+
+def _contract_month(tradingsymbol: str) -> Optional[Tuple[int, int]]:
+    """(year, month) parsed from an NFO futures tradingsymbol like
+    'RELIANCE26JULFUT' → (2026, 7), or None if it doesn't match the expected
+    `<YY><MON>FUT` suffix (e.g. a legacy blank contract label)."""
+    m = _FUT_RE.search(tradingsymbol or "")
+    if not m:
+        return None
+    mon = _MONTHS.get(m.group(2))
+    if not mon:
+        return None
+    return (2000 + int(m.group(1)), mon)
+
+
+def _is_immediate_successor(prev_contract: str, new_contract: str) -> Optional[bool]:
+    """True iff `new_contract`'s expiry month is exactly one calendar month after
+    `prev_contract`'s (Dec→Jan rolls the year). None when either label can't be
+    parsed — can't tell, so the caller must NOT treat it as a skipped roll."""
+    p, n = _contract_month(prev_contract), _contract_month(new_contract)
+    if not p or not n:
+        return None
+    py, pm = p
+    nxt = (py + 1, 1) if pm == 12 else (py, pm + 1)
+    return n == nxt
+
+
+def backadjust_merge(existing: Dict[str, list], new: Dict[str, list],
+                     new_contract: str) -> Tuple[Dict[str, list], str]:
+    """Merge freshly-fetched `new` (raw bars for `new_contract`) into the saved
+    `existing` continuous series, back-adjusting on a roll so the join has no price
+    gap. Returns (merged, note).
+
+    - No existing data → return `new` (fresh series).
+    - Same front contract as the saved series' latest bar → plain union (new wins
+      on overlap; backfills/refreshes recent bars), no price shift.
+    - Roll (new_contract differs): rebase ALL existing bars to the new contract's
+      price level using an additive offset measured at the latest timestamp the two
+      contracts share (back-adjustment; newest contract is the unadjusted
+      reference), then APPEND only the new bars BEYOND the saved series' last
+      timestamp. The old contract stays the front month for the overlap window (the
+      new contract was a thin back-month then, and only its price at the single
+      anchor lines up — overwriting the overlap would swap in the wrong contract and
+      leave a jump at the overlap's start). If the two share NO timestamp there is
+      nothing to anchor the offset to — union without adjustment and flag it
+      (Rule 12). If the new contract is NOT the immediate month after the saved
+      one (a run was skipped so the front month jumped >1 contract), the skipped
+      month gets filled with this contract's back-month prints — flag it
+      "ROLL-SKIP" so the caller warns (Rule 12)."""
+    if not existing:
+        return dict(new), "fresh"
+    prev_contract = existing[max(existing)][5]
+    if prev_contract == new_contract:
+        merged = dict(existing)
+        merged.update(new)
+        return merged, "same-contract"
+    common = set(existing) & set(new)
+    if not common:
+        merged = dict(existing)
+        merged.update(new)
+        return merged, "ROLL-NO-OVERLAP"
+    t = max(common)
+    offset = new[t][3] - existing[t][3]   # add to existing → rebase to new level
+    roll_ts = max(existing)   # old front-month's last saved bar = the roll point
+    merged: Dict[str, list] = {}
+    for ts, (op, hi, lo, cl, v, ct) in existing.items():
+        merged[ts] = [op + offset, hi + offset, lo + offset, cl + offset, v, ct]
+    for ts, row in new.items():
+        if ts > roll_ts:   # only extend past the roll; keep old front-month overlap
+            merged[ts] = row
+    # A skipped run makes the front month jump >1 contract; the skipped month is
+    # then filled with this (back-month) contract's prints — flag it (Rule 12).
+    tag = "ROLL-SKIP" if _is_immediate_successor(prev_contract, new_contract) is False \
+        else "ROLL"
+    return merged, f"{tag} {prev_contract}→{new_contract} offset={offset:+.2f}"
+
+
+def write_csv(path: Path, rows: Dict[str, list]) -> int:
+    """Write {ts: [o,h,l,c,v,contract]} sorted by timestamp; prices rounded to 2dp."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["date", "open", "high", "low", "close", "volume"])
-        for k in sorted(rows):
-            w.writerow(rows[k])
+        w.writerow(CSV_HEADER)
+        for ts in sorted(rows):
+            op, hi, lo, cl, v, ct = rows[ts]
+            w.writerow([ts, round(op, 2), round(hi, 2), round(lo, 2), round(cl, 2),
+                        int(v), ct])
     return len(rows)
 
 
@@ -173,25 +287,48 @@ def main() -> int:
     nfo = kite.instruments("NFO")
     ok = skipped = partial = 0
     for sym in symbols:
-        resolved = front_month_fut_token(nfo, sym)
-        if not resolved:
+        contract = front_month_contract(nfo, sym)
+        if not contract:
             skipped += 1
             continue
-        token, tsym = resolved
-        candles, failed_chunks = fetch_5min_continuous(kite, token, args.days)
+        tsym = contract["tradingsymbol"]
+        candles, failed_chunks = fetch_5min_contract(kite, contract["token"], args.days)
         if not candles:
             logger.warning("%s (%s): no candles returned", sym, tsym)
             skipped += 1
             continue
-        n = write_csv(sym, candles, out_dir)
+        new_rows = rows_from_candles(candles, tsym)
+        path = out_dir / f"{sym}.csv"
+        merged, note = backadjust_merge(load_existing(path), new_rows, tsym)
+        incomplete = False
+        if note == "ROLL-NO-OVERLAP":
+            # Fail loud: we rolled contracts but the old and new series share no
+            # timestamp to anchor the back-adjustment, so the join may have a gap.
+            logger.warning("%s (%s): ROLL with NO overlapping bar to back-adjust — "
+                           "the series may have a price JUMP at the roll; re-run "
+                           "sooner around expiry so the contracts overlap", sym, tsym)
+            incomplete = True
+        elif note.startswith("ROLL-SKIP"):
+            # Fail loud: a run was skipped so the front month jumped >1 contract;
+            # the skipped month(s) are now filled with this contract's back-month
+            # prints, not the true front month.
+            logger.warning("%s (%s): SKIPPED ROLL — front month advanced >1 "
+                           "contract since the last run [%s]; the intermediate "
+                           "month(s) hold this contract's back-month prints, not "
+                           "the true front month. Run monthly+ to capture each roll",
+                           sym, tsym, note)
+            incomplete = True
+        n = write_csv(path, merged)
         if failed_chunks:
-            # Fail loud: the CSV has a hole — do NOT report it as a clean write.
+            # Fail loud: the fetch has a hole — do NOT report it as a clean write.
             logger.warning("%s (%s): wrote %d 5-min bars but %d chunk(s) FAILED — "
-                           "CSV is INCOMPLETE; re-run to backfill the gap",
-                           sym, tsym, n, failed_chunks)
+                           "CSV is INCOMPLETE; re-run to backfill the gap [%s]",
+                           sym, tsym, n, failed_chunks, note)
+            incomplete = True
+        if incomplete:
             partial += 1
         else:
-            logger.info("%s (%s): wrote %d 5-min bars", sym, tsym, n)
+            logger.info("%s (%s): wrote %d 5-min bars [%s]", sym, tsym, n, note)
             ok += 1
     logger.info("Done: %d complete, %d PARTIAL (gaps), %d skipped → %s",
                 ok, partial, skipped, out_dir)
