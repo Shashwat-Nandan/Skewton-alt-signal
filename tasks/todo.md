@@ -1,3 +1,56 @@
+# Kalman pairs — exit-at-mean + debounce intraday validation, issue #66 (PLAN, 2026-07-04)
+
+Measure-first (issue is explicit: NO code change until 5-min evidence is in).
+5-min STF data now exists (used in #63/#81), so runnable. Failure mode to
+quantify: exit_z=0.0 (book exit-at-mean) + exit_debounce_ticks=2 can MISS a
+near-mean revert that never crosses zero (LONG z→-0.2 then falls back) or a
+single-bar overshoot (debounce=2 needs 2 consecutive) → a near-winner decays to
+the stop.
+
+Plan:
+- [x] Build a 5-min measurement harness (scratchpad/measure_exit_66.py): per
+      (exit_z ∈ {0.0,0.1,0.25} × debounce ∈ {1,2}), top-12 composite OOS,
+      shipped defaults else. Captures net/trips/win%/costs, exit-reason mix, and
+      the direct failure metric (per-trade min|z| while open → stall-to-stop).
+- [x] Split-half (MAY/JUN) robustness.
+- [x] Report + DECIDE.
+
+## FINDINGS + DECISION (2026-07-04, CORRECTED after code review) — KEEP 0.0/2
+
+⚠️ The first pass (a MAY/JUN split-half harness) concluded "0.0 clearly wins,
+monotonically, stall-to-stop=0" — a code review found that WRONG on two
+measurement bugs: (a) the split force-closed boundary-spanning positions as
+EOD_CLOSE, masking the exit knob; (b) min|z| was sampled AFTER the close, so a
+MAX_HOLD/stall that closes near the mean was never counted (→ false stall=0).
+Corrected + committed as `validate_kalman_exit.py` (continuous full-window with
+production-faithful per-day step + bar-START min|z| sampling; per-trade rows in
+data_cache/kalman_exit66_trades.csv → every number below is reproducible).
+
+**CONTINUOUS full-window** (production-faithful), net ₹ by exit_z (debounce 2):
+| exit_z | 0.0 | 0.1 | **0.25** | 0.4 | 0.6 |
+|---|---|---|---|---|---|
+| net | −50.1k | −52.1k | **−39.9k** | −80.2k | −70.4k |
+
+**Split-half** (debounce 2), net ₹: exit_z=0.0 → JUN +18.8k / MAY −39.7k;
+0.25 → JUN +10.9k / MAY −57.8k; 0.4/0.6 worse in both.
+
+- **The ranking is NOT robust.** exit_z=0.25 is BEST on the continuous window
+  (+₹10k vs 0.0) but 0.0 wins BOTH split-halves. The swing (~₹10–18k) is within
+  the noise of an n≈22, net-NEGATIVE, single-2-month sample. So there is no
+  robust evidence that a band beats the book default.
+- **A small band DOES convert a near-mean stall** (contra the buggy "stall=0"):
+  at 0.0 the closest adverse trade reaches |z|=0.199 and 1 trade stalls-to-stop
+  within 0.3; exit_z=0.25 converts it (MEAN_REVERT 4→5). But wider bands (0.4,
+  0.6) exit winners too early — clearly worse everywhere (both windows).
+- **debounce 1 vs 2 = wash** (net within noise, sign flips by window). Keep 2.
+- DECISION: **KEEP exit_z=0.0 / debounce=2** — the book-faithful default — for
+  lack of ROBUST evidence to deviate (0.0 wins the split cleanly; 0.25's
+  continuous edge doesn't survive sub-period splitting). exit_z≈0.25 is a
+  CANDIDATE to revisit on a larger / whippier sample; the real levers remain the
+  regime gate + entry threshold (#81), not the exit band. NO code change. Close #66.
+
+---
+
 # Kalman pairs — stale-restore gate robustness, issue #65 (PLAN, 2026-07-04)
 
 Problem (PR #64 review finding #7): after a long outage, restore_state falls

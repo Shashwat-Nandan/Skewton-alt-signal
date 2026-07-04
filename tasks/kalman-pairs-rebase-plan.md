@@ -264,7 +264,13 @@ fixed-roster full window):
   daily two-window at entry 1.5 says 0.05 beats 0.10 on BOTH windows
   (−492k vs −659k adverse; +92k vs +57k in-regime) → **keep 0.05**.
 - exit 0.25 vs 0.0: wash across halves (7/9 full-window cells prefer 0.25 but
-  halves split) → keep book exit-at-0 (Rule 3).
+  halves split) → keep book exit-at-0 (Rule 3). Confirmed by issue #66's targeted
+  exit×debounce measurement (validate_kalman_exit.py; see tasks/todo.md #66
+  FINDINGS): the exit-band ranking is NOT robust — exit_z=0.25 wins the continuous
+  full-window (~₹10k) but 0.0 wins both split-halves; the swing is within noise on
+  an n≈22 net-negative sample. A 0.25 band does convert one near-mean stall, but
+  wider bands (≥0.4) are clearly worse. KEEP exit_z=0.0 / debounce=2 for lack of
+  robust evidence to deviate; 0.25 is a candidate to revisit on more data.
 - max_hold 15 / debounce 6: no robust gain; mh 15 also fights the expiry
   cycle → keep 7 / 2.
 - **min_edge_multiplier is INERT** at these notionals: expected gain at entry
