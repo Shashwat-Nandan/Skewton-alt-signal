@@ -1,3 +1,85 @@
+# Kalman pairs — stale-restore gate robustness, issue #65 (PLAN, 2026-07-04)
+
+Problem (PR #64 review finding #7): after a long outage, restore_state falls
+back to training-seeded raw residuals; _refresh_regime_adf then computes a
+CONFIDENT-looking ADF p over a window that predates the gap, and the EOD report
+emits regime_gate_open as authoritative — entries gated on a STALE regime
+verdict, no warning. The <30-window warn (#3) doesn't help: a full-but-stale
+window computes a normal p and stays silent.
+
+Design decision: the newest residual's date is _last_step_date (the runner's
+catch_up_filters sets it to the last replayed bhavcopy day). Freshness = trading
+days between _last_step_date and the LIVE clock at decision time. catch_up
+refills contiguously when bhavcopy is current (gap→1, normal), so a persistent
+large gap means the DATA is behind (bhavcopy hole / VPS-wide outage) → the
+window genuinely can't assess the current regime → fail closed until fresh
+closes refill it (self-healing). Fresh seed (_last_step_date is None) is exempt
+— training residuals are current by construction (panel loaded fresh each run).
+
+Plan:
+- [x] Strategy: class attr _STALE_GATE_MAX_TRADING_DAYS=5 (normal op sits at 1);
+      _gate_stale_trading_days() + _gate_is_stale() (exempt when last_step_date
+      None); _gate_blocks_entry fails closed when stale (checked with live clock,
+      NOT only in _refresh — _refresh may run under catch_up's replay clock);
+      _refresh_regime_adf WARNs on staleness (fires at restore + daily) but still
+      computes p so the report shows both p AND regime_stale.
+- [x] EOD report: add regime_stale (regime_gate_open already flips false via
+      _gate_blocks_entry).
+- [x] Tests (Rule 9): stale restore degrades a full/confident window; recent
+      restore stays live; fresh seed never stale; self-heals after a fresh close.
+- [x] ruff + full suite (1048, +4); PR.
+
+## Review (2026-07-04)
+Shipped on branch kalman-pairs-stale-gate-65:
+- Load-bearing bug found while implementing: __init__ calls _refresh_regime_adf()
+  BEFORE _last_step_date existed → the new staleness read raised AttributeError
+  on every construction (19 tests red). Moved _last_step_date=None init ABOVE the
+  first refresh (removed the later duplicate assignment). This is why the full
+  suite, not just the new tests, was the gate.
+- Freshness signal = _trading_days_between(_last_step_date, live_clock): normal
+  op = 1 (today's close not stepped intraday), a multi-week outage / bhavcopy
+  hole = large. Self-healing: catch_up_filters (bhavcopy current) or a live close
+  brings _last_step_date current → gate re-opens same session. Verified the 5-min
+  backtest still trades (basic 4 / momentum 7 trips) — the guard does not trip on
+  continuous data.
+- 4 tests: stale restore fails closed despite a CONFIDENT p (<0.05, would open);
+  recent restore stays live; fresh seed exempt; self-heals after one fresh close.
+Limitation (documented, not fixed): a partial bhavcopy hole in the MIDDLE that
+catch_up skips while still reaching yesterday leaves _last_step_date fresh but
+the window internally holed — a data-integrity edge beyond this freshness guard.
+Dashboard: regime_stale is now IN the EOD report; wiring it to the /kalman-pairs
+tab UI is issue #67's scope (surface regime_adf_p / regime_gate_open), not this.
+
+### Code-review fixes (2026-07-04, /code-review high → 9 findings; applied 1-5)
+Empirically REFUTED the scariest candidate first: the staleness gate is live in
+backtest replays, but the top-12 panels have max per-pair gap 1 (daily) / 2
+(5-min) < 5, so it never trips on current data (would only affect a future pair
+with a ≥5-session hole — documented, not a live regression).
+Applied:
+1. scan_and_propose skip log attributes a stale block to STALENESS, not the ADF
+   p (a stale window holds a confident p → the old "ADF p=0.01 > 0.050" line was
+   self-contradictory).
+2. Removed the false-alarm WARN from _refresh_regime_adf (it fired on every
+   restart before catch_up refills + under the replay clock). Replaced with the
+   runner's warn_if_gate_stale(), called AFTER catch_up_filters — one loud,
+   correct WARNING per restart only for pairs GENUINELY still behind.
+3. Off-by-one: docstring/log said "more than"/"(> 5)" while code is >=5; now
+   "at least"/"(≥ 5)".
+4. Clock-skew fail-OPEN closed: a future-dated newest residual (backward skew /
+   fast-clock state file) made _trading_days_between return 0 → not stale; now
+   fails closed.
+5. Emergency-closure/holidays: no clean in-strategy fix (distinguishing an
+   unplanned closure from a data stall needs the true calendar = holidays.csv).
+   Documented the dependency; behavior is safe (fail-closed + self-healing); the
+   runner's warn_if_gate_stale uses the ACTUAL stepped bhavcopy dates as ground
+   truth. DEFERRED by design (surfaced to user): #6 newest-residual-only
+   self-heal (mid-window hole), #7 adf_gate_p=0 also disables staleness, #8
+   const-vs-config knob.
+Tests: +3 (stale block names the right reason; future-dated fails closed;
+warn_if_gate_stale flags only stale pairs). Full suite 1051 green; ruff clean.
+
+---
+
 # Kalman pairs — profitability refinement pre-live (PLAN, 2026-07-04)
 
 User ask: review the Kalman pair implementation, refine to higher

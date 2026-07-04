@@ -468,6 +468,34 @@ def test_entry_suppressed_near_front_month_expiry():
     assert off not in es([off], nfo, date(2026, 1, 28), 3)
 
 
+def test_warn_if_gate_stale_flags_only_stale_pairs_after_catchup(caplog):
+    """After catch_up, a pair whose gate is STILL stale is genuinely behind (the
+    DATA is stale, not just the runner) → one loud WARNING per restart; a current
+    pair stays silent. This is the non-false-alarm surfacing that replaced the
+    per-refresh WARN removed in code-review #65."""
+    import logging
+
+    class _S:
+        def __init__(self, a, stale, days):
+            self.symbol_a, self.symbol_b = a, "BBB"
+            self._STALE_GATE_MAX_TRADING_DAYS = 5
+            self._stale, self._days = stale, days
+
+        def _gate_is_stale(self):
+            return self._stale
+
+        def _gate_stale_trading_days(self):
+            return self._days
+
+    stale, fresh = _S("STALEPAIR", True, 30), _S("FRESHPAIR", False, 1)
+    with caplog.at_level(logging.WARNING):
+        out = R.warn_if_gate_stale([stale, fresh], R.logger)
+    assert out == [stale]
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "STALEPAIR" in msgs and "STALE" in msgs
+    assert "FRESHPAIR" not in msgs, "a current pair must not warn"
+
+
 def test_tick_one_halt_new_suppresses_entry_but_allows_exit():
     """The suppression rides the existing halt_new path: with halt_new=True
     tick_one must NOT scan for entries but MUST still rehedge/exit — that's why

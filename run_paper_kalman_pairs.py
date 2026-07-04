@@ -286,6 +286,27 @@ def catch_up_filters(strategies, panel: "pd.DataFrame", today: date,
                  s.symbol_a, s.symbol_b, len(missed), last)
 
 
+def warn_if_gate_stale(strategies, log: logging.Logger) -> List:
+    """After catch_up_filters has replayed every available bhavcopy day, any pair
+    whose regime gate is STILL stale is genuinely behind — the DATA is stale (a
+    bhavcopy hole / a VPS-wide outage that also stalled the fetch), not just the
+    runner. Surface it ONCE per restart here (code-review #65): this is the loud,
+    non-false-alarm signal — unlike a WARN inside _refresh_regime_adf, which fires
+    on every normal restart before catch_up refills. Entries for these pairs stay
+    fail-closed until fresh closes land; exits are unaffected. Returns the stale
+    strategies (for the caller/tests)."""
+    stale = [s for s in strategies if s._gate_is_stale()]
+    for s in stale:
+        log.warning(
+            "[%s/%s] regime gate STALE after catch-up: newest residual %d trading "
+            "days old (≥ %d) — bhavcopy is behind; NEW entries fail-closed until "
+            "fresh closes refill the window (exits unaffected). Issue #65.",
+            s.symbol_a, s.symbol_b, s._gate_stale_trading_days(),
+            s._STALE_GATE_MAX_TRADING_DAYS,
+        )
+    return stale
+
+
 def write_eod_sidecar(strategies, today: date, log: logging.Logger) -> None:
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
     path = DATA_CACHE / f"pair_paper_kalman_eod_{today.isoformat()}.json"
@@ -688,6 +709,7 @@ def main() -> int:
     strategies = build_strategies(pairs, panel, nfo, kite, config_path, today, log)
     restore_matching(strategies, load_prior_state(log), log)
     catch_up_filters(strategies, panel, today, log)
+    warn_if_gate_stale(strategies, log)   # #65: loud once-per-restart stale signal
 
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)

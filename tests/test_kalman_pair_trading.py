@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import date, datetime
 
 import numpy as np
 import pytest
@@ -396,6 +397,114 @@ def test_regime_gate_open_via_real_seed_on_cointegrated_data():
     pa, pb = _push_z(strat, 3.0)
     quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
     assert len(strat.scan_and_propose()) == 2
+
+
+def _stationary_source(step_date, clock_dt):
+    """A healthy pair with a full STATIONARY raw window (ADF would OPEN the gate),
+    last stepped on `step_date`, clock at `clock_dt`. Returned serialized so a
+    restore test can reload it into a strategy running later."""
+    src, _ = _make(model="basic", clock=lambda: clock_dt)
+    src.adf_gate_p = 0.05
+    src._raw_spread_history = list(np.random.default_rng(11).normal(0, 1.0, 120))
+    src._last_step_date = step_date
+    src._refresh_regime_adf()
+    return src
+
+
+def test_restore_from_stale_state_file_degrades_gate():
+    """issue #65: restoring a state file whose newest residual predates a long
+    outage must NOT wave entries through on a stale-but-confident ADF verdict.
+    The restored window is FULL and stationary (p computable — it would open the
+    gate), but weeks old, so the gate must fail closed. Without the freshness
+    guard the pair silently trades on a regime read from before the gap. This is
+    the exact PR#64-review-#7 hole. (Surfacing of the block is asserted in
+    test_stale_block_is_logged_with_the_right_reason + the runner's
+    warn_if_gate_stale, not at restore — see code-review #65.)"""
+    src = _stationary_source(date(2026, 1, 9), datetime(2026, 1, 12))
+    assert not src._gate_is_stale() and not src._gate_blocks_entry(), "source is fresh"
+    assert src._last_adf_p is not None and src._last_adf_p < 0.05, "gate would be OPEN"
+    blob = src.serialize_state()
+
+    tgt, _ = _make(model="basic", clock=lambda: datetime(2026, 2, 20))  # weeks later
+    tgt.adf_gate_p = 0.05
+    tgt.restore_state(blob)
+    # The p-value is still confident (full window) — that is the trap.
+    assert tgt._last_adf_p is not None and tgt._last_adf_p < 0.05
+    assert tgt._gate_is_stale()
+    assert tgt._gate_blocks_entry(), "stale window must fail closed despite a real p"
+
+
+def test_stale_block_is_logged_with_the_right_reason(caplog):
+    """When a stale window blocks an actionable entry signal, the skip log must
+    name STALENESS, not the ADF p-value: a stale window can hold a confident p
+    (<0.05), so the old 'ADF p=0.01 > 0.050' line was self-contradictory and
+    pointed at cointegration instead of the data gap (code-review #65)."""
+    src = _stationary_source(date(2026, 1, 9), datetime(2026, 1, 12))
+    blob = src.serialize_state()
+    tgt, quotes = _make(model="basic", clock=lambda: datetime(2026, 2, 20))
+    tgt.adf_gate_p = 0.05
+    tgt.restore_state(blob)
+    assert tgt._gate_is_stale() and tgt._last_adf_p < 0.05   # the trap: confident p
+    pa, pb = _push_z(tgt, 3.0)                                # a real entry signal
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    with caplog.at_level("INFO"):
+        assert tgt.scan_and_propose() == []                  # blocked
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "STALE" in msgs, "block must be attributed to staleness"
+    assert "ADF p=" not in msgs, "must NOT misattribute a stale block to the p-value"
+
+
+def test_future_dated_residual_fails_closed():
+    """Backward clock skew / a future-dated state file (newest residual dated
+    AFTER now) is unassessable — _trading_days_between returns 0 for end<=start,
+    which would silently wave the pair through. The guard must fail CLOSED
+    instead (code-review #65)."""
+    strat, _ = _make(model="basic", clock=lambda: datetime(2026, 1, 1))
+    strat.adf_gate_p = 0.05
+    strat._last_step_date = date(2026, 6, 1)   # dated in the future vs the clock
+    assert strat._gate_is_stale()
+    assert strat._gate_blocks_entry()
+
+
+def test_recent_restore_keeps_gate_live():
+    """The mirror: restoring after a NORMAL short gap (the runner's catch_up has
+    brought the window current) must leave the gate LIVE — otherwise the guard
+    would suppress every restart. A residual dated one session back is not stale."""
+    src = _stationary_source(date(2026, 1, 9), datetime(2026, 1, 12))
+    blob = src.serialize_state()
+    tgt, _ = _make(model="basic", clock=lambda: datetime(2026, 1, 12))  # ~1 day on
+    tgt.adf_gate_p = 0.05
+    tgt.restore_state(blob)
+    assert not tgt._gate_is_stale()
+    assert not tgt._gate_blocks_entry(), "a current window must keep trading"
+
+
+def test_fresh_seed_pair_never_treated_as_stale():
+    """A first-launch pair (never stepped → _last_step_date is None) trades on its
+    training seed, which is current by construction (fresh bhavcopy panel each
+    run). The staleness guard must EXEMPT it — else a brand-new pair would never
+    trade. Guards against keying staleness off the seed instead of a real gap."""
+    strat, _ = _make(model="basic")
+    assert strat._last_step_date is None
+    assert strat._gate_stale_trading_days() == 0
+    assert not strat._gate_is_stale()
+
+
+def test_stale_gate_self_heals_after_fresh_close():
+    """After a stale restore, a single fresh daily close (current clock) brings
+    _last_step_date current, so the gate re-opens — the guard is self-healing as
+    the runner's catch_up / live stepping refills the window, not a permanent
+    lockout."""
+    src = _stationary_source(date(2026, 1, 9), datetime(2026, 1, 12))
+    blob = src.serialize_state()
+    tgt, _ = _make(model="basic", clock=lambda: datetime(2026, 2, 20))
+    tgt.adf_gate_p = 0.05
+    tgt.restore_state(blob)
+    assert tgt._gate_blocks_entry()                     # stale → closed
+    # A fresh close dated "now" (what catch_up / the live session does).
+    tgt.step_daily_close(101.0, 100.0)
+    assert not tgt._gate_is_stale()
+    assert not tgt._gate_blocks_entry(), "gate must re-open once the window is current"
 
 
 def test_zero_crossing_exit_closes_on_overshoot_past_mean():

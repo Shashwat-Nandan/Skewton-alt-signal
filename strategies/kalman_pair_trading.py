@@ -189,6 +189,12 @@ class KalmanPairStrategy(BaseStrategy):
         self._spread_history: List[float] = []
         self._raw_spread_history: List[float] = []
         self._seed_spread_history(log_a, log_b)
+        # Date of the last daily filter step — used by the runner to detect/catch
+        # up missed sessions after a restart (see step_daily_close) and by the
+        # regime gate's staleness guard (issue #65). Initialised BEFORE the first
+        # _refresh_regime_adf() below, which now reads it. None = fresh seed
+        # (never stepped) → exempt from the staleness check.
+        self._last_step_date: Optional[date] = None
         # Cached ADF p-value of the recent raw-residual window (refreshed daily in
         # step_daily_close; computed once here so the gate works from day one).
         self._last_adf_p: Optional[float] = None
@@ -211,9 +217,6 @@ class KalmanPairStrategy(BaseStrategy):
         self._session_start_unrealized = 0.0
         self._pending_exit_reason: Optional[str] = None
         self._last_risk_band: Optional[dict] = None
-        # Date of the last daily filter step — used by the runner to detect/
-        # catch up missed sessions after a restart (see step_daily_close).
-        self._last_step_date: Optional[date] = None
 
     # ──────────────────────────────────────────────────────────────────
     # Filter / spread plumbing
@@ -361,6 +364,55 @@ class KalmanPairStrategy(BaseStrategy):
     # the Kalman *normalized* spread is inert (it is stationary by construction).
     # See tasks/kalman-pairs-rebase-plan.md.
     # ──────────────────────────────────────────────────────────────────
+    # A restored/idle pair whose newest raw residual (_last_step_date) is older
+    # than this many NSE trading days is feeding the ADF gate a window that
+    # predates the gap: the p-value looks confident but describes an OLD regime
+    # (issue #65). Treat the gate as un-assessable (fail closed) until fresh daily
+    # closes bring the window current — the runner's catch_up_filters refills it
+    # contiguously on restart WHEN bhavcopy is current (gap→1), so a persistent
+    # large gap means the DATA itself is behind (a bhavcopy hole / VPS-wide
+    # outage), which the gate genuinely cannot see past. Normal operation sits at
+    # 1 (today's close isn't stepped intraday), so 5 clears weekends/holidays and
+    # a few missed sessions while catching a multi-week outage.
+    _STALE_GATE_MAX_TRADING_DAYS = 5
+
+    def _gate_stale_trading_days(self) -> int:
+        """NSE trading days between the newest raw residual (_last_step_date) and
+        now (the LIVE clock). 0 when the filter was never stepped (_last_step_date
+        is None): a fresh training seed's residuals are current by construction
+        (the runner loads a fresh bhavcopy panel each start), so a first-launch
+        pair is never treated as stale.
+
+        A newest residual dated in the FUTURE relative to now (backward clock
+        skew, or a state file saved on a fast/mis-set clock) is an anomaly we
+        cannot assess: _trading_days_between returns 0 for end<=start, which would
+        silently wave the pair through. Fail closed instead — return the threshold
+        so _gate_is_stale trips (code-review #65).
+
+        Caveat: this counts trading days via the holidays.csv calendar, so it is a
+        PROXY for "sessions missed". An unplanned multi-day exchange closure that
+        is NOT in holidays.csv would be miscounted as missed sessions and
+        conservatively (fail-closed) block new entries until real sessions resume
+        — safe and self-healing, but keep holidays.csv complete. The runner's
+        post-catch_up check (warn_if_gate_stale) is the ground-truth operator
+        signal, since catch_up_filters steps the ACTUAL bhavcopy dates."""
+        if self._last_step_date is None:
+            return 0
+        now = self._clock().date()
+        if now < self._last_step_date:
+            return self._STALE_GATE_MAX_TRADING_DAYS
+        return _trading_days_between(
+            self._last_step_date, now, self._holidays_set,
+        )
+
+    def _gate_is_stale(self) -> bool:
+        """True when the newest residual is at least _STALE_GATE_MAX_TRADING_DAYS
+        trading days behind the current session — the ADF window can't assess the
+        CURRENT regime. Evaluated with the live clock at decision time (NOT cached
+        in _refresh_regime_adf, which the runner's catch_up replay calls under a
+        past-dated clock — see run_paper_kalman_pairs.catch_up_filters)."""
+        return self._gate_stale_trading_days() >= self._STALE_GATE_MAX_TRADING_DAYS
+
     def _refresh_regime_adf(self) -> None:
         """Recompute the cached ADF p-value of the recent raw-residual window.
         Sets _last_adf_p to None when the window is too short or the test errors
@@ -369,6 +421,14 @@ class KalmanPairStrategy(BaseStrategy):
         if self.adf_gate_p <= 0:
             self._last_adf_p = None
             return
+        # NOTE: staleness is NOT surfaced here. _refresh_regime_adf runs at restore
+        # (before catch_up_filters refills the window) and under catch_up's
+        # past-dated replay clock, so a WARN here fires on every normal restart and
+        # reads as a false alarm (code-review #65). Staleness is surfaced where it
+        # is genuinely actionable instead: the runner's warn_if_gate_stale (once
+        # per restart, AFTER catch_up), the per-entry skip log in scan_and_propose,
+        # and the regime_stale flag in the EOD report. We still compute p below so
+        # a stale window reports its (untrusted) p alongside regime_stale.
         recent = self._raw_spread_history[-self.adf_gate_window:]
         if len(recent) < 30:
             self._last_adf_p = None
@@ -393,10 +453,13 @@ class KalmanPairStrategy(BaseStrategy):
 
     def _gate_blocks_entry(self) -> bool:
         """True if the regime gate should suppress a new entry. Off when
-        adf_gate_p<=0. Fail closed: a missing p-value (short/degenerate window)
-        blocks the entry rather than waving it through."""
+        adf_gate_p<=0. Fail closed: a missing p-value (short/degenerate window),
+        OR a window whose newest residual is stale (issue #65 — a confident p over
+        weeks-old data must not wave entries through), blocks rather than trades."""
         if self.adf_gate_p <= 0:
             return False
+        if self._gate_is_stale():
+            return True
         return self._last_adf_p is None or self._last_adf_p > self.adf_gate_p
 
     # ──────────────────────────────────────────────────────────────────
@@ -416,9 +479,20 @@ class KalmanPairStrategy(BaseStrategy):
         # Regime gate: |z| has crossed s₀, but only act if the raw cointegration
         # residual is currently stationary (the pair is actually reverting).
         if self._gate_blocks_entry():
-            logger.info("[%s/%s] entry skipped: regime gate (ADF p=%s > %.3f)",
-                        self.symbol_a, self.symbol_b, self._last_adf_p,
-                        self.adf_gate_p)
+            # Attribute the block to its real cause. A stale window can hold a
+            # small (confident-looking) _last_adf_p, so logging "ADF p=0.01 >
+            # 0.050" would be self-contradictory and point at cointegration when
+            # the real cause is a data gap (code-review #65).
+            if self._gate_is_stale():
+                logger.info(
+                    "[%s/%s] entry skipped: regime gate STALE — newest residual "
+                    "%d trading days old (≥ %d); window predates a gap",
+                    self.symbol_a, self.symbol_b, self._gate_stale_trading_days(),
+                    self._STALE_GATE_MAX_TRADING_DAYS)
+            else:
+                logger.info("[%s/%s] entry skipped: regime gate (ADF p=%s > %.3f)",
+                            self.symbol_a, self.symbol_b, self._last_adf_p,
+                            self.adf_gate_p)
             return []
         if z <= -self.entry_z:
             return self._build_entry_proposals("LONG_SPREAD", z, spread, prices)
@@ -514,9 +588,12 @@ class KalmanPairStrategy(BaseStrategy):
             "current_z": z,
             "entry_z": self.state.entry_z,
             # Regime gate visibility: the ADF p-value of the raw residual window
-            # and whether the gate currently permits new entries.
+            # and whether the gate currently permits new entries. regime_stale
+            # flags a window whose newest residual predates a long gap (issue #65)
+            # — the p-value is then shown but not trusted (gate_open is False).
             "regime_adf_p": self._last_adf_p,
             "regime_gate_open": (not self._gate_blocks_entry()),
+            "regime_stale": self._gate_is_stale(),
             "realized_pnl": self.state.realized_pnl,
             "unrealized_pnl": self.state.unrealized_pnl,
             "transaction_costs": self.state.total_transaction_costs,
