@@ -198,6 +198,78 @@ def _half_life(spread: np.ndarray) -> float:
     return float(-np.log(2) / np.log(1 + phi))
 
 
+def _choose_direction(panel: pd.DataFrame, raw_a: str, raw_b: str):
+    """Varsity Ch. 10 Error-Ratio direction choice: regress both ways and keep
+    the orientation with the lower Error Ratio = SE(intercept)/SE(regression) —
+    the cleaner residual. Returns (a, b, fit, error_ratio) for the chosen y=a on
+    x=b. Shared by screen_pairs and screen_pairs_book (the latter previously
+    recomputed the error ratio a third time when building its row)."""
+    fit_ab = _fit(panel[raw_a].values, panel[raw_b].values)   # y=raw_a on x=raw_b
+    fit_ba = _fit(panel[raw_b].values, panel[raw_a].values)   # y=raw_b on x=raw_a
+    er_ab, er_ba = _error_ratio(fit_ab), _error_ratio(fit_ba)
+    if er_ab <= er_ba:
+        return raw_a, raw_b, fit_ab, er_ab
+    return raw_b, raw_a, fit_ba, er_ba
+
+
+def _pair_metrics_row(panel: pd.DataFrame, a: str, b: str, *, beta: float,
+                      intercept: float, error_ratio: float, p_value: float,
+                      correlation: float):
+    """Build the per-pair diagnostics row shared by screen_pairs and
+    screen_pairs_book (the ~17 columns the output CSV / candidate schema
+    guarantee). Returns None when the average leg price is non-positive
+    (degenerate spread normalization) so the caller skips the pair.
+
+    `correlation` is passed in because the two screeners derive it differently
+    (screen_pairs from the |corr| matrix it already built for its prefilter;
+    screen_pairs_book from a signed np.corrcoef) — kept as-is to avoid any
+    behaviour change. Callers add screener-specific keys (e.g. `npd`) after."""
+    ya, yb = panel[a].values, panel[b].values
+    spread = ya - beta * yb
+    spread_mean = float(np.mean(spread))
+    spread_std = float(np.std(spread))
+    # Normalize spread vol by average leg price (a tradeable-move proxy).
+    # Coefficient of variation (std/mean) blows up when the OLS hedge produces a
+    # spread that oscillates around zero — common for pairs with similar absolute
+    # price levels.
+    avg_leg_price = (float(np.mean(ya)) + abs(beta) * float(np.mean(yb))) / 2.0
+    if avg_leg_price <= 0:
+        return None
+    latest_spread = float(spread[-1])
+    return {
+        "symbol_a": a,
+        "symbol_b": b,
+        "correlation": correlation,
+        "hedge_ratio": beta,
+        "intercept": intercept,
+        "error_ratio": error_ratio,
+        "coint_pvalue": float(p_value),
+        "half_life_days": _half_life(spread),
+        "spread_vol_pct": spread_std / avg_leg_price * 100,
+        "spread_mean": spread_mean,
+        "spread_std": spread_std,
+        "latest_spread": latest_spread,
+        "latest_z_score": (
+            (latest_spread - spread_mean) / spread_std if spread_std > 0 else None
+        ),
+        "last_close_a": float(ya[-1]),
+        "last_close_b": float(yb[-1]),
+        "last_data_date": panel.index[-1].strftime("%Y-%m-%d"),
+        "n_obs": len(panel),
+    }
+
+
+def _composite_rank(df: pd.DataFrame) -> pd.Series:
+    """Composite selection score (lower = better): low coint p-value + low
+    half-life + high spread vol, each as a scale-free percentile rank, averaged.
+    Single definition shared by screen_pairs, screen_pairs_book (rank_by=
+    'composite'), and screen_pairs_persistent so a rank tweak lands in one place."""
+    p_rank = df["coint_pvalue"].rank(pct=True)               # lower better
+    hl_rank = df["half_life_days"].rank(pct=True)            # lower better
+    vol_rank = (-df["spread_vol_pct"]).rank(pct=True)        # higher vol → lower rank
+    return (p_rank + hl_rank + vol_rank) / 3.0
+
+
 def screen_pairs(
     panel: pd.DataFrame,
     p_threshold: float = 0.05,
@@ -231,21 +303,9 @@ def screen_pairs(
     for raw_a, raw_b in combinations(symbols, 2):
         if corr.loc[raw_a, raw_b] < min_correlation:
             continue
-        # Varsity Ch. 10: regress both directions and keep the one with the
-        # lower Error Ratio = SE(intercept)/SE(regression). Without this step,
-        # iterating combinations() locks in symbol-alphabetical order — which
-        # is statistically arbitrary — and we lose the cleaner residual the
-        # other direction would have produced.
-        series_a = panel[raw_a].values
-        series_b = panel[raw_b].values
-        fit_ab = _fit(series_a, series_b)   # y=raw_a on x=raw_b
-        fit_ba = _fit(series_b, series_a)   # y=raw_b on x=raw_a
-        er_ab = _error_ratio(fit_ab)
-        er_ba = _error_ratio(fit_ba)
-        if er_ab <= er_ba:
-            a, b, fit, error_ratio = raw_a, raw_b, fit_ab, er_ab
-        else:
-            a, b, fit, error_ratio = raw_b, raw_a, fit_ba, er_ba
+        # Error-Ratio direction choice (Varsity Ch. 10): without it,
+        # combinations() would lock in statistically-arbitrary alphabetical order.
+        a, b, fit, error_ratio = _choose_direction(panel, raw_a, raw_b)
 
         ya = panel[a].values
         yb = panel[b].values
@@ -265,43 +325,14 @@ def screen_pairs(
                 a, b, abs(beta), min_hedge_ratio, max_hedge_ratio,
             )
             continue
-        spread = ya - beta * yb
-        spread_mean = float(np.mean(spread))
-        spread_std = float(np.std(spread))
-        # Normalize spread vol by average leg price (a tradeable-move proxy).
-        # Coefficient of variation (std/mean) blows up when the OLS hedge
-        # produces a spread that oscillates around zero — common for pairs
-        # with similar absolute price levels.
-        avg_leg_price = (float(np.mean(ya)) + abs(beta) * float(np.mean(yb))) / 2.0
-        if avg_leg_price <= 0:
-            continue
-        spread_vol_pct = spread_std / avg_leg_price * 100
-        half_life = _half_life(spread)
-
-        latest_spread = float(spread[-1])
-        latest_z_score = (
-            (latest_spread - spread_mean) / spread_std if spread_std > 0 else None
+        row = _pair_metrics_row(
+            panel, a, b, beta=beta, intercept=float(fit.params[0]),
+            error_ratio=error_ratio, p_value=p_value,
+            correlation=float(corr.loc[a, b]),
         )
-
-        results.append({
-            "symbol_a": a,
-            "symbol_b": b,
-            "correlation": float(corr.loc[a, b]),
-            "hedge_ratio": beta,
-            "intercept": float(fit.params[0]),
-            "error_ratio": error_ratio,
-            "coint_pvalue": float(p_value),
-            "half_life_days": half_life,
-            "spread_vol_pct": spread_vol_pct,
-            "spread_mean": spread_mean,
-            "spread_std": spread_std,
-            "latest_spread": latest_spread,
-            "latest_z_score": latest_z_score,
-            "last_close_a": float(ya[-1]),
-            "last_close_b": float(yb[-1]),
-            "last_data_date": panel.index[-1].strftime("%Y-%m-%d"),
-            "n_obs": len(panel),
-        })
+        if row is None:      # degenerate avg leg price
+            continue
+        results.append(row)
 
     if skipped_beta:
         logger.info("Skipped %d pair(s) with |β| outside [%.2f, %.2f]",
@@ -313,14 +344,7 @@ def screen_pairs(
         return pd.DataFrame()
 
     df = pd.DataFrame(results)
-
-    # Composite rank: low p-value + low half-life + high spread vol all good.
-    # Use percentile ranks so the score is scale-free.
-    p_rank = df["coint_pvalue"].rank(pct=True)               # lower better
-    hl_rank = df["half_life_days"].rank(pct=True)            # lower better
-    vol_rank = (-df["spread_vol_pct"]).rank(pct=True)        # higher vol → lower rank
-    df["rank_score"] = (p_rank + hl_rank + vol_rank) / 3.0
-
+    df["rank_score"] = _composite_rank(df)
     df = df.sort_values("rank_score").reset_index(drop=True)
     return df
 
@@ -372,13 +396,10 @@ def screen_pairs_book(
 
     results = []
     for a0, b0, npd in candidates:
-        # Same Error-Ratio direction choice as screen_pairs (parity).
-        sa, sb = panel[a0].values, panel[b0].values
-        fit_ab, fit_ba = _fit(sa, sb), _fit(sb, sa)
-        if _error_ratio(fit_ab) <= _error_ratio(fit_ba):
-            a, b, fit = a0, b0, fit_ab
-        else:
-            a, b, fit = b0, a0, fit_ba
+        # Same Error-Ratio direction choice + per-pair metrics as screen_pairs
+        # (shared helpers — parity guaranteed). Book differs only in the NPD
+        # prescreen above, the signed correlation, and the added `npd` column.
+        a, b, fit, error_ratio = _choose_direction(panel, a0, b0)
         ya, yb = panel[a].values, panel[b].values
         # 2. Cointegration gate.
         try:
@@ -391,38 +412,22 @@ def screen_pairs_book(
         beta = float(fit.params[1])
         if not min_hedge_ratio <= abs(beta) <= max_hedge_ratio:
             continue
-        spread = ya - beta * yb
-        spread_mean, spread_std = float(np.mean(spread)), float(np.std(spread))
-        avg_leg_price = (float(np.mean(ya)) + abs(beta) * float(np.mean(yb))) / 2.0
-        if avg_leg_price <= 0:
+        row = _pair_metrics_row(
+            panel, a, b, beta=beta, intercept=float(fit.params[0]),
+            error_ratio=error_ratio, p_value=p_value,
+            correlation=float(np.corrcoef(ya, yb)[0, 1]),   # signed (book)
+        )
+        if row is None:      # degenerate avg leg price
             continue
-        latest_spread = float(spread[-1])
-        results.append({
-            "symbol_a": a, "symbol_b": b,
-            "correlation": float(np.corrcoef(ya, yb)[0, 1]),
-            "hedge_ratio": beta, "intercept": float(fit.params[0]),
-            "error_ratio": _error_ratio(fit), "coint_pvalue": float(p_value),
-            "half_life_days": _half_life(spread),
-            "spread_vol_pct": spread_std / avg_leg_price * 100,
-            "spread_mean": spread_mean, "spread_std": spread_std,
-            "latest_spread": latest_spread,
-            "latest_z_score": ((latest_spread - spread_mean) / spread_std
-                               if spread_std > 0 else None),
-            "last_close_a": float(ya[-1]), "last_close_b": float(yb[-1]),
-            "last_data_date": panel.index[-1].strftime("%Y-%m-%d"),
-            "n_obs": len(panel), "npd": npd,
-        })
+        row["npd"] = npd
+        results.append(row)
     if not results:
         logger.warning("screen_pairs_book: no pairs passed NPD prescreen + "
                        "coint p<%.3f", p_threshold)
         return pd.DataFrame()
     df = pd.DataFrame(results)
     if rank_by == "composite":
-        # Same composite as screen_pairs: low p-value + low half-life + high vol.
-        p_rank = df["coint_pvalue"].rank(pct=True)
-        hl_rank = df["half_life_days"].rank(pct=True)
-        vol_rank = (-df["spread_vol_pct"]).rank(pct=True)
-        df["rank_score"] = (p_rank + hl_rank + vol_rank) / 3.0
+        df["rank_score"] = _composite_rank(df)
     else:
         df["rank_score"] = df["npd"]            # rank by NPD ascending
     return df.sort_values("rank_score").reset_index(drop=True)
@@ -523,10 +528,7 @@ def screen_pairs_persistent(
     # stats). Persistence is a separate admission filter, not a rank component —
     # the runner's classify_pair_candidates does its own composite rerank, and
     # we want the downstream code to see a familiar shape.
-    p_rank = df["coint_pvalue"].rank(pct=True)
-    hl_rank = df["half_life_days"].rank(pct=True)
-    vol_rank = (-df["spread_vol_pct"]).rank(pct=True)
-    df["rank_score"] = (p_rank + hl_rank + vol_rank) / 3.0
+    df["rank_score"] = _composite_rank(df)
     df = df.sort_values("rank_score").reset_index(drop=True)
 
     logger.info(

@@ -8,9 +8,72 @@ with a KNOWN beta and a KNOWN mean-reversion speed, so a sign flip or an
 x/y transposition fails loudly.
 """
 import numpy as np
+import pandas as pd
 import pytest
 
-from screen_pairs import _half_life, _hedge_ratio
+from screen_pairs import (
+    _half_life,
+    _hedge_ratio,
+    screen_pairs,
+    screen_pairs_book,
+)
+
+
+def _cointegrated_panel(n=260, seed=1):
+    """A small panel with two cointegrated pairs (A/B, C/D) and an unrelated
+    walk E, positive-priced so both screeners (screen_pairs_book uses NPD /
+    avg-leg-price) can run."""
+    rng = np.random.default_rng(seed)
+    x = np.cumsum(rng.normal(0, 1, n)) + 300.0
+    z = np.cumsum(rng.normal(0, 1, n)) + 250.0
+    df = pd.DataFrame({
+        "A": x + rng.normal(0, 0.5, n),
+        "B": 0.9 * x + 30.0 + rng.normal(0, 0.5, n),
+        "C": z + rng.normal(0, 0.5, n),
+        "D": 1.1 * z - 20.0 + rng.normal(0, 0.5, n),
+        "E": np.cumsum(rng.normal(0, 1, n)) + 400.0,
+    }, index=pd.date_range("2025-01-01", periods=n, freq="D"))
+    return df
+
+
+class TestScreenerSchemaParity:
+    """The re-base de-dup (issue #68) routes both screeners' per-pair row through
+    the shared `_pair_metrics_row`. Pin the invariant that motivated it: the two
+    output the SAME candidate schema (book = screen + the extra `npd` column), so
+    a new diagnostic column can't land in one screener but not the other."""
+
+    def test_book_columns_are_screen_columns_plus_npd(self):
+        panel = _cointegrated_panel()
+        sp = screen_pairs(panel, p_threshold=0.05, min_correlation=0.5)
+        spb = screen_pairs_book(panel, p_threshold=0.05, npd_prescreen_keep=50)
+        assert not sp.empty and not spb.empty, "fixture must yield pairs in both"
+        # Both carry rank_score (added post-row); book adds exactly `npd`.
+        assert set(spb.columns) == set(sp.columns) | {"npd"}
+
+    def test_shared_metrics_are_value_identical_across_screeners(self):
+        """The real invariant the shared `_pair_metrics_row` guarantees: for a
+        pair BOTH screeners admit, every column the helper builds is bit-identical
+        regardless of caller — so a value regression in one path (not just a
+        schema drift) fails. `correlation` is the one DELIBERATE difference
+        (screen_pairs stores |corr| from its matrix; the book a signed corrcoef);
+        `rank_score`/`npd` are screener-specific. A schema-only test would pass
+        through a wrong hedge_ratio/latest_z_score; this one won't."""
+        panel = _cointegrated_panel()
+        sp = screen_pairs(panel, p_threshold=0.05, min_correlation=0.5)
+        spb = screen_pairs_book(panel, p_threshold=0.05, npd_prescreen_keep=50)
+        by_sp = {(r.symbol_a, r.symbol_b): r for _, r in sp.iterrows()}
+        by_spb = {(r.symbol_a, r.symbol_b): r for _, r in spb.iterrows()}
+        common = set(by_sp) & set(by_spb)
+        assert common, "fixture must yield at least one pair admitted by both"
+        shared = [c for c in sp.columns
+                  if c not in ("correlation", "rank_score")]
+        for key in common:
+            a, b = by_sp[key][shared], by_spb[key][shared]
+            pd.testing.assert_series_equal(a, b, check_names=False)
+            # correlation IS expected to differ (|corr| vs signed) whenever the
+            # book's signed value is negative — assert the documented relation.
+            assert by_sp[key]["correlation"] == pytest.approx(
+                abs(by_spb[key]["correlation"]))
 
 
 class TestHedgeRatio:

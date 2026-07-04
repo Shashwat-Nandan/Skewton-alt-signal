@@ -97,6 +97,42 @@ def _win_rate(closed_trades: List[dict]) -> Optional[float]:
     return wins / len(closed_trades) * 100
 
 
+def _force_close(strat, symbol_a, symbol_b, price_a, price_b, equity: list) -> None:
+    """Force-close an open position at the last test price and append the final
+    realized+unrealized equity point (so reported P&L is fully realized). No-op
+    when already flat. Shared by the daily and 5-min replays."""
+    if strat.state.position == "FLAT":
+        return
+    prices = {symbol_a: price_a, symbol_b: price_b}
+    strat._update_unrealized(prices)
+    props = strat._build_exit_proposals("EOD_CLOSE", 0.0, prices)
+    if props:
+        strat.execute_proposals(props)
+    equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
+
+
+def _replay_metrics(strat, symbol_a, symbol_b, label, spreads: list,
+                    equity: list, n_days: int) -> dict:
+    """The 12-key per-pair result row shared by run_replay and run_replay_5min.
+    Single source of truth for the report schema print_report consumes — a new
+    field or an accounting fix now lands in both replays at once."""
+    sp = np.asarray(spreads, dtype=float)
+    return {
+        "pair": f"{symbol_a}/{symbol_b}", "config": label,
+        "n_days": n_days,
+        "n_round_trips": len(strat.state.closed_trades),
+        "net_pnl": strat.state.realized_pnl + strat.state.unrealized_pnl,
+        "costs": strat.state.total_transaction_costs,
+        "gross_pnl": (strat.state.realized_pnl + strat.state.unrealized_pnl
+                      + strat.state.total_transaction_costs),
+        "win_rate_pct": _win_rate(strat.state.closed_trades),
+        "max_drawdown": _max_drawdown(np.asarray(equity)),
+        "spread_var": float(np.var(sp)) if sp.size else float("nan"),
+        "half_life": _half_life(sp) if sp.size > 10 else float("nan"),
+        "final_gamma": strat._gamma_today,
+    }
+
+
 def run_replay(symbol_a, symbol_b, lot_a, lot_b,
                train_a, train_b, test_a, test_b, test_dates,
                *, label, model, alpha, config_path) -> Optional[dict]:
@@ -141,29 +177,10 @@ def run_replay(symbol_a, symbol_b, lot_a, lot_b,
         equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
 
     # Force-close any open position at the last test bar.
-    if strat.state.position != "FLAT":
-        prices = {symbol_a: float(test_a[-1]), symbol_b: float(test_b[-1])}
-        strat._update_unrealized(prices)
-        props = strat._build_exit_proposals("EOD_CLOSE", 0.0, prices)
-        if props:
-            strat.execute_proposals(props)
-        equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
-
-    sp = np.asarray(spreads, dtype=float)
-    return {
-        "pair": f"{symbol_a}/{symbol_b}", "config": label,
-        "n_days": len(test_dates),
-        "n_round_trips": len(strat.state.closed_trades),
-        "net_pnl": strat.state.realized_pnl + strat.state.unrealized_pnl,
-        "costs": strat.state.total_transaction_costs,
-        "gross_pnl": (strat.state.realized_pnl + strat.state.unrealized_pnl
-                      + strat.state.total_transaction_costs),
-        "win_rate_pct": _win_rate(strat.state.closed_trades),
-        "max_drawdown": _max_drawdown(np.asarray(equity)),
-        "spread_var": float(np.var(sp)) if sp.size else float("nan"),
-        "half_life": _half_life(sp) if sp.size > 10 else float("nan"),
-        "final_gamma": strat._gamma_today,
-    }
+    _force_close(strat, symbol_a, symbol_b,
+                 float(test_a[-1]), float(test_b[-1]), equity)
+    return _replay_metrics(strat, symbol_a, symbol_b, label, spreads, equity,
+                           len(test_dates))
 
 
 def load_5min_panel(symbols, directory: Path = STF_5MIN_DIR) -> "pd.DataFrame":
@@ -240,28 +257,11 @@ def run_replay_5min(symbol_a, symbol_b, lot_a, lot_b, train_a, train_b, bars,
         if day_ca is not None:
             spreads.append(strat.step_daily_close(day_ca, day_cb))
 
-    if strat.state.position != "FLAT" and last_ca is not None:
-        prices = {symbol_a: last_ca, symbol_b: last_cb}
-        strat._update_unrealized(prices)
-        props = strat._build_exit_proposals("EOD_CLOSE", 0.0, prices)
-        if props:
-            strat.execute_proposals(props)
-        equity.append(strat.state.realized_pnl + strat.state.unrealized_pnl)
-
-    sp = np.asarray(spreads, dtype=float)
-    return {
-        "pair": f"{symbol_a}/{symbol_b}", "config": label, "n_days": n_days,
-        "n_round_trips": len(strat.state.closed_trades),
-        "net_pnl": strat.state.realized_pnl + strat.state.unrealized_pnl,
-        "costs": strat.state.total_transaction_costs,
-        "gross_pnl": (strat.state.realized_pnl + strat.state.unrealized_pnl
-                      + strat.state.total_transaction_costs),
-        "win_rate_pct": _win_rate(strat.state.closed_trades),
-        "max_drawdown": _max_drawdown(np.asarray(equity)),
-        "spread_var": float(np.var(sp)) if sp.size else float("nan"),
-        "half_life": _half_life(sp) if sp.size > 10 else float("nan"),
-        "final_gamma": strat._gamma_today,
-    }
+    # Force-close at the day's last VALID close (None only if every bar halted).
+    if last_ca is not None:
+        _force_close(strat, symbol_a, symbol_b, last_ca, last_cb, equity)
+    return _replay_metrics(strat, symbol_a, symbol_b, label, spreads, equity,
+                           n_days)
 
 
 def backtest_pair(a, b, train_panel, test_panel, lot_sizes, *, configs,

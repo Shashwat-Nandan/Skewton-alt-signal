@@ -1,3 +1,25 @@
+# Kalman pairs — de-dup screen + replay copy-paste, issue #68 (2026-07-04)
+
+Pure cleanup (Rule 2/3), NO behaviour change. Two copy-paste blocks the re-base
+added risked silent drift (two sources of truth for the candidate schema + the
+replay report). Factored shared helpers, verified byte-identical.
+
+- [x] screen_pairs.py: `_choose_direction` (Error-Ratio pick, once — fixes the
+      book's 3× `_error_ratio` recompute), `_pair_metrics_row` (the ~17-col row;
+      correlation passed in since screen=|corr|-matrix vs book=signed corrcoef),
+      `_composite_rank` (the (p+hl+vol)/3 score, now single-sourced across
+      screen_pairs / screen_pairs_book / screen_pairs_persistent).
+- [x] backtest_kalman_pairs.py: `_force_close` + `_replay_metrics` (the 12-key
+      dict) shared by run_replay + run_replay_5min.
+- [x] VERIFIED byte-identical vs pre-refactor baselines: screen_pairs /
+      screen_pairs_book(npd & composite) / screen_pairs_persistent frames
+      (atol=0); daily + 5-min backtest reports AND per-pair CSVs (diff clean).
+- [x] +1 Rule-9 test: screen_pairs vs screen_pairs_book column parity (book =
+      screen + `npd`) — guards the "new column lands in one only" risk. Full
+      suite 1054 green; ruff clean.
+
+---
+
 # Kalman pairs dashboard — surface regime gate, issue #67 (2026-07-04)
 
 Gap (PR #64 review #10): generate_eod_report records regime_adf_p /
