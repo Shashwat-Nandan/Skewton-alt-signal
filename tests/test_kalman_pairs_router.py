@@ -34,12 +34,14 @@ def _write_eod(cache: Path, d: date, pairs: list[dict]) -> Path:
 
 
 def _pair(a, b, *, position="FLAT", gamma=0.9, mu=0.1, z=1.2, entry_z=0.0,
-          band=None, realized=0.0, unreal=0.0, sess=0.0):
+          band=None, realized=0.0, unreal=0.0, sess=0.0,
+          adf_p=0.02, gate_open=True, stale=False):
     """Mirror KalmanPairStrategy.generate_eod_report()'s shape."""
     return {
         "strategy": "kalman_pair_trading", "pair": [a, b], "model": "momentum",
         "hedge_ratio": gamma, "gamma_filter": gamma, "mu_filter": mu,
         "position": position, "current_z": z, "entry_z": entry_z,
+        "regime_adf_p": adf_p, "regime_gate_open": gate_open, "regime_stale": stale,
         "realized_pnl": realized, "unrealized_pnl": unreal,
         "transaction_costs": 0.0, "n_closed_trades": 0,
         "spread_history_size": 180, "risk_band": band,
@@ -95,6 +97,52 @@ class TestKalmanPairs:
         # Negative-γ pair is carried through with its sign.
         assert by["COALINDIA/ITC"]["gamma"] == pytest.approx(-0.6)
         assert body["session_pnl"] == pytest.approx(-900.0)
+
+    def test_regime_gate_fields_surface_from_sidecar(self, client):
+        """issue #67: the ADF regime-gate fields (p-value, gate-open, stale) must
+        reach the API, not be dropped by the pydantic model. A pair with a stale,
+        blocked gate and one with an open gate must carry through distinctly."""
+        cache: Path = client._cache
+        _write_eod(cache, date(2026, 5, 15), [
+            _pair("OPEN", "GATE", z=1.0, adf_p=0.013, gate_open=True, stale=False),
+            _pair("STALE", "GATE", z=0.5, adf_p=0.088, gate_open=False, stale=True),
+        ])
+        by = {p["pair"]: p for p in
+              client.get(f"/api/kalman-pairs?end={END}").json()["pairs"]}
+        og = by["OPEN/GATE"]
+        assert og["regime_adf_p"] == pytest.approx(0.013)
+        assert og["regime_gate_open"] is True and og["regime_stale"] is False
+        sg = by["STALE/GATE"]
+        assert sg["regime_gate_open"] is False and sg["regime_stale"] is True
+        assert sg["regime_adf_p"] == pytest.approx(0.088)
+
+    def test_malformed_regime_field_degrades_to_none_not_dropped_pair(self, client):
+        """A malformed cosmetic regime value (e.g. gate_open written as a float,
+        stale as a string) must NOT drop the whole pair's row via pydantic's
+        strict-bool ValidationError → the endpoint's skip-handler. It degrades to
+        null; γ/position/P&L still surface."""
+        cache: Path = client._cache
+        rep = _pair("KEEP", "ME", z=1.4, gamma=0.77)
+        rep["regime_gate_open"] = 0.088      # wrong type (a float, not bool)
+        rep["regime_stale"] = "yes"          # wrong type (a string)
+        _write_eod(cache, date(2026, 5, 15), [rep])
+        body = client.get(f"/api/kalman-pairs?end={END}").json()
+        assert body["n_pairs"] == 1          # NOT dropped
+        p = body["pairs"][0]
+        assert p["pair"] == "KEEP/ME" and p["gamma"] == pytest.approx(0.77)
+        assert p["regime_gate_open"] is None and p["regime_stale"] is None
+
+    def test_missing_regime_fields_default_to_none(self, client):
+        """Older sidecars (written before the regime gate / #65) lack the keys;
+        the model must default them to null, not 500."""
+        cache: Path = client._cache
+        rep = _pair("OLD", "SIDECAR", z=1.0)
+        for k in ("regime_adf_p", "regime_gate_open", "regime_stale"):
+            rep.pop(k)
+        _write_eod(cache, date(2026, 5, 15), [rep])
+        p = client.get(f"/api/kalman-pairs?end={END}").json()["pairs"][0]
+        assert p["regime_adf_p"] is None
+        assert p["regime_gate_open"] is None and p["regime_stale"] is None
 
     def test_flat_pair_with_lingering_band_is_nulled(self, client):
         """A pair that flattened earlier in the session can carry a stale

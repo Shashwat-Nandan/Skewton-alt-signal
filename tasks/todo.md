@@ -1,3 +1,22 @@
+# Kalman pairs dashboard — surface regime gate, issue #67 (2026-07-04)
+
+Gap (PR #64 review #10): generate_eod_report records regime_adf_p /
+regime_gate_open (+ regime_stale from #65) but the dashboard dropped them
+(pydantic ignores extras). Fix (backend + frontend + tests):
+- [x] KalmanPair model: add regime_adf_p / regime_gate_open / regime_stale
+      (Optional, default None); populate in _build_pair from the EOD dict.
+- [x] types.ts: add the three fields; KalmanPairsPage: RegimeBadge (STALE amber
+      wins > OPEN green > blocked outline) + ADF p, new "regime gate" column.
+- [x] Router tests: fields surface distinctly (open vs stale/blocked); missing
+      keys (old sidecars) default to None not 500. 9 pass; ruff + tsc + build ok.
+- [ ] DEPLOY: dashboard-backend has NO auto-deploy → operator must
+      `systemctl restart dashboard-backend.service`; frontend rebuilt on host.
+      This adds fields to the EXISTING /api/kalman-pairs route (not a new route),
+      so until redeploy the endpoint just omits them (200, blank column) — it does
+      NOT 404.
+
+---
+
 # Kalman pairs — exit-at-mean + debounce intraday validation, issue #66 (PLAN, 2026-07-04)
 
 Measure-first (issue is explicit: NO code change until 5-min evidence is in).

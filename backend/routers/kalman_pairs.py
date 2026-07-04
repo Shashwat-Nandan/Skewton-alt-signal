@@ -47,6 +47,21 @@ def _session_pnl(rep: dict) -> float:
             + float(rep.get("session_unrealized_delta", 0.0)))
 
 
+def _opt_bool(v) -> Optional[bool]:
+    """Regime flags are DISPLAY-ONLY. pydantic v2's Optional[bool] rejects a
+    non-bool with a ValidationError (a ValueError subclass) that the endpoint's
+    per-record skip-handler would catch — dropping the whole pair's row (γ,
+    position, P&L and all) over a cosmetic field. Coerce anything non-bool to
+    None so a malformed regime value degrades to '—', never a vanished pair."""
+    return v if isinstance(v, bool) else None
+
+
+def _opt_float(v) -> Optional[float]:
+    """Same rationale as _opt_bool for the ADF p-value (excluding bool, which is
+    an int subclass that would otherwise coerce to 0.0/1.0)."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 # ───────────────────────── response shape ─────────────────────────
 
 class KalmanPair(BaseModel):
@@ -59,6 +74,12 @@ class KalmanPair(BaseModel):
     # Rolling z-score of the Kalman spread, and the z the position was opened at.
     current_z: Optional[float] = None
     entry_z: Optional[float] = None
+    # ADF regime gate visibility (issue #67): the p-value of the raw-residual
+    # window, whether the gate currently permits new entries, and whether the
+    # window is stale (predates a data gap → gate fail-closed; issue #65).
+    regime_adf_p: Optional[float] = None
+    regime_gate_open: Optional[bool] = None
+    regime_stale: Optional[bool] = None
     # Structure risk band (₹), present only while a position is open.
     stop_inr: Optional[float] = None
     target_inr: Optional[float] = None
@@ -97,6 +118,9 @@ def _build_pair(rep: dict) -> KalmanPair:
         position=position,
         current_z=rep.get("current_z"),
         entry_z=rep.get("entry_z"),
+        regime_adf_p=_opt_float(rep.get("regime_adf_p")),
+        regime_gate_open=_opt_bool(rep.get("regime_gate_open")),
+        regime_stale=_opt_bool(rep.get("regime_stale")),
         # Risk band is meaningful only for an OPEN position; the strategy's
         # _last_risk_band can linger after a close, so gate on position here too.
         stop_inr=band.get("stop_inr") if open_pos else None,

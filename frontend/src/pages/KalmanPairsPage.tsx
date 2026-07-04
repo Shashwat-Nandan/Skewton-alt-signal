@@ -37,6 +37,47 @@ function PositionBadge({ position }: { position: string }) {
   return <Badge variant="outline" className="text-muted-foreground">flat</Badge>;
 }
 
+/** ADF regime gate state: only enter when the raw cointegration residual is
+ *  currently stationary. Precedence: unknown → gate-off → STALE → OPEN →
+ *  blocked. "gate off" is inferred from gate_open=true with no p-value: a live
+ *  open gate always has a computed p, so open-without-p means adf_gate_p<=0 (the
+ *  gate is disabled, not passing). STALE (window predates a data gap →
+ *  fail-closed) only applies when the gate is actually on. */
+function RegimeBadge({
+  open,
+  stale,
+  p,
+}: {
+  open: boolean | null;
+  stale: boolean | null;
+  p: number | null;
+}) {
+  if (open == null && stale == null)
+    return <span className="text-muted-foreground">—</span>;
+  // p shown at 4dp to match the candidates page and read cleanly near the ~0.05 gate.
+  const pStr = p == null ? null : `p=${formatNum(p, 4)}`;
+  let badge;
+  if (open === true && p == null) {
+    // gate disabled (adf_gate_p<=0): entries permitted, no ADF evaluation.
+    badge = <Badge variant="outline" className="text-muted-foreground" title="ADF regime gate disabled (adf_gate_p ≤ 0)">gate off</Badge>;
+  } else if (stale === true) {
+    badge = <Badge className="bg-amber-600/15 text-amber-700 hover:bg-amber-600/15" title="Residual window predates a data gap — gate fail-closed (issue #65)">STALE</Badge>;
+  } else if (open === true) {
+    badge = <Badge className="bg-emerald-600/15 text-emerald-700 hover:bg-emerald-600/15" title="ADF gate open — raw residual is stationary, new entries permitted">OPEN</Badge>;
+  } else if (open === false) {
+    badge = <Badge variant="outline" className="text-muted-foreground" title="ADF gate blocked — residual non-stationary (p above threshold) or window unassessable">blocked</Badge>;
+  } else {
+    // gate_open unknown (partial/older sidecar) — do not imply 'blocked'.
+    return <span className="text-muted-foreground">—</span>;
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {badge}
+      {pStr && <span className="text-xs tabular-nums text-muted-foreground">{pStr}</span>}
+    </span>
+  );
+}
+
 function MetricCard({ label, value }: { label: string; value: string }) {
   return (
     <Card>
@@ -113,6 +154,7 @@ export function KalmanPairsPage() {
                     <TableHead className="text-right">μ</TableHead>
                     <TableHead className="text-right">z</TableHead>
                     <TableHead className="text-right">entry z</TableHead>
+                    <TableHead>regime gate</TableHead>
                     <TableHead className="text-right">stop ₹</TableHead>
                     <TableHead className="text-right">target ₹</TableHead>
                     <TableHead className="text-right">session P&L</TableHead>
@@ -135,6 +177,13 @@ export function KalmanPairsPage() {
                       </TableCell>
                       <TableCell className="text-right tabular-nums text-muted-foreground">
                         {p.position === "FLAT" ? "—" : formatNum(p.entry_z, 2)}
+                      </TableCell>
+                      <TableCell>
+                        <RegimeBadge
+                          open={p.regime_gate_open}
+                          stale={p.regime_stale}
+                          p={p.regime_adf_p}
+                        />
                       </TableCell>
                       <TableCell className="text-right tabular-nums text-muted-foreground">
                         {p.stop_inr == null ? "—" : formatINR(p.stop_inr)}

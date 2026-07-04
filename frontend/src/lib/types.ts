@@ -310,6 +310,11 @@ export type KalmanPair = {
   current_z: number | null;
   /** z the open position was entered at (0 while flat). */
   entry_z: number | null;
+  /** ADF regime gate: p-value of the raw-residual window, whether new entries
+   *  are permitted, and whether the window is stale (predates a data gap). */
+  regime_adf_p: number | null;
+  regime_gate_open: boolean | null;
+  regime_stale: boolean | null;
   /** Structure risk band (₹), present only while a position is open. */
   stop_inr: number | null;
   target_inr: number | null;
