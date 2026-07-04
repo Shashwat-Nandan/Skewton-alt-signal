@@ -242,6 +242,54 @@ later login today; refused to fresh-login per rule):
    regime, far narrower than the 532-day daily test).
 CAVEAT: until this runs, the re-base is validated on DAILY only.
 
+## 5-MIN REVALIDATION RESULTS (2026-07-04) — the pending host runbook, RUN
+
+Data: data_cache/stf_5min/ (48 syms, 2026-04-29→2026-07-02, 3,300 bars/sym;
+fetched via the #80-fixed fetch_5min_stf.py). All numbers = momentum, top-12
+composite-screened OOS on the pre-window daily panel, ₹ net of costs.
+
+**HEADLINE (Rule 12): the shipped daily-validated config LOSES at 5-min.**
+entry 1.0/exit 0/gate .05 on the full window: **−67k net** (gross −14k, costs
+53k over 35 trips ≈ ₹1.5k/trip — friction > edge/trade). The daily backtest's
+in-regime +290k did NOT survive 5-min resolution: intraday z touches ±1 on
+noise the daily replay never saw, so book s₀=1 enters far shallower live than
+the daily test modeled. This is exactly the issue-#63 coarse-timeframe hazard.
+
+54-config sweep (gate×entry×exit×edge-mult) + split-half (MAY / JUN halves,
+each re-screened+re-seeded OOS — closer to live weekly re-screen than the
+fixed-roster full window):
+- **entry 1.5 > 1.0 in BOTH halves and every gate** (fewer, deeper entries
+  clear friction). entry 2.0 negative everywhere (gives up the edge).
+- gate p: JUN wants 0.01, MAY wants 0.10 — regime-flipping, no robust winner;
+  daily two-window at entry 1.5 says 0.05 beats 0.10 on BOTH windows
+  (−492k vs −659k adverse; +92k vs +57k in-regime) → **keep 0.05**.
+- exit 0.25 vs 0.0: wash across halves (7/9 full-window cells prefer 0.25 but
+  halves split) → keep book exit-at-0 (Rule 3).
+- max_hold 15 / debounce 6: no robust gain; mh 15 also fights the expiry
+  cycle → keep 7 / 2.
+- **min_edge_multiplier is INERT** at these notionals: expected gain at entry
+  (~(|z|−exit)·std·notional·(1+|γ|) ≈ ₹15–20k) is ~10× round-trip cost, so
+  1.5 vs 3.0 is identical everywhere. It only binds as a degenerate-std guard.
+  Documented, left as-is.
+- Per-pair: winners (LT/TITAN, M&M/NESTLEIND, LT/EICHERMOT, JSWSTEEL/TCS) and
+  losers (GRASIM/BRITANNIA, BRITANNIA/ADANIPORTS, LT/HINDALCO) are consistent
+  across ALL configs, but NO screen-time stat separates them ex ante (losers
+  have the LOWEST coint p-values!) → no selection change (would overfit n=11).
+
+**SHIPPED (2026-07-04): entry_z default 1.0 → 1.5.** Everything else
+unchanged (exit 0 / stop 4 / lookback 126 / gate .05/60d / mh 7 / db 2 /
+composite). At (0.05, 1.5, 0): halves JUN +18.8k / MAY −39.7k (sum −21k) vs
+incumbent JUN −21.7k / MAY −64.3k (sum −86k) — better in BOTH halves, though
+MAY stays negative. The strongest raw cell (gate .10, entry 1.5: +61k…+90k
+both halves positive) was REJECTED: it contradicts the daily adverse-window
+evidence (−659k vs −492k) and the gate's whole job is adverse-regime damage
+control — not worth the tail risk going into a live decision.
+
+**HONEST LIVE-CUTOVER READ (Rule 12): even the refined config is ~flat on the
+recent 2-month 5-min tape.** The system's profitability is regime-gated
+(daily in-regime +92k at these settings), not an all-weather edge. Forward
+paper under the new default is the right next evidence, not another sweep.
+
 ## Notes
 - Code uses `(1+|γ|)` normalization vs book `(1+γ)`; identical for γ>0
   (cointegrated pairs), so leave (defensible, already documented).

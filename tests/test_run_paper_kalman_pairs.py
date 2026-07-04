@@ -15,12 +15,70 @@ import os
 import sys
 from datetime import date, datetime
 
+import configparser
+
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import backtest_kalman_pairs as BT
 import run_paper_kalman_pairs as R
+from strategies.kalman_pair_trading import KalmanPairStrategy
+
+
+HERE = os.path.dirname(os.path.dirname(__file__))
+
+
+def test_kalman_pairs_entry_z_defaults_in_sync():
+    """entry_z lives as independent literals in the runner argparse, the
+    backtest argparse, the strategy cfg.get fallback, and both config
+    [kalman_pair_trading] sections — before this guard they drifted silently
+    (the 5-min revalidation raised the CODE literals to 1.5 but left the config
+    template at the book's 1.0, which reintroduces the rejected noise-churn band
+    on any direct-against-config construction). The runner argparse default is
+    the value that ACTUALLY governs live paper (the deploy unit passes no
+    --entry-z; _write_config writes it into the derived config), so pin every
+    copy to it. If a future retune moves one and not the others, this fails."""
+    EXPECTED = 1.5
+
+    # Production-governing value: the runner argparse default (the deploy unit
+    # inherits it, so a drift here silently changes the LIVE band).
+    assert R.build_parser().parse_args([]).entry_z == EXPECTED
+    # Backtest argparse default (what the revalidation is run through).
+    assert BT.build_parser().parse_args([]).entry_z == EXPECTED
+    # Strategy cfg.get fallback (direct construction with no entry_z present).
+    assert _strategy_entry_z_default() == EXPECTED
+    # Tracked config template's section (host config.ini is gitignored, so the
+    # template is the guard). It documents values with inline `#` comments, so
+    # parse with inline_comment_prefixes to read just the number.
+    cfg = configparser.ConfigParser(inline_comment_prefixes=("#",))
+    cfg.read(os.path.join(HERE, "config_template.ini"))
+    assert cfg.getfloat("kalman_pair_trading", "entry_z") == EXPECTED
+
+
+def _strategy_entry_z_default() -> float:
+    """The strategy's cfg.get('entry_z', …) fallback, exercised by constructing
+    with a config that has the section but no entry_z key."""
+    pb = 100.0 + np.cumsum(np.random.default_rng(0).normal(0, 0.5, 200))
+    pa = 5.0 + 0.7 * pb + np.random.default_rng(1).normal(0, 0.4, 200)
+
+    real_read = configparser.ConfigParser.read
+
+    def fake_read(self, *a, **k):
+        self.read_dict({"strategy": {"total_capital": "500000"},
+                        "kalman_pair_trading": {"max_leg_notional": "5000000"}})
+        return []
+    configparser.ConfigParser.read = fake_read
+    try:
+        s = KalmanPairStrategy(
+            kite=None, mode="paper", symbol_a="PA", symbol_b="PB",
+            tradingsymbol_a="PA_FUT", tradingsymbol_b="PB_FUT",
+            lot_size_a=50, lot_size_b=50, training_a=pa, training_b=pb,
+            model="basic", quote_fn=lambda ts: None)
+    finally:
+        configparser.ConfigParser.read = real_read
+    return s.entry_z
 
 
 class FakeKite:

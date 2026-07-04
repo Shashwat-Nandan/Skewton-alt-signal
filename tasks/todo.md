@@ -1,3 +1,89 @@
+# Kalman pairs — profitability refinement pre-live (PLAN, 2026-07-04)
+
+User ask: review the Kalman pair implementation, refine to higher
+profitability; live cutover evaluation next week. Paper-only changes,
+backtest-gated (Rule 4/12). Standing rule: 5-min backtests (issue #63) —
+data_cache/stf_5min/ now exists (48 syms, 2026-04-29→2026-07-02), so the
+pending 5-MINUTE REVALIDATION from tasks/kalman-pairs-rebase-plan.md is
+finally runnable.
+
+Review findings (2026-07-04):
+- Paper book to date: realized −₹32.5k, unrealized −₹13.6k, costs ₹7.5k.
+  Dominated by trades entered 06-29/06-30 under OLD rules (entry_z≈2 /
+  z_in −4.02 stop) into JUN contracts 0–1 days before expiry →
+  EXPIRY_CLEANUP force-closes. Issue #70 entry cutoff (3d) is now shipped,
+  so that failure mode is closed; the losses are legacy, not the re-based
+  config's forward record. Only ONE new-rules organic entry so far
+  (COALINDIA/BAJAJFINSV 07-02, gate open p=0.013, currently −13.6k unrl).
+- Code review: strategy/runner are in good post-rebase shape (β-lock,
+  fail-closed ADF gate, cost hurdle, expiry flatten + entry cutoff).
+
+Plan (each step checkpointed):
+- [x] 1. Baseline 5-min revalidation at shipped defaults (entry 1.0 /
+      exit 0.0 / stop 4.0 / lookback 126 / gate p<.05/60d / composite,
+      top 12) — do daily-era findings hold at 5-min?
+- [x] 2. Lever sweep on 5-min (momentum only, screen once): adf_gate_p
+      {0.01,0.05,0.10} × entry {1.0,1.5,2.0} × exit {0.0,0.25,0.5} ×
+      min_edge_multiplier {1.5,3.0}; + split-half (MAY/JUN) robustness,
+      max_holding_days {7,15}, exit debounce {2,6} (issue #66).
+- [x] 3. Report robust region (not lucky cells); pick refinements.
+- [x] 4. Implement validated config/code changes + tests; ruff + suite.
+- [x] 5. Review section below + live-cutover read.
+
+## Review (2026-07-04)
+
+Full results + decision rationale recorded in
+tasks/kalman-pairs-rebase-plan.md → "5-MIN REVALIDATION RESULTS". Summary:
+- HEADLINE: the daily-validated shipped config (entry 1.0) is −67k on the
+  recent 2-month 5-min tape; the daily +290k in-regime did not survive
+  5-min resolution (book s₀=1 enters on intraday noise). Issue #63 hazard,
+  live-confirmed.
+- SHIPPED: entry_z default 1.0 → 1.5 (strategy + runner + backtest
+  argparse parity; installed unit passes no --entry-z so the new default
+  flows on the next timer start after merge). Only change — gate/exit/
+  stop/lookback/mh/debounce all failed robustness or were a wash.
+  Rejected the top raw cell (gate 0.10: +61k…+90k both halves) on the
+  daily adverse-window evidence (−659k vs −492k at 0.05).
+- min_edge_multiplier found INERT at 1-2M leg notionals (expected gain
+  ~10× round-trip cost) — documented, not changed.
+- Tests: +1 Rule-9 test (default band rejects the book-s₀ noise touch at
+  |z|=1.2, fires past 1.5). 62 kalman tests green; full suite 1073 green;
+  ruff clean. Stock 5-min harness at new defaults reproduces the sweep
+  cell exactly (momentum −50,143 full-window).
+- Open position (COALINDIA/BAJAJFINSV SHORT, entry_z≈0.98): unaffected —
+  entry_z gates NEW entries only; exit/stop management unchanged. No
+  migration needed.
+- HONEST live-cutover read (Rule 12): even the refined config is ~flat
+  on the recent 5-min tape (halves +18.8k/−39.7k vs incumbent
+  −21.7k/−64.3k). The edge is regime-gated, not all-weather. Recommend
+  next week's evaluation weigh the FORWARD paper record under the new
+  default (first sessions Mon 2026-07-06 onward), not the backtests
+  alone.
+
+### Code-review fixes (2026-07-04, /code-review high → 5 findings)
+The diff bumped the three CODE literals but entry_z lived as FIVE
+independent copies; the config surfaces + a stale comment lagged. Fixed:
+1. config_template.ini (tracked) + config.ini (host-local, gitignored):
+   entry_z 1.0 → 1.5; refreshed the "book s₀=1" / "at entry=1.0" comments
+   that steered a reader back to the retired value.
+2. strategies/kalman_pair_trading.py regime-gate comment no longer asserts
+   "book s₀=1 is best" (it contradicted the new __init__ rationale).
+3. Extracted `build_parser()` in run_paper_kalman_pairs.py AND
+   backtest_kalman_pairs.py; new test_kalman_pairs_entry_z_defaults_in_sync
+   pins the runner argparse default (the value that ACTUALLY governs live
+   paper — deploy unit passes no --entry-z) == backtest == strategy fallback
+   == config_template, so a future one-sided drift fails CI. Verified the
+   guard bites (flip template → red) — not tautological (Rule 9). The old
+   test only pinned the strategy cfg.get fallback, which is dead in the
+   runner path (_write_config always writes entry_z).
+KNOWINGLY DEFERRED (Rule 12): tests/test_backtest_5min.py base still pins
+entry_z=1.0 — its synthetic bars are tuned to fire entries at 1.0 for the
+plumbing tests (filter-steps-once/day, gate-feeds-decision); bumping risks
+breaking working tests for a low-severity coverage point now that the sync
+test guards the real shipped default. Full suite 1044 green; ruff clean.
+
+---
+
 # Taleb autoresearch — make the weekly sweep informative (PLAN, 2026-07-02)
 
 Context: the objective was already fixed on 2026-06-14 (net_pnl on captured

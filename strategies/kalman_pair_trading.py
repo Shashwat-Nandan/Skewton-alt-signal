@@ -121,12 +121,15 @@ class KalmanPairStrategy(BaseStrategy):
         self.model = model
 
         # Risk band — re-based on Palomar Ch.15 §15.5.1 (the book's "thresholded
-        # strategy"): enter at |z|=s₀ (entry_z, book s₀=1), unwind when z reverts
-        # to the mean (exit_z=0). This deliberately diverges from the static pair
-        # system's swept entry_z=2.0/exit_z=0.75 — see tasks/kalman-pairs-rebase-
-        # plan.md. The book's literal s₀=1 only profits in a mean-reverting regime,
-        # so it is paired with the ADF regime gate below.
-        self.entry_z = float(cfg.get("entry_z", 1.0))
+        # strategy"): enter at |z|=s₀, unwind when z reverts to the mean
+        # (exit_z=0). s₀ default 1.5, NOT the book's 1: the 2026-07-04 5-min
+        # revalidation showed intraday z touches 1.0 on noise the daily backtest
+        # never saw (s₀=1 at 5-min enters shallower than the daily replay that
+        # validated it), and 1.5 beat 1.0 on both independent half-windows —
+        # fewer, deeper entries that clear the ~₹1.5k/round-trip friction. See
+        # tasks/kalman-pairs-rebase-plan.md (5-MIN REVALIDATION). Still paired
+        # with the ADF regime gate below (s₀ alone only profits in-regime).
+        self.entry_z = float(cfg.get("entry_z", 1.5))
         self.exit_z = float(cfg.get("exit_z", 0.0))
         # stop_z=4.0 (not tighter): mean-reverting spreads overshoot to 2–3σ
         # before reverting, so a tight stop exits winners at the worst point and
@@ -350,11 +353,13 @@ class KalmanPairStrategy(BaseStrategy):
 
     # ──────────────────────────────────────────────────────────────────
     # Regime gate (Palomar re-base): the s₀-sweep showed regime, not the
-    # threshold, is the lever — book s₀=1 is best in a mean-reverting regime
-    # and worst in an adverse one. Only enter when the RAW cointegration
-    # residual is currently stationary (ADF), so the spread is actually
-    # reverting. Gating on the Kalman *normalized* spread is inert (it is
-    # stationary by construction). See tasks/kalman-pairs-rebase-plan.md.
+    # threshold, is the lever — a low s₀ is best in a mean-reverting regime and
+    # worst in an adverse one, so damage-control is a regime filter, not a
+    # threshold value (the entry_z default is 1.5, not the book's s₀=1; see the
+    # __init__ band comment). Only enter when the RAW cointegration residual is
+    # currently stationary (ADF), so the spread is actually reverting. Gating on
+    # the Kalman *normalized* spread is inert (it is stationary by construction).
+    # See tasks/kalman-pairs-rebase-plan.md.
     # ──────────────────────────────────────────────────────────────────
     def _refresh_regime_adf(self) -> None:
         """Recompute the cached ADF p-value of the recent raw-residual window.

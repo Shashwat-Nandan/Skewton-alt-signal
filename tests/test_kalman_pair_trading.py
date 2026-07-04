@@ -117,6 +117,23 @@ def test_entry_fires_on_correct_side_of_band():
     assert a.transaction_type == "SELL"
 
 
+def test_default_entry_band_rejects_book_s0_noise_touch():
+    """entry_z defaults to 1.5, not the book's s₀=1: at 5-min resolution the
+    z-score touches ±1 on intraday noise, and those shallow entries churn below
+    the ~₹1.5k round-trip friction (2026-07-04 5-min revalidation — 1.5 beat
+    1.0 on both independent half-windows). A z that the BOOK default would
+    trade (|z|=1.2) must NOT enter; past 1.5 it must. If this fails, the
+    noise-churn regression is back."""
+    strat, quotes = _make()
+    assert strat.entry_z == 1.5
+    pa, pb = _push_z(strat, 1.2)          # book s₀=1 would enter here
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    assert strat.scan_and_propose() == []
+    pa, pb = _push_z(strat, 1.7)          # beyond the raised band → trade
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    assert len(strat.scan_and_propose()) == 2
+
+
 def test_regime_break_above_max_entry_z_refuses():
     """Past max_entry_z the spread has broken its relationship — entering there
     is the runaway-churn failure the static system hit. Must refuse."""

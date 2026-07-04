@@ -340,13 +340,18 @@ def print_report(rows: List[dict], args):
         print(f"\nPer-pair rows written to {args.csv_out}")
 
 
-def main():
+def build_parser():
+    """The backtester's argument parser. Exposed (not inlined in main) so its
+    argparse defaults are inspectable by the sync test that pins entry_z to the
+    runner/strategy/config-template copies (they had drifted as independent
+    literals — see tasks/kalman-pairs-rebase-plan.md)."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--train-fraction", type=float, default=0.5)
-    # Defaults re-based on Palomar Ch.15 (book s₀=1, exit at mean, 6-mo lookback)
-    # + the ADF regime gate. Was entry 2.0 / exit 0.75 / lookback 60.
-    ap.add_argument("--entry-z", dest="entry_z", type=float, default=1.0)
+    # Defaults re-based on Palomar Ch.15 (exit at mean, 6-mo lookback) + the ADF
+    # regime gate. Was entry 2.0 / exit 0.75 / lookback 60. Entry 1.0→1.5 per
+    # the 2026-07-04 5-min revalidation (parity with strategy/runner defaults).
+    ap.add_argument("--entry-z", dest="entry_z", type=float, default=1.5)
     ap.add_argument("--exit-z", dest="exit_z", type=float, default=0.0)
     ap.add_argument("--stop-z", dest="stop_z", type=float, default=4.0)
     ap.add_argument("--lookback-days", dest="lookback_days", type=int, default=126)
@@ -370,6 +375,11 @@ def main():
     # bhavcopy closes (one decision/day) and is the legacy path.
     ap.add_argument("--timeframe", choices=("daily", "5min"), default="5min")
     ap.add_argument("--csv-out", dest="csv_out", default=None)
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
 

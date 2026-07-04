@@ -601,13 +601,21 @@ def _write_config(args) -> str:
     return str(out)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The runner's argument parser. Exposed (not inlined in main) so the
+    argparse defaults — the values that ACTUALLY govern the live paper runner,
+    since the deploy unit passes no threshold flags and _write_config writes
+    these into the derived config — are inspectable by the sync test that pins
+    them to the strategy/backtest/config-template defaults (they had drifted
+    silently as five independent literals)."""
     p = argparse.ArgumentParser(description="Kalman pair-trading paper runner")
     p.add_argument("--top", type=int, default=10)
-    # Defaults re-based on Palomar Ch.15 (thresholded strategy, book s₀=1, exit at
-    # the mean, 6-month z-lookback) + the ADF regime gate — see
-    # tasks/kalman-pairs-rebase-plan.md. Was entry 2.0 / exit 0.75 / lookback 60.
-    p.add_argument("--entry-z", type=float, default=1.0)
+    # Defaults re-based on Palomar Ch.15 (thresholded strategy, exit at the mean,
+    # 6-month z-lookback) + the ADF regime gate — see tasks/kalman-pairs-rebase-
+    # plan.md. Was entry 2.0 / exit 0.75 / lookback 60. Entry raised 1.0→1.5 by
+    # the 2026-07-04 5-min revalidation (book s₀=1 churns on intraday noise;
+    # 1.5 won both half-windows — see plan's 5-MIN REVALIDATION section).
+    p.add_argument("--entry-z", type=float, default=1.5)
     p.add_argument("--exit-z", type=float, default=0.0)
     # stop_z=4.0: a tighter stop exits mean-reversion winners before they revert
     # (backtest in-regime +290k @4.0 vs +8k @2.5); the regime gate handles
@@ -629,7 +637,11 @@ def main() -> int:
     p.add_argument("--candidates", default=str(CANDIDATES_PATH))
     p.add_argument("--force", action="store_true",
                    help="run even on a weekend/holiday (testing)")
-    args = p.parse_args()
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     today = date.today()
     log = _setup_logging(today)
