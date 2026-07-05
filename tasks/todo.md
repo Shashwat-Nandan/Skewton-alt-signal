@@ -1,3 +1,78 @@
+# Taleb BANKNIFTY variant, issue #62 (PLAN, 2026-07-04)
+
+DECISIONS (AskUserQuestion 2026-07-04):
+  1. FIRST deliverable = isolated BANKNIFTY paper runner (gather edge evidence);
+     DEFER the loop_engine orchestrator/checker/risk/dashboard to a follow-up
+     gated on paper showing something.
+  2. Reuse run_paper.py as a 2nd isolated instance (parameterize paths), not a
+     dedicated runner (Rule 2/8).
+  3. Cold seed (use_best_params=false, book defaults) — NOT NIFTY's best_params.
+  4. BANKNIFTY-only on loop_engine later; NIFTY stays on autoresearch.
+
+Strategy layer is ALREADY underlying-ready: underlying/exchange config-driven;
+_iv_history_path→iv_history_{underlying}.json; spot glob {underlying}_*_eod.csv;
+lot size + futures symbol resolved from kite.instruments per underlying; strike
+step 100 for non-NIFTY; _INDEX_SPOT_SYMBOLS[BANKNIFTY]="NSE:NIFTY BANK";
+best_params_path/use_best_params config-driven. So the ONLY gap = runner paths.
+
+## Increment 1 (this PR) — isolated BANKNIFTY paper instance, PAPER-ONLY
+- [x] run_paper.py: --config + --override (thin merge, override wins) → derive
+      underlying → derive_paths(): NIFTY keeps LEGACY unsuffixed names (byte-
+      identical), else suffix _{underlying}. Threaded `state_file` through
+      load/restore/write/end_of_session. Fail-loud on config-underlying mismatch.
+      Merged→derived config only when --override (NIFTY path unchanged).
+- [x] config_banknifty_template.ini (committed THIN override, not a full copy —
+      avoids the #68 duplication): underlying=BANKNIFTY, use_best_params=false,
+      book-default tunables; creds+rails inherited from base. gitignore
+      config_banknifty.ini (host copy).
+- [x] deploy/taleb-banknifty-paper.{service,timer} mirror taleb-hedger; ExecStart
+      run_paper.py --config config.ini --override config_banknifty.ini. Documented,
+      NOT auto-installed.
+- [x] Tests (Rule 9, +4): NIFTY→legacy names; BANKNIFTY→isolated/disjoint;
+      state persist/load uses the passed path; and an END-TO-END construction
+      test — merged base+override builds a COLD BANKNIFTY strategy (underlying,
+      iv_history_BANKNIFTY.json, book 30-70 band, 1M inherited). 8 run_paper tests.
+- [x] Data dependency documented in the template header (BANKNIFTY_*_eod.csv via
+      fetch_index_daily.py; iv_history_BANKNIFTY.json builds forward). NO live path.
+
+### Code-review fixes (2026-07-04, high-effort → applied)
+The review CHANGED the design: the thin-override-onto-config.ini approach was
+NOT actually cold — config.ini is the NIFTY autoresearch seed, so ~7 unlisted
+tunables (position_size_pct, max_entry_alpha, …) leaked NIFTY's fit; and merging
+added a derived-config truncate race + [kite]-cred spread into data_cache.
+Reworked to a SELF-CONTAINED cold BANKNIFTY config (book-default [strategy]
+verbatim, creds from .env) run as `--config config_banknifty.ini` — no merge, no
+derived file. This eliminated the race + secret-spread findings outright.
+Also: resolve_underlying() requires the EXACT canonical spelling (a case/typo
+variant like "nifty" would have derived suffixed paths and silently ORPHANED the
+real NIFTY state — now fails loud, never falls back to NIFTY); config parse
+errors caught → clean exit; BANKNIFTY timer STAGGERED 09:10→09:12 (+ smaller
+jitter) so it can't fresh-login concurrently with NIFTY off the shared session
+(the documented hazard); total_capital=1M documented as unvalidated for
+BANKNIFTY margin (Rule 1). +2 tests: exact-canonical validation, and a drift
+guard that BANKNIFTY [strategy] == config_template [strategy] (the #68 trap).
+DEFERRED (in the follow-up's scope): dashboard/positions reads only NIFTY's state
+— BANKNIFTY dashboard visibility IS the deferred loop_engine work. Full suite
+1062 green; ruff clean.
+
+## Review (2026-07-04)
+Strategy layer needed ZERO changes — it was already fully underlying-parameterized.
+Only the runner hardcoded paths + the config seam. Verified end-to-end: merged
+config constructs a cold BANKNIFTY strategy with an isolated IV path. NIFTY path
+is byte-identical (legacy names, no derived-config write without --override).
+Full suite green; ruff clean. loop_engine variant DEFERRED (follow-up, gated on
+this paper instance showing edge). OPERATOR (host, not autonomous): copy
+config_banknifty_template.ini → config_banknifty.ini; fetch BANKNIFTY EOD spot
+CSV; install + enable the two units (reuse the cached Kite session — do NOT
+fresh-login while the live pair runner is active).
+
+## DEFERRED to a follow-up issue (gated on BANKNIFTY paper edge)
+loop_engine orchestrator+checker(P&L-aligned)+risk_monitor for BANKNIFTY;
+its systemd loop/risk timers; /taleb-banknifty dashboard tab. (loop_engine is
+currently hardcoded to kalman_trend — Phase-6 generalization is its own work.)
+
+---
+
 # Kalman pairs — de-dup screen + replay copy-paste, issue #68 (2026-07-04)
 
 Pure cleanup (Rule 2/3), NO behaviour change. Two copy-paste blocks the re-base

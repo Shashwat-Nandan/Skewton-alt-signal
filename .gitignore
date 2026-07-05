@@ -1,5 +1,6 @@
 # Credentials and secrets
 config.ini
+config_banknifty.ini
 .kite_session.json
 .env
 

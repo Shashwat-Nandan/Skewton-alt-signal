@@ -1,0 +1,23 @@
+[Unit]
+Description=Fire taleb-banknifty-paper.service Mon–Fri at 09:12 IST (issue #62)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# STAGGERED to 09:12 — 2 min AFTER the NIFTY taleb-hedger.timer (09:10, jitter
+# 0-60s). Both instances auth off the SAME Kite account via one cached session
+# (.kite_session.json). kite_auth has no cross-process login lock, so if both
+# started together on a stale-session morning they could BOTH fresh-login and
+# the second would invalidate the first's token (the documented "never
+# fresh-login while another runner is active" hazard). Staggering lets the NIFTY
+# instance populate the shared session cache first; BANKNIFTY then reuses it —
+# no concurrent fresh login. RandomizedDelaySec kept small so the 2-min gap holds.
+# (A proper cross-process auth lock is the deeper fix; deferred — it touches the
+# shared live auth path.) The per-underlying lock still prevents a BANKNIFTY
+# double-run and does NOT block the concurrent NIFTY instance.
+OnCalendar=Mon..Fri *-*-* 09:12:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=15
+Unit=taleb-banknifty-paper.service
+
+[Install]
+WantedBy=timers.target
