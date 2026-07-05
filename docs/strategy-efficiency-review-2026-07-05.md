@@ -169,10 +169,11 @@ generation is FLAT with the ADF regime gate live on the dashboard.
 
 - Don't judge on 5 sessions. **Decision point: one full expiry cycle** —
   compare net-of-cost P&L against the persistent runner on the same calendar.
-- The known open item that matters for efficiency: **entry-side roll buffer
-  (issue #70)** — entering a pair days before expiry guarantees a forced
-  flatten (cost, no edge). That is a pure cost-avoidance fix; do it before the
-  JUL expiry week.
+- The entry-side near-expiry guard (issue #70) is **already implemented**
+  (closed 2026-06-30): new entries are suppressed when the front-month future
+  is within `--entry-cutoff-days` (default 3 calendar days) of expiry, while
+  exits/rehedges keep running. No action needed; note the default cutoff does
+  not guarantee a full `max_holding_days` window (documented in the runner).
 - Kalman pairs' promise is *capital efficiency* (better hedge ratio → less
   residual risk per rupee). Measure it that way: net P&L per rupee of real
   margin vs the persistent runner, not raw P&L.
@@ -261,9 +262,12 @@ lose.
 
 ## 5. Suggested 30-day sequence
 
-1. **Week 1**: E1 scoreboard + kill rules (small, pure win). Buy-on-gap halt
-   rule (§2.4). Kalman-trend kill date (§2.7). Kalman-pairs roll buffer #70
-   before JUL expiry week.
+1. **Week 1** *(implemented 2026-07-05, same PR as this doc)*: E1 scoreboard +
+   kill rules (`scripts/strategy_scoreboard.py`). Buy-on-gap halt rule (§2.4;
+   `--kill-*` flags, default net −₹50k or 15 trades under 35% win rate).
+   Kalman-trend kill date (§2.7; `KILL_DATE = 2026-08-01`). The fourth
+   candidate item — kalman-pairs roll buffer #70 — turned out to be already
+   implemented (see §2.6).
 2. **Week 2**: E2 cost hurdle in arbitrage + min-hold; if still ≈0 net after
    two weeks, park it. E4 autoresearch objective swap (before the next
    Saturday sweep if possible).

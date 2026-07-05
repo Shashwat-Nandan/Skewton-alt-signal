@@ -49,8 +49,21 @@ BAR_SECONDS = 300                            # 5-min signal bars
 # MA book by omitting costs entirely (issue #77). Flat across instruments to match
 # the backtest; per-instrument realism is a possible follow-up.
 COST_PER_UNIT_POINTS = 2.5
+# Experiment sunset (docs/strategy-efficiency-review-2026-07-05.md §2.7). The
+# backtest is NO-GO, the loop checker REJECTs every session, and the forward
+# A/B pays ~14x the MA control's trading for a net wash across instruments —
+# the experiment has answered its question. On/after this date the runner
+# refuses to trade and exits 0 without an EOD sidecar, which the loop
+# orchestrator already records as "no_session". Extending the runway is a
+# deliberate act: move the date in a commit, don't delete the gate.
+KILL_DATE = date(2026, 8, 1)
 
 logger = logging.getLogger("paper-kalman-trend")
+
+
+def experiment_expired(today: date, kill_date: date = KILL_DATE) -> bool:
+    """True once the A/B experiment is on/after its sunset date."""
+    return today >= kill_date
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -218,6 +231,15 @@ def main() -> int:  # pragma: no cover
     ok, why = is_trading_day(today, holidays)
     if not ok:
         logger.info("Not a trading day (%s) — exiting.", why)
+        return 0
+
+    if experiment_expired(today):
+        logger.critical(
+            "kalman_trend A/B is past its kill date (%s) — refusing to trade. "
+            "Verdict: backtest NO-GO + checker REJECT + ~14x MA churn for a "
+            "net wash (docs/strategy-efficiency-review-2026-07-05.md §2.7). "
+            "Operator: disable kalman-trend-paper/loop-kalman-trend timers; "
+            "to extend the runway, move KILL_DATE in a commit.", KILL_DATE)
         return 0
 
     install_signal_handlers(logger)

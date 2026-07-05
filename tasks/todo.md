@@ -16,7 +16,28 @@ long-run profitability; deliver a review doc in docs/.
 - [x] Write docs/strategy-efficiency-review-2026-07-05.md: per-strategy
       scoreboard + verdicts, ranked cross-cutting efficiency improvements,
       30-day action list
-- [ ] User reads doc, decides which recommendations to implement
+- [x] User approved: commit doc + implement Week-1 items
+
+## Week-1 implementation (2026-07-05, same branch)
+- [x] E1 scoreboard + kill rules → scripts/strategy_scoreboard.py (stdlib-only,
+      read-only; monthly net realized per strategy from EOD sidecars / state
+      backups / dashboard.db; PARK CANDIDATE = both of the last two COMPLETE
+      months net-negative). Smoke-tested against real data: flags Taleb NIFTY
+      (May −56k, Jun −64.7k); current partial month never counts.
+- [x] Buy-on-gap experiment kill rule (§2.4) → experiment_kill_reason() in
+      run_paper_buy_on_gap.py + --kill-net-loss-inr 50000 / --kill-min-trades
+      15 / --kill-max-win-rate 0.35; open positions ⇒ EXIT-ONLY session via
+      GapHaltState(kill_rule=True). Dry-run verified: fires at a ₹30k test
+      floor on the real −₹39,268 state, does NOT fire at defaults.
+- [x] Kalman-trend kill date (§2.7) → KILL_DATE = 2026-08-01 +
+      experiment_expired() gate in run_paper_kalman_trend.py main(); exits 0
+      without EOD → loop orchestrator records "no_session" (verified against
+      kite_engine's status contract).
+- [x] Kalman-pairs roll buffer #70: found ALREADY IMPLEMENTED (closed
+      2026-06-30, entry suppression via --entry-cutoff-days). Corrected the
+      review doc §2.6/§5, no code needed.
+- [x] Tests: +5 scoreboard-kill-rule tests (new file), +5 buy-on-gap kill-rule
+      tests, +2 sunset tests. Targeted files 27/27 green; ruff clean.
 
 ## Review (2026-07-05)
 Deliverable: docs/strategy-efficiency-review-2026-07-05.md (analysis only, no

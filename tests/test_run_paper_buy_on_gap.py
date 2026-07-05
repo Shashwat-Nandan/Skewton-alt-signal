@@ -74,3 +74,54 @@ def test_fetch_today_quotes_total_failure_returns_empty():
         def quote(self, keys):
             raise RuntimeError("token expired")
     assert r.fetch_today_quotes(DeadKite(), ["INFY"], LOG) == {}
+
+
+# ── Experiment kill rule (efficiency review 2026-07-05 §2.4) ──────────────
+# WHY these tests matter: the strategy was deployed as a known-overfit
+# experiment. The kill rule is the pre-agreed answer to "when has the forward
+# record confirmed the overfit?" — if these thresholds silently stop binding,
+# the experiment bleeds indefinitely (the failure mode the review found across
+# the paper book).
+class _P:
+    def __init__(self, pnl):
+        self.pnl = pnl
+
+
+def test_kill_reason_fires_on_cumulative_net_loss_floor():
+    reason = r.experiment_kill_reason(-50_000.0, [])
+    assert reason is not None and "floor" in reason
+
+
+def test_kill_reason_fires_on_losing_win_rate_with_enough_trades():
+    closed = [_P(-1000.0)] * 10 + [_P(500.0)] * 5   # 15 trades, 33% win rate
+    reason = r.experiment_kill_reason(-10_000.0, closed)
+    assert reason is not None and "win rate" in reason
+
+
+def test_kill_reason_holds_fire_below_both_thresholds():
+    # The book's real state at rule-introduction time (−₹39k over 5 losers)
+    # must NOT fire: the rule is a pre-agreed floor, not a retro-kill.
+    assert r.experiment_kill_reason(-39_268.0, [_P(-7853.0)] * 5) is None
+    # Win-rate leg needs the trade count: 14 losers is not yet an answer.
+    assert r.experiment_kill_reason(-10_000.0, [_P(-100.0)] * 14) is None
+
+
+def test_kill_reason_legs_can_be_disabled():
+    assert r.experiment_kill_reason(-9e9, [], net_loss_floor_inr=0,
+                                    min_trades=0) is None
+    assert r.experiment_kill_reason(-1.0, [_P(-1.0)] * 100,
+                                    net_loss_floor_inr=0, min_trades=0) is None
+
+
+def test_kill_rule_pins_entry_halt_for_the_whole_session(tmp_path, monkeypatch):
+    # With open positions the runner must go EXIT-ONLY: halt_new stays True
+    # across refresh() even when no operator HALT_* file exists.
+    monkeypatch.setattr(r, "HALT_ALL_PATH", tmp_path / "HALT_ALL")
+    monkeypatch.setattr(r, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW")
+    monkeypatch.setattr(r, "HALT_GAP_DAILY_LOSS_PATH", tmp_path / "HALT_LOSS")
+    hs = r.GapHaltState(kill_rule=True)
+    hs.refresh(LOG)
+    assert hs.halt_new and not hs.halt_all
+    plain = r.GapHaltState()
+    plain.refresh(LOG)
+    assert not plain.halt_new

@@ -206,19 +206,54 @@ def write_eod_sidecar(strategy, today: date, log: logging.Logger,
     log.info("EOD sidecar: %s", path)
 
 
+def experiment_kill_reason(realized_pnl: float, closed_positions,
+                           net_loss_floor_inr: float = 50_000.0,
+                           min_trades: int = 15,
+                           max_win_rate: float = 0.35) -> Optional[str]:
+    """CUMULATIVE kill rule for the buy-on-gap experiment
+    (docs/strategy-efficiency-review-2026-07-05.md §2.4).
+
+    The backtest edge was known-overfit before deployment (train Sharpe 2.71 →
+    test −0.83); this paper run exists to answer one question — does the
+    forward record confirm the overfit? Once it has (deep cumulative net loss,
+    or enough closed trades at a losing win rate), continuing is paying costs
+    and attention for an answered question. Unlike the DAILY loss flag above
+    (session-scoped, operator-clearable), this is cumulative and permanent
+    until the thresholds are changed on the command line.
+
+    Returns a human-readable reason string, or None while the experiment may
+    continue. net_loss_floor_inr <= 0 disables the loss leg; min_trades <= 0
+    disables the win-rate leg.
+    """
+    if net_loss_floor_inr > 0 and realized_pnl <= -net_loss_floor_inr:
+        return (f"cumulative net realized ₹{realized_pnl:+,.0f} breached the "
+                f"−₹{net_loss_floor_inr:,.0f} experiment floor")
+    if min_trades > 0 and len(closed_positions) >= min_trades:
+        wins = sum(1 for p in closed_positions if (p.pnl or 0.0) > 0)
+        win_rate = wins / len(closed_positions)
+        if win_rate < max_win_rate:
+            return (f"{len(closed_positions)} closed trades at win rate "
+                    f"{win_rate:.0%} < the {max_win_rate:.0%} experiment floor")
+    return None
+
+
 class GapHaltState:
     """Operator kill switches (shared HALT_ALL / HALT_NEW_ENTRIES) plus
-    buy-on-gap's OWN auto daily-loss flag. HALT_ALL implies HALT_NEW_ENTRIES."""
+    buy-on-gap's OWN auto daily-loss flag. HALT_ALL implies HALT_NEW_ENTRIES.
+    `kill_rule=True` (cumulative experiment kill rule fired while positions
+    were still open) pins halt_new for the whole session — exit-only mode."""
 
-    def __init__(self):
+    def __init__(self, kill_rule: bool = False):
         self.halt_all = False
         self.halt_new = False
+        self.kill_rule = kill_rule
 
     def refresh(self, log: logging.Logger) -> None:
         prev_all, prev_new = self.halt_all, self.halt_new
         self.halt_all = HALT_ALL_PATH.exists()
         halt_loss = HALT_GAP_DAILY_LOSS_PATH.exists()
-        self.halt_new = (self.halt_all or HALT_NEW_ENTRIES_PATH.exists() or halt_loss)
+        self.halt_new = (self.halt_all or HALT_NEW_ENTRIES_PATH.exists()
+                         or halt_loss or self.kill_rule)
         if self.halt_all and not prev_all:
             log.critical("KILL SWITCH: HALT_ALL present (%s) — entries AND exits "
                          "suspended.", HALT_ALL_PATH)
@@ -298,6 +333,15 @@ def main():
     parser.add_argument("--max-daily-loss-inr", type=float, default=30_000.0,
                         help="Session ΔP&L floor (₹). On breach touches "
                              "HALT_BUY_ON_GAP_DAILY_LOSS. 0 disables.")
+    parser.add_argument("--kill-net-loss-inr", type=float, default=50_000.0,
+                        help="Experiment kill rule: refuse to trade once "
+                             "CUMULATIVE net realized <= -this (₹). 0 disables.")
+    parser.add_argument("--kill-min-trades", type=int, default=15,
+                        help="Experiment kill rule: with at least this many "
+                             "closed trades, refuse to trade if win rate < "
+                             "--kill-max-win-rate. 0 disables.")
+    parser.add_argument("--kill-max-win-rate", type=float, default=0.35,
+                        help="Win-rate floor for the --kill-min-trades leg.")
     parser.add_argument("--kite-rate-per-sec", type=float, default=8.0)
     parser.add_argument("--kite-burst", type=int, default=8)
     parser.add_argument("--force", action="store_true",
@@ -379,6 +423,24 @@ def main():
     restore_strategy(strategy, load_prior_state(args.system, log), today, log)
     strategy._capture_session_baseline()
 
+    kill_reason = experiment_kill_reason(
+        strategy.realized_pnl, strategy.closed_positions,
+        net_loss_floor_inr=args.kill_net_loss_inr,
+        min_trades=args.kill_min_trades,
+        max_win_rate=args.kill_max_win_rate)
+    if kill_reason and not strategy.positions:
+        log.critical(
+            "EXPERIMENT KILL RULE: %s — refusing to trade "
+            "(docs/strategy-efficiency-review-2026-07-05.md §2.4). Operator: "
+            "disable buy-on-gap-paper.timer; to grant more runway, raise the "
+            "--kill-* thresholds in the unit file.", kill_reason)
+        return 0
+    if kill_reason:
+        log.critical(
+            "EXPERIMENT KILL RULE: %s — but %d position(s) are still OPEN; "
+            "running this session EXIT-ONLY (entries suppressed) so the book "
+            "closes cleanly.", kill_reason, len(strategy.positions))
+
     if args.dry_run:
         log.info("DRY RUN: preflight + panel + features OK, %d symbols ready. "
                  "Not authenticating or trading. Exiting 0.", len(universe))
@@ -407,7 +469,7 @@ def main():
                  sum(1 for p in strategy.closed_positions
                      if p.entry_dt is not None and p.entry_dt.date() == today))
 
-    halt_state = GapHaltState()
+    halt_state = GapHaltState(kill_rule=bool(kill_reason))
     install_signal_handlers(log)
     heartbeat = HeartbeatTracker(threshold=SILENT_FAIL_THRESHOLD,
                                  sentinel_path=silent_fail_flag_path(args.system), log=log)
