@@ -206,7 +206,7 @@ def write_eod_sidecar(strategy, today: date, log: logging.Logger,
     log.info("EOD sidecar: %s", path)
 
 
-def experiment_kill_reason(realized_pnl: float, closed_positions,
+def experiment_kill_reason(realized_pnl: float, closed_pnls: List[float],
                            net_loss_floor_inr: float = 50_000.0,
                            min_trades: int = 15,
                            max_win_rate: float = 0.35) -> Optional[str]:
@@ -214,12 +214,17 @@ def experiment_kill_reason(realized_pnl: float, closed_positions,
     (docs/strategy-efficiency-review-2026-07-05.md §2.4).
 
     The backtest edge was known-overfit before deployment (train Sharpe 2.71 →
-    test −0.83); this paper run exists to answer one question — does the
+    test -0.83); this paper run exists to answer one question — does the
     forward record confirm the overfit? Once it has (deep cumulative net loss,
     or enough closed trades at a losing win rate), continuing is paying costs
     and attention for an answered question. Unlike the DAILY loss flag above
     (session-scoped, operator-clearable), this is cumulative and permanent
     until the thresholds are changed on the command line.
+
+    Evaluated once at session START against the persisted book (it takes the
+    raw per-trade pnl list so it can run BEFORE the panel/auth startup cost);
+    a breach that happens mid-session is bounded by --max-daily-loss-inr that
+    day and caught by this rule the next morning.
 
     Returns a human-readable reason string, or None while the experiment may
     continue. net_loss_floor_inr <= 0 disables the loss leg; min_trades <= 0
@@ -227,14 +232,32 @@ def experiment_kill_reason(realized_pnl: float, closed_positions,
     """
     if net_loss_floor_inr > 0 and realized_pnl <= -net_loss_floor_inr:
         return (f"cumulative net realized ₹{realized_pnl:+,.0f} breached the "
-                f"−₹{net_loss_floor_inr:,.0f} experiment floor")
-    if min_trades > 0 and len(closed_positions) >= min_trades:
-        wins = sum(1 for p in closed_positions if (p.pnl or 0.0) > 0)
-        win_rate = wins / len(closed_positions)
+                f"-₹{net_loss_floor_inr:,.0f} experiment floor")
+    if min_trades > 0 and len(closed_pnls) >= min_trades:
+        wins = sum(1 for p in closed_pnls if (p or 0.0) > 0)
+        win_rate = wins / len(closed_pnls)
         if win_rate < max_win_rate:
-            return (f"{len(closed_positions)} closed trades at win rate "
+            return (f"{len(closed_pnls)} closed trades at win rate "
                     f"{win_rate:.0%} < the {max_win_rate:.0%} experiment floor")
     return None
+
+
+# On-disk marker dropped when the kill rule fires. Follows the HALT_* sentinel
+# convention (visible to the operator and the scoreboard) because once the
+# rule trips, the runner stops writing EOD sidecars — without a marker,
+# "killed" would be indistinguishable from "broken" on every surface that
+# watches those files (dashboard router, scripts/strategy_scoreboard.py).
+KILLED_SENTINEL_PATH = DATA_CACHE / "HALT_BUY_ON_GAP_KILLED"
+
+
+def _drop_killed_sentinel(reason: str, log: logging.Logger) -> None:
+    try:
+        KILLED_SENTINEL_PATH.write_text(
+            f"{reason}\nfired {datetime.now().isoformat(timespec='seconds')}; "
+            "informational marker — clearing it does NOT re-enable trading "
+            "(the rule re-evaluates from state each session).\n")
+    except Exception as e:
+        log.exception("Failed to write %s: %s", KILLED_SENTINEL_PATH, e)
 
 
 class GapHaltState:
@@ -374,6 +397,42 @@ def main():
              args.mode.upper(), today, args.system)
     log.info("=" * 60)
 
+    # Experiment kill rule — evaluated on the RAW persisted book, BEFORE the
+    # ~200-CSV panel load and Kite auth, so a permanently-killed experiment
+    # exits in milliseconds instead of paying the full startup cost every
+    # morning. `prior` is reused for restore_strategy below (single read).
+    prior = load_prior_state(args.system, log)
+    kill_reason = None
+    if prior is not None:
+        kill_reason = experiment_kill_reason(
+            float(prior.get("realized_pnl", 0.0)),
+            [p.get("pnl") for p in prior.get("closed_positions", [])],
+            net_loss_floor_inr=args.kill_net_loss_inr,
+            min_trades=args.kill_min_trades,
+            max_win_rate=args.kill_max_win_rate)
+    if kill_reason:
+        _drop_killed_sentinel(kill_reason, log)
+        # Raw open positions may include stale entries restore_strategy would
+        # drop (intraday book, crash carry-over) — erring toward the exit-only
+        # session in that rare case is harmless.
+        if not prior.get("positions") and not args.dry_run:
+            log.critical(
+                "EXPERIMENT KILL RULE: %s — refusing to trade "
+                "(docs/strategy-efficiency-review-2026-07-05.md §2.4). Marker: "
+                "%s. Operator: disable buy-on-gap-paper.timer; to grant more "
+                "runway, raise the --kill-* thresholds in the unit file.",
+                kill_reason, KILLED_SENTINEL_PATH.name)
+            return 0
+        if args.dry_run:
+            log.warning("EXPERIMENT KILL RULE would fire (%s) — continuing "
+                        "because --dry-run validates the preflight pipeline.",
+                        kill_reason)
+        else:
+            log.critical(
+                "EXPERIMENT KILL RULE: %s — but position(s) are still OPEN; "
+                "running this session EXIT-ONLY (entries suppressed) so the "
+                "book closes cleanly.", kill_reason)
+
     # Daily history through yesterday (no auth needed). The strategy adds
     # today's open/LTP/low from quotes at runtime.
     from strategies._eq_data import load_equity_panel, load_universe
@@ -420,26 +479,8 @@ def main():
              strategy.params["stop_loss_pct"], int(strategy.params["max_positions"]),
              strategy.params["total_capital"])
 
-    restore_strategy(strategy, load_prior_state(args.system, log), today, log)
+    restore_strategy(strategy, prior, today, log)
     strategy._capture_session_baseline()
-
-    kill_reason = experiment_kill_reason(
-        strategy.realized_pnl, strategy.closed_positions,
-        net_loss_floor_inr=args.kill_net_loss_inr,
-        min_trades=args.kill_min_trades,
-        max_win_rate=args.kill_max_win_rate)
-    if kill_reason and not strategy.positions:
-        log.critical(
-            "EXPERIMENT KILL RULE: %s — refusing to trade "
-            "(docs/strategy-efficiency-review-2026-07-05.md §2.4). Operator: "
-            "disable buy-on-gap-paper.timer; to grant more runway, raise the "
-            "--kill-* thresholds in the unit file.", kill_reason)
-        return 0
-    if kill_reason:
-        log.critical(
-            "EXPERIMENT KILL RULE: %s — but %d position(s) are still OPEN; "
-            "running this session EXIT-ONLY (entries suppressed) so the book "
-            "closes cleanly.", kill_reason, len(strategy.positions))
 
     if args.dry_run:
         log.info("DRY RUN: preflight + panel + features OK, %d symbols ready. "

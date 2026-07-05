@@ -44,7 +44,7 @@ CHECK_DEFERRED = "deferred:phase2"
 class SessionOutcome:
     """Result of one maker+execute session, handed back by the engine."""
 
-    status: str                          # "ok" | "error" | "silent_fail" | "no_session" | "dry_run"
+    status: str                          # "ok" | "error" | "silent_fail" | "no_session" | "dry_run" | "sunset"
     exit_code: int = 0
     eod: Optional[dict] = None           # the runner's eod_report sidecar, if any
     checker: str = CHECK_DEFERRED        # set by check()
@@ -65,6 +65,14 @@ def kite_engine(today: Optional[date] = None) -> SessionOutcome:  # pragma: no c
     import run_paper_kalman_trend as runner
 
     today = today or date.today()
+    # Sunset gate (docs/strategy-efficiency-review-2026-07-05.md §2.7):
+    # surfaced as its OWN status, not folded into no_session — a permanently
+    # dead experiment must stay distinguishable from a holiday streak in
+    # STATE.md, or a later real code-0-without-EOD fault would be silently
+    # absorbed into the expected stream.
+    if runner.experiment_expired(today):
+        return SessionOutcome(status="sunset", exit_code=0,
+                              extra={"kill_date": runner.KILL_DATE.isoformat()})
     code = runner.main()
     eod_path = runner.DATA_CACHE / f"kalman_trend_eod_{today.isoformat()}.json"
     eod = json.loads(eod_path.read_text()) if eod_path.exists() else None
@@ -147,7 +155,7 @@ class LoopOrchestrator:
             return CHECK_DEFERRED
         # Nothing was traded → don't burn the (expensive) verifier or fabricate a
         # holiday verdict; record that it was skipped.
-        if outcome.status in ("no_session", "dry_run"):
+        if outcome.status in ("no_session", "dry_run", "sunset"):
             return f"skipped:{outcome.status}"
         result = self._checker(outcome)
         if result.passed:

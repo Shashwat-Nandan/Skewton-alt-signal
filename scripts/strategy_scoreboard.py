@@ -33,7 +33,7 @@ import os
 import re
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -45,11 +45,22 @@ Monthly = Dict[str, float]          # "YYYY-MM" -> net realized ₹ for the mont
 # ──────────────────────────────────────────────────────────────────────────
 # Extraction — one small reader per persistence shape
 # ──────────────────────────────────────────────────────────────────────────
+# Every snapshot skipped anywhere feeds this list so the final output can
+# surface the count LOUDLY (Rule 12): a month computed on partial data can
+# flip a PARK verdict, so the reader must know figures may be incomplete.
+SKIPPED: List[str] = []
+
+
+def _skip(path: str, why: str) -> None:
+    SKIPPED.append(path)
+    print(f"  [warn] skipped {path}: {why}", file=sys.stderr)
+
+
 def _load(path: str) -> Optional[dict]:
     try:
         return json.loads(Path(path).read_text())
     except Exception as e:  # unreadable snapshot: skip it, but say so
-        print(f"  [warn] unreadable {path}: {e}", file=sys.stderr)
+        _skip(path, f"unreadable ({e})")
         return None
 
 
@@ -61,7 +72,10 @@ def pair_system_monthly(data_cache: Path, pattern: str) -> Tuple[Monthly, float]
     unrealized = 0.0
     for f in sorted(glob.glob(str(data_cache / pattern))):
         d = _load(f)
-        if not d or "pairs" not in d:
+        if d is None:
+            continue
+        if "pairs" not in d or not d.get("date"):
+            _skip(f, "missing 'pairs' or 'date' key")
             continue
         month = d["date"][:7]
         delta = sum(p.get("session_realized_delta") or 0.0 for p in d["pairs"])
@@ -79,8 +93,11 @@ def report_system_monthly(data_cache: Path, pattern: str) -> Tuple[Monthly, floa
     last_report: dict = {}
     for f in sorted(glob.glob(str(data_cache / pattern))):
         d = _load(f)
-        rep = (d or {}).get("report")
-        if not d or not rep:
+        if d is None:
+            continue
+        rep = d.get("report")
+        if not rep or not d.get("date"):
+            _skip(f, "missing 'report' or 'date' key")
             continue
         month = d["date"][:7]
         monthly[month] = monthly.get(month, 0.0) + (rep.get("session_realized_delta") or 0.0)
@@ -89,27 +106,39 @@ def report_system_monthly(data_cache: Path, pattern: str) -> Tuple[Monthly, floa
     return monthly, unrealized, last_report
 
 
-def cumulative_series_monthly(dated_cum: List[Tuple[str, float]]) -> Monthly:
+def cumulative_series_monthly(dated_cum: List[Tuple[str, float]],
+                              baseline: Optional[float] = None) -> Monthly:
     """Monthly deltas from a dated CUMULATIVE series: last value in each month
-    minus last value in the previous month. The FIRST month is measured from
-    the first observation in that month (a partial — flagged by the caller)."""
+    minus last value in the previous month. Keys must be chronologically
+    sortable strings whose first 7 chars are the month; sorting is by key ONLY
+    (never by value — two same-key observations must not tie-break on P&L).
+
+    The FIRST month depends on what the series' start means:
+      - baseline given (e.g. 0.0): the series begins at the strategy's birth,
+        so the first month's delta is measured from that baseline — the first
+        observation's own accumulation counts.
+      - baseline None: the series begins mid-life (e.g. state backups added
+        after the strategy started trading); only the observed window
+        (last − first observation) can be attributed, a partial the caller
+        must flag."""
     monthly: Monthly = {}
     last_by_month: Dict[str, float] = {}
     first_by_month: Dict[str, float] = {}
-    for iso, cum in sorted(dated_cum):
+    for iso, cum in sorted(dated_cum, key=lambda x: x[0]):
         m = iso[:7]
         last_by_month[m] = cum
         first_by_month.setdefault(m, cum)
     months = sorted(last_by_month)
     for i, m in enumerate(months):
         if i == 0:
-            monthly[m] = last_by_month[m] - first_by_month[m]
+            start = first_by_month[m] if baseline is None else baseline
+            monthly[m] = last_by_month[m] - start
         else:
             monthly[m] = last_by_month[m] - last_by_month[months[i - 1]]
     return monthly
 
 
-_BACKUP_TS = re.compile(r"\.(\d{8})T\d{6}\.json$")
+_BACKUP_TS = re.compile(r"\.(\d{8})T(\d{6})\.json$")
 
 
 def taleb_monthly(data_cache: Path) -> Tuple[Monthly, float, float]:
@@ -117,21 +146,36 @@ def taleb_monthly(data_cache: Path) -> Tuple[Monthly, float, float]:
     state backups. Returns (monthly, latest cumulative realized, latest
     unrealized)."""
     series: List[Tuple[str, float]] = []
-    for f in sorted(glob.glob(str(data_cache / "state_backups" / "taleb_paper_state.*.json"))):
+    backups = sorted(glob.glob(str(data_cache / "state_backups" / "taleb_paper_state.*.json")))
+    if not backups:
+        # The backup filename format is owned by _state_backup.py; if it ever
+        # changes, this glob would silently match nothing and Taleb's monthly
+        # column would go blank — say so instead.
+        print("  [warn] no taleb_paper_state.* backups found — Taleb monthly "
+              "figures unavailable", file=sys.stderr)
+    for f in backups:
         m = _BACKUP_TS.search(f)
         d = _load(f)
-        if not m or not d:
+        if d is None:
             continue
         st = d.get("state") or {}
-        if "realized_pnl" in st:
-            ts = m.group(1)
-            series.append((f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}", float(st["realized_pnl"])))
+        if not m or "realized_pnl" not in st:
+            _skip(f, "unrecognized backup name or missing state.realized_pnl")
+            continue
+        # Keep the FULL timestamp in the sort key: two same-day backups must
+        # order chronologically, never tie-break on the P&L value (that would
+        # pick the day's max as "month end" and corrupt the monthly delta).
+        ds, ts = m.group(1), m.group(2)
+        series.append((f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}T{ts}", float(st["realized_pnl"])))
     live = _load(str(data_cache / "taleb_paper_state.json")) or {}
     st = live.get("state") or {}
     cum = float(st.get("realized_pnl", series[-1][1] if series else 0.0))
     unreal = float(st.get("unrealized_pnl", 0.0))
     if series:
-        series.append((date.today().isoformat(), cum))
+        # Full now-timestamp so this sorts AFTER any backup taken today.
+        series.append((datetime.now().isoformat(), cum))
+    # baseline=None: the backup series began AFTER the strategy started
+    # trading, so the first month is observed-window only (footnoted).
     return cumulative_series_monthly(series), cum, unreal
 
 
@@ -143,12 +187,18 @@ def kalman_trend_monthly(data_cache: Path) -> Tuple[Monthly, Monthly, dict]:
     last: dict = {}
     for f in sorted(glob.glob(str(data_cache / "kalman_trend_eod_*.json"))):
         d = _load(f)
-        if not d or "total_kalman_rupees" not in d:
+        if d is None:
+            continue
+        if "total_kalman_rupees" not in d or not d.get("date"):
+            _skip(f, "missing 'total_kalman_rupees' or 'date' key")
             continue
         kal.append((d["date"], float(d["total_kalman_rupees"])))
         ma.append((d["date"], float(d["total_ma_rupees"])))
         last = d
-    return cumulative_series_monthly(kal), cumulative_series_monthly(ma), last
+    # baseline=0.0: the A/B's first EOD file IS its first session, so the
+    # first observation's own accumulation belongs to that month.
+    return (cumulative_series_monthly(kal, baseline=0.0),
+            cumulative_series_monthly(ma, baseline=0.0), last)
 
 
 def equity_swing_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
@@ -156,6 +206,11 @@ def equity_swing_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
     unrealized marked from last_mtm_px. Returns (monthly, cum realized,
     open unrealized)."""
     if not db_path.exists():
+        # An all-zeros row with a benign verdict is indistinguishable from a
+        # flat strategy — a vanished data source must be loud (Rule 12).
+        print(f"  [warn] {db_path} not found — equity swing figures "
+              "unavailable", file=sys.stderr)
+        SKIPPED.append(str(db_path))
         return {}, 0.0, 0.0
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -165,11 +220,24 @@ def equity_swing_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
                 "SELECT substr(exit_dt,1,7), SUM(COALESCE(pnl,0)) FROM equity_positions "
                 "WHERE status != 'OPEN' AND exit_dt IS NOT NULL GROUP BY 1"):
             monthly[m] = float(s or 0.0)
-        cum = sum(monthly.values())
+        # cum from ALL closed rows — a closed row with a NULL exit_dt can't be
+        # bucketed into a month but its P&L must not vanish from the total.
+        (cum,) = cur.execute("SELECT COALESCE(SUM(COALESCE(pnl,0)), 0) "
+                             "FROM equity_positions WHERE status != 'OPEN'").fetchone()
+        (n_unmonthed,) = cur.execute(
+            "SELECT COUNT(*) FROM equity_positions "
+            "WHERE status != 'OPEN' AND exit_dt IS NULL").fetchone()
+        if n_unmonthed:
+            print(f"  [warn] {n_unmonthed} closed equity position(s) have no "
+                  "exit_dt — included in cum, absent from monthly columns",
+                  file=sys.stderr)
+        # COALESCE(last_mtm_px, entry_px): a fresh position with no MTM tick
+        # yet counts as 0 unrealized instead of being silently dropped by
+        # SUM's NULL-skipping.
         (unreal,) = cur.execute(
-            "SELECT COALESCE(SUM((last_mtm_px - entry_px) * qty), 0) "
+            "SELECT COALESCE(SUM((COALESCE(last_mtm_px, entry_px) - entry_px) * qty), 0) "
             "FROM equity_positions WHERE status = 'OPEN'").fetchone()
-        return monthly, cum, float(unreal)
+        return monthly, float(cum), float(unreal)
     finally:
         con.close()
 
@@ -209,9 +277,12 @@ def kill_verdict(monthly: Monthly, today: date) -> str:
 def render(rows: List[dict], months: List[str], today: date) -> str:
     name_w = max(len(r["name"]) for r in rows) + 2
     cols = [f"{m}" for m in months] + ["cum realized", "unrealized", "verdict"]
-    out = [f"STRATEGY SCOREBOARD — {today.isoformat()} (net realized ₹, modeled costs included)",
-           "",
-           "  " + "strategy".ljust(name_w) + "".join(c.rjust(14) for c in cols[:-1]) + "  verdict"]
+    out = [f"STRATEGY SCOREBOARD — {today.isoformat()} (net realized ₹, modeled costs included)"]
+    if SKIPPED:
+        out += ["", f"  ⚠ {len(SKIPPED)} data source(s) skipped (see stderr) — monthly",
+                "  figures may be INCOMPLETE and verdicts unreliable."]
+    out += ["",
+            "  " + "strategy".ljust(name_w) + "".join(c.rjust(14) for c in cols[:-1]) + "  verdict"]
     out.append("  " + "-" * (name_w + 14 * (len(cols) - 1) + 30))
     for r in rows:
         cells = []
@@ -225,9 +296,9 @@ def render(rows: List[dict], months: List[str], today: date) -> str:
         "",
         "  Kill rule: net-negative in BOTH of the last two complete months → PARK",
         "  CANDIDATE (calendar months proxy expiry cycles). Notes: paper fills are",
-        "  optimistic vs live; Taleb's first month is a partial (backup series",
-        "  starts mid-month); kalman_trend rows are A/B rupee-equivalents, not a",
-        "  funded book.",
+        "  optimistic vs live; Taleb's FIRST month is observed-window only (backup",
+        "  series starts mid-life, pre-backup P&L unattributable); kalman_trend",
+        "  rows are A/B rupee-equivalents, not a funded book.",
     ]
     return "\n".join(out)
 
@@ -255,7 +326,13 @@ def build_rows(data_cache: Path, db_path: Path, today: date) -> List[dict]:
     m, u, rep = report_system_monthly(data_cache, "arbitrage_paper_eod_*.json")
     add("arbitrage (paper)", m, rep.get("realized_pnl"), u)
     m, u, rep = report_system_monthly(data_cache, "buy_on_gap_paper_eod_*.json")
-    add("buy-on-gap (paper)", m, rep.get("realized_pnl"), u)
+    # Once the runner's own cumulative kill rule fires it stops writing EOD
+    # sidecars, so this row's months go blank ("insufficient history") — the
+    # sentinel it drops is the authoritative "dead, not missing" signal.
+    bog_kill = data_cache / "HALT_BUY_ON_GAP_KILLED"
+    add("buy-on-gap (paper)", m, rep.get("realized_pnl"), u,
+        verdict=(f"KILLED by runner rule ({bog_kill.read_text().strip().splitlines()[0]})"
+                 if bog_kill.exists() else None))
 
     m, cum, u = equity_swing_monthly(db_path)
     add("equity swing (paper)", m, cum, u)
@@ -264,7 +341,35 @@ def build_rows(data_cache: Path, db_path: Path, today: date) -> List[dict]:
     add("kalman_trend A/B: kalman", kal, last.get("total_kalman_rupees", 0.0), None)
     add("kalman_trend A/B: MA ctl", ma, last.get("total_ma_rupees", 0.0), None,
         verdict="control arm")
+
+    warn_unclaimed_sidecars(data_cache)
     return rows
+
+
+# The glob each row consumes. This script is the enforcement point for the
+# book-wide kill rule, so an EOD series NO row consumes means a strategy is
+# silently exempt from it — detect and warn rather than stay quiet.
+CLAIMED_EOD_PATTERNS = [
+    "pair_paper_persistent_eod_*.json", "pair_paper_eod_2*.json",
+    "pair_paper_kalman_eod_*.json", "arbitrage_paper_eod_*.json",
+    "buy_on_gap_paper_eod_*.json", "kalman_trend_eod_*.json",
+]
+
+
+def warn_unclaimed_sidecars(data_cache: Path) -> None:
+    import fnmatch
+    claimed = set()
+    for pat in CLAIMED_EOD_PATTERNS:
+        claimed.update(Path(f).name for f in glob.glob(str(data_cache / pat)))
+    unclaimed = {re.sub(r"_2\d{3}.*$", "", Path(f).name)
+                 for f in glob.glob(str(data_cache / "*_eod_2*.json"))
+                 if Path(f).name not in claimed
+                 and not fnmatch.fnmatch(Path(f).name, "NIFTY_*")}
+    for prefix in sorted(unclaimed):
+        print(f"  [warn] EOD series '{prefix}_*' in {data_cache} is not on the "
+              "scoreboard — that strategy is EXEMPT from the kill rule until "
+              "a row is added", file=sys.stderr)
+        SKIPPED.append(prefix)
 
 
 def main() -> int:
