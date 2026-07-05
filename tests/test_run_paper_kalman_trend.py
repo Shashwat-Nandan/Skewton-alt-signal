@@ -124,3 +124,20 @@ def test_instrument_books_serialize_restore_identity():
         assert b.kalman.on_bar(p)["pos"] == rb.kalman.on_bar(p)["pos"]
         assert b.ma.on_bar(p)["pos"] == rb.ma.on_bar(p)["pos"]
     assert rb.kalman.realized_points == b.kalman.realized_points
+
+
+# ── Experiment sunset (efficiency review 2026-07-05 §2.7) ─────────────────
+# WHY: the A/B wraps a strategy whose backtest was NO-GO and whose checker
+# REJECTs every session. The kill date is the pre-agreed end of its runway;
+# if this gate stops binding, a rejected strategy trades forever.
+def test_experiment_expired_boundaries():
+    from datetime import timedelta
+    kd = r.KILL_DATE
+    assert not r.experiment_expired(kd - timedelta(days=1))
+    assert r.experiment_expired(kd)            # on the date: expired
+    assert r.experiment_expired(kd + timedelta(days=30))
+
+
+def test_experiment_expired_honours_override():
+    assert r.experiment_expired(date(2026, 1, 2), kill_date=date(2026, 1, 1))
+    assert not r.experiment_expired(date(2026, 1, 1), kill_date=date(2027, 1, 1))

@@ -1,3 +1,98 @@
+# Repo-wide strategy efficiency review (2026-07-05)
+
+Goal: review every strategy for efficiency improvements with the objective of
+long-run profitability; deliver a review doc in docs/.
+
+## Plan
+- [x] Inventory strategies + what actually runs on the host (systemd timers)
+- [x] Extract the forward record per strategy from primary sources
+      (state files, EOD snapshots, dashboard.db) — not from memory/docs
+- [x] Verify accounting semantics (pair realized_pnl is net of costs;
+      Taleb closed-trade gross vs costs; arbitrage per-trade costs)
+- [x] Verify status of previously-known code issues before citing them
+      (C1 phantom-fill FIXED 730d726; startup bhavcopy preload FIXED task 1.1;
+      FUT exchange 10x + calendar_entry_annual=0.05 mainlined; autoresearch
+      PR #74 MERGED 330af0c)
+- [x] Write docs/strategy-efficiency-review-2026-07-05.md: per-strategy
+      scoreboard + verdicts, ranked cross-cutting efficiency improvements,
+      30-day action list
+- [x] User approved: commit doc + implement Week-1 items
+
+## Week-1 implementation (2026-07-05, same branch)
+- [x] E1 scoreboard + kill rules → scripts/strategy_scoreboard.py (stdlib-only,
+      read-only; monthly net realized per strategy from EOD sidecars / state
+      backups / dashboard.db; PARK CANDIDATE = both of the last two COMPLETE
+      months net-negative). Smoke-tested against real data: flags Taleb NIFTY
+      (May −56k, Jun −64.7k); current partial month never counts.
+- [x] Buy-on-gap experiment kill rule (§2.4) → experiment_kill_reason() in
+      run_paper_buy_on_gap.py + --kill-net-loss-inr 50000 / --kill-min-trades
+      15 / --kill-max-win-rate 0.35; open positions ⇒ EXIT-ONLY session via
+      GapHaltState(kill_rule=True). Dry-run verified: fires at a ₹30k test
+      floor on the real −₹39,268 state, does NOT fire at defaults.
+- [x] Kalman-trend kill date (§2.7) → KILL_DATE = 2026-08-01 +
+      experiment_expired() gate in run_paper_kalman_trend.py main(); exits 0
+      without EOD → loop orchestrator records "no_session" (verified against
+      kite_engine's status contract).
+- [x] Kalman-pairs roll buffer #70: found ALREADY IMPLEMENTED (closed
+      2026-06-30, entry suppression via --entry-cutoff-days). Corrected the
+      review doc §2.6/§5, no code needed.
+- [x] Tests: +5 scoreboard-kill-rule tests (new file), +5 buy-on-gap kill-rule
+      tests, +2 sunset tests. Targeted files 27/27 green; ruff clean.
+
+## Code-review fixes (2026-07-05, 8-angle review → applied)
+- [x] Scoreboard correctness: same-day taleb backups no longer tie-break on
+      P&L (full timestamp in sort key); missing 'date'/'report' keys skip
+      loudly instead of KeyError-aborting every row; kalman_trend first month
+      now baseline=0 (June was understated +2,706 vs true +13,089); equity cum
+      includes closed rows with NULL exit_dt; NULL last_mtm_px open rows count
+      0 instead of being NULL-skipped.
+- [x] Fail-loud (Rule 12): missing dashboard.db warns + marks output; every
+      skipped snapshot is counted and surfaced in the header ("verdicts
+      unreliable"); empty taleb-backup glob warns; unclaimed *_eod_* series in
+      data_cache warn ("EXEMPT from the kill rule").
+- [x] Buy-on-gap gate moved BEFORE the 519-CSV panel load + Kite auth
+      (evaluates the raw persisted blob; measured 2ms to exit vs full
+      startup); on fire drops data_cache/HALT_BUY_ON_GAP_KILLED (reason +
+      "clearing does NOT re-enable"); scoreboard shows "KILLED by runner
+      rule" instead of "insufficient history" (killed ≠ broken); --dry-run
+      continues past a breach (warn) so the preflight pipeline stays
+      validatable; new-code U+2212 → ASCII '-' in log strings.
+- [x] Kalman-trend sunset raised to the lifecycle owner: loop orchestrator
+      kite_engine returns status="sunset" (distinct from no_session, so a
+      dead experiment can't be mistaken for a holiday streak in STATE.md and
+      a future real code-0-no-EOD fault isn't absorbed); runner gate stays
+      for standalone invocation.
+- [x] tasks/todo.md wholesale replacement had orphaned dated entries cited by
+      source files (pair_trading.py 2026-05-13 incident, loop_engine
+      "Loop-Engineering Orchestrator", …) — prior content restored under an
+      ARCHIVE divider. (screen_pairs.py's "2026-05-17 entry" was ALREADY
+      dangling on main before this branch — pre-existing, not fixed here.)
+- [x] Accepted as-is (deliberate): scoreboard's readers duplicate backend
+      router parsing (standalone-script tradeoff; consolidation = follow-up),
+      KILL_DATE as a source constant (sunset should require a commit),
+      kill rule evaluated at session start only (intra-session bounded by
+      --max-daily-loss-inr; documented in docstring).
+- [x] +7 tests covering the fixes. Full suite re-run pending below.
+
+## Review (2026-07-05)
+Deliverable: docs/strategy-efficiency-review-2026-07-05.md (analysis only, no
+code changed). Headline: the LIVE persistent pair runner is the only proven
+earner (+₹107.7k net); Taleb NIFTY paper (−₹140.5k, half of it costs),
+buy-on-gap (−₹39.3k, overfit), equity swing (−₹18.0k, zero target hits) and
+arbitrage (₹94.0k costs to earn ₹658) are the bleed. Ranked fixes are in the
+doc §5–6. Honesty notes: live pair figure is the runner's own net-of-modeled-
+cost accounting (pair-verify timer reconciles vs broker, not re-verified here);
+several forward windows are short (kalman pairs 5 sessions).
+
+---
+
+# ARCHIVE — prior tasks' plans & reviews (accumulated record)
+
+Kept because source files cite dated entries here (screen_pairs.py,
+strategies/pair_trading.py, compare_paper_systems.py, autoresearch_loop.py,
+loop_engine/__init__.py, tests/test_runner_live_gate.py, …). Do not prune
+without fixing those references.
+
 # Taleb BANKNIFTY variant, issue #62 (PLAN, 2026-07-04)
 
 DECISIONS (AskUserQuestion 2026-07-04):
