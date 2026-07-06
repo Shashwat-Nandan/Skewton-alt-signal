@@ -111,6 +111,7 @@ class RiskAnalyzer:
         rehedge_threshold_delta: float = 0.10,
         trading_days: int = 30,
         seed: Optional[int] = None,
+        charge_costs: bool = True,
     ) -> MonteCarloReport:
         """
         Taleb Ch 16, Tables 16.2-16.4: Shuffle the same returns into different
@@ -118,6 +119,13 @@ class RiskAnalyzer:
 
         Same start price, end price, and volatility — but different paths yield
         wildly different P/L for the dynamic hedger.
+
+        charge_costs (default True): net every path of modeled transaction
+        costs — option entry+exit legs, one futures order per rehedge, and
+        the final hedge unwind. A cost-free mean_pnl systematically flatters
+        rehedge-heavy structures (the kalman-trend #77 failure mode), and the
+        mc_min_mean_pnl entry gate compares this number against a rupee
+        floor, so the paths must be in net-of-cost rupees to mean anything.
         """
         rng = np.random.default_rng(seed)
         base_returns = rng.normal(0, daily_vol, trading_days)
@@ -128,7 +136,8 @@ class RiskAnalyzer:
         for path_id in range(n_paths):
             shuffled = rng.permutation(base_returns)
             result = self._simulate_single_path(
-                positions, spot, T, shuffled, rehedge_threshold_delta
+                positions, spot, T, shuffled, rehedge_threshold_delta,
+                charge_costs=charge_costs
             )
             result.path_id = path_id
             report.path_results.append(result)
@@ -154,9 +163,19 @@ class RiskAnalyzer:
         return report
 
     def _simulate_single_path(
-        self, positions, spot, T, daily_returns, rehedge_threshold
+        self, positions, spot, T, daily_returns, rehedge_threshold,
+        charge_costs: bool = True,
     ):
-        """Simulate one path of dynamic hedging with daily rebalancing."""
+        """Simulate one path of dynamic hedging with daily rebalancing.
+
+        With charge_costs, the path is netted of modeled transaction costs
+        using the SAME estimate_transaction_cost the live fills book:
+        option legs in+out, one futures order per rehedge, final unwind."""
+        # Local import: taleb_karpathy imports this module at top level, so
+        # the cost model can only be reached at call time, not import time.
+        if charge_costs:
+            from strategies.taleb_karpathy import estimate_transaction_cost
+
         current_spot = spot
         cumulative_pnl = 0.0
         gamma_total = 0.0
@@ -165,6 +184,18 @@ class RiskAnalyzer:
         max_pnl = 0.0
         min_pnl = 0.0
         hedge_delta = 0.0  # Delta of our futures hedge
+        mc_lot = positions[0].lot_size if positions else 25
+
+        if charge_costs:
+            # Entry legs at t0 premiums (BS mid at current spot / full T; no
+            # bid/ask spread on the premium itself — a stated simplification,
+            # the spread cost rides in estimate_transaction_cost's slippage
+            # term). Anchor BOTH extrema to the post-entry-cost level: net of
+            # costs the path was never at 0.0, so a 0-initialized max_pnl
+            # would report a break-even peak that never existed.
+            cumulative_pnl -= self._option_leg_costs(
+                positions, spot, max(T, 1 / 365), entering=True)
+            max_pnl = min_pnl = cumulative_pnl
 
         for day_idx, ret in enumerate(daily_returns):
             new_spot = current_spot * (1 + ret)
@@ -190,19 +221,34 @@ class RiskAnalyzer:
 
             # Rehedge if delta exceeds threshold
             net_delta = port_delta + hedge_delta
-            # Use lot_size from positions if available, otherwise default 25
-            mc_lot_size = positions[0].lot_size if positions else 25
-            if abs(net_delta) > rehedge_threshold * mc_lot_size:
+            if abs(net_delta) > rehedge_threshold * mc_lot:
                 hedge_delta -= net_delta  # Adjust futures position
                 rehedge_count += 1
                 # Gamma scalp P/L approximation
                 gamma_total += 0.5 * port_gamma * (new_spot - current_spot)**2
+                if charge_costs:
+                    # One futures order per rehedge, sized to the delta traded.
+                    day_pnl -= estimate_transaction_cost(
+                        new_spot, abs(net_delta) / mc_lot, mc_lot,
+                        "SELL" if net_delta > 0 else "BUY", "FUT")
 
             theta_total += abs(port_theta)
             cumulative_pnl += day_pnl
             max_pnl = max(max_pnl, cumulative_pnl)
             min_pnl = min(min_pnl, cumulative_pnl)
             current_spot = new_spot
+
+        if charge_costs:
+            # Exit legs at end-of-path premiums, and the hedge unwind.
+            end_T = max(T - len(daily_returns) / 365.0, 1 / 365)
+            cumulative_pnl -= self._option_leg_costs(
+                positions, current_spot, end_T, entering=False,
+                entry_spot=spot)
+            if abs(hedge_delta) > 1e-9:
+                cumulative_pnl -= estimate_transaction_cost(
+                    current_spot, abs(hedge_delta) / mc_lot, mc_lot,
+                    "BUY" if hedge_delta < 0 else "SELL", "FUT")
+            min_pnl = min(min_pnl, cumulative_pnl)
 
         return PathSimResult(
             path_id=0, final_pnl=cumulative_pnl,
@@ -211,6 +257,31 @@ class RiskAnalyzer:
             gamma_scalp_total=gamma_total,
             theta_paid_total=theta_total,
         )
+
+    def _option_leg_costs(self, positions, price_spot: float, tenor: float,
+                          entering: bool, entry_spot: float = None) -> float:
+        """Total transaction cost for opening (entering=True) or closing all
+        option legs, priced at BS mid at `price_spot`/`tenor`. ONE definition
+        of the side flip: a long leg (quantity > 0) BUYs to enter and SELLs
+        to exit — keeping entry/exit sign conventions in a single place so
+        they cannot drift apart. On exit, sigma follows the sticky-strike
+        vol_at_price adjustment from the path's start spot."""
+        from strategies.taleb_karpathy import estimate_transaction_cost
+
+        total = 0.0
+        for opt in positions:
+            iv = opt.iv or 0.2
+            sigma = iv if entering else self.greeks.vol_at_price(
+                iv, entry_spot if entry_spot is not None else price_spot,
+                price_spot)
+            px = self.greeks.bs_price(price_spot, opt.strike, tenor,
+                                      sigma, opt.option_type)
+            long_leg = opt.quantity > 0
+            side = ("BUY" if long_leg else "SELL") if entering else \
+                   ("SELL" if long_leg else "BUY")
+            total += estimate_transaction_cost(
+                px, abs(opt.quantity), opt.lot_size, side, "OPT")
+        return total
 
     # ═════════════════════════════════════════════════════════
     # Gap #14: STABILITY TESTS

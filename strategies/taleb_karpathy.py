@@ -679,9 +679,35 @@ class TalebKarpathyStrategy(BaseStrategy):
             # Python's built-in hash() which is salted by PYTHONHASHSEED.
             seed_payload = f"{self._clock().isoformat()}|{round(spot, 2)}".encode()
             mc_seed = int(hashlib.sha256(seed_payload).hexdigest()[:8], 16)
+            # Calibrate the simulated path vol to the CURRENT realized vol
+            # instead of the hardcoded 1%/day (~16% ann.). For an RV-vs-IV
+            # strategy the sign of the simulated edge is an artifact of this
+            # number: sim-RV above position IV flatters every long-gamma
+            # entry regardless of market conditions. 365-day annualization
+            # matches _compute_realized_vol / greeks_engine conventions.
+            rv = self._compute_realized_vol(
+                self.tunable_params.get("rv_window_days", 5.0))
+            # `is not None`: a legitimately flat window (rv == 0.0) must NOT
+            # fall back to 16%-annualized fake vol — zero dispersion is the
+            # honest simulation of a dead-calm regime (and correctly starves
+            # a long-gamma entry of scalp). Fail loud on the fallback: on
+            # warmup — and on EVERY tape replay, where a session fires one
+            # scan before _spot_history has 5 in-window samples — the gate
+            # runs on the old miscalibrated constant, and that must be
+            # visible in the log, not silent (Rule 12). Tape-side fix is
+            # spot-history seeding in run_backtest (tracked in issue #92).
+            if rv is not None:
+                mc_daily_vol = rv / math.sqrt(365.0)
+            else:
+                mc_daily_vol = 0.01
+                logger.info(
+                    "MC vol calibration: realized vol unavailable (warmup/"
+                    "tape replay) — falling back to 0.01/day (~16%% ann.); "
+                    "the expectancy gate is running on the uncalibrated "
+                    "constant this tick.")
             mc = self.risk.path_dependence_monte_carlo(
                 test_positions, spot, T, n_paths=50, trading_days=max(int(T*365), 5),
-                seed=mc_seed,
+                seed=mc_seed, daily_vol=mc_daily_vol,
             )
             self.state.monte_carlo_report = mc
 
@@ -693,7 +719,11 @@ class TalebKarpathyStrategy(BaseStrategy):
             # to pay more theta than the gamma scalp recovers. Rejecting
             # here (not scaling) blocks the 2026-06-04 straddle add
             # (mean -3,371, 14% profitable) while passing the earlier add
-            # (mean +23,614, 100% profitable).
+            # (mean +23,614, 100% profitable). NOTE those figures are from
+            # the GROSS, fixed-1%-vol era: since 2026-07-06 mean_pnl is net
+            # of modeled entry/exit/rehedge costs and simulated at live RV,
+            # so it reads systematically lower — recalibrate any floor
+            # intuition against the net numbers, not these.
             mc_min_mean = self.tunable_params.get("mc_min_mean_pnl", 0.0)
             if mc.mean_pnl < mc_min_mean:
                 logger.info(

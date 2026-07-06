@@ -182,6 +182,29 @@ class TestCapturedTapeReplay:
             # raises ValueError if malformed
             date.fromisoformat(s)
 
+    def test_todays_in_progress_capture_is_excluded(self, tmp_path, monkeypatch):
+        """WHY: during market hours today's JSONL is still being appended —
+        replaying it races the writer, biases sweeps, and by mid-session it
+        is tens of millions of rows (this exact test class OOM-killed a
+        16 GB pytest on 2026-07-06 by loading sessions[-1] == today). Every
+        replay consumer (autoresearch, sweeps, these tests) goes through
+        list_captured_sessions, so the guard lives there. 'Today' is the
+        IST trading date (matching tick filename stamps), NOT host-local —
+        on a CEST host, 20:30-00:00 local is already the next IST day, and
+        a host-local check would discard the just-COMPLETED session."""
+        from datetime import timedelta
+
+        from backtest import ist_today
+        ticks = tmp_path / "data_cache" / "ticks"
+        ticks.mkdir(parents=True)
+        today = ist_today().isoformat()
+        yesterday = (ist_today() - timedelta(days=1)).isoformat()
+        (ticks / f"ticks-{today}.jsonl").write_text("{}\n")
+        (ticks / f"ticks-{yesterday}.jsonl.zst").write_bytes(b"")
+        monkeypatch.chdir(tmp_path)
+        assert list_captured_sessions() == [yesterday]
+        assert list_captured_sessions(include_today=True) == [yesterday, today]
+
     def test_load_produces_mockkite_schema(self, captured_sessions):
         """The DataFrame must contain every column MockKite reads,
         else the replay path silently degrades to no-trades."""

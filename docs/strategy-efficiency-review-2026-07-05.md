@@ -285,8 +285,21 @@ lose.
    slots); if still ≈0 net after two weeks, park it. E4 autoresearch
    objective swap: found ALREADY DONE on verification (metric = net_pnl on
    host + template — see §3 E4 correction).
-3. **Week 3**: Taleb rehedge-economics sweep on tape (§2.2 items 2–3);
-   equity-swing exit-geometry backtest on 5-min data (§2.5).
+3. **Week 3** *(implemented 2026-07-06)*: verify-first again paid off — the
+   rehedge-economics gate (§2.2 item 2) already existed (WW cube-root
+   `cost_hurdle_factor` + churn caps, all autoresearch-ranged), and the
+   per-structure gate (§2.2 item 3) existed but was gating on a COST-FREE,
+   fixed-1%-vol MC simulation with a −₹10k host floor. Shipped: the MC
+   estimator now charges entry/exit/rehedge costs and simulates at live RV;
+   `sweep_rehedge_params.py --tape` replays captured sessions; the 10-session
+   sweep confirmed §2.2's prediction (band 1.2 beats 0.9: costs halved,
+   scalp UP; `cost_hurdle_factor` inert on tape — the band is the lever;
+   left to the weekly net_pnl sweep, range already covers 1.2). The
+   `mc_min_mean_pnl` floor stays −10000 by operator decision — evidence
+   recorded (floor 0 still admits 3 entries/4 sessions) for when it's
+   revisited. Equity-swing §2.5: geometry swept on daily bhavcopy (5-min
+   for 200 equities doesn't exist — flagged); trail-only rr=100/ts=20 was
+   the only both-windows-positive config and is live for new entries.
 4. **Week 4**: E3 margin realism for the live pair path; June-decomposition of
    the live pair P&L (§2.1) to decide whether the ₹25k cap should move.
 

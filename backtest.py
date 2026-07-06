@@ -18,7 +18,19 @@ import argparse
 import contextlib
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+# Trading-session dates are IST: tick filenames are stamped with
+# datetime.now(IST).date() (tick_capture.py). "Today" checks against those
+# filenames must use the SAME calendar — the host runs CEST, and between
+# 20:30 and 00:00 CEST the host-local date is one day BEHIND IST, so a
+# host-local today() would wrongly discard the just-completed IST session.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def ist_today() -> date:
+    """Today's date on the IST trading calendar (matches tick filenames)."""
+    return datetime.now(IST).date()
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -478,10 +490,18 @@ def load_captured_tape(
     return enriched[columns].sort_values("timestamp").reset_index(drop=True)
 
 
-def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
+def list_captured_sessions(underlying: str = "NIFTY",
+                           include_today: bool = False) -> List[str]:
     """Return ISO date strings for which tick captures exist — raw
     .jsonl or the .jsonl.zst archives tick-retention.sh produces (a date
-    with both counts once; _open_tape prefers the raw file)."""
+    with both counts once; _open_tape prefers the raw file).
+
+    TODAY's session is excluded by default: during market hours that JSONL
+    is still being appended by tick-capture, so replaying it means parsing
+    a partial, GROWING file — it races the writer, biases any sweep, and by
+    mid-session it is tens of millions of rows (a full-suite pytest OOM-
+    killed the host at 16 GB on 2026-07-06 exactly this way). Consumers
+    that genuinely want the live session must say so."""
     ticks_dir = Path("data_cache") / "ticks"
     if not ticks_dir.exists():
         return []
@@ -490,6 +510,8 @@ def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
         for pattern in ("ticks-*.jsonl", "ticks-*.jsonl.zst")
         for p in ticks_dir.glob(pattern)
     }
+    if not include_today:
+        dates.discard(ist_today().isoformat())
     return sorted(dates)
 
 
