@@ -1,3 +1,76 @@
+# Week-3 efficiency items (PLAN, 2026-07-06)
+
+Scope (review doc §5 week 3): Taleb rehedge-economics sweep on tape +
+per-structure cost hurdle (§2.2 items 2-3); equity-swing exit geometry (§2.5).
+
+VERIFY-FIRST findings (the #70/E4 lesson, applied again):
+  * §2.2 item 2 (rehedge economics gate) LARGELY EXISTS: WW cube-root cost
+    gate (cost_hurdle_factor, live 2.53 → ~1.36x), asymmetric √γ bands,
+    T-0 tightening, C2 churn caps (host: cooldown 180s, session cap 20).
+    All rehedge knobs are in TUNABLE_RANGES → tuned weekly under net_pnl.
+    Remaining gap = the sweep script (sweep_rehedge_params.py) runs on CSV
+    bars, not tape → add a --tape mode reusing backtest.py's loaders.
+  * §2.2 item 3 (per-structure cost hurdle): the mechanism EXISTS (Gap #2
+    MC expected-value gate, mc_min_mean_pnl) but is DOUBLY BROKEN:
+    (a) risk_analyzer._simulate_single_path charges ZERO transaction costs
+    (no entry/exit legs, no rehedge round trips) — same class of bug as
+    kalman-trend's zero-cost A/B (#77); (b) simulates at FIXED daily_vol=1%
+    (~16% ann.) regardless of market RV — for an RV-vs-IV strategy the
+    estimator's edge sign can be an artifact of the hardcoded vol;
+    (c) host floor mc_min_mean_pnl=-10000 admits ₹10k-negative-EV entries
+    (template default is 0.0; -10000 is a host override with no recorded
+    rationale in tasks/ or docs/).
+
+## Plan
+- [x] Increment 1 — honest MC estimator: charge entry+exit option-leg costs
+      and per-rehedge futures orders + final unwind inside
+      _simulate_single_path (charge_costs=True default; local import breaks
+      the cycle); gate call now passes daily_vol = live RV/√365 (fallback
+      0.01 when RV unavailable). +3 intent tests (same-seed cost drag;
+      rehedge-heavy paths pay more; daily_vol scales dispersion AND
+      long-gamma mean). 16/16 risk-analyzer tests green.
+- [x] Increment 2 — floor: NOT APPLIED (operator declined the config.ini /
+      best_params.json edit 2026-07-06 — the floor stays -10000 and remains
+      an operator decision). Evidence gathered and recorded for whenever it
+      is revisited: with the honest estimator, floor 0 still admits entries
+      (3 trades / 4 tape sessions vs ~7/10 at -10000), so raising it would
+      NOT zero out trading. If applied later, change BOTH config.ini (the
+      persistence seam) and best_params.json (live effective until the
+      weekly regen).
+- [x] Increment 3 — sweep_rehedge_params.py --tape N / --grid frontier
+      (reuses backtest.py loaders; per-session replay, aggregated net_pnl;
+      excludes today's in-progress capture). 10-session sweep RESULT
+      (2026-06-22→07-03, honest MC estimator, floor −10000):
+      * WIDER BANDS DOMINATE (the review's §2.2 prediction): reh_dt 1.2 →
+        net −27.9k / costs 7.0k / scalp 5.4k vs current 0.9 → −34.9k /
+        16.4k / 4.7k vs 0.6 → −38.1k / 16.6k. Halving rehedges RAISED scalp.
+      * cost_hurdle_factor INERT on tape (identical at 1.5/2.5/5.0) — the
+        WW gate is not the binding lever; the band is. No action (it's
+        autoresearch-ranged; harmless).
+      * NO best_params hand-edit: rehedge_delta_threshold is in
+        TUNABLE_RANGES (0.5–1.5) and the weekly net_pnl sweep can reach 1.2
+        itself; hand-edits are reverted by the weekly regen anyway. The tape
+        evidence is recorded here for the Saturday-sweep review.
+      * Entries still occur under the honest estimator (7 trades/10
+        sessions at floor −10000) — floor-0 check pending below.
+- [x] Increment 4 — equity-swing exit geometry (§2.5): swept rr {1.5, 2.0,
+      100=trail-only} × time_stop {10, 20} over 2024-06→2026-07 daily
+      bhavcopy, per-trade ledgers, train/test split at 2026-01-01 (windowed
+      runs failed: each window needs its own 200-bar SMA warmup, so
+      full-period + entry-date slicing instead). RESULT: trail-only rr=100 +
+      ts=20 is the ONLY config net-positive in BOTH windows (train +79.0k /
+      test +41.6k, best expectancy both; old rr=2.0/ts=20: test −46.0k;
+      rr=100/ts=10: test −110k — the trail NEEDS the 20d runway). Matches
+      the paper forward record (0/12 targets ever hit). APPLIED config-only:
+      host config.ini gains [equity_swing] risk_reward=100 (section was
+      absent → code defaults) + template updated; open positions keep their
+      entry-time targets; binds for NEW entries. Daily-bar caveat noted
+      (same-bar ordering conservative, SL first; 5-min data for 200
+      equities does not exist).
+- [ ] Tests + ruff + full suite; PR.
+
+---
+
 # Week-2 efficiency items (PLAN, 2026-07-05)
 
 Scope (review doc §5 week 2): E2 arbitrage rupee cost hurdle + min-hold;

@@ -478,10 +478,20 @@ def load_captured_tape(
     return enriched[columns].sort_values("timestamp").reset_index(drop=True)
 
 
-def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
+def list_captured_sessions(underlying: str = "NIFTY",
+                           include_today: bool = False) -> List[str]:
     """Return ISO date strings for which tick captures exist — raw
     .jsonl or the .jsonl.zst archives tick-retention.sh produces (a date
-    with both counts once; _open_tape prefers the raw file)."""
+    with both counts once; _open_tape prefers the raw file).
+
+    TODAY's session is excluded by default: during market hours that JSONL
+    is still being appended by tick-capture, so replaying it means parsing
+    a partial, GROWING file — it races the writer, biases any sweep, and by
+    mid-session it is tens of millions of rows (a full-suite pytest OOM-
+    killed the host at 16 GB on 2026-07-06 exactly this way). Consumers
+    that genuinely want the live session must say so."""
+    from datetime import date as _date
+
     ticks_dir = Path("data_cache") / "ticks"
     if not ticks_dir.exists():
         return []
@@ -490,6 +500,8 @@ def list_captured_sessions(underlying: str = "NIFTY") -> List[str]:
         for pattern in ("ticks-*.jsonl", "ticks-*.jsonl.zst")
         for p in ticks_dir.glob(pattern)
     }
+    if not include_today:
+        dates.discard(_date.today().isoformat())
     return sorted(dates)
 
 

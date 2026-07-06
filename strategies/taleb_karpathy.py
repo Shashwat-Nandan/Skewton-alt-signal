@@ -679,9 +679,18 @@ class TalebKarpathyStrategy(BaseStrategy):
             # Python's built-in hash() which is salted by PYTHONHASHSEED.
             seed_payload = f"{self._clock().isoformat()}|{round(spot, 2)}".encode()
             mc_seed = int(hashlib.sha256(seed_payload).hexdigest()[:8], 16)
+            # Calibrate the simulated path vol to the CURRENT realized vol
+            # instead of the hardcoded 1%/day (~16% ann.). For an RV-vs-IV
+            # strategy the sign of the simulated edge is an artifact of this
+            # number: sim-RV above position IV flatters every long-gamma
+            # entry regardless of market conditions. 365-day annualization
+            # matches _compute_realized_vol / greeks_engine conventions.
+            rv = self._compute_realized_vol(
+                self.tunable_params.get("rv_window_days", 5.0))
+            mc_daily_vol = (rv / math.sqrt(365.0)) if rv else 0.01
             mc = self.risk.path_dependence_monte_carlo(
                 test_positions, spot, T, n_paths=50, trading_days=max(int(T*365), 5),
-                seed=mc_seed,
+                seed=mc_seed, daily_vol=mc_daily_vol,
             )
             self.state.monte_carlo_report = mc
 

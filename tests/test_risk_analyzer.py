@@ -132,3 +132,73 @@ class TestNeutralityCheck:
         assert "level_1_delta" in checks
         assert "level_2_gamma" in checks
         assert "level_3_vega" in checks
+
+
+class TestMonteCarloCosts:
+    """Cost-charged MC paths (efficiency review 2026-07-05 §2.2 item 3).
+
+    WHY: mc.mean_pnl feeds the mc_min_mean_pnl ENTRY gate — the only
+    per-structure expected-value check in the Taleb entry path. A cost-free
+    simulation flatters rehedge-heavy structures (the kalman-trend #77
+    failure mode) and makes the rupee floor incomparable with reality. If
+    costs silently stop being charged, negative-net-EV structures re-enter
+    the book and the −₹144k paper bleed pattern returns.
+    """
+
+    def test_charging_costs_strictly_lowers_every_path(self, analyzer, long_straddle):
+        gross = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=15, trading_days=8,
+            seed=11, charge_costs=False)
+        net = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=15, trading_days=8,
+            seed=11, charge_costs=True)
+        # Same seed → identical underlying paths; net must be lower on every
+        # path by at least the unavoidable entry+exit brokerage (4 orders).
+        for g, n in zip(gross.path_results, net.path_results):
+            assert n.final_pnl < g.final_pnl
+        assert net.mean_pnl < gross.mean_pnl - 80.0   # 4×₹20 brokerage floor
+        assert net.worst_path_pnl < gross.worst_path_pnl
+
+    def test_rehedge_heavy_paths_pay_more(self, analyzer, long_straddle):
+        # A tight rehedge threshold forces more futures orders; with costs
+        # charged, the SAME market paths must net less than with a loose
+        # threshold's near-zero rehedging. Encodes "churn costs money" — the
+        # exact property the cost-free sim couldn't see.
+        tight = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=15, trading_days=10,
+            seed=13, rehedge_threshold_delta=0.01, charge_costs=True)
+        loose = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=15, trading_days=10,
+            seed=13, rehedge_threshold_delta=100.0, charge_costs=True)
+        n_tight = sum(p.rehedge_count for p in tight.path_results)
+        n_loose = sum(p.rehedge_count for p in loose.path_results)
+        assert n_tight > n_loose  # sanity: the threshold actually binds
+        # Identical option MTM (same seed/paths); the only P&L difference is
+        # hedge P&L ± rehedge costs. Charged costs must show up in the mean
+        # when rehedging is two orders of magnitude more frequent.
+        # (Not asserting tight < loose on gross — hedge P&L differs — only
+        # that the cost drag exists relative to its own cost-free twin.)
+        tight_gross = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=15, trading_days=10,
+            seed=13, rehedge_threshold_delta=0.01, charge_costs=False)
+        loose_gross = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=15, trading_days=10,
+            seed=13, rehedge_threshold_delta=100.0, charge_costs=False)
+        tight_drag = tight_gross.mean_pnl - tight.mean_pnl
+        loose_drag = loose_gross.mean_pnl - loose.mean_pnl
+        assert tight_drag > loose_drag
+
+    def test_daily_vol_parameter_scales_path_dispersion(self, analyzer, long_straddle):
+        # The gate now passes the strategy's live RV instead of the hardcoded
+        # 1%/day. If daily_vol were silently ignored again, calm and violent
+        # regimes would produce identical expectancy estimates.
+        calm = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=20, trading_days=10,
+            seed=17, daily_vol=0.002, charge_costs=False)
+        wild = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=20, trading_days=10,
+            seed=17, daily_vol=0.03, charge_costs=False)
+        assert wild.std_pnl > calm.std_pnl
+        # Long gamma earns more when realized vol is higher — the sign of the
+        # regime dependence the fixed 1% hid.
+        assert wild.mean_pnl > calm.mean_pnl
