@@ -1,3 +1,67 @@
+# Week-2 efficiency items (PLAN, 2026-07-05)
+
+Scope (review doc §5 week 2): E2 arbitrage rupee cost hurdle + min-hold;
+E4 autoresearch objective swap.
+
+## Plan
+- [x] Verify E4 status FIRST (Rule 8 / the #70 lesson): ALREADY DONE —
+      config.ini + config_template.ini both have [autoresearch] metric =
+      net_pnl (cost-inclusive: taleb metrics net_pnl = realized(net)+unreal);
+      autoresearch_loop.py PNL_METRICS handles no-trade sessions; no-promote
+      guards live. Only the review doc needs correcting (§3 E4 / §5 week 2).
+- [x] Arbitrage rupee-denominated cost hurdle at entry (§2.3): in
+      _build_calendar_entry, require expected convergence P&L over the
+      intended horizon ≥ calendar_cost_hurdle_mult × modeled 4-leg round-trip
+      cost. expected = (|carry_diff| − calendar_exit_annual) × lot notional ×
+      qty × min(dte_near, calendar_max_holding_days)/365. Knob default 2.0,
+      0 disables. Uses the same estimate_transaction_cost the fills book.
+- [x] Exit debounce (§2.3) — REDESIGNED after 8-angle code review. First cut
+      was a time-based min-hold (2.0 calendar days); review converged on it
+      being wrong-depth: pins converged spreads for days with NO stop-loss
+      exit (open re-divergence risk), starves max_open_calendars slots,
+      calendar-day arithmetic evaporates over weekends (the H6 lesson), and
+      DEBUG logging made the suppression invisible at the runner's INFO
+      level. Replaced with the repo's proven consecutive-tick streak idiom
+      (pair_trading mean_revert_streak / M-S3): CalendarTrade.converge_streak
+      + calendar_exit_debounce_ticks (default 3 ≈ 3 min at the 60s tick;
+      1 = off), INFO-logged, serialized/restored (old blobs default 0).
+      EXPIRY / MAX_HOLD never debounced.
+- [x] config_template.ini [arbitrage]: both knobs + cost-math rationale.
+      Host config.ini NOT edited: absent keys fall back to the code defaults
+      (2.0 / 2.0), which are the intended values — no operator step.
+- [x] run_paper_arbitrage.py startup log: cost_hurdle + min_hold shown.
+- [x] Correct review doc: §3 E4 marked already-implemented; §5 week-2 note.
+- [x] Tests (Rule 9, +7): thin-notional passes % gate but fails rupee gate;
+      fat carry clears; 0 disables; gate arithmetic pinned to
+      estimate_transaction_cost; CONVERGE debounced at 16min, honored at 3d;
+      EXPIRY never debounced. Existing tests get both knobs disabled-by-
+      default in _make_strategy (fixture convention).
+- [x] 8-angle code review → fixes applied:
+      * CONFIRMED: backtest_arbitrage.make_strategy (__new__-based) lacked the
+        new attrs → AttributeError SWALLOWED by the per-tick try/except —
+        backtest + sweep_arbitrage_thresholds + --compare-vs-arbitrage
+        calendar arms would silently die. Fixed: hurdle=2.0 (grade the gate
+        that trades) + debounce=1 (daily replay cadence: a tick IS a day).
+      * CONFIRMED: horizon off-by-one (EXPIRY force-exits at dte_near<=1) →
+        min(max(dte_near−1,0), max_hold).
+      * CONFIRMED: entry_annual <= exit_annual misconfig would silently zero
+        the harvest and block ALL entries → loud __init__ warning.
+      * CONFIRMED: doc still recommended the E4 swap in §2.2 item 1 → third
+        mention corrected; §2.3/§5 rewritten for the streak design.
+      * CONFIRMED (Rule 9): cost-model parity test was tautological (re-derived
+        the same formula) → replaced with monkeypatch substitution tests.
+      * REFUTED: "harvest formula over-lenient" — for monthly STFs the
+        inter-expiry gap (~28-35d) always exceeds the min(dte_near−1, 15d)
+        horizon, so the gate is ~2x CONSERVATIVE vs the full-convergence
+        bound; documented as such in the code + template.
+      * Accepted as-is: pair_trading's LIVE gate freezes the legacy FUT rate
+        (deliberate; noted in comment); shared cost-hurdle helper deferred to
+        the week-3 Taleb unification (three gates have three shapes); third
+        _snap fixture copy.
+- [ ] Full suite green → PR.
+
+---
+
 # Repo-wide strategy efficiency review (2026-07-05)
 
 Goal: review every strategy for efficiency improvements with the objective of

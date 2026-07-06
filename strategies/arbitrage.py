@@ -84,6 +84,11 @@ class CalendarTrade:
     # realized/costs booked during its lifetime.
     realized: float = 0.0
     costs: float = 0.0
+    # Consecutive ticks the carry_diff has printed inside the CONVERGE band
+    # (mirrors pair_trading's mean_revert_streak, M-S3): the exit fires only
+    # at calendar_exit_debounce_ticks, so one noisy print can't buy a
+    # round-trip. Reset whenever the diff prints back outside the band.
+    converge_streak: int = 0
 
 
 @dataclass
@@ -169,6 +174,32 @@ class ArbitrageStrategy(BaseStrategy):
         self.calendar_exit_annual = float(cfg.get("calendar_exit_annual", 0.005))
         self.calendar_max_holding_days = int(cfg.get("calendar_max_holding_days", 15))
         self.calendar_min_dte_near = int(cfg.get("calendar_min_dte_near", 4))
+        # Rupee cost hurdle at entry (efficiency review 2026-07-05 §2.3/E2).
+        # The % gate above is in annualized-carry units — blind to whether a
+        # 1-lot spread can MONETIZE the carry: the June 2026 forward record
+        # was ₹658 net earned on ₹93,963 of round-trip costs. Require the
+        # expected harvest (see _build_calendar_entry for the deliberately
+        # conservative formula) to clear this multiple of the modeled 4-leg
+        # round-trip cost. 0 disables.
+        self.calendar_cost_hurdle_mult = float(cfg.get("calendar_cost_hurdle_mult", 2.0))
+        # CONVERGE-exit debounce in consecutive ticks (pair_trading's proven
+        # exit_debounce_ticks idiom): the carry_diff quote flickers intraday,
+        # and honoring a single converged print was buying 16-minute round
+        # trips whose gross ≈ cost. A streak (~N minutes at the 60s tick)
+        # filters the noise WITHOUT pinning a genuinely-converged spread —
+        # there is no stop-loss exit in this strategy, so any time-based
+        # min-hold would carry open re-divergence risk and starve the
+        # max_open_calendars slots. EXPIRY / MAX_HOLD are never debounced.
+        self.calendar_exit_debounce_ticks = max(1, int(cfg.get("calendar_exit_debounce_ticks", 3)))
+        if self.calendar_entry_annual <= self.calendar_exit_annual:
+            # harvest_annual = |cd| − exit_annual would be 0 for every entry
+            # that only just clears the % gate → the rupee hurdle silently
+            # blocks ALL calendars while the % gate reports them tradable.
+            logger.warning(
+                "calendar_entry_annual (%.4f) <= calendar_exit_annual (%.4f): "
+                "the rupee cost hurdle will reject every calendar entry — "
+                "check the [arbitrage] thresholds",
+                self.calendar_entry_annual, self.calendar_exit_annual)
         # Cleanliness gate: skip the calendar if either leg has a large
         # standalone cash-futures basis (likely a discrete dividend pricing
         # artifact, not a calendar mispricing). Without this, full-archive
@@ -293,11 +324,23 @@ class ArbitrageStrategy(BaseStrategy):
                 proposals.extend(self._build_calendar_exit(trade, snap, "MAX_HOLD"))
                 continue
 
-            # Mean-revert: implied carry has converged toward fair.
+            # Mean-revert: implied carry has converged toward fair. Debounced
+            # by a consecutive-tick streak (see __init__): one noisy print
+            # can't fire the exit, but a genuine convergence still banks
+            # within ~N minutes — never pinned for days against re-divergence
+            # (there is no stop-loss exit below this to catch that).
             cd = snap.get("carry_diff")
             if cd is not None and abs(cd) <= self.calendar_exit_annual:
-                proposals.extend(self._build_calendar_exit(trade, snap, "CONVERGE"))
+                trade.converge_streak += 1
+                if trade.converge_streak >= self.calendar_exit_debounce_ticks:
+                    proposals.extend(self._build_calendar_exit(trade, snap, "CONVERGE"))
+                    continue
+                logger.info(
+                    "%s calendar: convergence print %d/%d — debounced "
+                    "(single-print noise guard)",
+                    symbol, trade.converge_streak, self.calendar_exit_debounce_ticks)
                 continue
+            trade.converge_streak = 0
 
         return proposals
 
@@ -435,6 +478,7 @@ class ArbitrageStrategy(BaseStrategy):
                     "entry_carry_diff": t.entry_carry_diff,
                     "realized": t.realized,
                     "costs": t.costs,
+                    "converge_streak": t.converge_streak,
                     "legs": [
                         {
                             "symbol": l.symbol,
@@ -475,6 +519,9 @@ class ArbitrageStrategy(BaseStrategy):
                 position=tblob["position"],
                 entry_time=datetime.fromisoformat(tblob["entry_time"]),
                 entry_carry_diff=float(tblob["entry_carry_diff"]),
+                # .get: blobs written before the debounce existed lack the
+                # key; a fresh streak is the safe default (never exits early).
+                converge_streak=int(tblob.get("converge_streak", 0)),
                 legs=[
                     CalendarLeg(
                         symbol=l["symbol"],
@@ -872,6 +919,44 @@ class ArbitrageStrategy(BaseStrategy):
                 symbol, max(one_lot_near, one_lot_next), self.max_leg_notional,
             )
             return []
+
+        # Rupee cost hurdle (efficiency review 2026-07-05 §2.3/E2): the
+        # expected harvest must clear calendar_cost_hurdle_mult × the modeled
+        # 4-leg (entry+exit, both legs) round-trip cost. Same cost model this
+        # strategy's fills book, so the gate and the ledger can't disagree.
+        # (pair_trading's LIVE gate deliberately freezes the legacy FUT
+        # exchange rate — that divergence is intentional, don't "fix" it.)
+        #
+        # Harvest model, stated so the next tuner knows what 2.0x means: full
+        # convergence of the carry mispricing moves the spread by roughly
+        # |carry_diff| × notional × (dte_next − dte_near)/365 — the INTER-
+        # EXPIRY gap (~28-35d for monthly STFs), regardless of how fast it
+        # happens. We deliberately count only min(dte_near − 1, max_hold)
+        # ≤ 15d — an implicit ~2x haircut standing in for the risk that
+        # convergence completes only partially before a forced exit (the
+        # dte_near − 1 matches the EXPIRY force-exit in check_and_rehedge).
+        # The gate is therefore conservative: it under-, never over-states.
+        if self.calendar_cost_hurdle_mult > 0:
+            from strategies.taleb_karpathy import estimate_transaction_cost
+            horizon_days = min(max(float(snap["dte_near"]) - 1.0, 0.0),
+                               float(self.calendar_max_holding_days))
+            harvest_annual = max(abs(cd) - self.calendar_exit_annual, 0.0)
+            notional = max(one_lot_near, one_lot_next) * qty
+            expected_pnl = harvest_annual * notional * horizon_days / 365.0
+            round_trip_cost = sum(
+                estimate_transaction_cost(px, qty, near_lot, side, "FUT")
+                for px in (snap["near_price"], snap["next_price"])
+                for side in ("BUY", "SELL"))
+            if expected_pnl < self.calendar_cost_hurdle_mult * round_trip_cost:
+                logger.info(
+                    "%s calendar: expected carry ₹%.0f over %.0fd < %.1fx "
+                    "round-trip cost ₹%.0f — skipping (rupee cost hurdle; "
+                    "carry_diff %.2f%% ann. passed the %% gate but can't be "
+                    "monetized at this size/horizon)",
+                    symbol, expected_pnl, horizon_days,
+                    self.calendar_cost_hurdle_mult, round_trip_cost, cd * 100,
+                )
+                return []
 
         # Calendar-spread margin: one-leg notional × calendar_margin_pct, split
         # evenly across the two legs (they net for margin — not 0.20 per leg).
