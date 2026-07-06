@@ -52,6 +52,11 @@ def _make_strategy(
     s.calendar_max_holding_days = 15
     s.calendar_min_dte_near = 4
     s.calendar_max_leg_basis = calendar_max_leg_basis
+    # Disabled by default in tests (like calendar_max_leg_basis above) so the
+    # directional/threshold tests keep exercising exactly the logic they were
+    # written for; the rupee-hurdle/debounce tests enable them explicitly.
+    s.calendar_cost_hurdle_mult = 0.0
+    s.calendar_exit_debounce_ticks = 1
     s.disable_calendar = disable_calendar
     s.lots_per_leg = 1
     s.max_open_calendars = 5
@@ -415,6 +420,148 @@ class TestCalendarExit:
         exits = s.check_and_rehedge()
         assert len(exits) == 2
         assert all("EXPIRY" in p.rationale for p in exits)
+
+    # ── CONVERGE streak debounce (efficiency review 2026-07-05 §2.3) ──────
+    # WHY: the carry_diff quote flickers intraday; honoring a SINGLE
+    # converged print minutes after entry buys a full round-trip cost for
+    # near-zero capture (June 2026: 64 round trips, ₹658 net on ₹93,963 of
+    # costs). The guard must filter one-print noise WITHOUT pinning a
+    # genuinely-converged spread — there is no stop-loss exit in this
+    # strategy, so any hold-based suppression carries open re-divergence
+    # risk. Mirrors pair_trading's mean_revert_streak (M-S3).
+    def test_converge_single_print_is_debounced(self):
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        s.calendar_exit_debounce_ticks = 3
+        trade = self._open_calendar(s)
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        assert s.check_and_rehedge() == []      # print 1/3: no exit
+        assert trade.converge_streak == 1
+
+    def test_converge_streak_reaching_threshold_exits(self):
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        s.calendar_exit_debounce_ticks = 3
+        self._open_calendar(s)
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        assert s.check_and_rehedge() == []      # 1/3
+        assert s.check_and_rehedge() == []      # 2/3
+        exits = s.check_and_rehedge()           # 3/3 → banked
+        assert len(exits) == 2
+        assert all("CONVERGE" in p.rationale for p in exits)
+
+    def test_streak_resets_when_diff_prints_back_outside_band(self):
+        # Noise looks like: converged print, then back out. Two such episodes
+        # must never accumulate into an exit — that would be the same
+        # one-noisy-print churn with extra steps.
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        s.calendar_exit_debounce_ticks = 2
+        trade = self._open_calendar(s)
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        assert s.check_and_rehedge() == []      # 1/2
+        s._observe_universe = lambda: [self._snap(carry_diff=0.05)]
+        assert s.check_and_rehedge() == []      # back outside → reset
+        assert trade.converge_streak == 0
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        assert s.check_and_rehedge() == []      # 1/2 again, NOT 2/2
+
+    def test_expiry_exit_is_never_debounced(self):
+        # The streak guards against churn, not against safety: a leg about
+        # to expire must square off even on its first converged print
+        # (cash-settlement risk trumps cost).
+        s = _make_strategy(mode="paper")
+        s.calendar_exit_debounce_ticks = 5
+        self._open_calendar(s)
+        s._observe_universe = lambda: [self._snap(dte_near=1, carry_diff=0.001)]
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2
+        assert all("EXPIRY" in p.rationale for p in exits)
+
+    def test_converge_streak_survives_serialize_restore(self):
+        # A mid-streak restart (runner crash between ticks) must not reset
+        # the count to a value that fires the exit early; old blobs without
+        # the key restore to 0 (fresh streak, conservative).
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        s.calendar_exit_debounce_ticks = 3
+        trade = self._open_calendar(s)
+        trade.converge_streak = 2
+        blob = s.serialize_state()
+        s2 = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        s2.restore_state(blob)
+        assert s2.state.open_calendars["AAA"].converge_streak == 2
+        del blob["open_calendars"][0]["converge_streak"]   # pre-debounce blob
+        s3 = _make_strategy(mode="paper")
+        s3.restore_state(blob)
+        assert s3.state.open_calendars["AAA"].converge_streak == 0
+
+
+# ──────────────────────────────────────────────────────────
+# Rupee cost hurdle at entry (efficiency review 2026-07-05 §2.3/E2)
+# ──────────────────────────────────────────────────────────
+# WHY: the % gate (calendar_entry_annual) is blind to whether the carry can
+# be MONETIZED — a thin-notional spread can pass 5% annualized while its
+# harvestable rupees over the holding window are smaller than the four-leg
+# round-trip cost. These tests pin the gate's unit: rupees, not percent.
+class TestCalendarCostHurdle:
+    def _snap(self, near_px, next_px, lot, carry_diff, dte_near=11):
+        return {
+            "symbol": "AAA", "spot": near_px - 0.5,
+            "near": {"tradingsymbol": "AAA26APRFUT", "lot_size": lot,
+                     "expiry": "2026-04-28", "instrument_token": 1},
+            "near_price": near_px, "dte_near": dte_near,
+            "next": {"tradingsymbol": "AAA26MAYFUT", "lot_size": lot,
+                     "expiry": "2026-05-26", "instrument_token": 2},
+            "next_price": next_px, "dte_next": 39,
+            "basis_annual": 0.0, "basis_annual_next": 0.0,
+            "carry_implied": 0.10, "carry_diff": carry_diff,
+        }
+
+    def test_thin_notional_passes_percent_gate_but_fails_rupee_gate(self):
+        # 6% annualized clears the 5% gate, but on a ₹10k-notional lot held
+        # ≤11 days the harvest is a few rupees vs ~₹100+ of costs.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 2.0
+        assert s._build_calendar_entry(
+            self._snap(near_px=100.0, next_px=101.0, lot=100,
+                       carry_diff=0.06)) == []
+
+    def test_fat_carry_on_big_notional_clears_the_hurdle(self):
+        # ₹1M notional at a huge diff: harvest ≫ 2× round-trip cost. The
+        # magnitude is deliberately extreme so the assertion stays robust to
+        # small cost-model revisions.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 2.0
+        props = s._build_calendar_entry(
+            self._snap(near_px=2000.0, next_px=2020.0, lot=500,
+                       carry_diff=0.50))
+        assert len(props) == 2
+
+    def test_zero_mult_disables_the_hurdle(self):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 0.0
+        props = s._build_calendar_entry(
+            self._snap(near_px=100.0, next_px=101.0, lot=100,
+                       carry_diff=0.06))
+        assert len(props) == 2
+
+    def test_gate_consults_estimate_transaction_cost(self, monkeypatch):
+        # The gate must price costs through the SHARED estimate_transaction_cost
+        # (the same function the fills book) — not a private formula. Proven by
+        # substitution, not by re-deriving the arithmetic (which would share
+        # any bug with the code under test): with the cost model forced huge,
+        # even the fat-carry fixture must be refused; forced to zero, even a
+        # marginal one must pass.
+        import strategies.taleb_karpathy as tk
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 2.0
+        fat = self._snap(near_px=2000.0, next_px=2020.0, lot=500,
+                         carry_diff=0.50)
+        monkeypatch.setattr(tk, "estimate_transaction_cost",
+                            lambda *a, **k: 1e12)
+        assert s._build_calendar_entry(fat) == []
+        monkeypatch.setattr(tk, "estimate_transaction_cost",
+                            lambda *a, **k: 0.0)
+        thin = self._snap(near_px=100.0, next_px=101.0, lot=100,
+                          carry_diff=0.06)
+        assert len(s._build_calendar_entry(thin)) == 2
 
 
 # ──────────────────────────────────────────────────────────

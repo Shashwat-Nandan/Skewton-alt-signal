@@ -271,6 +271,12 @@ def make_strategy(
     s.calendar_max_holding_days = calendar_max_holding_days
     s.calendar_min_dte_near = calendar_min_dte_near
     s.calendar_max_leg_basis = calendar_max_leg_basis
+    # Production default for the rupee cost hurdle so the backtest grades the
+    # same gate that trades. The exit debounce is 1 (= off) here: this replay
+    # is DAILY-cadence (one check_and_rehedge per bhavcopy day), so N ticks
+    # would mean N DAYS — not the ~N-minute intraday noise filter it is live.
+    s.calendar_cost_hurdle_mult = 2.0
+    s.calendar_exit_debounce_ticks = 1
     s.disable_calendar = False
     s.lots_per_leg = lots_per_leg
     s.max_open_calendars = max_open_calendars

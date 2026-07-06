@@ -85,9 +85,9 @@ structures and state counters:
 Efficiency improvements, in order of expected impact:
 
 1. **Autoresearch fitness must be net-of-cost P&L, not `gamma_theta_ratio`.**
-   The 2026-06-13 episode already proved the ratio objective picks candidates
-   that lose *more*. The sweep machinery (15-session .zst tape replay, PR #74)
-   is now sound — point it at the right objective.
+   *(Correction 2026-07-05: ALREADY the case — see §3 E4.)* The 2026-06-13
+   episode proved the ratio objective picks candidates that lose *more*; the
+   host has since been on `metric = net_pnl`, so nothing to do here.
 2. **Rehedge economics gate**: only rehedge when expected scalp from the move
    exceeds ~2× the futures round-trip cost. `sweep_rehedge_params.py` exists;
    sweep on tape with the corrected objective. At ₹207 gross/rehedge, wider
@@ -116,17 +116,22 @@ expensive.
   ₹1,700 of round-trip cost. Add a rupee-denominated hurdle: expected
   convergence P&L over the intended holding period ≥ 2× modeled round-trip
   cost, else no entry.
-- **Minimum holding period / exit debounce.** 64 round trips in 22 sessions on
-  a *carry* strategy means it is exiting on noise. Carry accrues over days;
-  exits within the hour guarantee the cost side dominates.
+- **Exit debounce.** 64 round trips in 22 sessions on a *carry* strategy
+  means it is exiting on noise — single flickering carry_diff prints.
+  *(Refined at implementation, 2026-07-05: a consecutive-tick convergence
+  streak, not a time-based minimum hold — the strategy has no stop-loss
+  exit, so pinning a converged spread for days would carry open
+  re-divergence risk and starve the `max_open_calendars` slots. With the
+  rupee entry hurdle in place, capture at genuine convergence clears cost
+  by construction, so banking it promptly is correct.)*
 - **Margin model blocks the good version of this trade**: code reserves
   0.20×notional per leg (~7× the real ₹74k for 3 spreads measured via
   `basket_order_margins` on 2026-06-17). Fixing the margin model widens
   capacity for the *held-to-convergence* variant, which is the only variant
   with positive expectancy after costs.
 - **Park criterion**: if net-of-cost P&L is still ≈0 after the rupee hurdle +
-  min-hold change, the edge isn't harvestable at retail cost structure — stop
-  the runner rather than pay attention-cost for ₹658/month.
+  exit-debounce change, the edge isn't harvestable at retail cost structure —
+  stop the runner rather than pay attention-cost for ₹658/month.
 
 ### 2.4 Buy-on-gap (paper) — the backtest warned us
 
@@ -229,11 +234,14 @@ overstate ~7× (blocks trades that are fine), cross-stock pairs understate
 directly changes what the live pair runner can safely size to (§2.1).
 
 **E4 — Fix the autoresearch objective (Taleb).**
-The weekly sweep is the only self-improving loop attached to real tunables and
-it optimizes a ratio proven anti-correlated with P&L. Change fitness to
-net-of-cost tape P&L with the existing no-promote guards (hold-out must trade;
-in-sample must be net-positive). Until then, every Saturday run is compute
-spent generating candidates that must be manually distrusted.
+*(Correction 2026-07-05, week-2 verification: ALREADY DONE.)* Both the host
+config.ini and config_template.ini set `[autoresearch] metric = net_pnl`
+(cost-inclusive: realized-net + unrealized), `autoresearch_loop.py` handles
+P&L metrics explicitly (`PNL_METRICS` — no-trade sessions are a defined 0),
+and the CLI help itself warns that `gamma_theta_ratio` is "DECOUPLED from
+money (2026-06-14) — don't optimize it alone". The no-promote guards
+(hold-out must trade; in-sample net-positive) are also live. No action needed;
+the residual risk is manual runs passing `--metric gamma_theta_ratio`.
 
 **E5 — Measure churn as a first-class metric.**
 The pattern "more trades, worse net" repeats across kalman-trend (83 vs 6),
@@ -268,9 +276,15 @@ lose.
    Kalman-trend kill date (§2.7; `KILL_DATE = 2026-08-01`). The fourth
    candidate item — kalman-pairs roll buffer #70 — turned out to be already
    implemented (see §2.6).
-2. **Week 2**: E2 cost hurdle in arbitrage + min-hold; if still ≈0 net after
-   two weeks, park it. E4 autoresearch objective swap (before the next
-   Saturday sweep if possible).
+2. **Week 2** *(implemented 2026-07-05)*: E2 cost hurdle in arbitrage
+   (`calendar_cost_hurdle_mult`, default 2.0× the 4-leg round-trip, with a
+   deliberately conservative harvest model) + CONVERGE-exit streak debounce
+   (`calendar_exit_debounce_ticks`, default 3 consecutive converged prints —
+   NOT a time-based min-hold, which review found would pin converged spreads
+   for days against re-divergence with no stop-loss and starve the open
+   slots); if still ≈0 net after two weeks, park it. E4 autoresearch
+   objective swap: found ALREADY DONE on verification (metric = net_pnl on
+   host + template — see §3 E4 correction).
 3. **Week 3**: Taleb rehedge-economics sweep on tape (§2.2 items 2–3);
    equity-swing exit-geometry backtest on 5-min data (§2.5).
 4. **Week 4**: E3 margin realism for the live pair path; June-decomposition of
