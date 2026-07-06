@@ -1776,3 +1776,38 @@ session writes data_cache/arbitrage_paper_eod_<date>.json.
 The strategy's own backtest note says calendar net P&L is structurally negative
 after retail F&O costs. Paper mode measures this honestly — read the dashboard
 number with that prior. Flip `disable_calendar = true` to run monitoring-only.
+
+## 2026-07-06 — Backfill costs on pre-#77 kalman_trend trades
+
+Pre-fix trades were booked with cost_per_unit=0.0 (see #77); STATE.md's
+kalman-vs-MA delta is inflated by ~₹13.5k of uncharged round-trip costs.
+
+- [x] Back up runner state + risk-monitor peaks JSONs
+- [x] Classify every trade exactly: pnl == side*(exit-entry) → zero-cost;
+      pnl == raw - 5 → already costed; anything else → abort (fail loud)
+- [x] Patch trades' pnl_points and realized_points in
+      data_cache/kalman_trend_runner_state.json (atomic write)
+- [x] Recompute risk-monitor peaks as running max of the cost-adjusted
+      EOD equity series (peaks otherwise overstate drawdown vs adjusted book)
+- [x] Verify: state restores via IntradayTrendStrategy.restore(); realized ==
+      sum(trade pnls); risk monitor reads adjusted file without tripping
+- [x] Update state/kalman_trend/STATE.md (Last run figures + lesson on top)
+- [x] Leave historical kalman_trend_eod_*.json untouched (they record what
+      was booked at the time; next EOD will show a documented discontinuity)
+
+### Review
+- 103 trades across 4 books; 79 classified zero-cost by exact price-diff match
+  (31 NIFTY:kalman, 4 NIFTY:ma, 43 BANKNIFTY:kalman, 1 BANKNIFTY:ma); zero
+  ambiguous trades, so no heuristics were needed.
+- Adjusted book: kalman ₹-6,237.5 vs ma ₹5,637 → Δ ₹-11,874.5 (was +1,400.5).
+- Peaks rebuilt from adjusted EOD path: worst drawdown-from-peak now ₹8,401
+  (BANKNIFTY:kalman), kill switch (₹20k) not tripped. Caveat: pre-2026-07-06
+  intraday peak highs are unrecoverable; EOD-granularity peaks slightly
+  understate the true high-water mark.
+- Verified with project venv: IntradayTrendStrategy.restore() round-trips all
+  4 books (realized == Σ trade pnls, pos 0, cost 2.5); risk_monitor
+  read_book_equities + evaluate on the patched files → breach False.
+- STATE.md Last-run figures updated + lesson added; next loop session will
+  regenerate them from the adjusted state, so numbers stay consistent.
+- Backups: data_cache/{kalman_trend_runner_state,kalman_trend_risk_monitor}
+  .json.bak-prebackfill-20260706
