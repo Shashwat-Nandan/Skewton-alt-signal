@@ -188,12 +188,17 @@ class TestCapturedTapeReplay:
         is tens of millions of rows (this exact test class OOM-killed a
         16 GB pytest on 2026-07-06 by loading sessions[-1] == today). Every
         replay consumer (autoresearch, sweeps, these tests) goes through
-        list_captured_sessions, so the guard lives there."""
-        from datetime import date, timedelta
+        list_captured_sessions, so the guard lives there. 'Today' is the
+        IST trading date (matching tick filename stamps), NOT host-local —
+        on a CEST host, 20:30-00:00 local is already the next IST day, and
+        a host-local check would discard the just-COMPLETED session."""
+        from datetime import timedelta
+
+        from backtest import ist_today
         ticks = tmp_path / "data_cache" / "ticks"
         ticks.mkdir(parents=True)
-        today = date.today().isoformat()
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        today = ist_today().isoformat()
+        yesterday = (ist_today() - timedelta(days=1)).isoformat()
         (ticks / f"ticks-{today}.jsonl").write_text("{}\n")
         (ticks / f"ticks-{yesterday}.jsonl.zst").write_bytes(b"")
         monkeypatch.chdir(tmp_path)

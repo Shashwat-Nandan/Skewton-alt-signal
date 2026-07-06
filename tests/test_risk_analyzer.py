@@ -156,6 +156,11 @@ class TestMonteCarloCosts:
         # path by at least the unavoidable entry+exit brokerage (4 orders).
         for g, n in zip(gross.path_results, net.path_results):
             assert n.final_pnl < g.final_pnl
+            # max_pnl must be on the same cost basis as final/min: net of
+            # entry costs the path was NEVER at 0.0, so the peak must sit
+            # strictly below the cost-free twin's (no phantom break-even
+            # peak from a 0-initialized max).
+            assert n.max_pnl < g.max_pnl
         assert net.mean_pnl < gross.mean_pnl - 80.0   # 4×₹20 brokerage floor
         assert net.worst_path_pnl < gross.worst_path_pnl
 

@@ -18,7 +18,19 @@ import argparse
 import contextlib
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+# Trading-session dates are IST: tick filenames are stamped with
+# datetime.now(IST).date() (tick_capture.py). "Today" checks against those
+# filenames must use the SAME calendar — the host runs CEST, and between
+# 20:30 and 00:00 CEST the host-local date is one day BEHIND IST, so a
+# host-local today() would wrongly discard the just-completed IST session.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def ist_today() -> date:
+    """Today's date on the IST trading calendar (matches tick filenames)."""
+    return datetime.now(IST).date()
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -490,8 +502,6 @@ def list_captured_sessions(underlying: str = "NIFTY",
     mid-session it is tens of millions of rows (a full-suite pytest OOM-
     killed the host at 16 GB on 2026-07-06 exactly this way). Consumers
     that genuinely want the live session must say so."""
-    from datetime import date as _date
-
     ticks_dir = Path("data_cache") / "ticks"
     if not ticks_dir.exists():
         return []
@@ -501,7 +511,7 @@ def list_captured_sessions(underlying: str = "NIFTY",
         for p in ticks_dir.glob(pattern)
     }
     if not include_today:
-        dates.discard(_date.today().isoformat())
+        dates.discard(ist_today().isoformat())
     return sorted(dates)
 
 

@@ -56,12 +56,18 @@ def main():
     src.add_argument("--tape", type=int, metavar="N",
                      help="replay the last N captured tape sessions")
     parser.add_argument("--underlying", type=str, default="NIFTY")
-    parser.add_argument("--grid", type=str, default="full",
+    parser.add_argument("--grid", type=str, default=None,
                         choices=["full", "frontier"],
                         help="'frontier' = 3x3x1 around the current "
-                             "best_params for a fast on-host sanity sweep; "
-                             "'full' = the original 5x4x3 grid.")
+                             "best_params; 'full' = the legacy 5x4x3 grid, "
+                             "whose 0.10-0.30 thresholds predate the "
+                             "current TUNABLE_RANGES (0.5-1.5) scale. "
+                             "Default: frontier with --tape, full with "
+                             "--data — a bare tape run must sweep the "
+                             "PRODUCTION scale, not the legacy one.")
     args = parser.parse_args()
+    if args.grid is None:
+        args.grid = "frontier" if args.tape else "full"
 
     frames = _replay_frames(args)
     iv_seed = skew_seed = None
@@ -118,15 +124,21 @@ def main():
                     )
                     metrics = results["metrics"]
                     trades_df = results.get("closed_trades")
-                    if trades_df is not None and not trades_df.empty:
+                    traded = trades_df is not None and not trades_df.empty
+                    if traded:
                         n += len(trades_df)
                         win_n += int((trades_df["gross_pnl"] > 0).sum())
                         gross += float(trades_df["gross_pnl"].sum())
                         costs += float(trades_df["costs"].sum())
                         scalp += float(trades_df["gamma_scalp"].sum())
+                        # Sharpe only over sessions that TRADED: averaging a
+                        # 0.0 in for no-trade sessions conflates "didn't
+                        # trade" with "zero-return trade" and penalizes
+                        # selective grid points (net_pnl stays the ranking
+                        # metric either way).
+                        sharpes.append(metrics.get("sharpe_ratio", 0.0))
                     net += metrics.get("net_pnl", 0.0)
                     rehedges += int(metrics.get("rehedge_count", 0))
-                    sharpes.append(metrics.get("sharpe_ratio", 0.0))
                 win_pct = (win_n / n * 100) if n else 0.0
                 sh = sum(sharpes) / len(sharpes) if sharpes else 0.0
                 print(

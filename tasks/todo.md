@@ -67,7 +67,40 @@ VERIFY-FIRST findings (the #70/E4 lesson, applied again):
       entry-time targets; binds for NEW entries. Daily-bar caveat noted
       (same-bar ordering conservative, SL first; 5-min data for 200
       equities does not exist).
-- [ ] Tests + ruff + full suite; PR.
+- [x] Tests + ruff + full suite (1127 under 8GB ulimit); PR #91 opened.
+
+## Code-review fixes (2026-07-06, 8-angle review → confirmed findings applied)
+- [x] RV calibration inert on tape (TOP finding): root cause = run_backtest
+      has no seed_spot_history (pre-existing gap) → single-scan replay sees
+      rv=None → 0.01 fallback. Fixed the VISIBILITY now (INFO log on every
+      fallback; `rv is not None` so a legitimate 0.0 RV simulates as true
+      dead-calm instead of 16% ann.); the seeding itself is issue #92
+      (needs a lookahead-hygiene design, not a same-branch patch).
+- [x] sweep --grid default now mode-dependent: frontier with --tape (the
+      production 0.5-1.5 scale), full only for legacy --data (its 0.10-0.30
+      thresholds predate the retune).
+- [x] sweep sharpe column averages only sessions that TRADED (0.0-padding
+      penalized selective grid points; net_pnl remains the ranking metric).
+- [x] Today-exclusion now uses the IST trading date (backtest.ist_today();
+      tick filenames are IST-stamped, host is CEST — between 20:30-00:00
+      CEST a host-local check discarded the just-COMPLETED session). Test
+      updated to the same calendar; _date alias import cleaned up.
+- [x] max_pnl anchored to the post-entry-cost level (was reporting a
+      phantom 0.0 break-even peak on cost-charged paths; max/min/final now
+      share one cost basis; asserted per-path in the cost test).
+- [x] Copy-pasted entry/exit leg costing → one _option_leg_costs helper
+      (single definition of the side flip); stale gross-era rationale
+      figures (+23,614/-3,371) annotated at the gate.
+- [x] Templates annotated: mc_min_mean_pnl=0.0 is materially stricter now
+      that mean_pnl is net-of-cost — flagged in config_template.ini AND
+      config_banknifty_template.ini (the RUNNING BANKNIFTY paper instance
+      inherits the stricter gate implicitly; loosening = operator decision,
+      surfaced in the PR).
+- [x] NOT fixed (PLAUSIBLE, deliberate): MC call still uses default
+      rehedge_threshold_delta=0.10 not the tuned band (pre-existing,
+      noted); sweep drop_recent parity (host runs 0 → currently identical;
+      the shared seed can't bias ranking, so the recorded band evidence
+      stands). REFUTED: OMS doc "out of scope" (explicitly requested).
 
 ---
 

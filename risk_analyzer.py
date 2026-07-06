@@ -187,14 +187,15 @@ class RiskAnalyzer:
         mc_lot = positions[0].lot_size if positions else 25
 
         if charge_costs:
-            # Entry legs at t0 premiums (BS at current spot / full T).
-            for opt in positions:
-                px = self.greeks.bs_price(spot, opt.strike, max(T, 1 / 365),
-                                          opt.iv or 0.2, opt.option_type)
-                side = "BUY" if opt.quantity > 0 else "SELL"
-                cumulative_pnl -= estimate_transaction_cost(
-                    px, abs(opt.quantity), opt.lot_size, side, "OPT")
-            min_pnl = min(min_pnl, cumulative_pnl)
+            # Entry legs at t0 premiums (BS mid at current spot / full T; no
+            # bid/ask spread on the premium itself — a stated simplification,
+            # the spread cost rides in estimate_transaction_cost's slippage
+            # term). Anchor BOTH extrema to the post-entry-cost level: net of
+            # costs the path was never at 0.0, so a 0-initialized max_pnl
+            # would report a break-even peak that never existed.
+            cumulative_pnl -= self._option_leg_costs(
+                positions, spot, max(T, 1 / 365), entering=True)
+            max_pnl = min_pnl = cumulative_pnl
 
         for day_idx, ret in enumerate(daily_returns):
             new_spot = current_spot * (1 + ret)
@@ -240,13 +241,9 @@ class RiskAnalyzer:
         if charge_costs:
             # Exit legs at end-of-path premiums, and the hedge unwind.
             end_T = max(T - len(daily_returns) / 365.0, 1 / 365)
-            for opt in positions:
-                sigma = self.greeks.vol_at_price(opt.iv or 0.2, spot, current_spot)
-                px = self.greeks.bs_price(current_spot, opt.strike, end_T,
-                                          sigma, opt.option_type)
-                side = "SELL" if opt.quantity > 0 else "BUY"
-                cumulative_pnl -= estimate_transaction_cost(
-                    px, abs(opt.quantity), opt.lot_size, side, "OPT")
+            cumulative_pnl -= self._option_leg_costs(
+                positions, current_spot, end_T, entering=False,
+                entry_spot=spot)
             if abs(hedge_delta) > 1e-9:
                 cumulative_pnl -= estimate_transaction_cost(
                     current_spot, abs(hedge_delta) / mc_lot, mc_lot,
@@ -260,6 +257,31 @@ class RiskAnalyzer:
             gamma_scalp_total=gamma_total,
             theta_paid_total=theta_total,
         )
+
+    def _option_leg_costs(self, positions, price_spot: float, tenor: float,
+                          entering: bool, entry_spot: float = None) -> float:
+        """Total transaction cost for opening (entering=True) or closing all
+        option legs, priced at BS mid at `price_spot`/`tenor`. ONE definition
+        of the side flip: a long leg (quantity > 0) BUYs to enter and SELLs
+        to exit — keeping entry/exit sign conventions in a single place so
+        they cannot drift apart. On exit, sigma follows the sticky-strike
+        vol_at_price adjustment from the path's start spot."""
+        from strategies.taleb_karpathy import estimate_transaction_cost
+
+        total = 0.0
+        for opt in positions:
+            iv = opt.iv or 0.2
+            sigma = iv if entering else self.greeks.vol_at_price(
+                iv, entry_spot if entry_spot is not None else price_spot,
+                price_spot)
+            px = self.greeks.bs_price(price_spot, opt.strike, tenor,
+                                      sigma, opt.option_type)
+            long_leg = opt.quantity > 0
+            side = ("BUY" if long_leg else "SELL") if entering else \
+                   ("SELL" if long_leg else "BUY")
+            total += estimate_transaction_cost(
+                px, abs(opt.quantity), opt.lot_size, side, "OPT")
+        return total
 
     # ═════════════════════════════════════════════════════════
     # Gap #14: STABILITY TESTS
