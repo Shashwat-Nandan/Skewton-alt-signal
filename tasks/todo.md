@@ -1,3 +1,26 @@
+# Issue #87 — BANKNIFTY loop_engine increment (PLAN, 2026-07-06)
+
+GATE CHECK FIRST (the issue's own instruction): the loop harness must not be
+built until BANKNIFTY paper shows tradeable behaviour — and the paper
+instance from #62/PR #86 has NEVER RUN (units documented in deploy/, never
+installed; no state/log/iv-history on host). So working #87 now means
+UNBLOCKING THE GATE, not building the loop:
+- [ ] Host ops (the PR #86 operator steps, explicitly requested via "work on
+      issue 87"): config_banknifty.ini from template (creds via .env),
+      BANKNIFTY EOD seed via fetch_index_daily.py (cached session,
+      post-market), install+enable taleb-banknifty-paper.{service,timer}
+      (09:12 stagger), correcting the deploy files' /opt template path to
+      this host's checkout at install.
+- [ ] Dashboard visibility (#87 explicitly owns this gap): backend/routers/
+      positions.py reads only taleb_paper_state.json — parameterize the
+      taleb block by underlying and add the BANKNIFTY system. Frontend
+      iterates data.systems generically → NO frontend change needed.
+- [ ] Comment on #87: gate status, what was installed, what evidence to
+      watch; loop harness (engine generalization, checker, risk monitor,
+      loop timers) DEFERRED per the issue's own gate.
+
+---
+
 # Week-3 efficiency items (PLAN, 2026-07-06)
 
 Scope (review doc §5 week 3): Taleb rehedge-economics sweep on tape +
@@ -1811,3 +1834,38 @@ kalman-vs-MA delta is inflated by ~₹13.5k of uncharged round-trip costs.
   regenerate them from the adjusted state, so numbers stay consistent.
 - Backups: data_cache/{kalman_trend_runner_state,kalman_trend_risk_monitor}
   .json.bak-prebackfill-20260706
+
+## 2026-07-06 — Offline experiment: cost-aware warmup fit for kalman_trend
+
+Question: does passing cost_per_unit=2.5 into the warmup CMA-ES fit (runner
+today fits at 0.0 — run_paper_kalman_trend.py:177) cut churn enough to beat
+the costed MA baseline OOS? Mirrors deployment: train 1500 5-min bars,
+n_gen=25, OOS eval always charged 2.5/side.
+
+- [x] Time one fit; size folds/seeds to finish in reasonable wall time
+- [x] 4 arms × {NIFTY,BANKNIFTY}: kal-fit@0, kal-fit@2.5, ma-fit@0, ma-fit@2.5
+- [x] Report per arm: pooled Sharpe (median over seeds), OOS points, trades,
+      fold-win rate vs MA; verdict via o.verdict_passed
+- [x] Verdict + recommendation in review section
+
+### Review (run finished 2026-07-07 ~03:40 CEST)
+Protocol: 10 walk-forward folds x 3 seeds per symbol on the 9,000-bar 5-min
+history (train 1500 bars = runner warmup, test 375 bars = 1 week, n_gen=25 =
+runner setting). OOS always charged 2.5/side. Results in scratchpad
+{nifty,banknifty}_result.json.
+
+- Churn mechanism confirmed: costs in the CMA-ES objective halve trade count
+  (NIFTY 27.8 -> 11.2 trades/fold; BN 20.6 -> 14.7) and widen median stops
+  (140 -> 252; 40 -> 305 points).
+- NIFTY: costed fit flips OOS from -769 pts/seed (Sharpe -0.20) to +702
+  pts/seed (Sharpe 0.18); formal verdict (verdict_passed) flips to KAL BEATS
+  MA (fold-win 0.667). But one of three seeds is ~0 Sharpe.
+- BANKNIFTY: costed fit is WORSE than zero-cost fit (3,593 vs 4,843 pts/seed)
+  and the verdict flips the OTHER way (True -> False). Seed spread is huge
+  (0.72 / -0.0 / 0.15). Zero-cost BN fit medians stop=40, i.e. the deployed
+  6-pt stop was an unlucky warmup draw, not the typical fit.
+- Conclusion: cost-aware fitting is a genuine consistency fix and cuts churn,
+  worth shipping to the A/B runner (one line: pass cost_per_unit into
+  fit_params). It is NOT promotion evidence: verdicts flip in opposite
+  directions across symbols on 3 seeds - the same instability behind the
+  original NO-GO. Let the honest A/B run out its Aug-1 runway.

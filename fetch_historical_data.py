@@ -68,15 +68,21 @@ def fetch_instrument_master(kite, underlying: str = "NIFTY") -> pd.DataFrame:
 
 
 def get_spot_token(kite, underlying: str = "NIFTY") -> int:
-    """Get the instrument token for the underlying index."""
+    """Get the instrument token for the underlying index.
+
+    NSE lists index spot under display names, not the F&O underlying key —
+    same mapping the strategy layer uses (taleb_karpathy._INDEX_SPOT_SYMBOLS):
+    NIFTY → "NIFTY 50", BANKNIFTY → "NIFTY BANK". Without this, a BANKNIFTY
+    fetch dies on 'Could not find instrument token' (hit on 2026-07-06 while
+    seeding the #62 paper instance's spot history)."""
+    spot_names = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
+    wanted = {underlying, spot_names.get(underlying, underlying)}
     instruments = kite.instruments("NSE")
     for inst in instruments:
-        if inst["tradingsymbol"] == underlying:
+        if inst["tradingsymbol"] in wanted:
             return inst["instrument_token"]
-        # NIFTY 50 is listed as "NIFTY 50" on NSE
-        if inst["tradingsymbol"] == f"{underlying} 50":
-            return inst["instrument_token"]
-    raise ValueError(f"Could not find instrument token for {underlying}")
+    raise ValueError(f"Could not find instrument token for {underlying} "
+                     f"(looked for {sorted(wanted)})")
 
 
 def select_strikes(
