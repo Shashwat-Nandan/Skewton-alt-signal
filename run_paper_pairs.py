@@ -64,6 +64,7 @@ from runner_common import (  # noqa: F401  (re-exported)
     assert_disk_space_ok,
     assert_holiday_data_fresh,
     assert_timezone_ist,
+    durable_write_text,
     install_signal_handlers,
     is_trading_day,
     load_holidays,
@@ -620,20 +621,8 @@ def write_state_file(strategies, system: str, log: logging.Logger,
                      archive: bool = True, mode: str = "paper"):
     """Atomically and durably persist current strategy state. Each strategy
     emits its own serialize_state() blob; runner adds a system/timestamp
-    header.
-
-    Crash- and power-loss-safe write:
-      1. write payload to '<path>.tmp'
-      2. fsync the tmp file's fd — forces data blocks to disk before any
-         metadata change is journaled. Without this, ext4 (`data=ordered`)
-         could journal the rename's inode update while the data blocks
-         are still in page cache; a crash before the data flush would
-         replay the rename pointing at unflushed (effectively empty) data.
-      3. os.replace(tmp, path) — atomic rename, no half-truncated file
-      4. fsync the parent dir's fd — directory-entry changes from the
-         rename are metadata that the journal records but doesn't commit
-         to disk synchronously; this forces it so the rename itself
-         survives power loss.
+    header. Crash/power-loss safety is runner_common.durable_write_text
+    (tmp → fsync → atomic rename → dir fsync; rationale documented there).
 
     archive=False skips the timestamped backup + log line — used by the
     intraday tick-loop persist, which fires every minute and would
@@ -657,22 +646,12 @@ def write_state_file(strategies, system: str, log: logging.Logger,
         except Exception as e:
             log.exception("serialize_state failed for %s/%s: %s",
                           s.symbol_a, s.symbol_b, e)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Use Python's file object (which loops over os.write internally to
-    # handle partial-write returns) + an explicit fsync on the fd before
-    # close. Default mode = 0o666 & ~umask, matching the old
-    # `tmp.write_text(...)` so prod (UMask=0027 → 0o640) and dev
-    # (umask 0022 → 0o644) behaviour is unchanged.
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(payload, default=str, indent=2))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    # durable_write_text owns the tmp→fsync→replace→dir-fsync steps
+    # (extracted to runner_common in the PR #96 review; identical
+    # behaviour, one shared copy). Default mode = 0o666 & ~umask, so
+    # prod (UMask=0027 → 0o640) and dev (umask 0022 → 0o644) behaviour
+    # is unchanged.
+    durable_write_text(path, json.dumps(payload, default=str, indent=2))
     if archive:
         log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
         archive_state_backup(path, log)

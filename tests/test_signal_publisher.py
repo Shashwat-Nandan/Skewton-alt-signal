@@ -107,6 +107,7 @@ class TestSequence:
         g = uuid7()
         pub.publish(_entry(group=g))
         pub.publish(_exit(g))
+        pub.close()  # release the lifetime lock, as a process exit would
         reborn = _publisher(tmp_path)
         r = reborn.publish(_entry())
         assert r["sequence"] == 2
@@ -220,10 +221,71 @@ class TestStatePersistence:
         pub = _publisher(tmp_path)
         g = uuid7()
         pub.publish(_entry(group=g))
+        pub.close()
         reborn = _publisher(tmp_path)
         r = reborn.publish(_exit(g))
         assert r is not None
         assert g not in reborn.open_groups
+
+    def test_second_live_publisher_same_strategy_refused(self, tmp_path):
+        # PR #96 review: the per-publish flock never re-read state, so two
+        # concurrent publishers would assign duplicate sequence numbers
+        # from stale in-memory copies — the lifetime lock makes the second
+        # instance fail loud at construction instead.
+        pub = _publisher(tmp_path)
+        pub.publish(_entry())
+        with pytest.raises(RuntimeError, match="signal publisher"):
+            _publisher(tmp_path)
+        pub.close()
+        reborn = _publisher(tmp_path)  # released lock → construction OK
+        assert reborn.last_sequence == 0
+
+    def test_empty_state_file_fails_loud(self, tmp_path):
+        # PR #96 review: a 0-byte state file used to silently reset the
+        # sequence counter to -1 — reusing sequences already on the bus,
+        # the duplicate-sequence money bug. Anomalous file → refuse start.
+        pub = _publisher(tmp_path)
+        pub.publish(_entry())
+        pub.close()
+        state_path = (tmp_path / "data_cache"
+                      / "signal_publisher_pair_trading.json")
+        state_path.write_text("")
+        with pytest.raises(RuntimeError, match="empty"):
+            _publisher(tmp_path)
+
+    def test_append_failure_keeps_group_open_for_retry(self, tmp_path,
+                                                       monkeypatch):
+        # PR #96 review: the group-close used to be persisted BEFORE the
+        # bus append, so a failed append lost the EXIT forever (retries
+        # suppressed as already-closed). Now the group only closes after
+        # the record is on the bus: the retry publishes, at the cost of a
+        # detectable sequence gap for the failed attempt.
+        pub = _publisher(tmp_path)
+        g = uuid7()
+        pub.publish(_entry(group=g))
+
+        real_append = pub._append_to_bus
+        calls = {"n": 0}
+
+        def failing_append(record):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("disk full")
+            return real_append(record)
+
+        monkeypatch.setattr(pub, "_append_to_bus", failing_append)
+        with pytest.raises(OSError):
+            pub.publish(_exit(g))
+        # Group still open — the exit was NOT recorded as told-to-close.
+        assert g in pub.open_groups
+        # Retry (a fresh envelope, as the strategy would mint) succeeds
+        # and closes the group.
+        r = pub.publish(_exit(g))
+        assert r is not None
+        assert g not in pub.open_groups
+        # The failed attempt burned its sequence: bus shows 0 then 2 —
+        # a gap consumers detect and replay, never a duplicate.
+        assert [rec["sequence"] for rec in _bus_records(pub)] == [0, 2]
 
     def test_state_file_belongs_to_one_strategy(self, tmp_path):
         pub = _publisher(tmp_path)

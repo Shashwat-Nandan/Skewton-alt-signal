@@ -103,6 +103,36 @@ def acquire_lock(lock_path: Path, log: logging.Logger,
     return fd
 
 
+def durable_write_text(path: Path, text: str) -> None:
+    """Crash- and power-loss-safe file replace:
+
+      1. write to '<path>.tmp' and fsync the fd — forces data blocks to
+         disk before any metadata change is journaled (ext4 data=ordered
+         would otherwise happily journal the rename against unflushed
+         data, replaying a rename that points at an empty file).
+      2. os.replace(tmp, path) — atomic rename, no half-truncated file.
+      3. fsync the parent dir fd — the rename's directory entry is
+         metadata the journal records but doesn't commit synchronously;
+         force it so the rename itself survives power loss.
+
+    Extracted from run_paper_pairs.write_state_file (PR #96 review): the
+    pair runner, the kalman-pairs runner, and the signal publisher all
+    need the identical discipline — one copy so a future hardening fix
+    can't land in one and silently miss the others.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def load_holidays(path: Path) -> set[date]:
     # M-O1: lint each non-comment line and raise a precise error that
     # names the offending line number + content. Pre-fix, a typo like

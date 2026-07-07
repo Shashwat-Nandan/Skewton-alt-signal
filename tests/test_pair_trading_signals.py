@@ -219,6 +219,14 @@ class TestExecuteProposalsPublishes:
             assert records[1]["tags"]["exit_reason"] == reason
             assert records[1]["position_group_id"] == \
                 records[0]["position_group_id"]
+            # PR #96 review: legs stored at fill time now persist expiry,
+            # so real exits name their exact contracts (roll safety) with
+            # the ISO date instead of dropping legs.
+            exit_legs = records[1]["legs"]
+            assert [leg["instrument"]["tradingsymbol_hint"]
+                    for leg in exit_legs] == ["AAA26APRFUT", "BBB26APRFUT"]
+            assert all(leg["instrument"]["expiry"] == "2026-04-28"
+                       for leg in exit_legs)
             assert s.state.position == "FLAT"
             assert s.state.position_group_id is None
 
@@ -239,6 +247,40 @@ class TestExecuteProposalsPublishes:
             records[0]["position_group_id"]
         assert s.state.position == "FLAT"
         assert not s.state.legs
+
+    def test_margin_refused_entry_publishes_nothing(self, tmp_path):
+        # PR #96 review: the ENTRY used to be published BEFORE the H15
+        # margin pre-check, whose `return []` skipped the CANCEL reconcile
+        # — subscribers were left holding a structure the master never
+        # opened, re-published with a fresh group every tick. The gate now
+        # runs first: no funds on the master, no signal at all.
+        s = _strategy_with_history()
+        s.mode = "live"
+        pub = _publisher(tmp_path)
+        s._signal_publisher = pub
+        s._pending_entry_z = -2.5
+        s._margin_precheck_ok = lambda proposals: False
+        results = s.execute_proposals(_entry_props())
+        assert results == []
+        assert _bus_records(pub) == []
+        assert pub.last_sequence == -1  # no sequence burned either
+        assert pub.open_groups == {}
+
+    def test_backoff_window_entry_publishes_nothing(self, tmp_path):
+        # PR #96 review: during an armed M-B5 backoff every leg is FAILED
+        # by _live_execute's short-circuit, so publishing the ENTRY only
+        # produced an ENTRY+CANCEL whipsaw per tick. No intent the master
+        # can act on → no signal (same reasoning as HALT_NEW_ENTRIES).
+        s = _strategy_with_history()
+        s.mode = "live"
+        s._place_order_skip_ticks_left = 2
+        pub = _publisher(tmp_path)
+        s._signal_publisher = pub
+        s._pending_entry_z = -2.5
+        s._margin_precheck_ok = lambda proposals: True
+        s.execute_proposals(_entry_props())
+        assert _bus_records(pub) == []
+        assert s.state.position == "FLAT"
 
     def test_publish_failure_never_blocks_trading(self, tmp_path):
         # The live book's safety outranks the bus: a broken publisher logs

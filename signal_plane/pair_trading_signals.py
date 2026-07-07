@@ -182,9 +182,7 @@ def build_entry_signal(strategy, proposals, *, z: float,
         "max_holding_days": strategy.max_holding_days,
         "spot_basis": "spread",
     }
-    system_tag = getattr(strategy, "signal_system_tag", None)
-    if system_tag:
-        tags["system"] = system_tag
+    tags = _with_system_tag(strategy, tags)
     if risk_unit is not None:
         sizing = Sizing(method="RISK_PER_TRADE_PCT",
                         base_multiplier=base_multiplier,

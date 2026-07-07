@@ -71,9 +71,39 @@ those tests skip). Deviations from plan, all surfaced by tests:
   * backtest_pairs.make_strategy bootstrap mirrors the 3 new strategy attrs
     (the repo's own __new__-coverage guard test caught it).
 Operator steps (NOT done here): mirror --publish-signals into the installed
-pair-paper-persistent-live unit + daemon-reload; ensure jsonschema is
-installed in the runner venv on deploy (redeploy.sh has no pip-install
-step — known audit gap).
+pair-paper-persistent-live unit + daemon-reload. (Earlier draft also listed
+a jsonschema venv step — STALE: redeploy.sh installs hash-pinned from the
+lockfiles, the audit gap was already closed.)
+
+### /code-review fixes applied (2026-07-07, same branch)
+
+10 findings (9 CONFIRMED + 1 PLAUSIBLE); all 9 CONFIRMED fixed:
+  1+3. H15 margin pre-check + M-B5 backoff gates now run BEFORE the publish
+       hook; entries are not published while backoff is armed (was:
+       margin-refusal returned [] between ENTRY publish and CANCEL
+       reconcile → subscribers held uncancelled structures; backoff →
+       ENTRY+CANCEL whipsaw per tick).
+  2.   Publisher write ordering split: persist sequence+id → bus append →
+       persist group transition. A failed append no longer closes the
+       group (EXIT retry works; gap-not-duplicate preserved); exit-failure
+       CRITICAL log no longer promises a retry that can't happen.
+  4.   Publisher takes a process-lifetime flock (runner_common.acquire_lock)
+       in __init__ — a second publisher for the same strategy_id fails loud
+       (H9 lock is per --system and didn't cover this); false docstring
+       fixed; close() added for tests.
+  5.   PairLeg persists expiry (entry-fill capture; back-compat "" for old
+       state files) → exit signals now NAME their legs with ISO expiry;
+       leg-less exits remain only for pre-upgrade positions.
+  6.   0-byte publisher state file now fails loud instead of silently
+       resetting the sequence counter.
+  8.   tmp→fsync→replace→dir-fsync extracted to
+       runner_common.durable_write_text; publisher + both pair runners use
+       the one copy.
+  9.   Enum parity test: contract frozensets asserted equal to the schema's
+       enum lists (drift = test failure).
+  10.  build_entry_signal uses _with_system_tag (inline copy removed).
+NOT fixed (PLAUSIBLE, latent): _pending_entry_z z=0.0 fallback — every
+production entry path sets the stash today; revisit when ADD/layering lands.
 ---
 
 # Issue #87 — BANKNIFTY loop_engine increment (PLAN, 2026-07-06)

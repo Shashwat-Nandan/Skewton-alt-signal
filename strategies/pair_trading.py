@@ -147,6 +147,12 @@ class PairLeg:
     quantity: int          # signed lots: +N long, -N short
     entry_price: float
     current_price: float = 0.0
+    # Contract expiry as the entry proposal carried it (ISO-date-prefixed
+    # string). Persisted so exit signals can name a fully-resolvable
+    # instrument (PR #96 review: without it, every published EXIT had to
+    # drop its legs). "" for legs restored from pre-upgrade state files —
+    # those exits stay leg-less (the tagged legs_omitted path).
+    expiry: str = ""
 
 
 @dataclass
@@ -519,21 +525,6 @@ class PairTradingStrategy(BaseStrategy):
         is_entry_batch = (self.state.position == "FLAT")
         filled_entry_props: List[Tuple[TradeProposal, Dict]] = []
 
-        # Issue #90: publish the decision as a §4 signal BEFORE executing on
-        # the master book — subscribers must never trail the master's own
-        # fills (§7.2), and an exit signal must go out even if the master's
-        # own exit orders then fail. Publish failures are logged CRITICAL
-        # but never block the trading loop: managing the live book beats
-        # telling subscribers about it.
-        # getattr: backtest_pairs.py and the test fixtures build instances
-        # via __new__ (no __init__), so the attribute may not exist there.
-        published_entry = None
-        if getattr(self, "_signal_publisher", None) is not None and proposals:
-            if is_entry_batch:
-                published_entry = self._publish_entry_signal(proposals)
-            else:
-                self._publish_exit_signal(proposals)
-
         # H15: kite.margins() pre-check on live entry batches. If the
         # broker reports insufficient available balance, refuse the batch
         # entirely — without this, leg B rejects on margin AFTER leg A has
@@ -548,14 +539,41 @@ class PairTradingStrategy(BaseStrategy):
         # thing most likely to be broken). If the decrement clears the
         # cooldown to 0, also clear the fail_streak so the very next
         # FAILED outcome doesn't immediately re-arm the cooldown.
+        # Both gates run BEFORE the signal-publish hook (review of PR #96):
+        # publishing an ENTRY that a local gate then voids left subscribers
+        # holding a structure the master never opened (margin path returned
+        # [] before the CANCEL reconcile) or whipsawed them with an
+        # ENTRY+CANCEL pair every tick of a backoff window.
         if not self.is_paper_mode and self._place_order_skip_ticks_left > 0:
             self._place_order_skip_ticks_left -= 1
             if self._place_order_skip_ticks_left == 0:
                 self._place_order_fail_streak = 0
+        backoff_active = (not self.is_paper_mode
+                          and self._place_order_skip_ticks_left > 0)
 
         if is_entry_batch and not self.is_paper_mode and proposals:
             if not self._margin_precheck_ok(proposals):
                 return []
+
+        # Issue #90: publish the decision as a §4 signal BEFORE executing on
+        # the master book — subscribers must never trail the master's own
+        # fills (§7.2), and an exit signal must go out even if the master's
+        # own exit orders then fail. Entries are NOT published while the
+        # M-B5 backoff is armed (_live_execute will fail every leg, so the
+        # master cannot open — same reasoning as HALT_NEW_ENTRIES: no
+        # intent, no signal); exits publish regardless — the exit decision
+        # stands even when the master's own orders are failing. Publish
+        # failures are logged CRITICAL but never block the trading loop:
+        # managing the live book beats telling subscribers about it.
+        # getattr: backtest_pairs.py and the test fixtures build instances
+        # via __new__ (no __init__), so the attribute may not exist there.
+        published_entry = None
+        if getattr(self, "_signal_publisher", None) is not None and proposals:
+            if is_entry_batch:
+                if not backoff_active:
+                    published_entry = self._publish_entry_signal(proposals)
+            else:
+                self._publish_exit_signal(proposals)
 
         # COMPLETE is the whitelist (not !FAILED) — PENDING/REJECTED/
         # CANCELLED returned by _live_execute all share the property that
@@ -689,8 +707,11 @@ class PairTradingStrategy(BaseStrategy):
         except Exception as e:
             logger.critical(
                 "SIGNAL PUBLISH FAILED (EXIT %s/%s, reason=%s): %s — "
-                "trading continues but SUBSCRIBERS WERE NOT TOLD TO EXIT; "
-                "will retry on the next exit tick",
+                "trading continues but SUBSCRIBERS WERE NOT TOLD TO EXIT. "
+                "A retry only happens if the master still holds and a "
+                "later exit decision fires; if the master's own exit "
+                "fills now, the bus permanently misses this exit — "
+                "OPERATOR: audit logs/signal-bus against the book.",
                 self.symbol_a, self.symbol_b, self._pending_exit_reason, e,
             )
 
@@ -774,6 +795,7 @@ class PairTradingStrategy(BaseStrategy):
                         "quantity": leg.quantity,
                         "entry_price": leg.entry_price,
                         "current_price": leg.current_price,
+                        "expiry": leg.expiry,
                     }
                     for leg in self.state.legs
                 ],
@@ -832,6 +854,9 @@ class PairTradingStrategy(BaseStrategy):
                 quantity=int(l["quantity"]),
                 entry_price=float(l["entry_price"]),
                 current_price=float(l.get("current_price", l["entry_price"])),
+                # Pre-upgrade state files carry no expiry — "" keeps those
+                # legs on the leg-less exit-signal path.
+                expiry=str(l.get("expiry", "") or ""),
             )
             for l in state_blob["legs"]
         ]
@@ -1263,7 +1288,7 @@ class PairTradingStrategy(BaseStrategy):
             tradingsymbol=leg.tradingsymbol,
             instrument_token=0,
             strike=0.0,
-            expiry="",
+            expiry=leg.expiry,
             option_type="FUT",
             lot_size=int(leg.lot_size),
             quantity=int(abs(leg.quantity)),
@@ -1409,6 +1434,7 @@ class PairTradingStrategy(BaseStrategy):
                 symbol=symbol, tradingsymbol=prop.tradingsymbol,
                 lot_size=prop.lot_size, quantity=signed_qty,
                 entry_price=fill_price, current_price=fill_price,
+                expiry=str(prop.expiry or ""),
             ))
             return
 

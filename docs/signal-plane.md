@@ -33,10 +33,20 @@ Publisher state (`data_cache/signal_publisher_pair_trading.json`) persists
 with the same tmp→fsync→replace→dir-fsync discipline as the runner's state
 file.
 
-**Crash discipline — gap, never duplicate:** the sequence counter is
-persisted BEFORE the bus append. A crash between the two leaves a sequence
-gap, which consumers detect and replay (§4.11); the reverse order could emit
-two different signals with one sequence number, which is a money bug.
+**Crash discipline — gap, never duplicate (per-publish write ordering):**
+(1) sequence + signal_id persisted durably, (2) bus append, (3) group
+transition applied + persisted. A crash after (1) leaves a sequence gap,
+which consumers detect and replay (§4.11) — never a duplicate sequence. The
+group transition deliberately waits for the append (PR #96 review): closing
+the group first meant a failed append lost the EXIT forever, because the
+retry was suppressed as an already-closed group. Worst case now is a benign
+duplicate EXIT, which consumers no-op.
+
+**One publisher per strategy_id per host:** enforced by a process-lifetime
+flock taken in the publisher's constructor (fail-loud on a second instance).
+The runners' H9 lock is per `--system`, so it alone would let a baseline and
+a persistent runner share one sequence stream from stale in-memory counters
+(PR #96 review).
 
 ## Decision inventory (§5 audit, pair runner)
 
@@ -59,10 +69,14 @@ Not book-mutating, hence no signal: HALT_ALL (book frozen), HALT_NEW_ENTRIES
 ## Semantics chosen in this increment
 
 - **Publish at decision time**, before the master's own execution (§7.2: the
-  platform book must not trade ahead of subscribers). If a published ENTRY
-  then fails to establish (all legs rejected, or partial batch reversed to
-  flat), a **CANCEL** follows so subscribers aren't left holding a structure
-  the master never opened.
+  platform book must not trade ahead of subscribers) — but AFTER the cheap
+  local gates (H15 margin pre-check, M-B5 backoff): a batch those gates void
+  produces no signal at all (PR #96 review — publishing first left
+  subscribers holding uncancelled structures on the margin path and
+  whipsawed them with ENTRY+CANCEL pairs during backoff windows). If a
+  published ENTRY then fails to establish (all legs rejected, or partial
+  batch reversed to flat), a **CANCEL** follows so subscribers aren't left
+  holding a structure the master never opened.
 - **Exit reliability > entry reliability:** exit publishes use the
   publisher's `allow_unknown_group` escape, so an exit is emitted even when
   the entry never made it onto the bus (pre-upgrade positions, or an entry
@@ -78,11 +92,13 @@ Not book-mutating, hence no signal: HALT_ALL (book frozen), HALT_NEW_ENTRIES
   from entry z to the planned effective stop for one structure unit
   (Varsity share-count model). Falls back to FIXED_LOTS (tagged) when the
   rolling std is unavailable.
-- **Exit legs are omitted** when contract terms are incomplete — `PairLeg`
-  state does not persist expiry, and a FUT descriptor without expiry cannot
-  uniquely resolve (§4.12). §4.3 blesses leg-less exits: the OMS derives
-  them from the group's open position via `position_group_id`. Tagged
-  `legs_omitted` so it's visible.
+- **Exit signals name their legs** (stored contract + ISO expiry — the
+  roll-safety cross-check): `PairLeg` persists the entry proposal's expiry
+  since the PR #96 review. Legs are omitted ONLY for positions restored
+  from pre-upgrade state files (no stored expiry → the FUT descriptor
+  cannot uniquely resolve, §4.12); §4.3 blesses that leg-less shape — the
+  OMS derives legs from the group's open position via `position_group_id` —
+  and it is tagged `legs_omitted`, never silent.
 - **`underlying` = "A/B" pair label**, `reference.spot` = the spread
   (`tags.spot_basis="spread"`): for a cross-stock pair, the pair is the
   routing group and the spread is the structure's own underlying level.
@@ -102,9 +118,10 @@ position correlates correctly.
   **operator step:** mirror the flag into the installed unit +
   `systemctl daemon-reload` (installed units differ from the /opt-pathed
   templates on this host).
-- New dependency: `jsonschema` (requirements.in/.lock). **Operator step:**
-  ensure it's installed in the runner venv after deploy (`redeploy.sh` has
-  no pip-install step — known gap from the 2026-06-10 audit).
+- New dependency: `jsonschema` (requirements.in/.lock). No operator step:
+  `redeploy.sh` installs hash-pinned from the lockfiles (the 2026-06-10
+  audit's missing-pip-install gap was closed since; the claim that it still
+  exists was found stale in the PR #96 review).
 - Disk: signal volume is tens of KB/day (pair book); no retention policy
   needed yet — revisit when the bus carries all six strategies (issue #90 D).
 

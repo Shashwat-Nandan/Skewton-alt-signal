@@ -16,14 +16,26 @@ Responsibilities (§4.11, §5):
   - every outgoing record passes signal_plane.validation first; an invalid
     signal never reaches the bus and never burns a sequence number
 
+Write ordering per publish (PR #96 review):
+  1. persist sequence + signal_id           (durable BEFORE the append —
+     a crash here is a sequence gap, never a duplicate)
+  2. append the record to the bus
+  3. apply + persist the group transition   (only AFTER the append — a
+     failed append must NOT close the group, or the exit retry would be
+     suppressed and the EXIT lost forever; the worst case of a crash
+     between 2 and 3 is a benign duplicate EXIT, which consumers no-op)
+
 Bus layout: logs/signal-bus/<strategy_id>/YYYY-MM-DD.jsonl, append-only,
 flock'd + fsync'd per record. This file IS the system of record until the
 Redis-Streams bus lands; the legacy logs/signals-*.jsonl mirror written by
 base._emit_signal is untouched.
 
-Concurrency: one publisher per strategy_id per host (the pair runner already
-enforces single-instance via its H9 lock). A .lock flock around the
-read-modify-write publish cycle makes cross-process races fail safe anyway.
+Concurrency: exactly ONE live publisher per strategy_id per host, enforced
+by a process-lifetime flock taken in __init__ (runner_common.acquire_lock —
+same discipline as the runners' H9 lock, which is per --system and therefore
+does NOT cover two runners sharing a strategy_id). A second publisher for
+the same strategy_id fails loud at construction instead of silently
+assigning duplicate sequence numbers from its own stale in-memory state.
 """
 from __future__ import annotations
 
@@ -35,6 +47,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from runner_common import acquire_lock, durable_write_text
 from signal_plane.contract import SignalEnvelope
 from signal_plane.validation import SignalValidationError, validate_signal
 
@@ -65,12 +78,38 @@ class SignalPublisher:
         self.state_dir = Path(state_dir)
         self._state_path = self.state_dir / f"signal_publisher_{strategy_id}.json"
         self._lock_path = self.state_dir / f".signal_publisher_{strategy_id}.lock"
+        # Process-lifetime single-instance lock (see module docstring).
+        # Held until close() or process exit; fail-loud on a second
+        # publisher for the same strategy_id.
+        self._lock_fd: Optional[int] = acquire_lock(
+            self._lock_path, logger,
+            label=f"signal publisher (strategy_id={strategy_id})",
+        )
         self._state = self._load_state()
+
+    def close(self) -> None:
+        """Release the single-instance lock. The runner never calls this
+        (process lifetime = lock lifetime); tests use it to simulate a
+        restart without spawning a process."""
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     # ── persisted publisher state ──
 
     def _load_state(self) -> Dict:
-        if self._state_path.exists() and self._state_path.stat().st_size > 0:
+        if self._state_path.exists():
+            if self._state_path.stat().st_size == 0:
+                # Rule 12: an empty state file is an anomaly (truncation,
+                # botched restore), not a fresh install — silently starting
+                # at sequence -1 would reuse sequence numbers already on
+                # the bus, the exact duplicate-sequence money bug.
+                raise RuntimeError(
+                    f"{self._state_path} exists but is empty — refusing to "
+                    f"silently reset the sequence counter. Restore the file "
+                    f"or, after auditing the bus for the true last sequence, "
+                    f"delete it to acknowledge a fresh stream."
+                )
             state = json.loads(self._state_path.read_text())
             if state.get("strategy_id") != self.strategy_id:
                 raise RuntimeError(
@@ -95,21 +134,9 @@ class SignalPublisher:
         }
 
     def _persist_state(self) -> None:
-        """Atomic + durable (same tmp→fsync→replace→dir-fsync discipline as
-        the runner's write_state_file)."""
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._state["updated_at"] = datetime.now().isoformat()
-        tmp = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self._state, indent=2))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._state_path)
-        dir_fd = os.open(self._state_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        durable_write_text(self._state_path, json.dumps(self._state, indent=2))
 
     # ── introspection (tests / ops) ──
 
@@ -132,9 +159,11 @@ class SignalPublisher:
         """Validate, order, and append one signal to the bus.
 
         Returns the wire record, or None when the signal_id was already
-        published (idempotent no-op). Raises SignalValidationError /
+        published (idempotent no-op) or the group was already closed
+        (suppressed repeat close). Raises SignalValidationError /
         SignalOrderingError without emitting anything or burning a
-        sequence number.
+        sequence number. Single-process by construction (the __init__
+        lifetime lock), so no per-call locking is needed.
         """
         if envelope.strategy_id != self.strategy_id:
             raise SignalOrderingError([
@@ -142,16 +171,6 @@ class SignalPublisher:
                 f"match publisher strategy_id={self.strategy_id!r}"
             ])
 
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._lock_path, "a") as lock_f:
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-            try:
-                return self._publish_locked(envelope, allow_unknown_group)
-            finally:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-
-    def _publish_locked(self, envelope: SignalEnvelope,
-                        allow_unknown_group: bool) -> Optional[Dict]:
         if envelope.signal_id in self._state["published_ids"]:
             logger.info(
                 "[signal-bus %s] duplicate publish of signal_id=%s — no-op",
@@ -169,16 +188,24 @@ class SignalPublisher:
         record = envelope.to_wire()
         validate_signal(record)
 
-        # Reserve sequence + idempotency id + group transition durably
-        # BEFORE the bus append (gap-not-duplicate crash semantics).
+        # Step 1: reserve sequence + idempotency id durably BEFORE the bus
+        # append (gap-not-duplicate crash semantics). The group transition
+        # deliberately does NOT happen here — see module docstring.
         self._state["last_sequence"] = envelope.sequence
         ids: List[str] = self._state["published_ids"]
         ids.append(envelope.signal_id)
         del ids[:-_PUBLISHED_ID_WINDOW]
-        self._apply_group_transition(envelope)
         self._persist_state()
 
+        # Step 2: the append. If this raises, the group state is untouched:
+        # a failed EXIT append leaves the group OPEN so the next exit
+        # decision publishes a fresh EXIT (retry works); the burned
+        # sequence shows up as a detectable gap, never a duplicate.
         self._append_to_bus(record)
+
+        # Step 3: the record is on the bus — now transition the group.
+        self._apply_group_transition(envelope)
+        self._persist_state()
         logger.info(
             "[signal-bus %s] seq=%d %s group=%s signal_id=%s",
             self.strategy_id, envelope.sequence, envelope.intent,

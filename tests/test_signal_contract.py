@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from signal_plane import contract
 from signal_plane.contract import (
     Instrument,
     Leg,
@@ -204,6 +205,56 @@ class TestSemanticRules:
                                   placement="RESTING_AT_BROKER",
                                   resting_order_type="SL_M")]
         assert check_risk_leg_refs(env.to_wire())
+
+
+class TestEnumParity:
+    """PR #96 review: the contract module's frozensets and the JSON schema
+    each carry a copy of every closed enum. Nothing at runtime cross-checks
+    them, so a MINOR bump that edits one and not the other would let a
+    consumer built on the frozensets reject schema-valid signals (or vice
+    versa). This test IS the parity check."""
+
+    @classmethod
+    def _schema(cls):
+        with open(contract.schema_path(), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_frozensets_match_schema_enums(self):
+        schema = self._schema()
+        props = schema["properties"]
+        leg = props["legs"]["items"]["properties"]
+        inst = leg["instrument"]["properties"]
+        risk = props["risk"]["items"]["properties"]
+        sizing = props["sizing"]["properties"]
+        pairs = [
+            (contract.INTENTS, props["intent"]["enum"]),
+            (contract.SIDES, leg["side"]["enum"]),
+            (contract.ORDER_TYPES, leg["order_type"]["enum"]),
+            (contract.PRODUCTS, leg["product"]["enum"]),
+            (contract.EXCHANGES, inst["exchange"]["enum"]),
+            (contract.INSTRUMENT_CLASSES, inst["instrument_class"]["enum"]),
+            # option_type is nullable on the wire; null is not a member.
+            (contract.OPTION_TYPES,
+             [v for v in inst["option_type"]["enum"] if v is not None]),
+            (contract.RISK_KINDS, risk["kind"]["enum"]),
+            (contract.RISK_SCOPES, risk["scope"]["enum"]),
+            (contract.RISK_BASES, risk["basis"]["enum"]),
+            (contract.RISK_COMPARATORS, risk["comparator"]["enum"]),
+            (contract.RISK_PLACEMENTS, risk["placement"]["enum"]),
+            (contract.RESTING_ORDER_TYPES,
+             risk["resting_order_type"]["enum"]),
+            (contract.SIZING_METHODS, sizing["method"]["enum"]),
+        ]
+        for frozen, schema_list in pairs:
+            assert frozen == frozenset(schema_list), (
+                f"contract frozenset {sorted(frozen)} != schema enum "
+                f"{sorted(schema_list)} — bump both together (§4.13)"
+            )
+
+    def test_sizing_rounding_const_matches_schema(self):
+        schema = self._schema()
+        const = schema["properties"]["sizing"]["properties"]["rounding"]["const"]
+        assert contract.SIZING_ROUNDING == const
 
 
 class TestUuid7:
