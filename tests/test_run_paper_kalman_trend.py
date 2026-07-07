@@ -66,6 +66,32 @@ def test_set_cost_overrides_restored_zero_cost():
     assert rb.kalman.realized_points == 10 - 2 * r.COST_PER_UNIT_POINTS
 
 
+def test_fit_params_charges_book_cost(monkeypatch):
+    """The warmup fit must optimize under the SAME per-side cost the book
+    charges. optimize_kalman_trend defaults cost_per_unit=0.0, and a costless
+    objective picks hyper-tight stops (deployed 6-pt stop vs 101-pt target =
+    82% of the stop lost to costs per round trip); the 2026-07-07 walk-forward
+    showed the zero-cost fit loses −769 pts/seed OOS on NIFTY where the costed
+    fit makes +702 at half the trades. If this drifts back to a costless fit,
+    the A/B tests parameters the live book can never afford."""
+    seen = {}
+
+    def fake_kal(prices, **kw):
+        seen["kal"] = kw
+        return dict(KAL)
+
+    def fake_ma(prices, **kw):
+        seen["ma"] = kw
+        return dict(MA)
+
+    monkeypatch.setattr(r.opt, "fit_kalman_reduced", fake_kal)
+    monkeypatch.setattr(r.opt, "fit_ma_crossover", fake_ma)
+    kal, ma = r.fit_params(np.linspace(100.0, 110.0, 50))
+    assert seen["kal"]["cost_per_unit"] == r.COST_PER_UNIT_POINTS
+    assert seen["ma"]["cost_per_unit"] == r.COST_PER_UNIT_POINTS
+    assert kal == KAL and ma == MA
+
+
 def test_both_books_step_on_same_bars_and_intraday_exit():
     b = r.build_books("NIFTY", KAL, MA)
     for p in 100 + 0.5 * np.arange(40):       # uptrend → both books go long

@@ -173,9 +173,19 @@ def eod_report(books: List[InstrumentBooks], today: date) -> dict:
 
 
 def fit_params(prices: np.ndarray, *, n_gen: int = 25, seed: int = 0) -> tuple[dict, dict]:
-    """Fit reduced-Kalman + MA params on a recent intraday window (warmup)."""
-    kal = opt.fit_kalman_reduced(prices, tick_size=1.0, n_gen=n_gen, seed=seed)
-    ma = opt.fit_ma_crossover(prices, tick_size=1.0, n_gen=n_gen, seed=seed)
+    """Fit reduced-Kalman + MA params on a recent intraday window (warmup).
+
+    The fit MUST charge the same per-side cost the book charges
+    (COST_PER_UNIT_POINTS): at optimize's cost_per_unit=0.0 default, CMA-ES
+    prefers hyper-tight stops whose churn the live book then pays for
+    (2026-07-07 walk-forward: zero-cost fit −769 pts/seed OOS on NIFTY vs
+    +702 costed, at half the trade count)."""
+    kal = opt.fit_kalman_reduced(prices, tick_size=1.0,
+                                 cost_per_unit=COST_PER_UNIT_POINTS,
+                                 n_gen=n_gen, seed=seed)
+    ma = opt.fit_ma_crossover(prices, tick_size=1.0,
+                              cost_per_unit=COST_PER_UNIT_POINTS,
+                              n_gen=n_gen, seed=seed)
     return kal, ma
 
 
