@@ -42,6 +42,18 @@ DATA_CACHE = HERE / "data_cache"
 HALT_ALL_PATH = DATA_CACHE / "HALT_ALL"
 HALT_NEW_ENTRIES_PATH = DATA_CACHE / "HALT_NEW_ENTRIES"
 
+
+def taleb_state_suffix(underlying: str) -> str:
+    """Underlying suffix for a Taleb instance's per-underlying files (state,
+    lock, log, IV history). NIFTY keeps the LEGACY unsuffixed names (the
+    original single-instance runner); every other underlying is suffixed.
+
+    Single source of truth so the runner (run_paper.derive_paths) and any
+    reader of those files (the dashboard positions router) can't drift — a
+    mismatch would make a live instance silently invisible, the exact bug
+    issue #87 fixed."""
+    return "" if underlying == "NIFTY" else f"_{underlying}"
+
 # Session-time boundaries (IST wall-clock; systemd sets TZ=Asia/Kolkata).
 MARKET_OPEN = (9, 15)
 # Wall-clock when the tick loop ends and state is persisted. Open

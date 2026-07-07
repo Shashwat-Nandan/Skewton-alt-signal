@@ -107,7 +107,8 @@ def resolve_underlying(config_path: str) -> str:
 
 
 def derive_paths(underlying: str) -> RunnerPaths:
-    sfx = "" if underlying == "NIFTY" else f"_{underlying}"
+    from runner_common import taleb_state_suffix
+    sfx = taleb_state_suffix(underlying)
     return RunnerPaths(
         state_file=DATA_CACHE / f"taleb_paper_state{sfx}.json",
         lock_file=DATA_CACHE / f".taleb_paper{sfx}.lock",

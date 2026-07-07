@@ -148,33 +148,49 @@ _STRUCTURE_LABELS = {
 }
 
 
-def _taleb_group(types) -> str:
+def _taleb_group(types, underlying: str = "NIFTY") -> str:
     """Group label for a Taleb position/trade from its structure value(s).
 
     `types` is the runner's active_structure_types (a list) or the
     comma-joined `structure` string recorded on a closed trade. Falls back to
-    "NIFTY options" when the structure is unknown (e.g. trades closed before
-    the structure was recorded)."""
+    "<underlying> options" when the structure is unknown (e.g. trades closed
+    before the structure was recorded)."""
     if isinstance(types, str):
         types = [t.strip() for t in types.split(",") if t.strip()]
     names = [_STRUCTURE_LABELS.get(t, t.replace("_", " ")) for t in (types or [])]
     names = list(dict.fromkeys(names))  # dedupe, preserve order
-    return "NIFTY " + " + ".join(names) if names else "NIFTY options"
+    return f"{underlying} " + " + ".join(names) if names else f"{underlying} options"
 
 
-def _build_taleb_block(today: date) -> SystemBlock:
-    path = DATA_CACHE / "taleb_paper_state.json"
+def _taleb_state_path(underlying: str) -> Path:
+    """The Taleb instance's state file, via the SAME suffix rule the runner
+    writes with (runner_common.taleb_state_suffix, shared with
+    run_paper.derive_paths). One rule, so the reader can't drift from the
+    writer — a mismatch would render a live instance permanently unavailable
+    (the bug issue #87 fixed)."""
+    from runner_common import taleb_state_suffix
+    return DATA_CACHE / f"taleb_paper_state{taleb_state_suffix(underlying)}.json"
+
+
+def _build_taleb_block(today: date, underlying: str = "NIFTY") -> SystemBlock:
+    # NIFTY keeps its legacy unsuffixed system key/label; others are suffixed.
+    path = _taleb_state_path(underlying)
+    if underlying == "NIFTY":
+        name, label = "taleb", "Taleb hedger"
+    else:
+        name = f"taleb_{underlying.lower()}"
+        label = f"Taleb hedger — {underlying}"
     payload = _load_state(path)
     if not payload:
         return SystemBlock(
-            name="taleb", label="Taleb hedger", mode=_state_mode(payload),
+            name=name, label=label, mode=_state_mode(payload),
             state_file=path.name, available=False,
             summary=_empty_summary(), open_positions=[], closed_today=[],
         )
 
     state = payload.get("state", {}) or {}
     entry_time = state.get("entry_time")
-    open_group = _taleb_group(state.get("active_structure_types"))
+    open_group = _taleb_group(state.get("active_structure_types"), underlying)
 
     open_positions: List[OpenPosition] = []
     for p in state.get("positions", []) or []:
@@ -220,7 +236,7 @@ def _build_taleb_block(today: date) -> SystemBlock:
         net = float(t.get("gross_pnl", 0.0))
         costs = float(t.get("costs", 0.0))
         closed_today.append(ClosedTrade(
-            group=_taleb_group(t.get("structure")),
+            group=_taleb_group(t.get("structure"), underlying),
             entry_time=t.get("entry_time"),
             exit_time=t.get("exit_time"),
             realized_pnl=net,
@@ -233,7 +249,7 @@ def _build_taleb_block(today: date) -> SystemBlock:
     unrealized = float(state.get("unrealized_pnl", 0.0))
     costs = float(state.get("total_transaction_costs", 0.0))
     return SystemBlock(
-        name="taleb", label="Taleb hedger", mode=_state_mode(payload),
+        name=name, label=label, mode=_state_mode(payload),
         state_file=path.name, updated_at=payload.get("saved_at"), available=True,
         summary=SystemSummary(
             realized_pnl=realized,
@@ -339,6 +355,10 @@ def list_positions() -> PositionsResponse:
     today = date.today()
     systems = [
         _build_taleb_block(today),
+        # 2nd isolated Taleb instance (#62/PR #86); dashboard visibility is
+        # the #87 gate-evaluation prerequisite. Renders available=False until
+        # the instance's first session writes its suffixed state file.
+        _build_taleb_block(today, underlying="BANKNIFTY"),
         _build_pair_block("pair_baseline", "Pair trading — baseline",
                           "pair_paper_state_baseline.json", today),
         _build_pair_block("pair_persistent", "Pair trading — persistent",

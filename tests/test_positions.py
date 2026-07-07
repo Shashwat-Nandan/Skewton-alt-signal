@@ -144,3 +144,52 @@ class TestKalmanBlock:
         monkeypatch.setattr(positions, "DATA_CACHE", tmp_path)  # no kalman file written
         block = next(b for b in positions.list_positions().systems if b.name == "kalman")
         assert block.available is False and block.open_positions == []
+
+
+class TestBankniftyTalebVisibility:
+    """Issue #87: the BANKNIFTY instance (#62/PR #86) had NO dashboard
+    visibility — positions read only the legacy NIFTY state file. WHY these
+    matter: #87's gate ('paper shows tradeable behaviour before the loop is
+    built') can only be judged from the dashboard; an invisible book means
+    the gate gets decided on vibes. The filename contract mirrors
+    run_paper.derive_paths: NIFTY legacy-unsuffixed, others suffixed."""
+
+    def test_banknifty_block_reads_suffixed_state_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(positions, "DATA_CACHE", tmp_path)
+        (tmp_path / "taleb_paper_state_BANKNIFTY.json").write_text(json.dumps({
+            "saved_at": "2026-07-07T15:25:00",
+            "state": {"positions": [], "closed_trades": [],
+                      "realized_pnl": -1234.0, "unrealized_pnl": 10.0,
+                      "total_transaction_costs": 55.0,
+                      "active_structure_types": ["straddle"]},
+        }))
+        block = positions._build_taleb_block(date(2026, 7, 7),
+                                             underlying="BANKNIFTY")
+        assert block.available
+        assert block.name == "taleb_banknifty"          # distinct system key
+        assert block.state_file == "taleb_paper_state_BANKNIFTY.json"
+        assert block.summary.realized_pnl == -1234.0
+
+    def test_banknifty_absent_state_is_unavailable_not_nifty_fallback(
+            self, tmp_path, monkeypatch):
+        # Only the NIFTY file exists: the BANKNIFTY block must report
+        # available=False, NEVER silently render NIFTY's book under the
+        # BANKNIFTY label (the orphaned-state hazard from the #62 review).
+        monkeypatch.setattr(positions, "DATA_CACHE", tmp_path)
+        (tmp_path / "taleb_paper_state.json").write_text(json.dumps({
+            "state": {"realized_pnl": 999.0}}))
+        block = positions._build_taleb_block(date(2026, 7, 7),
+                                             underlying="BANKNIFTY")
+        assert not block.available
+        assert block.summary.realized_pnl == 0.0
+
+    def test_groups_are_labelled_with_the_underlying(self):
+        assert positions._taleb_group(["straddle"], "BANKNIFTY").startswith("BANKNIFTY")
+        assert positions._taleb_group(None, "BANKNIFTY") == "BANKNIFTY options"
+        # NIFTY default unchanged (legacy callers pass no underlying).
+        assert positions._taleb_group(None) == "NIFTY options"
+
+    def test_list_positions_contains_both_taleb_instances(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(positions, "DATA_CACHE", tmp_path)
+        names = [s.name for s in positions.list_positions().systems]
+        assert "taleb" in names and "taleb_banknifty" in names

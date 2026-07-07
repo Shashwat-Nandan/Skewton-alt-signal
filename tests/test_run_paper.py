@@ -74,6 +74,23 @@ def test_banknifty_paths_are_isolated_from_nifty():
                 & {n.state_file, n.lock_file, n.silent_fail_flag})
 
 
+def test_runner_and_dashboard_share_one_suffix_rule():
+    """PR #94 review: the runner (derive_paths) and the dashboard reader
+    (positions router) must NOT keep independent copies of the state-filename
+    suffix rule — drift there makes a live instance silently invisible, the
+    bug #87 fixed. Both go through runner_common.taleb_state_suffix; pin that
+    the reader reconstructs exactly what the writer produces."""
+    from backend.routers import positions
+    from runner_common import taleb_state_suffix
+
+    assert taleb_state_suffix("NIFTY") == ""            # legacy unsuffixed
+    assert taleb_state_suffix("BANKNIFTY") == "_BANKNIFTY"
+    for u in ("NIFTY", "BANKNIFTY"):
+        written = run_paper.derive_paths(u).state_file.name
+        read = positions._taleb_state_path(u).name
+        assert written == read == f"taleb_paper_state{taleb_state_suffix(u)}.json"
+
+
 def test_state_persist_and_load_use_the_passed_path(tmp_path):
     """write/load are threaded a state_file (not a global), so each underlying's
     state round-trips through its OWN file. Guards the isolation at the I/O seam:
