@@ -46,6 +46,17 @@ MAX_LESSONS = 8                            # newest-first slice surfaced to the 
 
 # ───────────────────────── response shape ─────────────────────────
 
+class SessionTrade(BaseModel):
+    """One closed fill from the latest session (from the EOD sidecar's
+    per-book `session_trades`). Prices are index points; pnl is net of costs."""
+    side: int                              # +1 long / -1 short
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    pnl_points: float = 0.0
+    pnl_rupees: float = 0.0
+    reason: str = ""                       # "target" | "stop" | "force_close"
+
+
 class TrendBook(BaseModel):
     """One book (Kalman OR MA) of the A/B for a single instrument."""
     signal_kind: str
@@ -55,6 +66,11 @@ class TrendBook(BaseModel):
     # long). NOT from the EOD sidecar — that force-closes at 15:25 so its open_pos
     # is always 0; the live state shows real intraday exposure during the session.
     open_pos: int = 0
+    # THIS session's fills + net ₹ from the sidecar (the realized_rupees above is
+    # cumulative across the run). Absent on sidecars written before this shipped →
+    # empty list / 0.0, so old sessions cleanly show aggregate-only.
+    session_realized_rupees: float = 0.0
+    session_trades: List[SessionTrade] = []
 
 
 class TrendInstrument(BaseModel):
@@ -117,6 +133,27 @@ def _live_positions(data_cache: Path) -> dict:
     return out
 
 
+def _session_trades(blob: dict) -> List[SessionTrade]:
+    """Parse the sidecar's per-book `session_trades`, skipping any malformed row
+    rather than dropping the whole book (old sidecars lack the key → [])."""
+    out: List[SessionTrade] = []
+    for t in blob.get("session_trades") or []:
+        if not isinstance(t, dict) or t.get("side") is None:
+            continue
+        try:
+            out.append(SessionTrade(
+                side=int(t["side"]),
+                entry_price=float(t.get("entry_price") or 0.0),
+                exit_price=float(t.get("exit_price") or 0.0),
+                pnl_points=float(t.get("pnl_points") or 0.0),
+                pnl_rupees=float(t.get("pnl_rupees") or 0.0),
+                reason=str(t.get("reason", "")),
+            ))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _book(blob: Optional[dict], default_kind: str, *, open_pos: int = 0) -> TrendBook:
     blob = blob or {}
     return TrendBook(
@@ -126,6 +163,8 @@ def _book(blob: Optional[dict], default_kind: str, *, open_pos: int = 0) -> Tren
         realized_rupees=float(blob.get("realized_rupees") or 0.0),
         n_trades=int(blob.get("n_trades") or 0),
         open_pos=open_pos,
+        session_realized_rupees=float(blob.get("session_realized_rupees") or 0.0),
+        session_trades=_session_trades(blob),
     )
 
 

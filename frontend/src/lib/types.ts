@@ -338,12 +338,26 @@ export type KalmanPairsResponse = {
 
 // ── Kalman trend (loop-engineering pilot: Kalman-vs-MA A/B + loop memory) ──
 
+/** One closed fill from the latest session (EOD sidecar). pnl is net of costs. */
+export type SessionTrade = {
+  side: number; // +1 long / -1 short
+  entry_price: number;
+  exit_price: number;
+  pnl_points: number;
+  pnl_rupees: number;
+  reason: string; // "target" | "stop" | "force_close"
+};
+
 export type TrendBook = {
   signal_kind: string; // "kalman" | "ma"
   realized_rupees: number;
   n_trades: number;
   /** Current live position (-1 short / 0 flat / +1 long), from the runner state file. */
   open_pos: number;
+  /** THIS session's net ₹ (realized_rupees above is cumulative across the run). */
+  session_realized_rupees: number;
+  /** THIS session's fills; empty for sessions recorded before this shipped. */
+  session_trades: SessionTrade[];
 };
 
 export type TrendInstrument = {

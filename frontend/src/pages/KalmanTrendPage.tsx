@@ -17,9 +17,59 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
-import { cn, formatINR } from "@/lib/utils";
+import { cn, formatINR, formatNum } from "@/lib/utils";
+import type { SessionTrade, TrendBook, TrendInstrument } from "@/lib/types";
 
 const POLL_MS = 60_000;
+
+/** One book's fills for the latest session, with the session net in the header. */
+function SessionBook({ label, book }: { label: string; book: TrendBook }) {
+  const trades = book.session_trades ?? [];
+  return (
+    <div>
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
+        <span className="text-sm font-medium">
+          {label}{" "}
+          <span className="text-xs font-normal text-muted-foreground">
+            ({trades.length} {trades.length === 1 ? "trade" : "trades"})
+          </span>
+        </span>
+        <span className="text-xs text-muted-foreground">
+          net{" "}
+          <span className={cn("font-medium", pnlClass(book.session_realized_rupees))}>
+            {formatINR(book.session_realized_rupees)}
+          </span>
+        </span>
+      </div>
+      {trades.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No trades this session.</p>
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Side</TableHead>
+              <TableHead className="text-right">Entry</TableHead>
+              <TableHead className="text-right">Exit</TableHead>
+              <TableHead className="text-right">P&amp;L</TableHead>
+              <TableHead>Reason</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {trades.map((t: SessionTrade, idx: number) => (
+              <TableRow key={idx}>
+                <TableCell><PosBadge pos={t.side} /></TableCell>
+                <TableCell className="text-right tabular-nums text-muted-foreground">{formatNum(t.entry_price)}</TableCell>
+                <TableCell className="text-right tabular-nums text-muted-foreground">{formatNum(t.exit_price)}</TableCell>
+                <TableCell className={cn("text-right", pnlClass(t.pnl_rupees))}>{formatINR(t.pnl_rupees)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{t.reason}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </div>
+  );
+}
 
 function pnlClass(v: number | null | undefined): string {
   return cn(
@@ -200,6 +250,42 @@ export function KalmanTrendPage() {
                   ))}
                 </TableBody>
               </Table>
+            </CardContent>
+          </Card>
+
+          {/* Per-day trade detail — this session's fills + net ₹ per book. The
+              aggregate cards above are cumulative; this isolates the latest day.
+              Sessions recorded before this shipped have no per-trade detail. */}
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">
+                Session trades{" "}
+                <span className="text-xs font-normal text-muted-foreground">
+                  (latest session{data?.latest_date ? ` ${data.latest_date}` : ""}; net of costs)
+                </span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              {instruments.every(
+                (i: TrendInstrument) =>
+                  (i.kalman.session_trades?.length ?? 0) === 0 &&
+                  (i.ma.session_trades?.length ?? 0) === 0,
+              ) ? (
+                <p className="text-sm text-muted-foreground">
+                  No per-trade detail for this session. Sessions recorded before this view shipped
+                  show aggregate totals only; per-trade detail appears from the next session onward.
+                </p>
+              ) : (
+                instruments.map((i: TrendInstrument) => (
+                  <div key={i.symbol} className="space-y-3">
+                    <div className="text-sm font-semibold">{i.symbol}</div>
+                    <div className="grid gap-4 lg:grid-cols-2">
+                      <SessionBook label="Kalman" book={i.kalman} />
+                      <SessionBook label="MA" book={i.ma} />
+                    </div>
+                  </div>
+                ))
+              )}
             </CardContent>
           </Card>
         </>

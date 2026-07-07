@@ -193,6 +193,48 @@ def test_on_session_start_noop_for_ma():
     s.on_session_start()                       # must not raise (no filter)
 
 
+def test_session_trades_isolate_the_current_session_across_restore():
+    """The per-day dashboard view must show only TODAY's fills. The book carries
+    prior sessions' trades across the daily restore, so session_trades() must
+    exclude them: two trades 'yesterday', restore + on_session_start (the day
+    boundary), then one trade 'today' → session has just the one, cumulative
+    still counts all three, and session ₹ excludes yesterday's."""
+    s = _kal(lot_size=75)
+    for entry, exit_ in [(100.0, 110.0), (110.0, 105.0)]:   # two fills yesterday
+        s.pos, s.entry_price = 1, entry
+        s.force_close(exit_)
+    assert len(s.trades) == 2
+
+    r = IntradayTrendStrategy.restore(s.serialize())         # carry to next day
+    r.on_session_start()                                     # marks the boundary
+    assert r.session_trades() == []                          # nothing today yet
+
+    r.pos, r.entry_price = -1, 120.0
+    r.force_close(118.0)                                     # today's only fill: +2 pts
+    sess = r.session_trades()
+    assert len(sess) == 1 and sess[0].side == -1
+
+    summ = r.book_summary()
+    assert summ["session_n_trades"] == 1
+    assert summ["n_trades"] == 3                             # cumulative unchanged
+    assert summ["session_realized_rupees"] == round(sess[0].pnl_points * 75, 2)
+    assert summ["session_realized_rupees"] == round(2.0 * 75, 2)   # only today's
+    assert [t["side"] for t in summ["session_trades"]] == [-1]
+    assert summ["session_trades"][0]["pnl_rupees"] == round(2.0 * 75, 2)
+
+
+def test_fresh_book_treats_all_trades_as_this_session():
+    """A fresh warmup book (no prior state; on_session_start never called) has
+    _session_start_n=0, so every trade is this session's — session equals
+    cumulative on day one."""
+    s = _kal(lot_size=15)
+    s.pos, s.entry_price = 1, 100.0
+    s.force_close(105.0)                                     # +5 pts gross
+    summ = s.book_summary()
+    assert summ["session_n_trades"] == summ["n_trades"] == 1
+    assert summ["session_realized_rupees"] == round(5.0 * 15, 2)
+
+
 def test_ma_serialize_restore_identity():
     s = IntradayTrendStrategy(signal_kind="ma", short=3, long=8, offset=0.0,
                               stop_ticks=20, target_ticks=40)

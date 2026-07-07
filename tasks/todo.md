@@ -1869,3 +1869,40 @@ runner setting). OOS always charged 2.5/side. Results in scratchpad
   fit_params). It is NOT promotion evidence: verdicts flip in opposite
   directions across symbols on 3 seeds - the same instability behind the
   original NO-GO. Let the honest A/B run out its Aug-1 runway.
+
+## 2026-07-07 — Per-day trade detail on the kalman_trend dashboard
+
+Goal: for the latest session, show each entered trade (side, entry, exit,
+₹ P&L, exit reason) and the session's net ₹ — the aggregate view already
+shows cumulative totals. Scope = forward-only (robust): the EOD sidecar
+embeds THIS session's trades; existing sidecars keep aggregate-only.
+
+- [x] strategies/kalman_trend_following.py: track session boundary
+      (_session_start_n; set in on_session_start; fresh books default 0),
+      add session_trades()/session summary fields to book_summary()
+- [x] run_paper_kalman_trend.py: no new call site (on_session_start already
+      called for restored books; fresh books start at 0) — verify EOD sidecar
+      carries the new fields
+- [x] backend/routers/kalman_trend.py: SessionTrade model + session_trades /
+      session_realized_rupees on TrendBook; old sidecars → empty/0 (fail-safe)
+- [x] frontend: types.ts + KalmanTrendPage.tsx per-day trades card
+- [x] tests: strategy (session slice across restore), runner (sidecar carries
+      trades), backend (exposes trades; old sidecar empty), tsc/build
+
+### Review
+- strategies/kalman_trend_following.py: _session_start_n (0 default; set in
+  on_session_start), session_trades(), and session_n_trades /
+  session_realized_rupees / session_trades[] added to book_summary(). Not
+  serialized (session-transient, re-marked each day).
+- backend/routers/kalman_trend.py: SessionTrade model + session_realized_rupees
+  / session_trades on TrendBook, parsed fail-safe (bad row skipped, missing key
+  → []). Old sidecars → aggregate-only.
+- frontend: SessionTrade type; "Session trades" card (per instrument, Kalman +
+  MA sub-tables with side/entry/exit/₹/reason + session net); pre-ship sessions
+  show an explanatory note, not a blank card.
+- Tests: 4 new (strategy session-slice-across-restore + fresh-book; runner
+  sidecar carries trades; backend pass-through + old-sidecar-empty). 199 pass.
+  tsc + build clean. End-to-end writer→reader integration check confirms
+  yesterday's carried fill is excluded from the session view.
+- NOT verified live in the browser (would need the backend restarted with a
+  populated sidecar); contract covered by tests + build. Forward-only by design.

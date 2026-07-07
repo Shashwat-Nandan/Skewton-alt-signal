@@ -93,6 +93,12 @@ class IntradayTrendStrategy:
             raise ValueError(f"unknown signal_kind {self.signal_kind!r}")
         if not (self.stop_ticks > 0 and self.target_ticks > 0):
             raise ValueError("stop_ticks and target_ticks must be > 0")
+        # Index into `trades` where the current session began, so the EOD sidecar
+        # can report just THIS session's fills (the book carries prior sessions'
+        # trades across the daily restore). Fresh books start at 0 (all trades are
+        # this session's); restored books get it set by on_session_start(). Not
+        # serialized — it's session-transient, re-marked at each session start.
+        self._session_start_n = 0
 
     # ── exits (callable between signal bars for intraday fills) ────────
     def check_exit(self, price: float) -> Optional[TradeRecord]:
@@ -136,6 +142,9 @@ class IntradayTrendStrategy:
         engine, whose window self-gates.)"""
         if self._filter is not None:
             self._filter.inflate_uncertainty()
+        # Mark where this session begins in the (carried-over) trades list so the
+        # EOD sidecar reports only today's fills.
+        self._session_start_n = len(self.trades)
 
     # ── signal + entry, once per completed signal bar ─────────────────
     def on_bar(self, price: float, *, allow_entry: bool = True) -> dict:
@@ -191,8 +200,26 @@ class IntradayTrendStrategy:
     def realized_rupees(self) -> float:
         return self.realized_points * self.lot_size
 
+    def session_trades(self) -> list:
+        """Trades closed during the CURRENT session only (the book carries prior
+        sessions' trades across the daily restore; on_session_start() marks the
+        boundary). Fresh books return all their trades."""
+        return self.trades[self._session_start_n:]
+
+    def _session_trade_dicts(self) -> list:
+        """Per-trade rows for the EOD sidecar / dashboard: raw fills plus ₹ P&L."""
+        return [{
+            "side": t.side,
+            "entry_price": round(t.entry_price, 2),
+            "exit_price": round(t.exit_price, 2),
+            "pnl_points": round(t.pnl_points, 2),
+            "pnl_rupees": round(t.pnl_points * self.lot_size, 2),
+            "reason": t.reason,
+        } for t in self.session_trades()]
+
     def book_summary(self) -> dict:
         wins = sum(1 for t in self.trades if t.pnl_points > 0)
+        sess = self.session_trades()
         return {
             "signal_kind": self.signal_kind,
             "n_trades": len(self.trades),
@@ -201,6 +228,12 @@ class IntradayTrendStrategy:
             "win_rate": round(wins / len(self.trades), 3) if self.trades else None,
             "open_pos": self.pos,
             "n_bars": self.n_bars,
+            # THIS session's fills + net ₹ (the aggregate fields above are
+            # cumulative across the run; these isolate the latest day for clarity).
+            "session_n_trades": len(sess),
+            "session_realized_rupees": round(
+                sum(t.pnl_points for t in sess) * self.lot_size, 2),
+            "session_trades": self._session_trade_dicts(),
         }
 
     # ── state persistence (runner restart) ────────────────────────────

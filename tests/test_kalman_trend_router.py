@@ -119,6 +119,45 @@ class TestKalmanTrend:
         assert nifty["kalman"]["open_pos"] == 1
         assert nifty["ma"]["open_pos"] == -1
 
+    def test_session_trades_surface_from_the_sidecar(self, client):
+        """Per-day view: each book's session_trades + session net ₹ from the EOD
+        sidecar pass through, so the dashboard can list today's fills alongside the
+        cumulative aggregate."""
+        cache: Path = client._cache
+        kal = _book("kalman", realized_rupees=900.0, n_trades=4)
+        kal["session_realized_rupees"] = 7152.0
+        kal["session_trades"] = [
+            {"side": -1, "entry_price": 24132.0, "exit_price": 24030.56,
+             "pnl_points": 101.44, "pnl_rupees": 7608.0, "reason": "target"},
+            {"side": 1, "entry_price": 23891.0, "exit_price": 23884.92,
+             "pnl_points": -6.08, "pnl_rupees": -456.0, "reason": "stop"},
+        ]
+        _write_eod(cache, date(2026, 6, 26), [
+            {"symbol": "NIFTY", "kalman": kal, "ma": _book("ma")}])
+
+        nifty = next(i for i in client.get(f"/api/kalman-trend?end={END}").json()["instruments"]
+                     if i["symbol"] == "NIFTY")
+        assert nifty["kalman"]["session_realized_rupees"] == 7152.0
+        trades = nifty["kalman"]["session_trades"]
+        assert len(trades) == 2
+        assert trades[0]["reason"] == "target" and trades[0]["pnl_rupees"] == 7608.0
+        assert trades[1]["side"] == 1 and trades[1]["pnl_rupees"] == -456.0
+        assert nifty["ma"]["session_trades"] == []          # MA book had no fills
+
+    def test_old_sidecar_without_session_fields_defaults_empty(self, client):
+        """Sessions recorded before this shipped lack session_trades; the tab must
+        show them aggregate-only (empty list / 0.0), never 500."""
+        cache: Path = client._cache
+        _write_eod(cache, date(2026, 6, 26), [
+            {"symbol": "NIFTY",
+             "kalman": _book("kalman", realized_rupees=900.0, n_trades=4),
+             "ma": _book("ma")}])
+        nifty = next(i for i in client.get(f"/api/kalman-trend?end={END}").json()["instruments"]
+                     if i["symbol"] == "NIFTY")
+        assert nifty["kalman"]["session_trades"] == []
+        assert nifty["kalman"]["session_realized_rupees"] == 0.0
+        assert nifty["kalman"]["realized_rupees"] == 900.0  # aggregate still shows
+
     def test_null_fields_do_not_500(self, client):
         """#3: a sidecar with explicit JSON null instruments/totals must not crash."""
         cache: Path = client._cache

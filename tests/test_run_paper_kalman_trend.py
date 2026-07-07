@@ -128,6 +128,25 @@ def test_eod_report_totals_and_delta():
     assert rep["instruments"][0]["symbol"] == "NIFTY"
 
 
+def test_eod_report_carries_session_trades():
+    """The dashboard's per-day view reads each book's THIS-session fills from the
+    EOD sidecar, so eod_report must embed them. A fresh book's session == all its
+    trades; a book with no fills carries an empty list (not a missing key)."""
+    b = r.build_books("NIFTY", KAL, MA)
+    b.kalman.pos, b.kalman.entry_price = 1, 100.0
+    b.kalman.force_close(110.0)               # +10 gross, minus round-trip cost
+    rep = r.eod_report([b], date(2026, 6, 27))
+    kb = rep["instruments"][0]["kalman"]
+    rt = 2 * r.COST_PER_UNIT_POINTS
+    assert kb["session_n_trades"] == 1
+    assert len(kb["session_trades"]) == 1
+    t = kb["session_trades"][0]
+    assert t["side"] == 1 and t["reason"] == "force_close"
+    assert kb["session_realized_rupees"] == round((10 - rt) * 75, 2)
+    assert t["pnl_rupees"] == round((10 - rt) * 75, 2)
+    assert rep["instruments"][0]["ma"]["session_trades"] == []   # MA had no fills
+
+
 def test_restored_book_can_inflate_for_overnight_gap():
     """The runner calls on_session_start() after restore() so a book resumed the
     next morning absorbs the overnight gap. Verify the restored Kalman filter's
