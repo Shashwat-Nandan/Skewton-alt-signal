@@ -334,6 +334,7 @@ def build_strategies(
     book_notional_fn=None,
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
+    signal_publisher=None,
 ):
     from strategies.pair_trading import PairTradingStrategy
 
@@ -352,9 +353,11 @@ def build_strategies(
                 kite_refresh=kite_refresh,
                 book_notional_fn=book_notional_fn,
                 spread_panel=spread_panel,
+                signal_publisher=signal_publisher,
             )
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
+            s.signal_system_tag = args.system
         except Exception as e:
             log.exception("Could not init %s/%s: %s — skipping", a, b, e)
             continue
@@ -727,6 +730,7 @@ def build_orphan_strategies(
     book_notional_fn=None,
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
+    signal_publisher=None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -755,9 +759,11 @@ def build_orphan_strategies(
                 kite_refresh=kite_refresh,
                 book_notional_fn=book_notional_fn,
                 spread_panel=spread_panel,
+                signal_publisher=signal_publisher,
             )
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
+            s.signal_system_tag = args.system
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z
@@ -1053,6 +1059,14 @@ def main():
                              "--i-understand-this-is-real-money AND "
                              "--max-daily-loss-inr > 0. signals: emit "
                              "JSONL signals only, no fills.")
+    parser.add_argument("--publish-signals", action="store_true",
+                        dest="publish_signals",
+                        help="Issue #90 signal plane: publish every "
+                             "book-mutating decision (entries, all exit "
+                             "reasons, failed-entry cancels) as §4 contract "
+                             "signals to the file-backed bus "
+                             "(logs/signal-bus/pair_trading/). Opt-in; "
+                             "off = behaviour unchanged.")
     parser.add_argument("--i-understand-this-is-real-money",
                         dest="i_understand", action="store_true",
                         help="Required confirmation flag for --mode live. "
@@ -1267,6 +1281,26 @@ def main():
         )
         spread_panel = None
 
+    # Issue #90: one shared publisher per runner — sequence numbering is
+    # per strategy_id, and every pair instance publishes onto the same
+    # ordered stream. Fail-loud at startup (a broken publisher state file
+    # should stop the session before the market opens, not mid-tick).
+    signal_publisher = None
+    if args.publish_signals:
+        from signal_plane import SignalPublisher
+        from signal_plane.pair_trading_signals import STRATEGY_ID
+        signal_publisher = SignalPublisher(
+            strategy_id=STRATEGY_ID,
+            bus_dir=LOG_DIR / "signal-bus",
+            state_dir=DATA_CACHE,
+        )
+        log.info(
+            "Signal publishing armed: strategy_id=%s bus=%s last_sequence=%d "
+            "open_groups=%d",
+            STRATEGY_ID, signal_publisher.bus_file(),
+            signal_publisher.last_sequence, len(signal_publisher.open_groups),
+        )
+
     strategies = build_strategies(
         pairs, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
@@ -1274,6 +1308,7 @@ def main():
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,
+        signal_publisher=signal_publisher,
     )
 
     # Restore prior-session state (no-op if no state file exists yet).
@@ -1285,6 +1320,7 @@ def main():
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,
+        signal_publisher=signal_publisher,
     )
     strategies = strategies + orphans
 

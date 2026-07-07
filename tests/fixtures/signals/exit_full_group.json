@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "signal_id": "018f9d40-9999-7c10-b200-ee11ff22aa33",
+  "position_group_id": "018f9c0a-7b3e-7e21-9a2f-2b6c4d1e5f00",
+  "strategy_id": "taleb_karpathy",
+  "sequence": 4480,
+  "intent": "EXIT",
+  "created_at": "2026-06-20T14:55:00+05:30",
+  "valid_until": "2026-06-20T15:20:00+05:30",
+  "underlying": "NIFTY",
+  "fraction": 1.0,
+  "reference": {
+    "spot": 24010.0,
+    "captured_at": "2026-06-20T14:55:00+05:30"
+  },
+  "rationale": "safety trigger — close all"
+}

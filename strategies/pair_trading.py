@@ -179,6 +179,12 @@ class PairState:
     # rows (delta = current - baseline) instead of running totals.
     realized_at_entry: float = 0.0
     tx_costs_at_entry: float = 0.0
+    # Issue #90: correlation id linking this open position to its published
+    # ENTRY signal (§4.11). Set when the signal publisher accepts the entry,
+    # cleared when the book flattens. None when no publisher is wired or the
+    # position pre-dates signal history (bootstrap — exits then publish with
+    # the unmatched-entry escape).
+    position_group_id: Optional[str] = None
 
 
 class PairTradingStrategy(BaseStrategy):
@@ -197,8 +203,18 @@ class PairTradingStrategy(BaseStrategy):
         kite_refresh: Optional[Callable[[], object]] = None,
         book_notional_fn: Optional[Callable[[], float]] = None,
         spread_panel: Optional[pd.DataFrame] = None,
+        signal_publisher=None,
     ):
         super().__init__(kite, config_path=config_path, mode=mode)
+
+        # Issue #90: optional signal_plane.SignalPublisher. When wired (the
+        # persistent runner's --publish-signals), every book-mutating
+        # decision — entry, every exit reason, failed-entry cancel — is
+        # published as a §4 contract signal before/around execution.
+        # None (default) = behaviour unchanged.
+        self._signal_publisher = signal_publisher
+        # Runner-owned provenance for the signal tags (e.g. "persistent").
+        self.signal_system_tag: Optional[str] = None
 
         cfg = (
             dict(self.config["pair_trading"])
@@ -330,6 +346,10 @@ class PairTradingStrategy(BaseStrategy):
         # into execute_proposals (which promotes it onto state once the book is
         # actually flat). Not persisted — only state.last_exit_* survives.
         self._pending_exit_reason: Optional[str] = None
+        # Issue #90: transient stash for the entry z-score carried from
+        # _build_entry_proposals into execute_proposals' signal-publish hook
+        # (same pattern as _pending_exit_reason).
+        self._pending_entry_z: Optional[float] = None
         # H19: session-wide NFO instruments dump (~150k rows, ~5MB). The
         # runner fetches it once at startup and injects it here so 12 pairs
         # × 360 ticks/day on expiry day don't each re-fetch. None = no cache
@@ -499,6 +519,21 @@ class PairTradingStrategy(BaseStrategy):
         is_entry_batch = (self.state.position == "FLAT")
         filled_entry_props: List[Tuple[TradeProposal, Dict]] = []
 
+        # Issue #90: publish the decision as a §4 signal BEFORE executing on
+        # the master book — subscribers must never trail the master's own
+        # fills (§7.2), and an exit signal must go out even if the master's
+        # own exit orders then fail. Publish failures are logged CRITICAL
+        # but never block the trading loop: managing the live book beats
+        # telling subscribers about it.
+        # getattr: backtest_pairs.py and the test fixtures build instances
+        # via __new__ (no __init__), so the attribute may not exist there.
+        published_entry = None
+        if getattr(self, "_signal_publisher", None) is not None and proposals:
+            if is_entry_batch:
+                published_entry = self._publish_entry_signal(proposals)
+            else:
+                self._publish_exit_signal(proposals)
+
         # H15: kite.margins() pre-check on live entry batches. If the
         # broker reports insufficient available balance, refuse the batch
         # entirely — without this, leg B rejects on margin AFTER leg A has
@@ -563,6 +598,19 @@ class PairTradingStrategy(BaseStrategy):
         if is_entry_batch and self.state.legs:
             self._set_position_from_legs()
 
+        # Issue #90: reconcile the published ENTRY with what actually
+        # happened on the master book. Established → adopt the group id so
+        # exits correlate (§4.11); not established (all legs rejected, or
+        # the partial batch was reversed to flat) → CANCEL so subscribers
+        # aren't left holding a structure the master never opened.
+        if published_entry is not None:
+            if self.state.position != "FLAT":
+                self.state.position_group_id = (
+                    published_entry["position_group_id"]
+                )
+            else:
+                self._publish_cancel_signal(published_entry)
+
         # If the book is now flat, log the closed trade
         if not self.state.legs and not is_entry_batch:
             self._record_close()
@@ -582,8 +630,88 @@ class PairTradingStrategy(BaseStrategy):
             self.state.last_exit_time = self._clock()
             self.state.last_exit_reason = self._pending_exit_reason
             self._pending_exit_reason = None
+            # Issue #90: the position this group identified no longer
+            # exists; the EXIT signal (published at decision time above)
+            # already closed the group on the bus.
+            self.state.position_group_id = None
 
         return results
+
+    # ── Issue #90: signal-plane publishing (opt-in via signal_publisher) ──
+    # Every book-mutating decision flows through execute_proposals, so these
+    # three hooks cover the full inventory: ENTRY (scan), EXIT for every
+    # reason (MEAN_REVERT/STOP/MAX_HOLD from check_and_rehedge, EXPIRY/
+    # OPS_FORCE via the runner's flatten_one), and CANCEL when a published
+    # entry fails to establish. Publish failures log CRITICAL and never
+    # interrupt trading — the live book's safety outranks the bus.
+
+    def _publish_entry_signal(self, proposals) -> Optional[Dict]:
+        from signal_plane import pair_trading_signals as sigmap
+        try:
+            envelope = sigmap.build_entry_signal(
+                self, proposals,
+                z=(self._pending_entry_z
+                   if getattr(self, "_pending_entry_z", None) is not None
+                   else 0.0),
+            )
+            return self._signal_publisher.publish(envelope)
+        except Exception as e:
+            logger.critical(
+                "SIGNAL PUBLISH FAILED (ENTRY %s/%s): %s — trading "
+                "continues; the bus is missing this entry, so no exit "
+                "will be published for it either",
+                self.symbol_a, self.symbol_b, e,
+            )
+            return None
+
+    def _publish_exit_signal(self, proposals) -> None:
+        from signal_plane import pair_trading_signals as sigmap
+        from signal_plane.contract import uuid7
+        try:
+            group = self.state.position_group_id
+            bootstrap = group is None
+            if bootstrap:
+                # Position pre-dates signal history (opened before the
+                # publisher was wired, or its ENTRY publish failed). Exits
+                # are money events — publish anyway via the explicit
+                # unmatched-entry escape rather than staying silent.
+                group = uuid7()
+            envelope = sigmap.build_exit_signal(
+                self, proposals,
+                reason=self._pending_exit_reason or "EXIT",
+                group_id=group,
+            )
+            self._signal_publisher.publish(envelope, allow_unknown_group=True)
+            if bootstrap:
+                # Remember the group so a retry of a failed exit fill next
+                # tick is suppressed as already-closed, not re-bootstrapped.
+                self.state.position_group_id = group
+        except Exception as e:
+            logger.critical(
+                "SIGNAL PUBLISH FAILED (EXIT %s/%s, reason=%s): %s — "
+                "trading continues but SUBSCRIBERS WERE NOT TOLD TO EXIT; "
+                "will retry on the next exit tick",
+                self.symbol_a, self.symbol_b, self._pending_exit_reason, e,
+            )
+
+    def _publish_cancel_signal(self, entry_record: Dict) -> None:
+        from signal_plane import pair_trading_signals as sigmap
+        try:
+            envelope = sigmap.build_cancel_signal(
+                self,
+                group_id=entry_record["position_group_id"],
+                entry_signal_id=entry_record["signal_id"],
+                entry_spot=entry_record["reference"]["spot"],
+                detail="all legs rejected or partial batch reversed to flat",
+            )
+            self._signal_publisher.publish(envelope)
+        except Exception as e:
+            logger.critical(
+                "SIGNAL PUBLISH FAILED (CANCEL %s/%s): %s — subscribers "
+                "may hold a structure the master never opened; manual "
+                "review of the signal bus required",
+                self.symbol_a, self.symbol_b, e,
+            )
 
     def generate_eod_report(self) -> Dict:
         spread, prices = self._observe_spread()
@@ -668,6 +796,9 @@ class PairTradingStrategy(BaseStrategy):
                     if self.state.last_exit_time else None
                 ),
                 "last_exit_reason": self.state.last_exit_reason,
+                # Issue #90: signal correlation id for the open position.
+                # Older state files restore this as None (bootstrap path).
+                "position_group_id": self.state.position_group_id,
             },
         }
 
@@ -731,6 +862,9 @@ class PairTradingStrategy(BaseStrategy):
         self.state.tx_costs_at_entry = float(
             state_blob.get("tx_costs_at_entry", self.state.total_transaction_costs)
         )
+        # Issue #90: backwards-compat — pre-signal-plane state files carry
+        # no group id; None routes exits through the bootstrap escape.
+        self.state.position_group_id = state_blob.get("position_group_id")
         # Re-baseline session deltas against the restored cumulative figures.
         self._capture_session_baseline()
         # M-S1: warn if the reseeded spread distribution has drifted enough
@@ -1060,6 +1194,9 @@ class PairTradingStrategy(BaseStrategy):
             f"z={z:.2f} (entry_z={self.entry_z}) "
             f"spread={spread:.2f} β={self.hedge_ratio:.4f}"
         )
+        # Issue #90: stash the decision z for the signal-publish hook in
+        # execute_proposals (mirrors the _pending_exit_reason pattern).
+        self._pending_entry_z = z
         return [
             self._make_fut_proposal(fut_a, qty_a, prices[self.symbol_a], side_a, rationale),
             self._make_fut_proposal(fut_b, qty_b, prices[self.symbol_b], side_b, rationale),

@@ -206,6 +206,11 @@ def make_strategy(
     s._nfo_instruments_cache = None
     s._holidays_cache = None
     s._pending_exit_reason = None
+    # Issue #90: no signal publishing in backtests — replays are not master
+    # decisions and must never land on the bus.
+    s._signal_publisher = None
+    s.signal_system_tag = None
+    s._pending_entry_z = None
     s._place_order_fail_streak = 0
     s._place_order_skip_ticks_left = 0
     s._place_order_skip_window = 5

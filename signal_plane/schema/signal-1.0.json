@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://signals.example/contract/signal-1.0.json",
+  "title": "Signal",
+  "type": "object",
+  "required": ["schema_version", "signal_id", "position_group_id",
+               "strategy_id", "sequence", "intent", "created_at",
+               "valid_until", "underlying", "reference"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^\\d+\\.\\d+$"},
+    "signal_id": {"type": "string", "format": "uuid"},
+    "position_group_id": {"type": "string", "format": "uuid"},
+    "strategy_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 0},
+    "intent": {"enum": ["ENTRY", "ADD", "REDUCE", "EXIT", "EXIT_ALL",
+                        "REPLACE_STOP", "CANCEL"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "valid_until": {"type": "string", "format": "date-time"},
+    "underlying": {"type": "string"},
+    "fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+    "supersedes": {"type": "string", "format": "uuid"},
+    "rationale": {"type": "string"},
+    "tags": {"type": "object"},
+    "max_slippage": {
+      "type": "object",
+      "required": ["bps", "abs_inr"],
+      "properties": {"bps": {"type": "number", "minimum": 0},
+                     "abs_inr": {"type": "number", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "reference": {
+      "type": "object",
+      "required": ["spot", "captured_at"],
+      "properties": {
+        "spot": {"type": "number"},
+        "captured_at": {"type": "string", "format": "date-time"},
+        "greeks": {"type": "object"},
+        "iv": {"type": "number"},
+        "regime": {"type": "string"}
+      }
+    },
+    "sizing": {
+      "type": "object",
+      "required": ["method", "base_multiplier", "rounding"],
+      "properties": {
+        "method": {"enum": ["PER_LOT_AT_CAPITAL", "FIXED_LOTS",
+                            "RISK_PER_TRADE_PCT", "NOTIONAL_TARGET"]},
+        "reference_capital": {"type": "number", "exclusiveMinimum": 0},
+        "risk_per_unit_inr": {"type": "number", "exclusiveMinimum": 0},
+        "base_multiplier": {"type": "integer", "minimum": 1},
+        "min_multiplier": {"type": "integer", "minimum": 1},
+        "max_multiplier": {"type": "integer", "minimum": 1},
+        "rounding": {"const": "STRUCTURE_PRESERVING"}
+      },
+      "additionalProperties": false
+    },
+    "legs": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["leg_id", "instrument", "side", "ratio", "quantity_lots",
+                     "order_type", "product", "reference_price"],
+        "additionalProperties": false,
+        "properties": {
+          "leg_id": {"type": "string"},
+          "side": {"enum": ["BUY", "SELL"]},
+          "ratio": {"type": "integer", "minimum": 1},
+          "quantity_lots": {"type": "integer", "minimum": 1},
+          "order_type": {"enum": ["MARKET", "LIMIT", "MARKETABLE_LIMIT",
+                                  "SL", "SL_M"]},
+          "limit_price": {"type": "number", "exclusiveMinimum": 0},
+          "trigger_price": {"type": "number", "exclusiveMinimum": 0},
+          "product": {"enum": ["INTRADAY", "OVERNIGHT", "DELIVERY"]},
+          "reference_price": {"type": "number", "exclusiveMinimum": 0},
+          "instrument": {
+            "type": "object",
+            "required": ["exchange", "instrument_class", "underlying"],
+            "additionalProperties": false,
+            "properties": {
+              "exchange": {"enum": ["NSE", "NFO", "BSE", "BFO", "MCX"]},
+              "instrument_class": {"enum": ["EQ", "FUT", "OPT"]},
+              "underlying": {"type": "string"},
+              "expiry": {"type": ["string", "null"], "format": "date"},
+              "strike": {"type": ["number", "null"]},
+              "option_type": {"enum": ["CE", "PE", null]},
+              "tradingsymbol_hint": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "risk": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "scope", "basis", "value", "comparator",
+                     "placement"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {"enum": ["STOP", "TARGET"]},
+          "scope": {"enum": ["LEG", "STRUCTURE"]},
+          "leg_id": {"type": "string"},
+          "basis": {"enum": ["LEG_PRICE", "UNDERLYING_LEVEL",
+                             "STRUCTURE_PNL_INR", "PREMIUM_PERCENT",
+                             "ATR_MULTIPLE"]},
+          "value": {"type": "number"},
+          "comparator": {"enum": ["LTE", "GTE"]},
+          "placement": {"enum": ["RESTING_AT_BROKER", "MANAGED_BY_PLATFORM"]},
+          "resting_order_type": {"enum": ["SL", "SL_M", "GTT", "OCO"]}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {"if": {"properties": {"intent": {"enum": ["ENTRY", "ADD"]}},
+            "required": ["intent"]},
+     "then": {"required": ["legs", "sizing"]}},
+    {"if": {"properties": {"intent": {"enum": ["REDUCE", "EXIT"]}},
+            "required": ["intent"]},
+     "then": {"required": ["fraction"]}},
+    {"if": {"properties": {"intent": {"const": "REPLACE_STOP"}},
+            "required": ["intent"]},
+     "then": {"required": ["supersedes", "risk"]}}
+  ]
+}

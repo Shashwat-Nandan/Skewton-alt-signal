@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "signal_id": "018f9c0a-7b3e-7e21-9a2f-2b6c4d1e5f00",
+  "position_group_id": "018f9c0a-7b3e-7e21-9a2f-2b6c4d1e5f00",
+  "strategy_id": "taleb_karpathy",
+  "sequence": 4412,
+  "intent": "ENTRY",
+  "created_at": "2026-06-20T10:31:00+05:30",
+  "valid_until": "2026-06-20T10:33:00+05:30",
+  "underlying": "NIFTY",
+  "legs": [
+    {
+      "leg_id": "L1",
+      "side": "BUY",
+      "ratio": 1,
+      "quantity_lots": 1,
+      "order_type": "MARKETABLE_LIMIT",
+      "limit_price": 116.5,
+      "product": "OVERNIGHT",
+      "reference_price": 114.85,
+      "instrument": {
+        "exchange": "NFO",
+        "instrument_class": "OPT",
+        "underlying": "NIFTY",
+        "expiry": "2026-06-23",
+        "strike": 23150,
+        "option_type": "PE",
+        "tradingsymbol_hint": "NIFTY2662323150PE"
+      }
+    },
+    {
+      "leg_id": "L2",
+      "side": "BUY",
+      "ratio": 1,
+      "quantity_lots": 1,
+      "order_type": "MARKETABLE_LIMIT",
+      "limit_price": 43.0,
+      "product": "OVERNIGHT",
+      "reference_price": 42.4,
+      "instrument": {
+        "exchange": "NFO",
+        "instrument_class": "OPT",
+        "underlying": "NIFTY",
+        "expiry": "2026-06-23",
+        "strike": 24000,
+        "option_type": "CE",
+        "tradingsymbol_hint": "NIFTY2662324000CE"
+      }
+    }
+  ],
+  "sizing": {
+    "method": "PER_LOT_AT_CAPITAL",
+    "reference_capital": 1000000,
+    "base_multiplier": 1,
+    "min_multiplier": 1,
+    "rounding": "STRUCTURE_PRESERVING"
+  },
+  "risk": [
+    {
+      "kind": "STOP",
+      "scope": "STRUCTURE",
+      "basis": "STRUCTURE_PNL_INR",
+      "value": -10000,
+      "comparator": "LTE",
+      "placement": "MANAGED_BY_PLATFORM"
+    }
+  ],
+  "max_slippage": {
+    "bps": 50,
+    "abs_inr": 5
+  },
+  "reference": {
+    "spot": 23985.0,
+    "captured_at": "2026-06-20T10:31:00+05:30",
+    "iv": 11.0,
+    "regime": "asymmetric_strangle"
+  },
+  "rationale": "asymmetric strangle: long 30Δ PE downside + cheap 15Δ CE tail"
+}

@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "signal_id": "018f9c1b-1122-7a40-8c01-aa01bb02cc03",
+  "position_group_id": "018f9c1b-1122-7a40-8c01-aa01bb02cc03",
+  "strategy_id": "buy_on_gap",
+  "sequence": 88,
+  "intent": "ENTRY",
+  "created_at": "2026-06-20T09:20:00+05:30",
+  "valid_until": "2026-06-20T09:25:00+05:30",
+  "underlying": "RELIANCE",
+  "legs": [
+    {
+      "leg_id": "L1",
+      "side": "BUY",
+      "ratio": 1,
+      "quantity_lots": 50,
+      "order_type": "MARKETABLE_LIMIT",
+      "limit_price": 1452.0,
+      "product": "INTRADAY",
+      "reference_price": 1450.0,
+      "instrument": {
+        "exchange": "NSE",
+        "instrument_class": "EQ",
+        "underlying": "RELIANCE",
+        "expiry": null,
+        "strike": null,
+        "option_type": null,
+        "tradingsymbol_hint": "RELIANCE"
+      }
+    }
+  ],
+  "sizing": {
+    "method": "RISK_PER_TRADE_PCT",
+    "risk_per_unit_inr": 1500,
+    "base_multiplier": 1,
+    "rounding": "STRUCTURE_PRESERVING"
+  },
+  "risk": [
+    {
+      "kind": "STOP",
+      "scope": "LEG",
+      "leg_id": "L1",
+      "basis": "LEG_PRICE",
+      "value": 1420.0,
+      "comparator": "LTE",
+      "placement": "RESTING_AT_BROKER",
+      "resting_order_type": "SL_M"
+    }
+  ],
+  "max_slippage": {
+    "bps": 30,
+    "abs_inr": 2
+  },
+  "reference": {
+    "spot": 1450.0,
+    "captured_at": "2026-06-20T09:20:00+05:30"
+  }
+}

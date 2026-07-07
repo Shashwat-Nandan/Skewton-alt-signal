@@ -61,6 +61,11 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # on a full-size book will very likely trip HALT_DAILY_LOSS on the first adverse
 # tick (entries stop, exits continue) and does not strictly bound a fast-move
 # loss to ₹25k. Accepted; recorded in tasks/todo.md.
+#
+# --publish-signals (issue #90 Phase 0): every book-mutating decision this
+# runner makes is also published as a §4 signal-contract record to
+# logs/signal-bus/pair_trading/YYYY-MM-DD.jsonl. Publishing is additive and
+# fail-open (a publish failure logs CRITICAL but never blocks trading).
 ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py \
     --top 12 --max-leg-notional 1000000 \
     --candidates data_cache/pair_candidates_persistent.csv \
@@ -69,7 +74,8 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run
     --max-csv-age-days 4 \
     --mode live \
     --i-understand-this-is-real-money \
-    --max-daily-loss-inr 25000
+    --max-daily-loss-inr 25000 \
+    --publish-signals
 # ------------------------------------
 
 Restart=on-failure
