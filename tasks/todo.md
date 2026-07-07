@@ -1,3 +1,111 @@
+# Issue #90 increment 1 — signal plane for pair_trading persistent (PLAN, 2026-07-07)
+
+Scope (user decision): build the §4 signal contract + file-backed publisher and
+wire it into the PERSISTENT pair runner only. Bus (Redis), replay endpoint,
+dashboard tab, signing, and the other five strategies are LATER increments of
+#90. Publisher is OPT-IN (`--publish-signals`); live behaviour unchanged until
+the operator adds the flag to the installed unit.
+
+## Decision inventory — every book mutation in the persistent pair runner (B)
+All flow through `PairTradingStrategy.execute_proposals` (single choke point):
+  1. ENTRY — scan_and_propose (LONG/SHORT_SPREAD, 2 legs, one structure)
+  2. EXIT MEAN_REVERT — check_and_rehedge (debounced |z| <= exit_z)
+  3. EXIT STOP — check_and_rehedge (|z| >= effective_stop_z)
+  4. EXIT MAX_HOLD — check_and_rehedge (trading-day time stop)
+  5. EXIT EXPIRY — end_of_session → flatten_one (expiry-day force-flatten)
+  6. EXIT OPS_FORCE — --force-flatten-on-exit → flatten_one
+  7. Partial-entry reversal (_reverse_filled_legs) → book ends FLAT → CANCEL
+Not book-mutating (no signal): HALT_ALL freeze, HALT_NEW_ENTRIES /
+HALT_DAILY_LOSS (entries suspended; exits continue and ARE published).
+
+## Plan
+- [x] `signal_plane/schema/signal-1.0.json` — §4.9 JSON Schema (draft 2020-12)
+- [x] `signal_plane/contract.py` — §4.2–4.8 object model (Envelope/Leg/
+      RiskDirective/Sizing/Reference/Instrument dataclasses + closed enums +
+      §4.15 lifecycle enum), `schema_version="1.0"`, uuid7(), to_wire()
+- [x] `signal_plane/validation.py` — schema validation (jsonschema
+      Draft202012Validator) + §4.12 publisher-side rules as unit-testable
+      checks; fail loud, never emit an invalid signal
+- [x] `signal_plane/publisher.py` — SignalPublisher: strictly monotonic
+      per-strategy sequence + open-group registry persisted crash-safe
+      (flock+fsync, atomic replace) in data_cache/; idempotent re-publish
+      (same signal_id = no-op); EXIT for unknown group refused (bootstrap
+      escape for positions opened before signal history, tagged); appends
+      to logs/signal-bus/<strategy_id>/YYYY-MM-DD.jsonl (file-backed bus
+      until §6 lands); legacy signals-*.jsonl untouched
+- [x] `signal_plane/pair_trading_signals.py` — §4.14 mapper: 2 proposals →
+      ONE signal (legs L1/L2, gcd ratio, base_multiplier), ISO expiry,
+      instrument_token dropped, sizing=RISK_PER_TRADE_PCT (risk_per_unit_inr
+      = modeled ₹ loss to effective stop), STRUCTURE_PNL_INR stop directive
+      (MANAGED_BY_PLATFORM), z/β/max_hold context in tags
+- [x] `strategies/pair_trading.py` (surgical): optional signal_publisher
+      param; PairState.position_group_id (+serialize/restore, back-compat);
+      execute_proposals publishes ENTRY at decision, CANCEL if the entry
+      batch fails to establish, EXIT with reason for every exit path.
+      Publish failures log CRITICAL but never block the live loop.
+- [x] `run_paper_pairs.py`: --publish-signals flag → one shared publisher
+- [x] deploy/pair-paper-persistent-live.service template: add flag + comment
+      (installed-unit edit = operator step)
+- [x] deps: jsonschema (>=4.18 for 2020-12) → requirements.in + lock (plain
+      compile, pins preserved) + venv install
+- [x] docs/signal-plane.md: scope, inventory, mapping decisions, semantics
+- [x] Tests (Rule 9): schema round-trip; §4.10 worked examples pinned as
+      fixtures; sequence monotonic across publisher restarts; idempotent
+      re-publish; exit-never-before-entry; mapper structure/ratio/ISO-expiry;
+      strategy integration entry→exit and reversal→CANCEL
+- [x] Review section below when done
+
+
+## Review (2026-07-07)
+
+Built and tested; 52 new tests + all 526 pair/runner-affected tests pass.
+Full-suite run OOMs on this host (a pytest process hits ~16GB reading the
+operator data_cache — pre-existing; CI runs the suite on a 7GB runner where
+those tests skip). Deviations from plan, all surfaced by tests:
+  * Exit signals OMIT legs when contract terms are incomplete — PairLeg
+    doesn't persist expiry, and a FUT descriptor without expiry can't
+    uniquely resolve (§4.12). §4.3 blesses leg-less exits (OMS derives them
+    from the group); tagged `legs_omitted`.
+  * Publisher grew a bounded `closed_groups` memory: master retries of
+    failed exit fills are suppressed no-ops, not ordering errors.
+  * backtest_pairs.make_strategy bootstrap mirrors the 3 new strategy attrs
+    (the repo's own __new__-coverage guard test caught it).
+Operator steps (NOT done here): mirror --publish-signals into the installed
+pair-paper-persistent-live unit + daemon-reload. (Earlier draft also listed
+a jsonschema venv step — STALE: redeploy.sh installs hash-pinned from the
+lockfiles, the audit gap was already closed.)
+
+### /code-review fixes applied (2026-07-07, same branch)
+
+10 findings (9 CONFIRMED + 1 PLAUSIBLE); all 9 CONFIRMED fixed:
+  1+3. H15 margin pre-check + M-B5 backoff gates now run BEFORE the publish
+       hook; entries are not published while backoff is armed (was:
+       margin-refusal returned [] between ENTRY publish and CANCEL
+       reconcile → subscribers held uncancelled structures; backoff →
+       ENTRY+CANCEL whipsaw per tick).
+  2.   Publisher write ordering split: persist sequence+id → bus append →
+       persist group transition. A failed append no longer closes the
+       group (EXIT retry works; gap-not-duplicate preserved); exit-failure
+       CRITICAL log no longer promises a retry that can't happen.
+  4.   Publisher takes a process-lifetime flock (runner_common.acquire_lock)
+       in __init__ — a second publisher for the same strategy_id fails loud
+       (H9 lock is per --system and didn't cover this); false docstring
+       fixed; close() added for tests.
+  5.   PairLeg persists expiry (entry-fill capture; back-compat "" for old
+       state files) → exit signals now NAME their legs with ISO expiry;
+       leg-less exits remain only for pre-upgrade positions.
+  6.   0-byte publisher state file now fails loud instead of silently
+       resetting the sequence counter.
+  8.   tmp→fsync→replace→dir-fsync extracted to
+       runner_common.durable_write_text; publisher + both pair runners use
+       the one copy.
+  9.   Enum parity test: contract frozensets asserted equal to the schema's
+       enum lists (drift = test failure).
+  10.  build_entry_signal uses _with_system_tag (inline copy removed).
+NOT fixed (PLAUSIBLE, latent): _pending_entry_z z=0.0 fallback — every
+production entry path sets the stash today; revisit when ADD/layering lands.
+---
+
 # Issue #87 — BANKNIFTY loop_engine increment (PLAN, 2026-07-06)
 
 GATE CHECK FIRST (the issue's own instruction): the loop harness must not be

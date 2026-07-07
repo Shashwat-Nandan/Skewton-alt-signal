@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "signal_id": "018f9d55-0000-7d20-c300-1122334455aa",
+  "position_group_id": "018f9c0a-7b3e-7e21-9a2f-2b6c4d1e5f00",
+  "strategy_id": "taleb_karpathy",
+  "sequence": 4475,
+  "intent": "REPLACE_STOP",
+  "supersedes": "018f9c0a-7b3e-7e21-9a2f-2b6c4d1e5f00",
+  "created_at": "2026-06-20T13:00:00+05:30",
+  "valid_until": "2026-06-20T15:25:00+05:30",
+  "underlying": "NIFTY",
+  "risk": [
+    {
+      "kind": "STOP",
+      "scope": "STRUCTURE",
+      "basis": "STRUCTURE_PNL_INR",
+      "value": -4000,
+      "comparator": "LTE",
+      "placement": "MANAGED_BY_PLATFORM"
+    }
+  ],
+  "reference": {
+    "spot": 24050.0,
+    "captured_at": "2026-06-20T13:00:00+05:30"
+  }
+}

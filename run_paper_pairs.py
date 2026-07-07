@@ -64,6 +64,7 @@ from runner_common import (  # noqa: F401  (re-exported)
     assert_disk_space_ok,
     assert_holiday_data_fresh,
     assert_timezone_ist,
+    durable_write_text,
     install_signal_handlers,
     is_trading_day,
     load_holidays,
@@ -334,6 +335,7 @@ def build_strategies(
     book_notional_fn=None,
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
+    signal_publisher=None,
 ):
     from strategies.pair_trading import PairTradingStrategy
 
@@ -352,9 +354,11 @@ def build_strategies(
                 kite_refresh=kite_refresh,
                 book_notional_fn=book_notional_fn,
                 spread_panel=spread_panel,
+                signal_publisher=signal_publisher,
             )
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
+            s.signal_system_tag = args.system
         except Exception as e:
             log.exception("Could not init %s/%s: %s — skipping", a, b, e)
             continue
@@ -617,20 +621,8 @@ def write_state_file(strategies, system: str, log: logging.Logger,
                      archive: bool = True, mode: str = "paper"):
     """Atomically and durably persist current strategy state. Each strategy
     emits its own serialize_state() blob; runner adds a system/timestamp
-    header.
-
-    Crash- and power-loss-safe write:
-      1. write payload to '<path>.tmp'
-      2. fsync the tmp file's fd — forces data blocks to disk before any
-         metadata change is journaled. Without this, ext4 (`data=ordered`)
-         could journal the rename's inode update while the data blocks
-         are still in page cache; a crash before the data flush would
-         replay the rename pointing at unflushed (effectively empty) data.
-      3. os.replace(tmp, path) — atomic rename, no half-truncated file
-      4. fsync the parent dir's fd — directory-entry changes from the
-         rename are metadata that the journal records but doesn't commit
-         to disk synchronously; this forces it so the rename itself
-         survives power loss.
+    header. Crash/power-loss safety is runner_common.durable_write_text
+    (tmp → fsync → atomic rename → dir fsync; rationale documented there).
 
     archive=False skips the timestamped backup + log line — used by the
     intraday tick-loop persist, which fires every minute and would
@@ -654,22 +646,12 @@ def write_state_file(strategies, system: str, log: logging.Logger,
         except Exception as e:
             log.exception("serialize_state failed for %s/%s: %s",
                           s.symbol_a, s.symbol_b, e)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Use Python's file object (which loops over os.write internally to
-    # handle partial-write returns) + an explicit fsync on the fd before
-    # close. Default mode = 0o666 & ~umask, matching the old
-    # `tmp.write_text(...)` so prod (UMask=0027 → 0o640) and dev
-    # (umask 0022 → 0o644) behaviour is unchanged.
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(payload, default=str, indent=2))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    # durable_write_text owns the tmp→fsync→replace→dir-fsync steps
+    # (extracted to runner_common in the PR #96 review; identical
+    # behaviour, one shared copy). Default mode = 0o666 & ~umask, so
+    # prod (UMask=0027 → 0o640) and dev (umask 0022 → 0o644) behaviour
+    # is unchanged.
+    durable_write_text(path, json.dumps(payload, default=str, indent=2))
     if archive:
         log.info("State persisted: %s (%d pairs)", path.name, len(payload["pairs"]))
         archive_state_backup(path, log)
@@ -727,6 +709,7 @@ def build_orphan_strategies(
     book_notional_fn=None,
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
+    signal_publisher=None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -755,9 +738,11 @@ def build_orphan_strategies(
                 kite_refresh=kite_refresh,
                 book_notional_fn=book_notional_fn,
                 spread_panel=spread_panel,
+                signal_publisher=signal_publisher,
             )
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
+            s.signal_system_tag = args.system
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z
@@ -1053,6 +1038,14 @@ def main():
                              "--i-understand-this-is-real-money AND "
                              "--max-daily-loss-inr > 0. signals: emit "
                              "JSONL signals only, no fills.")
+    parser.add_argument("--publish-signals", action="store_true",
+                        dest="publish_signals",
+                        help="Issue #90 signal plane: publish every "
+                             "book-mutating decision (entries, all exit "
+                             "reasons, failed-entry cancels) as §4 contract "
+                             "signals to the file-backed bus "
+                             "(logs/signal-bus/pair_trading/). Opt-in; "
+                             "off = behaviour unchanged.")
     parser.add_argument("--i-understand-this-is-real-money",
                         dest="i_understand", action="store_true",
                         help="Required confirmation flag for --mode live. "
@@ -1267,6 +1260,26 @@ def main():
         )
         spread_panel = None
 
+    # Issue #90: one shared publisher per runner — sequence numbering is
+    # per strategy_id, and every pair instance publishes onto the same
+    # ordered stream. Fail-loud at startup (a broken publisher state file
+    # should stop the session before the market opens, not mid-tick).
+    signal_publisher = None
+    if args.publish_signals:
+        from signal_plane import SignalPublisher
+        from signal_plane.pair_trading_signals import STRATEGY_ID
+        signal_publisher = SignalPublisher(
+            strategy_id=STRATEGY_ID,
+            bus_dir=LOG_DIR / "signal-bus",
+            state_dir=DATA_CACHE,
+        )
+        log.info(
+            "Signal publishing armed: strategy_id=%s bus=%s last_sequence=%d "
+            "open_groups=%d",
+            STRATEGY_ID, signal_publisher.bus_file(),
+            signal_publisher.last_sequence, len(signal_publisher.open_groups),
+        )
+
     strategies = build_strategies(
         pairs, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
@@ -1274,6 +1287,7 @@ def main():
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,
+        signal_publisher=signal_publisher,
     )
 
     # Restore prior-session state (no-op if no state file exists yet).
@@ -1285,6 +1299,7 @@ def main():
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,
+        signal_publisher=signal_publisher,
     )
     strategies = strategies + orphans
 

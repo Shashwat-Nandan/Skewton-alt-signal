@@ -47,7 +47,6 @@ import argparse
 import json
 import logging
 import math
-import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -67,6 +66,7 @@ from runner_common import (
     acquire_lock,
     assert_disk_space_ok,
     assert_timezone_ist,
+    durable_write_text,
     install_signal_handlers,
     is_trading_day,
     load_holidays,
@@ -201,17 +201,7 @@ def write_state_file(strategies, log: logging.Logger, *, archive: bool = True) -
         except Exception as e:
             log.exception("serialize_state failed for %s/%s: %s",
                           s.symbol_a, s.symbol_b, e)
-    tmp = STATE_PATH.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(payload, default=str, indent=2))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, STATE_PATH)
-    dfd = os.open(STATE_PATH.parent, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
+    durable_write_text(STATE_PATH, json.dumps(payload, default=str, indent=2))
     if archive:
         archive_state_backup(STATE_PATH, log)
 
