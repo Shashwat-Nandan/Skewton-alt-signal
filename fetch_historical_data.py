@@ -70,19 +70,26 @@ def fetch_instrument_master(kite, underlying: str = "NIFTY") -> pd.DataFrame:
 def get_spot_token(kite, underlying: str = "NIFTY") -> int:
     """Get the instrument token for the underlying index.
 
-    NSE lists index spot under display names, not the F&O underlying key —
-    same mapping the strategy layer uses (taleb_karpathy._INDEX_SPOT_SYMBOLS):
-    NIFTY → "NIFTY 50", BANKNIFTY → "NIFTY BANK". Without this, a BANKNIFTY
-    fetch dies on 'Could not find instrument token' (hit on 2026-07-06 while
-    seeding the #62 paper instance's spot history)."""
-    spot_names = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
-    wanted = {underlying, spot_names.get(underlying, underlying)}
-    instruments = kite.instruments("NSE")
-    for inst in instruments:
-        if inst["tradingsymbol"] in wanted:
-            return inst["instrument_token"]
+    NSE lists index spot under display names, not the F&O underlying key
+    (BANKNIFTY → "NIFTY BANK"). Reuses the canonical NSE_INDEX_NAME map from
+    fetch_index_daily (the 5-index superset) rather than a local subset, and
+    tries candidates in PRIORITY order — mapped display name first, then the
+    raw key / "<key> 50" as fallbacks. Priority matters: the raw F&O key is
+    never a real NSE spot symbol, so matching it ahead of the display name
+    could return an unrelated equity/ETF that happens to share the name."""
+    from fetch_index_daily import NSE_INDEX_NAME
+
+    candidates = []
+    if underlying in NSE_INDEX_NAME:
+        candidates.append(NSE_INDEX_NAME[underlying])
+    candidates += [underlying, f"{underlying} 50"]
+
+    by_name = {inst["tradingsymbol"]: inst for inst in kite.instruments("NSE")}
+    for name in candidates:
+        if name in by_name:
+            return by_name[name]["instrument_token"]
     raise ValueError(f"Could not find instrument token for {underlying} "
-                     f"(looked for {sorted(wanted)})")
+                     f"(tried {candidates})")
 
 
 def select_strikes(

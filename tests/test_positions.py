@@ -183,7 +183,7 @@ class TestBankniftyTalebVisibility:
         assert not block.available
         assert block.summary.realized_pnl == 0.0
 
-    def test_groups_are_labelled_with_the_underlying(self, tmp_path, monkeypatch):
+    def test_groups_are_labelled_with_the_underlying(self):
         assert positions._taleb_group(["straddle"], "BANKNIFTY").startswith("BANKNIFTY")
         assert positions._taleb_group(None, "BANKNIFTY") == "BANKNIFTY options"
         # NIFTY default unchanged (legacy callers pass no underlying).

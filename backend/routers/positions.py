@@ -162,15 +162,22 @@ def _taleb_group(types, underlying: str = "NIFTY") -> str:
     return f"{underlying} " + " + ".join(names) if names else f"{underlying} options"
 
 
+def _taleb_state_path(underlying: str) -> Path:
+    """The Taleb instance's state file, via the SAME suffix rule the runner
+    writes with (runner_common.taleb_state_suffix, shared with
+    run_paper.derive_paths). One rule, so the reader can't drift from the
+    writer — a mismatch would render a live instance permanently unavailable
+    (the bug issue #87 fixed)."""
+    from runner_common import taleb_state_suffix
+    return DATA_CACHE / f"taleb_paper_state{taleb_state_suffix(underlying)}.json"
+
+
 def _build_taleb_block(today: date, underlying: str = "NIFTY") -> SystemBlock:
-    # Mirrors run_paper.derive_paths (#62): NIFTY keeps the LEGACY unsuffixed
-    # state filename byte-for-byte; every other underlying is suffixed. The
-    # BANKNIFTY instance had NO dashboard visibility until issue #87.
+    # NIFTY keeps its legacy unsuffixed system key/label; others are suffixed.
+    path = _taleb_state_path(underlying)
     if underlying == "NIFTY":
-        path = DATA_CACHE / "taleb_paper_state.json"
         name, label = "taleb", "Taleb hedger"
     else:
-        path = DATA_CACHE / f"taleb_paper_state_{underlying}.json"
         name = f"taleb_{underlying.lower()}"
         label = f"Taleb hedger — {underlying}"
     payload = _load_state(path)
