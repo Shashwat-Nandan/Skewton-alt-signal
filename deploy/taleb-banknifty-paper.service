@@ -35,7 +35,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
-ProtectHome=true
+# NOTE: do NOT set ProtectHome=true here. If WorkingDirectory / .venv / .env are
+# under /root or /home (as on the dev VPS), ProtectHome=true hides them from the
+# unit's mount namespace and the unit fails (203/EXEC — the interpreter path
+# vanishes) before the strategy runs — silently, since the timer just
+# reschedules. Mirrors pair-paper.service; see tasks/lessons.md (2026-05-12).
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
