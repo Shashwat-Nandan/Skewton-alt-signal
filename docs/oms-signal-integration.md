@@ -13,6 +13,32 @@ and to say loudly when it can't.
 
 ---
 
+## 0. Status — what increment 1 actually ships (as of 2026-07-08)
+
+This guide describes the **target** consumer contract. Increment 1 (issue #90,
+PR #96) shipped a deliberate subset: the §4 envelope contract, publisher-side
+validation/ordering, and a file-backed bus, wired to **one** strategy. The
+rest of this document is still normative for what you *build toward*, but do
+not code against the following as if they were live today — several would make
+you build against a stub (unsigned payloads, a Redis client, a replay
+endpoint) that isn't there yet.
+
+| Area | Target (rest of this doc) | Increment 1 reality |
+|---|---|---|
+| **Transport** | Redis Streams, durable/ordered/replayable | Append-only **JSONL files**: `logs/signal-bus/<strategy_id>/YYYY-MM-DD.jsonl`, flock'd + fsync'd per record, one dir per `strategy_id`. Ordering/monotonic-sequence guarantees already hold; consume the log directly. |
+| **Signatures / auth** (§2, §3.1) | Every payload signed; verify before acting; mTLS between planes | **Unsigned.** No signature field, no mTLS. `verify signature` is a no-op today — do not gate on it, but keep the hook so it lights up when signing lands. Trust currently rests on file/host access control. |
+| **Replay endpoint** (§2, §3.3, §6, §9) | `signals for strategy X since sequence N` service | **Not implemented.** "Replay" = read the JSONL files (they carry every `sequence`). Gap-fill and cold-start still work against the files; just don't expect a service call. |
+| **REST/gRPC façade** (§2) | Thin façade over the bus for dashboard/bridge | **Does not exist yet.** |
+| **Intents on the wire** | `ENTRY ADD REDUCE EXIT EXIT_ALL REPLACE_STOP CANCEL` (§4.8 enum, all schema-valid) | Only **`ENTRY`**, **full `EXIT`** (always `fraction=1.0`), and **`CANCEL`** are emitted. No `ADD/REDUCE/EXIT_ALL/REPLACE_STOP` and no partial `EXIT` today. §8's worked flow uses `REPLACE_STOP` illustratively — build the handler (enums are closed; an unhandled member must quarantine, §3.2), but know it won't fire yet. |
+| **Stop directives** | `RESTING_AT_BROKER` and `MANAGED_BY_PLATFORM` both (§4.5) | The pair producer emits **only `MANAGED_BY_PLATFORM`** structure-scoped `STRUCTURE_PNL_INR` stops (a z-score stop can't rest at a broker). No `RESTING_AT_BROKER` directive reaches you yet — that consumer path is real per contract but unexercised by the live producer. |
+| **Strategies publishing** | All six (§6 partitions) | Only **`pair_trading`** (the persistent runner). The other five inventories are later increments. |
+
+Everything below stays the spec you implement to; treat this table as the
+"not yet" overlay. When an item ships, its row moves to "reality" — the wire
+contract itself does not change (that's the point of the versioned envelope).
+
+---
+
 ## 1. What you receive
 
 Every message on the bus is one **envelope** (§4.3): identity
@@ -42,9 +68,11 @@ Key properties you can rely on:
 ## 2. Transport & subscription
 
 - **Bus:** durable, ordered, replayable log; **partition key =
-  `strategy_id`** (§6). MVP transport is Redis Streams; the consumption
-  contract (at-least-once + idempotent consumers + per-partition ordering) is
-  transport-independent — do not couple OMS logic to Redis specifics.
+  `strategy_id`** (§6). Target transport is Redis Streams; **today it is a
+  file-backed JSONL log** (§0). The consumption contract (at-least-once +
+  idempotent consumers + per-partition ordering) is transport-independent —
+  do not couple OMS logic to Redis specifics, and equally do not couple it to
+  the JSONL layout beyond "an ordered, replayable, per-strategy log."
 - **Consumer groups:** one per strategy (§7.1). Cross-strategy ordering is
   meaningless; intra-strategy ordering is sacred.
 - **Delivery is at-least-once.** You WILL see redeliveries. Correctness comes
@@ -52,11 +80,15 @@ Key properties you can rely on:
 - **Replay endpoint:** `signals for strategy X since sequence N` (§6). This is
   your recovery and onboarding primitive; design cold-start around it, not
   around "hope the group offset is right."
-- **Auth:** every payload is signed by the signal plane; verify the signature
-  before acting — a forged exit/entry is catastrophic (§6). mTLS between
-  planes once both exist. Publisher egresses from a static IP you can pin.
-- A thin **REST/gRPC façade** exists over the bus for the dashboard and the
-  hybrid user-side bridge; the OMS itself should consume the log directly.
+- **Auth:** the target is that every payload is signed by the signal plane and
+  you verify the signature before acting — a forged exit/entry is catastrophic
+  (§6). mTLS between planes once both exist; publisher egresses from a static
+  IP you can pin. **Not yet implemented (§0): payloads are unsigned today** —
+  wire the verification hook, but do not gate consumption on it until signing
+  lands, and rely on file/host access control in the meantime.
+- A thin **REST/gRPC façade** over the bus is planned for the dashboard and the
+  hybrid user-side bridge (**not built yet, §0**); the OMS itself should
+  consume the log directly regardless.
 
 ## 3. The consumption protocol (non-negotiables)
 
@@ -181,6 +213,12 @@ PUBLISHED → DISTRIBUTED → EVALUATING
 | Kill switch active (any of the 4 levels, §12) | Respect precise flatten-vs-resting semantics; exits still honored |
 
 ## 8. Worked flow (what a normal day looks like)
+
+> Illustrative of the full contract. In increment 1 (§0) the live producer
+> emits only steps 1 and 3's shapes (`ENTRY`, full `EXIT`); the `REPLACE_STOP`
+> in step 2 and the resting per-leg stops in step 1 are not on the wire yet —
+> the pair producer's stops are all `MANAGED_BY_PLATFORM`.
+
 
 1. `ENTRY` seq=101, `position_group_id=G1`: 2-leg NIFTY strangle, ratios 1:1,
    `sizing.PER_LOT_AT_CAPITAL(reference_capital=1_000_000, base_multiplier=1)`,
