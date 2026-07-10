@@ -2014,3 +2014,24 @@ embeds THIS session's trades; existing sidecars keep aggregate-only.
   yesterday's carried fill is excluded from the session view.
 - NOT verified live in the browser (would need the backend restarted with a
   populated sidecar); contract covered by tests + build. Forward-only by design.
+
+## 2026-07-10 — Reference consumer (signal plane increment 2, issue #99 item 2)
+
+Plan (user-directed start; findings context in #99 comment):
+- [x] `signal_plane/consumer.py` — ReferenceConsumer implementing the §3
+      consumption protocol against the file bus, in protocol order:
+      version policy (unknown MAJOR → QUARANTINE) → schema validation →
+      sequence ordering (gap → STALL, regression → QUARANTINE) →
+      signal_id idempotency (dup → DUPLICATE no-op) → group correlation
+      (ENTRY opens; full EXIT/EXIT_ALL/CANCEL closes; exit for unknown
+      group → no-op per §6 onboarding) → TTL asymmetry classification
+      (entry past TTL → STALE; exit past TTL → EXECUTE_ANYWAY note).
+      No execution, no users — contract verifier + OMS scaffold.
+- [x] CLI (`python -m signal_plane.consumer <bus-dir>`): replay all days in
+      order, per-signal outcome lines + end report; nonzero exit on any
+      violation → doubles as the EOD bus watchdog primitive (finding 4).
+- [x] Tests: golden-fixture replay + synthetic streams (dup, gap,
+      regression, unknown MAJOR, ENTRY-reopen violation, unknown-group
+      exit, TTL asymmetry).
+- [x] Run against the real bus (seq 0–2) and record the outcome.
+- [ ] PR; merge on green per session pattern.
