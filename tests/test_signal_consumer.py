@@ -20,6 +20,7 @@ from signal_plane.consumer import (
     NOOP_UNKNOWN_GROUP,
     QUARANTINED,
     STALE_ENTRY,
+    UNMATCHED_MUTATION,
     ReferenceConsumer,
     StreamQuarantined,
 )
@@ -132,8 +133,32 @@ def test_newer_minor_unknown_field_ignored_not_rejected():
     c = ReferenceConsumer(as_of=LIVE_CLOCK)
     out = c.consume(entry)
     assert out.status == ACCEPTED
-    assert any("ignored unknown field" in n for n in out.notes)
+    assert any("violations ignored per §4.13" in n for n in out.notes)
     assert c.report()["ok"] is True
+
+
+def test_newer_minor_nested_unknown_field_also_ignored():
+    """§4.13 sets no top-level restriction, and the schema has
+    additionalProperties:false at every nesting level — a legal 1.1 record
+    adding an optional NESTED field (legs[].margin_hint) must not be
+    quarantined. (PR #101 review: top-level-only stripping rejected it.)"""
+    entry = _fixture("entry_taleb_strangle", 0)
+    entry["schema_version"] = "1.1"
+    entry["legs"][0]["margin_hint"] = 123.0
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    out = c.consume(entry)
+    assert out.status == ACCEPTED
+    assert c.report()["ok"] is True
+
+
+def test_newer_minor_still_rejects_unknown_enum_member():
+    """Tolerance is for unknown FIELDS only — enums stay closed on a MINOR
+    bump; a new intent value must still quarantine, never default."""
+    entry = _fixture("entry_taleb_strangle", 0)
+    entry["schema_version"] = "1.1"
+    entry["intent"] = "SHINY_NEW_INTENT"
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    assert c.consume(entry).status == QUARANTINED
 
 
 def test_unknown_enum_member_quarantines_record_not_stream():
@@ -212,3 +237,141 @@ def test_corrupt_bus_line_quarantines_stream(tmp_path):
     (bus / "2026-06-20.jsonl").write_text('{"not": "closed"\n')
     with pytest.raises(StreamQuarantined, match="unparseable"):
         ReferenceConsumer(as_of=LIVE_CLOCK).replay_dir(bus)
+
+
+# ──────────────────────────────────────────────────────────
+# PR #101 review findings — each test pins one confirmed defect
+# ──────────────────────────────────────────────────────────
+
+
+def test_redelivered_quarantined_record_is_duplicate_not_regression():
+    """Review finding 1a: at-least-once redelivery of a schema-invalid
+    record must be a DUPLICATE no-op — the quarantine path remembers the
+    signal_id, so the redelivery cannot trip the REGRESSION quarantine the
+    docstring promises immunity from."""
+    bad = _fixture("entry_taleb_strangle", 0)
+    bad["intent"] = "YOLO"
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    assert c.consume(bad).status == QUARANTINED
+    redelivery = json.loads(json.dumps(bad))
+    assert c.consume(redelivery).status == DUPLICATE
+
+
+def test_invalid_record_sequence_is_not_trusted():
+    """Review finding 1b: a garbage record carrying an absurd sequence must
+    not move the cursor — otherwise every subsequent legitimate record
+    raises a false REGRESSION and one bad line poisons the stream."""
+    bad = _fixture("entry_taleb_strangle", 999_999)
+    bad["intent"] = "YOLO"
+    c = ReferenceConsumer(as_of=LIVE_CLOCK, tolerate_gaps=True)
+    out = c.consume(bad)
+    assert out.status == QUARANTINED
+    assert any("not trusted" in n for n in out.notes)
+    # Cursor untouched: the real seq=0 record consumes normally.
+    good = _fixture("replace_stop_trail", 0)
+    assert c.consume(good).status not in (QUARANTINED,)
+    assert c.report()["last_sequence"] == 0
+
+
+def test_known_signal_id_on_new_sequence_consumes_the_sequence():
+    """Review finding 2: the publisher's idempotency window ages out after
+    2000 ids, so a re-published old signal_id with a FRESH sequence is a
+    legal stream. The DUPLICATE branch must consume that sequence or the
+    next legitimate record false-GAPs."""
+    entry, _, exit_rec = _taleb_lifecycle()
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    c.consume(entry)
+    reuse = _fixture("replace_stop_trail", 1)
+    reuse["signal_id"] = entry["signal_id"]     # aged-out id, new sequence
+    out = c.consume(reuse)
+    assert out.status == DUPLICATE
+    assert any("NEW in-order sequence" in n for n in out.notes)
+    # No false gap: seq=2 follows cleanly.
+    assert c.consume(exit_rec).status == ACCEPTED
+    assert c.report()["gaps"] == []
+    assert c.report()["ok"] is True
+
+
+def test_missing_schema_version_is_record_level_not_stream_kill():
+    """Review finding 5: an absent/malformed schema_version is a schema
+    violation of ONE record — §4.13's stream quarantine is reserved for a
+    well-formed, genuinely foreign MAJOR."""
+    entry, replace, _ = _taleb_lifecycle()
+    del entry["schema_version"]
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    assert c.consume(entry).status == QUARANTINED   # no raise
+    assert c.consume(replace).status != QUARANTINED  # stream continues
+
+
+def test_missing_strategy_id_is_record_level_and_never_seeds_identity():
+    """Review finding 6: a record missing strategy_id is a record-level
+    schema quarantine — not a 'strategy_id changed mid-stream' stream kill,
+    and a first record missing it must not lock the stream identity to
+    None (which silently disabled the identity check)."""
+    first = _fixture("entry_taleb_strangle", 0)
+    del first["strategy_id"]
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    assert c.consume(first).status == QUARANTINED
+    assert c.strategy_id is None                    # not seeded to None-lock
+    nxt = _fixture("replace_stop_trail", 1)
+    c.consume(nxt)                                  # no raise
+    assert c.strategy_id == "taleb_karpathy"        # seeded from a real sid
+    # Mid-stream missing sid: also record-level, no stream kill.
+    mid = _fixture("exit_full_group", 2)
+    del mid["strategy_id"]
+    assert c.consume(mid).status == QUARANTINED
+
+
+def test_unparseable_valid_until_quarantines_record():
+    """Review finding 4: jsonschema's format is annotation-only, so the
+    schema cannot reject a garbage valid_until — and §4.12's TTL asymmetry
+    is unactionable without it. Silently ACCEPTED is the one wrong answer."""
+    entry = _fixture("entry_taleb_strangle", 0)
+    entry["valid_until"] = "not-a-timestamp"
+    c = ReferenceConsumer(as_of=LATER_CLOCK)
+    out = c.consume(entry)
+    assert out.status == QUARANTINED
+    assert any("valid_until" in n for n in out.notes)
+
+
+def test_unmatched_mutation_fails_ok():
+    """Review finding 7: ADD/REDUCE/REPLACE_STOP resolving against no group
+    is §3.3's money-bug class — it must be surfaced and fail the stream
+    verdict, not blend into the benign exit-bootstrap no-op."""
+    rs = _fixture("replace_stop_trail", 0)
+    c = ReferenceConsumer(as_of=LIVE_CLOCK)
+    out = c.consume(rs)
+    assert out.status == UNMATCHED_MUTATION
+    assert c.ok() is False
+    assert c.report()["violations"] == [rs["signal_id"]]
+
+
+def test_cli_exit_codes_distinguish_missing_bus_from_violation(tmp_path):
+    """Review finding 9: an absent bus (holiday, publisher not enabled) is
+    an operational condition — exit 3 with its own message — never the
+    same signal as a protocol violation (exit 2)."""
+    from signal_plane.consumer import main
+    empty = tmp_path / "no_bus_here"
+    empty.mkdir()
+    assert main([str(empty), "--quiet"]) == 3
+    # And a clean bus exits 0 through the same CLI path.
+    bus = tmp_path / "pair_trading"
+    bus.mkdir()
+    entry, replace, exit_rec = _taleb_lifecycle()
+    (bus / "2026-06-20.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in (entry, replace, exit_rec)))
+    assert main([str(bus), "--quiet"]) == 0
+
+
+def test_closes_group_is_shared_between_planes():
+    """Review finding 10: the group-close rule must live in ONE place —
+    contract.closes_group — so the publisher's state and the consumer's
+    derived state cannot drift. Pin the truth table."""
+    from signal_plane.contract import closes_group
+    assert closes_group("EXIT_ALL", None) is True
+    assert closes_group("CANCEL", None) is True
+    assert closes_group("EXIT", 1.0) is True
+    assert closes_group("EXIT", 0.5) is False
+    assert closes_group("EXIT", None) is False
+    assert closes_group("REDUCE", 1.0) is False
+    assert closes_group("ENTRY", None) is False

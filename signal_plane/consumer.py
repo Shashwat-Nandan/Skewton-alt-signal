@@ -6,30 +6,61 @@ This is NOT an executor: no users, no sizing, no broker. It is the executable
 form of the consumer contract — the thing the OMS team codes against and the
 thing that proves a day's bus is coherent. Per record, in protocol order:
 
-  1. strategy_id consistency (one stream = one strategy)
-  2. version policy (§4.13): unknown MAJOR quarantines the STREAM; a newer
-     MINOR on our MAJOR has its unknown top-level fields ignored (noted)
-  3. schema validation for our checked-in schema → record-level QUARANTINE
-     (never default a field you must act on; the stream continues)
-  4. idempotency: a redelivered signal_id is a DUPLICATE no-op. Checked
-     BEFORE ordering — at-least-once redelivery must not trip the
-     regression quarantine.
-  5. ordering: sequence must be exactly last+1. Lower → REGRESSION, stream
+  1. signature hook (§3 step 1): a NO-OP until signing lands (issue #99
+     item 3) — the call site exists so signing activates here, not in a
+     future refactor.
+  2. strategy_id consistency (one stream = one strategy). Identity is only
+     seeded/compared from records that CARRY a strategy_id — a record
+     missing it is a record-level schema quarantine, not a stream event.
+  3. version policy (§4.13): a well-formed version with an unknown MAJOR
+     quarantines the STREAM; a malformed/absent version falls through to
+     the schema layer (record-level). A newer MINOR on our MAJOR validates
+     with unknown-field (additionalProperties) violations ignored at every
+     nesting level — closed enums still reject.
+  4. idempotency: a redelivered signal_id is a DUPLICATE no-op returning
+     the prior outcome (§3.4) — checked before schema validation and
+     ordering, so redelivery of a quarantined record can't re-quarantine
+     and redelivery of anything can't trip the regression quarantine.
+     A known signal_id arriving on a NEW in-order sequence is NOT a
+     redelivery — the publisher's idempotency window ages out after 2000
+     ids, so a re-published old id with a fresh sequence is a legal
+     stream; its sequence is consumed (keeping the cursor in sync) and
+     the record itself is still not re-applied.
+  5. schema + semantic validation → record-level QUARANTINE. The stream
+     continues; the quarantined signal_id (when present) is remembered so
+     an at-least-once redelivery is a DUPLICATE no-op, and the record's
+     sequence is trusted ONLY when it is exactly the expected next one —
+     an out-of-order sequence on an invalid record must not move the
+     cursor (a garbage record carrying sequence=999999 would otherwise
+     poison every subsequent legitimate record into a false REGRESSION).
+     valid_until must parse (§4.12 is unactionable otherwise; jsonschema
+     treats `format` as annotation-only, so the schema cannot own this).
+  6. ordering: sequence must be exactly last+1. Lower → REGRESSION, stream
      quarantined (never apply). Higher → GAP; with the file bus a gap is
      PERMANENT (the burned sequence never existed — see issue #99), so the
-     default is fail-loud stop; --tolerate-gaps records and continues.
-  6. group correlation: ENTRY opens a group (re-open = stream bug →
-     QUARANTINE); full EXIT / EXIT_ALL / CANCEL closes it; EXIT/CANCEL for
-     an unknown group is a per-user NO-OP (§6 onboarding policy — also the
-     publisher's documented bootstrap escape); a repeat close is the
-     publisher's documented crash worst-case → DUPLICATE_CLOSE no-op.
-  7. TTL asymmetry (§4.12): an ENTRY past valid_until is what a user would
-     SKIP(stale) — classified STALE_ENTRY but the MASTER group state is
-     still tracked (the master did open it; later exits must correlate).
-     An exit past TTL executes anyway — ACCEPTED with a note.
+     default is fail-loud stop; --tolerate-gaps records burned ranges and
+     continues.
+  7. group correlation: ENTRY opens a group (re-open = stream bug →
+     QUARANTINE); contract.closes_group() closes it (the SAME predicate
+     the publisher uses — the planes must not drift). EXIT/EXIT_ALL/CANCEL
+     for an unknown group is a per-user NO-OP (§6 onboarding policy — also
+     the publisher's documented bootstrap escape); a repeat close is the
+     publisher's documented crash worst-case → no-op. ADD/REDUCE/
+     REPLACE_STOP for an unknown group is UNMATCHED_MUTATION and fails
+     ok(): §3.3 calls "a REPLACE_STOP before the stop exists" a money bug,
+     and replaying from sequence 0 leaves only pre-history positions as a
+     legitimate (operator-acknowledgeable) cause.
+  8. TTL asymmetry (§4.12): an ENTRY/ADD past valid_until is what a user
+     would SKIP(stale) — classified STALE_ENTRY but the MASTER group state
+     is still tracked (the master did open it; later exits must
+     correlate). An exit past TTL executes anyway — ACCEPTED with a note.
 
-Stream verdict: ok() is True iff no quarantine/gap/regression was seen —
-usable as an EOD bus watchdog (nonzero CLI exit on violation).
+Stream verdict: ok() is True iff no gap was seen and no record was
+QUARANTINED/UNMATCHED_MUTATION — usable as an EOD bus watchdog. CLI exit
+codes: 0 clean, 2 protocol violation (including stream quarantine),
+3 no bus files (an absent bus — holiday, publisher not enabled — is an
+operational condition, NOT a protocol violation, and must not train
+operators to ignore quarantine alerts).
 
 CLI: python -m signal_plane.consumer logs/signal-bus/pair_trading
 """
@@ -43,8 +74,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from signal_plane.contract import SCHEMA_VERSION
-from signal_plane.validation import check_schema
+from signal_plane.contract import SCHEMA_VERSION, closes_group
+from signal_plane.validation import check_schema, parse_ts
 
 # Record outcomes (per signal). Stream-level events (gap/regression) live in
 # the report, not on a record.
@@ -53,15 +84,18 @@ DUPLICATE = "DUPLICATE"                    # redelivered signal_id — no-op
 STALE_ENTRY = "STALE_ENTRY"                # entry past TTL — user would skip
 NOOP_UNKNOWN_GROUP = "NOOP_UNKNOWN_GROUP"  # exit/cancel for a group we never saw
 DUPLICATE_CLOSE = "DUPLICATE_CLOSE"        # close for an already-closed group
+UNMATCHED_MUTATION = "UNMATCHED_MUTATION"  # ADD/REDUCE/REPLACE_STOP, no group
 QUARANTINED = "QUARANTINED"                # schema/enum/correlation violation
 
-_CLOSING_INTENTS = ("EXIT", "EXIT_ALL", "CANCEL")
+# Outcomes that make the stream verdict red (ok() False).
+_VIOLATION_STATUSES = frozenset({QUARANTINED, UNMATCHED_MUTATION})
 
 
 class StreamQuarantined(Exception):
     """The whole stream is untrustworthy from this record on (unknown MAJOR,
-    sequence regression, or a gap without --tolerate-gaps). §3: quarantine
-    and alert a human — never keep applying."""
+    sequence regression, a gap without --tolerate-gaps, a mid-stream
+    strategy_id switch, or a corrupt bus line). §3: quarantine and alert a
+    human — never keep applying."""
 
     def __init__(self, reason: str):
         self.reason = reason
@@ -85,20 +119,21 @@ class Outcome:
 
 class ReferenceConsumer:
     def __init__(self, tolerate_gaps: bool = False,
-                 start_sequence: int = 0,
                  as_of: Optional[datetime] = None):
         self.tolerate_gaps = tolerate_gaps
         self.as_of = as_of or datetime.now().astimezone()
         self.strategy_id: Optional[str] = None
-        # Next sequence we expect. §4.9 minimum is 0; a consumer replaying
-        # a partial bus passes --from-sequence.
-        self.next_sequence = start_sequence
+        # Next sequence we expect; §4.9's minimum is 0. Partial replay was
+        # deliberately dropped (PR #101 review): it belongs to the real
+        # replay primitive (issue #99), which owns burned-sequence
+        # semantics — a bolted-on --from-sequence produced false
+        # REGRESSION verdicts against a full bus dir.
+        self.next_sequence = 0
         self.seen_ids: Set[str] = set()
         self.open_groups: Dict[str, str] = {}   # group -> entry signal_id
         self.closed_groups: Set[str] = set()
         self.outcomes: List[Outcome] = []
         self.gaps: List[range] = []             # burned sequence ranges
-        self.quarantined_records: List[str] = []
 
     # ── protocol ──
 
@@ -113,8 +148,72 @@ class ReferenceConsumer:
             group=str(record.get("position_group_id")),
             status=ACCEPTED,
         )
+        self.outcomes.append(out)
+        try:
+            return self._consume(record, sig_id, out)
+        except StreamQuarantined:
+            # The stream died AT this record — it was not consumed; the
+            # reason travels on the exception, not as a phantom outcome.
+            self.outcomes.pop()
+            raise
 
+    def _consume(self, record: Dict, sig_id: str, out: Outcome) -> Outcome:
+        self.verify_signature(record)
+        self._check_stream_identity(record)
+        tolerant = self._version_tolerance(record, out)
+
+        if sig_id in self.seen_ids:
+            # Idempotency BEFORE schema validation: §3.4 says a redelivered
+            # signal_id "returns the prior outcome and does nothing" — that
+            # includes a record whose first delivery was quarantined, which
+            # would otherwise re-quarantine (double-counting the violation).
+            out.status = DUPLICATE
+            seq = record.get("sequence")
+            if isinstance(seq, int) and seq == self.next_sequence:
+                # NOT a redelivery: a known signal_id on a NEW in-order
+                # sequence. The publisher's idempotency window ages out
+                # (2000 ids), so this is a legal stream — consume the
+                # sequence or the cursor desyncs and the next record
+                # false-GAPs; the record's content is still not re-applied.
+                # Same trust rule as the quarantine path: only an exactly
+                # in-order sequence moves the cursor.
+                self.next_sequence = seq + 1
+                out.notes.append(
+                    "known signal_id on a NEW in-order sequence (publisher "
+                    "idempotency window aged out) — sequence consumed, "
+                    "content not re-applied"
+                )
+            else:
+                out.notes.append("redelivered signal_id — prior outcome stands")
+            return out
+
+        problems = check_schema(record, ignore_unknown_fields=tolerant)
+        problems.extend(self._semantic_problems(record))
+        if problems:
+            return self._quarantine_record(record, out, problems)
+
+        self._advance_sequence(record, out)
+        self.seen_ids.add(sig_id)
+        self._apply_group_rules(record, out)
+        self._classify_ttl(record, out)
+        return out
+
+    # ── steps ──
+
+    def verify_signature(self, record: Dict) -> None:
+        """§3 step 1. NO-OP: payloads are unsigned today (OMS guide §0).
+        This is the activation point when signing lands (issue #99 item 3)
+        — a real implementation raises StreamQuarantined on a bad
+        signature. Kept as a method so the OMS scaffold inherits the call
+        site, not a TODO."""
+
+    def _check_stream_identity(self, record: Dict) -> None:
         sid = record.get("strategy_id")
+        if sid is None:
+            # Missing strategy_id is a record-level schema violation (it is
+            # a required field); it must not seed the stream identity to
+            # None or read as a mid-stream identity switch.
+            return
         if self.strategy_id is None:
             self.strategy_id = sid
         elif sid != self.strategy_id:
@@ -123,64 +222,67 @@ class ReferenceConsumer:
                 f"{sid!r} (one stream = one strategy, §6)"
             )
 
-        record = self._apply_version_policy(record, out)
-
-        problems = check_schema(record)
-        if problems:
-            out.status = QUARANTINED
-            out.notes.extend(problems[:3])
-            self.quarantined_records.append(sig_id)
-            self._record(out)
-            # A schema-invalid record still consumed its sequence.
-            self._advance_sequence(record, out)
-            return out
-
-        if sig_id in self.seen_ids:
-            out.status = DUPLICATE
-            out.notes.append("redelivered signal_id — prior outcome stands")
-            self._record(out)
-            return out
-
-        self._advance_sequence(record, out)
-        self.seen_ids.add(sig_id)
-        self._apply_group_rules(record, out)
-        self._classify_ttl(record, out)
-        self._record(out)
-        return out
-
-    # ── steps ──
-
-    def _apply_version_policy(self, record: Dict, out: Outcome) -> Dict:
+    def _version_tolerance(self, record: Dict, out: Outcome) -> bool:
+        """§4.13. Returns True when the record advertises a newer MINOR on
+        our MAJOR (validate with unknown fields ignored). A well-formed
+        version with a foreign MAJOR quarantines the stream; a malformed or
+        absent version returns False and is left to the schema layer — a
+        record-level defect, not a version-policy event."""
         version = str(record.get("schema_version", ""))
-        major = version.split(".", 1)[0]
+        parts = version.split(".")
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            return False  # schema quarantines the record (pattern ^\d+\.\d+$)
+        major, minor = parts
         ours_major, ours_minor = SCHEMA_VERSION.split(".")
         if major != ours_major:
             raise StreamQuarantined(
                 f"unknown schema MAJOR {version!r} (we hold {SCHEMA_VERSION}) "
                 f"— reject + quarantine + alert (§4.13); never guess"
             )
-        minor = version.split(".", 1)[1] if "." in version else "0"
-        if minor.isdigit() and int(minor) > int(ours_minor):
-            # Newer MINOR on our MAJOR: unknown optional top-level fields are
-            # ignored (§4.13). Strip them so additionalProperties:false in
-            # our older schema doesn't reject a legal newer record; then
-            # validate what remains. Enum members are still closed — a new
-            # member inside a known field fails schema → quarantine.
-            known = set(_schema_properties())
-            unknown = [k for k in record if k not in known]
-            if unknown:
-                out.notes.append(
-                    f"schema {version} > ours {SCHEMA_VERSION}: ignored "
-                    f"unknown field(s) {sorted(unknown)}"
-                )
-                record = {k: v for k, v in record.items() if k in known}
-                record["schema_version"] = SCHEMA_VERSION
-        return record
+        if int(minor) > int(ours_minor):
+            out.notes.append(
+                f"schema {version} > ours {SCHEMA_VERSION}: unknown-field "
+                f"violations ignored per §4.13 (closed enums still reject)"
+            )
+            return True
+        return False
+
+    def _semantic_problems(self, record: Dict) -> List[str]:
+        """Consumer-side semantic checks the schema cannot express: §4.12's
+        TTL is a field we must act on, and jsonschema's `format` is
+        annotation-only — an unparseable valid_until would silently disable
+        the TTL asymmetry, so it quarantines the record instead."""
+        if "valid_until" in record and parse_ts(record["valid_until"]) is None:
+            return [f"valid_until {record['valid_until']!r} is not a "
+                    f"parseable RFC3339 timestamp — §4.12 TTL is unactionable"]
+        return []
+
+    def _quarantine_record(self, record: Dict, out: Outcome,
+                           problems: List[str]) -> Outcome:
+        out.status = QUARANTINED
+        out.notes.extend(problems)
+        # Remember the id (when the record has one) so an at-least-once
+        # redelivery of this same bad record is a DUPLICATE no-op instead
+        # of a false REGRESSION.
+        if record.get("signal_id"):
+            self.seen_ids.add(str(record["signal_id"]))
+        # Trust the invalid record's sequence ONLY when it is exactly the
+        # expected next one (the common case: a mostly-valid record with
+        # one bad field, occupying its slot on the bus). Anything else is
+        # an unvalidated number from a broken record — moving the cursor
+        # on it would poison every subsequent legitimate record.
+        seq = record.get("sequence")
+        if isinstance(seq, int) and seq == self.next_sequence:
+            self.next_sequence = seq + 1
+        else:
+            out.notes.append(
+                f"sequence {seq!r} not trusted from an invalid record — "
+                f"cursor stays at {self.next_sequence}"
+            )
+        return out
 
     def _advance_sequence(self, record: Dict, out: Outcome) -> None:
-        seq = record.get("sequence")
-        if not isinstance(seq, int):
-            return  # schema layer already quarantined this shape
+        seq = record["sequence"]  # schema-valid here: required int >= 0
         if seq < self.next_sequence:
             raise StreamQuarantined(
                 f"sequence REGRESSION: got {seq}, already consumed up to "
@@ -208,14 +310,11 @@ class ReferenceConsumer:
                     "ENTRY re-opens a known group — group ids are never "
                     "reused; publisher-side invariant broken upstream"
                 )
-                self.quarantined_records.append(record["signal_id"])
                 return
             self.open_groups[group] = record["signal_id"]
             return
 
-        closes = (intent in ("EXIT_ALL", "CANCEL")
-                  or (intent == "EXIT"
-                      and float(record.get("fraction") or 0) >= 1.0))
+        closes = closes_group(intent, record.get("fraction"))
         if group in self.open_groups:
             supersedes = record.get("supersedes")
             if supersedes and supersedes not in self.seen_ids:
@@ -232,7 +331,7 @@ class ReferenceConsumer:
                 "group already closed — publisher's documented crash "
                 "worst-case; no-op"
             )
-        else:
+        elif intent in ("EXIT", "EXIT_ALL", "CANCEL"):
             out.status = NOOP_UNKNOWN_GROUP
             out.notes.append(
                 "no ENTRY seen for this group (bootstrap escape or "
@@ -240,12 +339,21 @@ class ReferenceConsumer:
             )
             if closes:
                 self.closed_groups.add(group)  # suppress a repeat close
+        else:
+            # ADD/REDUCE/REPLACE_STOP resolving against nothing. §3.3:
+            # "a REPLACE_STOP before the stop exists is a money bug, not a
+            # warning" — replaying from sequence 0, only a position that
+            # pre-dates signal history can legitimately cause this, and
+            # that deserves an operator's eyes, not a green verdict.
+            out.status = UNMATCHED_MUTATION
+            out.notes.append(
+                f"{intent} for a group with no ENTRY on this stream — "
+                f"correlation cannot resolve (§3.5); legitimate only for "
+                f"pre-history positions"
+            )
 
     def _classify_ttl(self, record: Dict, out: Outcome) -> None:
-        try:
-            valid_until = datetime.fromisoformat(record["valid_until"])
-        except (KeyError, TypeError, ValueError):
-            return  # schema layer owns malformed timestamps
+        valid_until = parse_ts(record["valid_until"])  # parseable: checked
         if valid_until.tzinfo is None:
             valid_until = valid_until.astimezone()
         if valid_until >= self.as_of:
@@ -259,9 +367,6 @@ class ReferenceConsumer:
             )
         else:
             out.notes.append("past valid_until — executes anyway (§4.12)")
-
-    def _record(self, out: Outcome) -> None:
-        self.outcomes.append(out)
 
     # ── replay + report ──
 
@@ -288,7 +393,9 @@ class ReferenceConsumer:
         return self.outcomes
 
     def ok(self) -> bool:
-        return not self.gaps and not self.quarantined_records
+        return not self.gaps and not any(
+            o.status in _VIOLATION_STATUSES for o in self.outcomes
+        )
 
     def report(self) -> Dict:
         counts: Dict[str, int] = {}
@@ -302,14 +409,10 @@ class ReferenceConsumer:
             "open_groups": dict(self.open_groups),
             "closed_groups": len(self.closed_groups),
             "gaps": [[g.start, g.stop - 1] for g in self.gaps],
-            "quarantined": list(self.quarantined_records),
+            "violations": [o.signal_id for o in self.outcomes
+                           if o.status in _VIOLATION_STATUSES],
             "ok": self.ok(),
         }
-
-
-def _schema_properties() -> List[str]:
-    from signal_plane.validation import _schema_validator
-    return list(_schema_validator().schema.get("properties", {}))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -321,25 +424,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--tolerate-gaps", action="store_true",
                         help="record burned sequences and continue instead of "
                              "quarantining the stream at the first gap")
-    parser.add_argument("--from-sequence", type=int, default=0,
-                        help="first sequence expected (default 0 = full history)")
     parser.add_argument("--quiet", action="store_true",
                         help="suppress per-signal lines; print only the report")
     args = parser.parse_args(argv)
 
-    consumer = ReferenceConsumer(tolerate_gaps=args.tolerate_gaps,
-                                 start_sequence=args.from_sequence)
+    consumer = ReferenceConsumer(tolerate_gaps=args.tolerate_gaps)
+    stream_error: Optional[Exception] = None
     try:
         consumer.replay_dir(args.bus_dir)
-    except (StreamQuarantined, FileNotFoundError) as e:
-        for o in consumer.outcomes:
-            if not args.quiet:
-                print(o.line())
-        print(f"STREAM QUARANTINED: {e}", file=sys.stderr)
-        return 2
+    except FileNotFoundError as e:
+        # An absent/empty bus (holiday, publisher not enabled) is an
+        # operational condition, not a protocol violation — a distinct
+        # message and exit code so watchdog alerting can tell them apart.
+        print(f"NO BUS FILES: {e}", file=sys.stderr)
+        return 3
+    except StreamQuarantined as e:
+        stream_error = e
+
     if not args.quiet:
         for o in consumer.outcomes:
             print(o.line())
+    if stream_error is not None:
+        print(f"STREAM QUARANTINED: {stream_error}", file=sys.stderr)
+        return 2
     print(json.dumps(consumer.report(), indent=2))
     return 0 if consumer.ok() else 2
 

@@ -69,6 +69,16 @@ LIFECYCLE_STATES = ("PUBLISHED", "DISTRIBUTED", "EVALUATING", "SKIPPED",
                     "CLOSING", "CLOSED")
 
 
+def closes_group(intent: str, fraction: Optional[float]) -> bool:
+    """§4.15 group lifecycle: does this signal FULLY close its
+    position_group? One shared rule for the publisher's group transitions
+    and the consumer's correlation tracking — the two planes must never
+    drift on this predicate (PR #101 review: it was hand-copied in both)."""
+    if intent in ("EXIT_ALL", "CANCEL"):
+        return True
+    return intent == "EXIT" and (fraction or 0) >= 1.0
+
+
 def uuid7() -> str:
     """RFC 9562 UUIDv7 (time-ordered): 48-bit unix-ms timestamp + random.
 

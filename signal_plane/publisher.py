@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from runner_common import acquire_lock, durable_write_text
-from signal_plane.contract import SignalEnvelope
+from signal_plane.contract import SignalEnvelope, closes_group
 from signal_plane.validation import SignalValidationError, validate_signal
 
 logger = logging.getLogger(__name__)
@@ -256,10 +256,7 @@ class SignalPublisher:
     def _apply_group_transition(self, envelope: SignalEnvelope) -> None:
         group = envelope.position_group_id
         open_groups = self._state["open_groups"]
-        closes = (
-            envelope.intent in ("CANCEL", "EXIT_ALL")
-            or (envelope.intent == "EXIT" and (envelope.fraction or 0) >= 1.0)
-        )
+        closes = closes_group(envelope.intent, envelope.fraction)
         if envelope.intent == "ENTRY":
             open_groups[group] = envelope.signal_id
         elif closes:

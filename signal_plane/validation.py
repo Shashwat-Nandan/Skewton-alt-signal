@@ -48,20 +48,35 @@ def _schema_validator() -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
-def check_schema(record: Dict) -> List[str]:
-    """Layer 1: the record validates against the checked-in JSON Schema."""
+def check_schema(record: Dict, ignore_unknown_fields: bool = False) -> List[str]:
+    """Layer 1: the record validates against the checked-in JSON Schema.
+
+    ignore_unknown_fields implements the §4.13 newer-MINOR tolerance for
+    CONSUMERS: additionalProperties violations are excluded at EVERY nesting
+    level (a legal 1.x MINOR bump may add an optional field anywhere —
+    legs[].instrument, sizing, risk[] — not just at the top level), while
+    every other violation, including a new member of a closed enum, still
+    fails. Publishers never set this: they must emit only fields their own
+    schema knows."""
     return [
         "schema: %s: %s" % ("/".join(str(p) for p in e.absolute_path) or "$",
                             e.message)
         for e in _schema_validator().iter_errors(record)
+        if not (ignore_unknown_fields and e.validator == "additionalProperties")
     ]
 
 
-def _parse_ts(value):
+def parse_ts(value):
+    """RFC3339 → datetime, or None when absent/malformed. The ONE timestamp
+    parser for both planes (publisher's check_ttl and the consumer's TTL
+    classification must accept the same set of strings)."""
     try:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+_parse_ts = parse_ts  # internal alias, kept for existing callers
 
 
 def check_ttl(record: Dict) -> List[str]:
