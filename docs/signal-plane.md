@@ -17,7 +17,8 @@ payload signing, and the other five strategies are later increments.
 | Strategy hooks | `strategies/pair_trading.py` (`execute_proposals`) | §5 |
 | Runner flag | `run_paper_pairs.py --publish-signals` | — |
 | Worked examples pinned | `tests/fixtures/signals/*.json` | §4.10 |
-| Reference consumer (§3 protocol, replay + verify; `python -m signal_plane.consumer <bus-dir>`, nonzero exit on violation → EOD watchdog) | `signal_plane/consumer.py` | oms-guide §3, #99 |
+| Reference consumer (§3 protocol, replay + verify; `python -m signal_plane.consumer <bus-dir>`; exit 0 clean / 2 violation / 3 no bus files → EOD watchdog) | `signal_plane/consumer.py` | oms-guide §3, #99 |
+| Shared group-close predicate (publisher + consumer must not drift) | `signal_plane/contract.py` `closes_group()` | §4.15 |
 
 The schema dir doubles as the MVP schema registry (§6): consumers reject any
 MAJOR they don't have a checked-in schema for.
