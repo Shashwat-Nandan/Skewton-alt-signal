@@ -805,40 +805,63 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
         if pos.get("average_price") not in (None, 0, 0.0):
             broker_avg_price[ts] = float(pos.get("average_price"))
 
-    mismatches: List[str] = []
-    price_warnings: List[str] = []
-    expected_tradingsymbols: set = set()
+    # Aggregate expected shares per tradingsymbol across ALL live
+    # strategies before comparing. Kite's "net" bucket reports ONE net row
+    # per contract, so two pairs holding offsetting legs in the same
+    # contract (e.g. BHARTIARTL/M&M +200 vs M&M/HDFCLIFE −200 M&M26JULFUT,
+    # 2026-07-09/10 incident) legitimately show broker qty 0 — comparing
+    # any single leg against the net row is a false mismatch that halted
+    # entries mid-session and then refused the next day's start.
+    expected_qty: Dict[str, int] = {}
+    leg_holders: Dict[str, List[tuple]] = {}
     for s in live_strategies:
         if s.state.position == "FLAT":
             continue
         for leg in s.state.legs:
-            expected_shares = leg.quantity * leg.lot_size  # signed
-            actual_shares = broker_qty.get(leg.tradingsymbol, 0)
-            expected_tradingsymbols.add(leg.tradingsymbol)
-            if expected_shares != actual_shares:
-                mismatches.append(
-                    f"{s.symbol_a}/{s.symbol_b} {leg.tradingsymbol}: "
-                    f"state expects {expected_shares} shares, broker has "
-                    f"{actual_shares}"
-                )
-                continue
-            # M-R2: cross-check entry_price against broker's average_price.
-            # State-schema corruption or wrong-state-file-copied would
-            # otherwise leave stop-z math calibrated to a baseline the
-            # broker doesn't agree with. 0.5% tolerance covers normal
-            # rounding + intra-trade adds without flagging routine drift.
-            broker_px = broker_avg_price.get(leg.tradingsymbol)
-            if broker_px is None or broker_px == 0:
-                continue  # broker didn't report price — skip silently
-            tol = max(0.005 * broker_px, 0.5)  # 0.5% or ₹0.50 floor
-            if abs(leg.entry_price - broker_px) > tol:
-                price_warnings.append(
-                    f"{s.symbol_a}/{s.symbol_b} {leg.tradingsymbol}: "
-                    f"state entry_price ₹{leg.entry_price:.2f} vs broker "
-                    f"average_price ₹{broker_px:.2f} (diff "
-                    f"₹{abs(leg.entry_price - broker_px):.2f}, tol "
-                    f"₹{tol:.2f})"
-                )
+            shares = leg.quantity * leg.lot_size  # signed
+            expected_qty[leg.tradingsymbol] = (
+                expected_qty.get(leg.tradingsymbol, 0) + shares
+            )
+            leg_holders.setdefault(leg.tradingsymbol, []).append(
+                (f"{s.symbol_a}/{s.symbol_b}", shares, leg)
+            )
+
+    mismatches: List[str] = []
+    price_warnings: List[str] = []
+    expected_tradingsymbols: set = set(expected_qty)
+    for ts, expected_shares in expected_qty.items():
+        actual_shares = broker_qty.get(ts, 0)
+        if expected_shares != actual_shares:
+            held_by = " + ".join(f"{label} {shares:+d}"
+                                 for label, shares, _leg in leg_holders[ts])
+            mismatches.append(
+                f"{ts}: state expects {expected_shares} shares net "
+                f"({held_by}), broker has {actual_shares}"
+            )
+            continue
+        # M-R2: cross-check entry_price against broker's average_price.
+        # State-schema corruption or wrong-state-file-copied would
+        # otherwise leave stop-z math calibrated to a baseline the
+        # broker doesn't agree with. 0.5% tolerance covers normal
+        # rounding + intra-trade adds without flagging routine drift.
+        # Only meaningful when exactly ONE leg holds this contract — the
+        # broker's single net average_price cannot be attributed across
+        # multiple legs (and nets to 0/absent for offsetting legs).
+        if len(leg_holders[ts]) != 1:
+            continue
+        label, _shares, leg = leg_holders[ts][0]
+        broker_px = broker_avg_price.get(ts)
+        if broker_px is None or broker_px == 0:
+            continue  # broker didn't report price — skip silently
+        tol = max(0.005 * broker_px, 0.5)  # 0.5% or ₹0.50 floor
+        if abs(leg.entry_price - broker_px) > tol:
+            price_warnings.append(
+                f"{label} {ts}: "
+                f"state entry_price ₹{leg.entry_price:.2f} vs broker "
+                f"average_price ₹{broker_px:.2f} (diff "
+                f"₹{abs(leg.entry_price - broker_px):.2f}, tol "
+                f"₹{tol:.2f})"
+            )
 
     # Broker positions we don't know about — flag (don't refuse). Could be
     # manual orders or another runner's positions on the same account.

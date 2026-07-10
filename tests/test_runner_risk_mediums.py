@@ -147,6 +147,55 @@ def test_share_mismatch_still_blocks(caplog):
         reconcile_with_broker([s], kite, logging.getLogger("test"))
 
 
+def test_offsetting_legs_across_pairs_reconcile_against_broker_net(caplog):
+    """2026-07-09/10 incident: two pairs held equal-and-opposite legs in the
+    same contract (+200/−200 M&M26JULFUT). Kite's "net" bucket reports ONE
+    net row per contract (qty 0, and often no row at all), so per-leg
+    comparison false-flagged BOTH legs, halting entries mid-session and
+    refusing the next day's start while state and broker actually agreed.
+    Expected shares must be summed across strategies per tradingsymbol."""
+    from run_paper_pairs import reconcile_with_broker
+    caplog.set_level(logging.WARNING, logger="")
+    s1 = _LiveStrategy("BHA", "MMM", [
+        _Leg("BHA26JULFUT", quantity=-1, lot_size=475, entry_price=1900.0),
+        _Leg("MMM26JULFUT", quantity=1, lot_size=200, entry_price=3200.0),
+    ])
+    s2 = _LiveStrategy("MMM", "HDF", [
+        _Leg("MMM26JULFUT", quantity=-1, lot_size=200, entry_price=3150.0),
+        _Leg("HDF26JULFUT", quantity=1, lot_size=1100, entry_price=640.0),
+    ])
+    # Broker: the two MMM legs net to zero → no MMM row at all (Kite may
+    # also report a 0-qty row; absent is the harsher case).
+    kite = _kite_with_positions([
+        {"exchange": "NFO", "tradingsymbol": "BHA26JULFUT",
+         "quantity": -475, "average_price": 1900.0},
+        {"exchange": "NFO", "tradingsymbol": "HDF26JULFUT",
+         "quantity": 1100, "average_price": 640.0},
+    ])
+    # Must NOT raise: +200 − 200 = 0 matches the absent broker row.
+    reconcile_with_broker([s1, s2], kite, logging.getLogger("test"))
+    # M-R2 must not fire for the shared contract (entry prices 3200/3150
+    # differ, but no single broker average_price is attributable).
+    assert not any("M-R2" in r.message for r in caplog.records)
+
+
+def test_offsetting_legs_aggregate_mismatch_still_blocks():
+    """Aggregation must not weaken the gate: if the summed expectation
+    disagrees with the broker net, refuse to start and name every
+    contributing pair."""
+    from run_paper_pairs import reconcile_with_broker
+    s1 = _LiveStrategy("BHA", "MMM", [
+        _Leg("MMM26JULFUT", quantity=1, lot_size=200, entry_price=3200.0),
+    ])
+    s2 = _LiveStrategy("MMM", "HDF", [
+        _Leg("MMM26JULFUT", quantity=-2, lot_size=200, entry_price=3150.0),
+    ])
+    # Expected net = +200 − 400 = −200; broker says flat.
+    kite = _kite_with_positions([])
+    with pytest.raises(RuntimeError, match=r"MMM26JULFUT.*BHA/MMM \+200.*MMM/HDF -400"):
+        reconcile_with_broker([s1, s2], kite, logging.getLogger("test"))
+
+
 # ──────────────────────────────────────────────────────────
 # 3.7 / M-6 — mid-session reconcile cadence (non-fatal drift handling)
 # ──────────────────────────────────────────────────────────
