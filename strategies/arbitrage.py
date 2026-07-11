@@ -89,6 +89,17 @@ class CalendarTrade:
     # at calendar_exit_debounce_ticks, so one noisy print can't buy a
     # round-trip. Reset whenever the diff prints back outside the band.
     converge_streak: int = 0
+    # Ledger-integrity fields (review 2026-07-11). expected_harvest is the
+    # entry-time rupee expectation from the cost-hurdle model — the
+    # STOP_LOSS exit compares MTM against it (thesis invalidation). The
+    # exit_* fields are stamped by _build_calendar_exit and archived onto
+    # the closed_trades row; pnl_verified flips False when any exit leg had
+    # to be priced at a last-known mark (missing from the snapshot), so the
+    # ledger distinguishes verified P&L from expiry-window approximations.
+    expected_harvest: Optional[float] = None
+    exit_reason: Optional[str] = None
+    exit_carry_diff: Optional[float] = None
+    pnl_verified: bool = True
 
 
 @dataclass
@@ -104,6 +115,10 @@ class ArbitrageState:
     # number from scan_and_propose into _apply_fill so closed_trades record
     # the entry conditions accurately.
     pending_entry_diff: Dict[str, float] = field(default_factory=dict)
+    # Entry-time expected harvest (₹) from the cost-hurdle model, same
+    # lifecycle as pending_entry_diff (proposal tick → _apply_fill; never
+    # serialized). Lands on CalendarTrade.expected_harvest for the stop.
+    pending_expected_harvest: Dict[str, float] = field(default_factory=dict)
 
 
 class ArbitrageStrategy(BaseStrategy):
@@ -174,6 +189,21 @@ class ArbitrageStrategy(BaseStrategy):
         self.calendar_exit_annual = float(cfg.get("calendar_exit_annual", 0.005))
         self.calendar_max_holding_days = int(cfg.get("calendar_max_holding_days", 15))
         self.calendar_min_dte_near = int(cfg.get("calendar_min_dte_near", 4))
+        # Expiry-safe entry window (review 2026-07-11): a hold entered with
+        # dte_near < max_hold + 2 can live into the roll zone, where exit legs
+        # drop out of the snapshot and get priced at last-known marks — the
+        # source of the ±₹16k "approximate P&L" artifacts around the JUN-2026
+        # expiry (and the regime of the 06-19 loss). Require enough runway at
+        # ENTRY that the full max-hold ends before the DTE≤2 force-exit.
+        self.calendar_entry_min_dte = max(
+            self.calendar_min_dte_near, self.calendar_max_holding_days + 2)
+        # Thesis-invalidation stop (review 2026-07-11): exit when the spread's
+        # MTM is down more than this multiple of the ENTRY-TIME expected
+        # harvest — if the trade has lost more than it could ever have made,
+        # the "mispricing" is structure (dividends/borrow), not noise. The
+        # forward book's multi-day bleeders ran −₹11k…−₹22k against ~₹2-4k
+        # expectations with no stop below them. 0 disables.
+        self.calendar_stop_loss_mult = float(cfg.get("calendar_stop_loss_mult", 1.0))
         # Rupee cost hurdle at entry (efficiency review 2026-07-05 §2.3/E2).
         # The % gate above is in annualized-carry units — blind to whether a
         # 1-lot spread can MONETIZE the carry: the June 2026 forward record
@@ -284,7 +314,10 @@ class ArbitrageStrategy(BaseStrategy):
             if (
                 snap["near"] is not None
                 and snap["next"] is not None
-                and snap["dte_near"] >= self.calendar_min_dte_near
+                # calendar_entry_min_dte (= max_hold + 2), NOT the bare
+                # calendar_min_dte_near: entries must have enough runway that
+                # the hold can never reach the roll zone (see __init__).
+                and snap["dte_near"] >= self.calendar_entry_min_dte
                 and snap["carry_diff"] is not None
                 and abs(snap["carry_diff"]) >= self.calendar_entry_annual
                 and snap["symbol"] not in self.state.open_calendars
@@ -315,14 +348,42 @@ class ArbitrageStrategy(BaseStrategy):
 
             held_days = (self._clock() - trade.entry_time).total_seconds() / 86400.0
 
-            # Force-exit if near-month is about to expire (cash settlement risk).
-            if snap["near"] is not None and snap["dte_near"] <= 1:
+            # Force-exit before the roll zone (cash settlement risk AND
+            # pricing integrity: at DTE≤1 exit legs start dropping out of the
+            # snapshot and get priced at last-known marks). DTE≤2 pairs with
+            # the calendar_entry_min_dte entry gate so a max-hold exit and
+            # this force-exit meet, never cross.
+            if snap["near"] is not None and snap["dte_near"] <= 2:
                 proposals.extend(self._build_calendar_exit(trade, snap, "EXPIRY"))
                 continue
 
             if held_days >= self.calendar_max_holding_days:
                 proposals.extend(self._build_calendar_exit(trade, snap, "MAX_HOLD"))
                 continue
+
+            # Thesis-invalidation stop (never debounced — a spread this far
+            # under water is not a noisy print). MTM = this trade's own
+            # realized (entry costs so far) + open-leg mark-to-market; leg
+            # current_price was refreshed by _update_unrealized above.
+            if self.calendar_stop_loss_mult > 0:
+                expected = trade.expected_harvest
+                if expected is None:
+                    # Legacy trade opened before the field existed: rebuild
+                    # the entry-time expectation from what was recorded.
+                    notional = max((l.entry_price * abs(l.quantity) * l.lot_size
+                                    for l in trade.legs), default=0.0)
+                    expected = (max(abs(trade.entry_carry_diff) - self.calendar_exit_annual, 0.0)
+                                * notional * self.calendar_max_holding_days / 365.0)
+                mtm = trade.realized + sum(
+                    (l.current_price - l.entry_price) * l.quantity * l.lot_size
+                    for l in trade.legs)
+                if expected > 0 and mtm <= -self.calendar_stop_loss_mult * expected:
+                    logger.warning(
+                        "%s calendar: MTM ₹%.0f ≤ -%.1fx expected harvest ₹%.0f "
+                        "— thesis invalidated, exiting STOP_LOSS",
+                        symbol, mtm, self.calendar_stop_loss_mult, expected)
+                    proposals.extend(self._build_calendar_exit(trade, snap, "STOP_LOSS"))
+                    continue
 
             # Mean-revert: implied carry has converged toward fair. Debounced
             # by a consecutive-tick streak (see __init__): one noisy print
@@ -479,6 +540,8 @@ class ArbitrageStrategy(BaseStrategy):
                     "realized": t.realized,
                     "costs": t.costs,
                     "converge_streak": t.converge_streak,
+                    "expected_harvest": t.expected_harvest,
+                    "pnl_verified": t.pnl_verified,
                     "legs": [
                         {
                             "symbol": l.symbol,
@@ -522,6 +585,11 @@ class ArbitrageStrategy(BaseStrategy):
                 # .get: blobs written before the debounce existed lack the
                 # key; a fresh streak is the safe default (never exits early).
                 converge_streak=int(tblob.get("converge_streak", 0)),
+                # .get: pre-2026-07-11 blobs lack these; None makes the stop
+                # fall back to its entry_carry_diff reconstruction.
+                expected_harvest=(float(tblob["expected_harvest"])
+                                  if tblob.get("expected_harvest") is not None else None),
+                pnl_verified=bool(tblob.get("pnl_verified", True)),
                 legs=[
                     CalendarLeg(
                         symbol=l["symbol"],
@@ -558,6 +626,24 @@ class ArbitrageStrategy(BaseStrategy):
                 trade.realized = -open_costs
             open_calendars[trade.symbol] = trade
         self.state.open_calendars = open_calendars
+        # Ledger reconciliation (Rule 12, review 2026-07-11): the headline
+        # realized_pnl and the per-trade ledger are updated in lockstep by
+        # _apply_fill, so any drift means state surgery or an accounting bug.
+        # As of 2026-07-11 ~₹39k of historical drift exists from the JUN-2026
+        # expiry repairs — the warning makes any CHANGE in the number visible,
+        # and says loudly that the headline alone must not grade the book.
+        ledger = (
+            sum(float(t.get("realized_pnl", 0.0) or 0.0)
+                for t in self.state.closed_trades)
+            + sum(t.realized for t in open_calendars.values())
+        )
+        drift = self.state.realized_pnl - ledger
+        if abs(drift) > 1.0:
+            logger.warning(
+                "LEDGER DRIFT: headline realized ₹%.0f vs per-trade ledger "
+                "₹%.0f (drift ₹%.0f) — do not grade the experiment on the "
+                "headline alone; segment closed_trades by pnl_verified/era",
+                self.state.realized_pnl, ledger, drift)
         # Session start = this restore point, so session_*_delta measures only
         # what happens after restore. Capturing it here (not in the runner)
         # means every caller of generate_eod_report gets correct per-session
@@ -936,13 +1022,16 @@ class ArbitrageStrategy(BaseStrategy):
         # convergence completes only partially before a forced exit (the
         # dte_near − 1 matches the EXPIRY force-exit in check_and_rehedge).
         # The gate is therefore conservative: it under-, never over-states.
+        horizon_days = min(max(float(snap["dte_near"]) - 1.0, 0.0),
+                           float(self.calendar_max_holding_days))
+        harvest_annual = max(abs(cd) - self.calendar_exit_annual, 0.0)
+        notional = max(one_lot_near, one_lot_next) * qty
+        # Computed unconditionally (not only under the hurdle): the entry-time
+        # expectation is also the STOP_LOSS exit's yardstick, stashed on the
+        # trade via pending_expected_harvest below.
+        expected_pnl = harvest_annual * notional * horizon_days / 365.0
         if self.calendar_cost_hurdle_mult > 0:
             from strategies.taleb_karpathy import estimate_transaction_cost
-            horizon_days = min(max(float(snap["dte_near"]) - 1.0, 0.0),
-                               float(self.calendar_max_holding_days))
-            harvest_annual = max(abs(cd) - self.calendar_exit_annual, 0.0)
-            notional = max(one_lot_near, one_lot_next) * qty
-            expected_pnl = harvest_annual * notional * horizon_days / 365.0
             round_trip_cost = sum(
                 estimate_transaction_cost(px, qty, near_lot, side, "FUT")
                 for px in (snap["near_price"], snap["next_price"])
@@ -975,6 +1064,7 @@ class ArbitrageStrategy(BaseStrategy):
             f"vs fair={self.risk_free_rate - q_sym:.3f} "
             f"(diff={cd*100:.2f}% ann., near {snap['dte_near']}d / next {snap['dte_next']}d)"
         )
+        self.state.pending_expected_harvest[symbol] = expected_pnl
         return [
             self._make_fut_proposal(near, qty, snap["near_price"], side_near,
                                     rationale, margin_required=leg_margin),
@@ -989,6 +1079,11 @@ class ArbitrageStrategy(BaseStrategy):
             f"EXIT_{reason} on {trade.symbol} (entry_diff={trade.entry_carry_diff:.3f}, "
             f"now_diff={(snap.get('carry_diff') or 0):.3f})"
         )
+        # Stamp the exit conditions on the trade so _apply_fill archives them
+        # onto the closed_trades row (paper fills are same-tick, so the stamp
+        # and the archive can't interleave with another exit decision).
+        trade.exit_reason = reason
+        trade.exit_carry_diff = snap.get("carry_diff")
         proposals: List[TradeProposal] = []
         for leg in trade.legs:
             # Match the leg back to a future in the snapshot for current price.
@@ -1006,10 +1101,11 @@ class ArbitrageStrategy(BaseStrategy):
                 # P&L on this exit is *unverified* (it could be off by the
                 # contract's last-day move).
                 current_px = leg.current_price or leg.entry_price
+                trade.pnl_verified = False   # closed row carries the flag
                 logger.warning(
                     "exit %s/%s: leg %s not in current snapshot (likely "
                     "rolled/delisted); pricing at last-known %.2f — "
-                    "realized P&L on this leg is approximate",
+                    "realized P&L on this leg is approximate (pnl_verified=False)",
                     trade.symbol, reason, leg.tradingsymbol, current_px,
                 )
 
@@ -1084,6 +1180,7 @@ class ArbitrageStrategy(BaseStrategy):
                 position="LONG_CALENDAR",   # finalized after both legs in
                 entry_time=self._clock(),
                 entry_carry_diff=self.state.pending_entry_diff.pop(symbol, 0.0),
+                expected_harvest=self.state.pending_expected_harvest.pop(symbol, None),
                 legs=[],
             )
             self.state.open_calendars[symbol] = trade
@@ -1136,14 +1233,23 @@ class ArbitrageStrategy(BaseStrategy):
         # each closed_trades row is independently meaningful even when calendars
         # overlap (sweeps and autoresearch loss functions consume these directly).
         if not trade.legs:
+            now = self._clock()
             self.state.closed_trades.append({
                 "symbol": symbol,
-                "exit_time": self._clock(),
+                "exit_time": now,
                 "entry_time": trade.entry_time,
                 "entry_carry_diff": trade.entry_carry_diff,
                 "realized_pnl": trade.realized,
                 "transaction_costs": trade.costs,
                 "position": trade.position,
+                # Ledger-integrity fields (review 2026-07-11): without these
+                # the forward record can't be segmented by exit path or
+                # cleaned of approximate-priced expiry exits.
+                "exit_reason": trade.exit_reason,
+                "exit_carry_diff": trade.exit_carry_diff,
+                "held_days": round((now - trade.entry_time).total_seconds() / 86400.0, 2),
+                "expected_harvest": trade.expected_harvest,
+                "pnl_verified": trade.pnl_verified,
             })
             del self.state.open_calendars[symbol]
 

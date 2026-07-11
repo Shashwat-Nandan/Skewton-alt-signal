@@ -2054,3 +2054,22 @@ Plan:
       the day's gap candidates + open positions (issue #63 forward-capture).
 - [x] Tests for all three live-path behaviours; full suite green.
 - [x] PR → merge → install unit change + daemon-reload.
+
+## 2026-07-11 — Calendar-spread review + fine-tune (user-approved 3 of 4)
+
+Findings: era A (k=.025) −₹53.6k churn (fixed 06-19); era B ±₹16k
+approximate-priced roll exits; era C unpinnable (5/5 slots since 07-01);
+ledger drift ₹42.8k vs headline; no stop-loss existed; P&L noise ≫ modeled
+₹2-4k/trade edge. Park-rule pre-registration declined by operator.
+
+- [x] Ledger integrity: exit_reason/exit_carry_diff/held_days/
+      expected_harvest/pnl_verified on closed rows; pnl_verified=False on
+      last-known-price exits; LEDGER DRIFT warning at restore.
+- [x] Thesis-invalidation stop: STOP_LOSS at MTM ≤ −1× entry expected
+      harvest (calendar_stop_loss_mult, default 1.0; legacy-trade fallback
+      from entry_carry_diff covers the 5 open host spreads).
+- [x] Expiry-safe window: entry needs dte_near ≥ max_hold+2 (=17);
+      force-exit at DTE≤2 (was 1).
+- [x] Tests: 13 new, 99 arbitrage-suite green; real host-state restore
+      smoke verified (drift warning + fallback stops preview).
+- [x] PR → merge (timer deploys from main).

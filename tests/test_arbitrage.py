@@ -57,6 +57,10 @@ def _make_strategy(
     # written for; the rupee-hurdle/debounce tests enable them explicitly.
     s.calendar_cost_hurdle_mult = 0.0
     s.calendar_exit_debounce_ticks = 1
+    # Test-friendly window (real __init__ computes max(min_dte, max_hold+2));
+    # the expiry-safe-window tests set 17 explicitly.
+    s.calendar_entry_min_dte = 4
+    s.calendar_stop_loss_mult = 0.0
     s.disable_calendar = disable_calendar
     s.lots_per_leg = 1
     s.max_open_calendars = 5
@@ -1238,3 +1242,191 @@ class TestLiveStatusHandling:
         trade = next(iter(s.state.open_calendars.values()))
         assert trade.legs[0].entry_price == 1003.5
         assert trade.legs[0].current_price == 1003.5
+
+
+# ──────────────────────────────────────────────────────────
+# Review 2026-07-11: stop-loss, expiry-safe window, ledger integrity
+# ──────────────────────────────────────────────────────────
+
+class TestReview20260711:
+    """WHY these exist (Rule 9): the forward book's multi-day bleeders ran
+    −₹11k…−₹22k against ~₹2-4k entry-time expectations with NO stop below the
+    CONVERGE exit, and the JUN-2026 roll produced ±₹16k closed rows priced at
+    last-known marks with no flag distinguishing them from verified fills.
+    Each test would fail if the corresponding guard were removed."""
+
+    def _open_calendar(self, s, symbol="AAA", entry_time=None, **trade_kw):
+        trade = CalendarTrade(
+            symbol=symbol, position="SHORT_CALENDAR",
+            entry_time=entry_time or datetime(2026, 4, 15, 10, 0),
+            entry_carry_diff=0.04,
+            legs=[
+                CalendarLeg(symbol=symbol, tradingsymbol=f"{symbol}26APRFUT",
+                            expiry="2026-04-28", lot_size=100, quantity=1,
+                            entry_price=100.0, current_price=100.0),
+                CalendarLeg(symbol=symbol, tradingsymbol=f"{symbol}26MAYFUT",
+                            expiry="2026-05-26", lot_size=100, quantity=-1,
+                            entry_price=101.0, current_price=101.0),
+            ],
+            **trade_kw,
+        )
+        s.state.open_calendars[symbol] = trade
+        return trade
+
+    def _snap(self, **overrides):
+        snap = {
+            "symbol": "AAA", "spot": 99.5,
+            "near": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
+                     "expiry": "2026-04-28", "instrument_token": 1},
+            "near_price": 100.0, "dte_near": 11,
+            "next": {"tradingsymbol": "AAA26MAYFUT", "lot_size": 100,
+                     "expiry": "2026-05-26", "instrument_token": 2},
+            "next_price": 101.0, "dte_next": 39,
+            "basis_annual": 0.0, "basis_annual_next": 0.0,
+            "carry_implied": 0.07, "carry_diff": 0.05,
+        }
+        snap.update(overrides)
+        return snap
+
+    # ── STOP_LOSS (thesis invalidation) ────────────────────────────────
+
+    def test_stop_loss_fires_when_mtm_breaches_expected_harvest(self):
+        s = _make_strategy(mode="paper")
+        s.calendar_stop_loss_mult = 1.0
+        self._open_calendar(s, expected_harvest=2000.0)
+        # SHORT_CALENDAR: short far leg. Far rallies 101→131 → MTM −3000.
+        s._observe_universe = lambda: [self._snap(next_price=131.0)]
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2
+        assert all("STOP_LOSS" in p.rationale for p in exits)
+
+    def test_stop_loss_holds_above_the_line(self):
+        s = _make_strategy(mode="paper")
+        s.calendar_stop_loss_mult = 1.0
+        self._open_calendar(s, expected_harvest=2000.0)
+        # MTM −1500 > −(1.0 × 2000): thesis not yet invalidated → hold.
+        s._observe_universe = lambda: [self._snap(next_price=116.0)]
+        assert s.check_and_rehedge() == []
+
+    def test_stop_loss_zero_mult_disables(self):
+        s = _make_strategy(mode="paper")
+        s.calendar_stop_loss_mult = 0.0
+        self._open_calendar(s, expected_harvest=2000.0)
+        s._observe_universe = lambda: [self._snap(next_price=131.0)]
+        assert s.check_and_rehedge() == []
+
+    def test_stop_loss_legacy_trade_falls_back_to_entry_diff(self):
+        # Pre-2026-07-11 trades (the 5 currently open on the host) have no
+        # expected_harvest; the stop must still cover them via the
+        # entry_carry_diff reconstruction, not silently skip them.
+        s = _make_strategy(mode="paper")
+        s.calendar_stop_loss_mult = 1.0
+        self._open_calendar(s, expected_harvest=None)
+        # fallback expected = (0.04−0.005) × 10,100 × 15/365 ≈ ₹14.5
+        s._observe_universe = lambda: [self._snap(next_price=131.0)]  # MTM −3000
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2 and all("STOP_LOSS" in p.rationale for p in exits)
+
+    # ── Expiry-safe window ──────────────────────────────────────────────
+
+    def test_entry_blocked_inside_expiry_window(self):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        s.calendar_entry_min_dte = 17          # max_hold 15 + 2
+        snap = self._snap(dte_near=11, carry_diff=0.05)
+        s._observe_universe = lambda: [snap]
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert props == [], "dte_near=11 < 17 must not open a 15-day hold"
+
+    def test_entry_allowed_with_full_runway(self):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        s.calendar_entry_min_dte = 17
+        snap = self._snap(dte_near=20, carry_diff=0.05)
+        s._observe_universe = lambda: [snap]
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert len(props) == 2
+
+    def test_entry_min_dte_computed_from_max_hold(self):
+        # Real __init__ wiring (the fixture bypasses it): the window must
+        # follow max_hold so shortening the hold widens the entry window.
+        s = ArbitrageStrategy(kite=MagicMock(), config_path="/dev/null", mode="paper")
+        assert s.calendar_entry_min_dte == max(
+            s.calendar_min_dte_near, s.calendar_max_holding_days + 2)
+
+    def test_expiry_force_exit_now_at_dte_2(self):
+        s = _make_strategy(mode="paper")
+        self._open_calendar(s)
+        s._observe_universe = lambda: [self._snap(dte_near=2)]
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2 and all("EXPIRY" in p.rationale for p in exits)
+
+    # ── Ledger integrity ────────────────────────────────────────────────
+
+    def test_closed_row_carries_exit_metadata(self):
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        self._open_calendar(s, expected_harvest=1234.0)
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        exits = s.check_and_rehedge()          # CONVERGE (debounce=1)
+        s.execute_proposals(exits)
+        row = s.state.closed_trades[-1]
+        assert row["exit_reason"] == "CONVERGE"
+        assert row["exit_carry_diff"] == pytest.approx(0.001)
+        assert row["expected_harvest"] == pytest.approx(1234.0)
+        assert row["pnl_verified"] is True
+        # entry 04-15 10:00 → clock 04-17 10:30 ≈ 2.02 days
+        assert row["held_days"] == pytest.approx(2.02, abs=0.01)
+
+    def test_fallback_priced_exit_marks_pnl_unverified(self):
+        # Near leg missing from the snapshot (rolled off) → exit prices it at
+        # last-known and the closed row must say so.
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        self._open_calendar(s)
+        s._observe_universe = lambda: [self._snap(near=None, carry_diff=0.001)]
+        exits = s.check_and_rehedge()
+        s.execute_proposals(exits)
+        row = s.state.closed_trades[-1]
+        assert row["exit_reason"] == "CONVERGE"
+        assert row["pnl_verified"] is False
+
+    def test_entry_records_expected_harvest_on_trade(self):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        snap = self._snap(dte_near=20, carry_diff=0.05)
+        s._observe_universe = lambda: [snap]
+        s.execute_proposals(s.scan_and_propose())
+        trade = s.state.open_calendars["AAA"]
+        # (0.05 − 0.005) × 10,100 × min(19, 15)/365
+        assert trade.expected_harvest == pytest.approx(
+            0.045 * 10_100 * 15 / 365.0, rel=1e-6)
+
+    def test_serialize_restore_roundtrips_new_fields_and_defaults(self):
+        s = _make_strategy(mode="paper")
+        self._open_calendar(s, expected_harvest=999.0)
+        s.state.open_calendars["AAA"].pnl_verified = False
+        blob = s.serialize_state()
+        fresh = _make_strategy(mode="paper")
+        fresh.restore_state(blob)
+        t = fresh.state.open_calendars["AAA"]
+        assert t.expected_harvest == pytest.approx(999.0)
+        assert t.pnl_verified is False
+        # Pre-upgrade blob without the keys → safe defaults.
+        for tb in blob["open_calendars"]:
+            tb.pop("expected_harvest"); tb.pop("pnl_verified")
+        legacy = _make_strategy(mode="paper")
+        legacy.restore_state(blob)
+        t2 = legacy.state.open_calendars["AAA"]
+        assert t2.expected_harvest is None and t2.pnl_verified is True
+
+    def test_restore_warns_on_ledger_drift(self, caplog):
+        import logging as _logging
+        s = _make_strategy(mode="paper")
+        s.state.realized_pnl = 500.0
+        s.state.closed_trades.append({
+            "symbol": "AAA", "exit_time": datetime(2026, 4, 16, 15, 0),
+            "entry_time": datetime(2026, 4, 15, 10, 0),
+            "entry_carry_diff": 0.04, "realized_pnl": 100.0,
+            "transaction_costs": 50.0, "position": "SHORT_CALENDAR",
+        })
+        blob = s.serialize_state()
+        fresh = _make_strategy(mode="paper")
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            fresh.restore_state(blob)
+        assert any("LEDGER DRIFT" in r.message for r in caplog.records)

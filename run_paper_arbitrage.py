@@ -634,12 +634,14 @@ def main():
     log.info(
         "Strategy: universe=%d disable_calendar=%s calendar_entry=%.3f "
         "calendar_exit=%.3f max_open=%d lots=%d max_leg_notional=₹%.0f "
-        "cost_hurdle=%.1fx exit_debounce=%d ticks",
+        "cost_hurdle=%.1fx exit_debounce=%d ticks entry_min_dte=%dd "
+        "stop_loss=%.1fx",
         len(strategy.universe), strategy.disable_calendar,
         strategy.calendar_entry_annual, strategy.calendar_exit_annual,
         strategy.max_open_calendars, strategy.lots_per_leg,
         strategy.max_leg_notional or 0.0,
         strategy.calendar_cost_hurdle_mult, strategy.calendar_exit_debounce_ticks,
+        strategy.calendar_entry_min_dte, strategy.calendar_stop_loss_mult,
     )
     if strategy.disable_calendar:
         log.warning(
