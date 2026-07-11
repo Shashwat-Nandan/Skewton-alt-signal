@@ -180,11 +180,19 @@ class PairState:
     # immediately. Counter increments per qualifying tick, fires the
     # exit when it reaches exit_debounce_ticks, resets otherwise.
     mean_revert_streak: int = 0
-    # M-S4: cumulative realized/tx-cost figures at the moment this open
-    # position was entered. Used at _record_close to write per-trade P&L
-    # rows (delta = current - baseline) instead of running totals.
+    # M-S4: cumulative realized/tx-cost figures at the moment this position's
+    # ENTRY BATCH began (before its fills book costs — code-review follow-up
+    # 2026-07-11). Used at _record_close to write per-trade P&L rows
+    # (delta = current - baseline) instead of running totals.
     realized_at_entry: float = 0.0
     tx_costs_at_entry: float = 0.0
+    # Ledger anchor for reconcile_ledger (code-review follow-up 2026-07-11):
+    # headline ≡ anchor + Σ closed-row deltas + open-position delta. Self-set
+    # on the first restore of a pre-anchor state file, absorbing history the
+    # rows can't express (pre-fix rows exclude their entry costs; any past
+    # state surgery). Afterwards it only changes if the operator re-anchors —
+    # so NEW drift (surgery, bugs, aborted-entry reversal costs) warns.
+    ledger_anchor: Optional[float] = None
     # Issue #90: correlation id linking this open position to its published
     # ENTRY signal (§4.11). Set when the signal publisher accepts the entry,
     # cleared when the book flattens. None when no publisher is wired or the
@@ -575,6 +583,19 @@ class PairTradingStrategy(BaseStrategy):
             else:
                 self._publish_exit_signal(proposals)
 
+        # M-S4 baseline, captured at entry-batch START (code-review follow-up
+        # 2026-07-11): _apply_fill books each entry leg's costs into
+        # realized_pnl, so a baseline captured AFTER the fills (the old
+        # _set_position_from_legs placement) structurally excluded entry
+        # costs from every closed row's per-trade delta — Σ rows could never
+        # reconcile with the headline. Captured here, the whole trade
+        # (entry costs → rehedges → exit) lands inside one delta window.
+        # Harmless when the batch then fails: the baseline is only read by
+        # _record_close, and the next entry batch re-captures it.
+        if is_entry_batch and proposals:
+            self.state.realized_at_entry = self.state.realized_pnl
+            self.state.tx_costs_at_entry = self.state.total_transaction_costs
+
         # COMPLETE is the whitelist (not !FAILED) — PENDING/REJECTED/
         # CANCELLED returned by _live_execute all share the property that
         # the order did NOT settle, and applying the fill on those would
@@ -805,6 +826,7 @@ class PairTradingStrategy(BaseStrategy):
                 "mean_revert_streak": self.state.mean_revert_streak,
                 "realized_at_entry": self.state.realized_at_entry,
                 "tx_costs_at_entry": self.state.tx_costs_at_entry,
+                "ledger_anchor": self.state.ledger_anchor,
                 "closed_trades": [
                     self._serialise_closed_trade(t)
                     for t in self.state.closed_trades
@@ -890,6 +912,34 @@ class PairTradingStrategy(BaseStrategy):
         # Issue #90: backwards-compat — pre-signal-plane state files carry
         # no group id; None routes exits through the bootstrap escape.
         self.state.position_group_id = state_blob.get("position_group_id")
+        # Ledger reconciliation (code-review follow-up 2026-07-11). Identity:
+        # headline = anchor + Σ closed-row deltas + open-position delta. A
+        # pre-anchor state file self-anchors on this first restore (absorbing
+        # pre-fix rows that exclude entry costs, and any historical surgery);
+        # from then on the anchor is fixed, so NEW drift — state surgery, an
+        # accounting bug, or an aborted-entry reversal's unattributed costs —
+        # warns loudly. This is the LIVE book: a warning here means stop and
+        # look before trusting the headline.
+        from .base import reconcile_ledger
+        ledger_sum = sum(
+            float(t.get("realized_pnl", 0.0) or 0.0)
+            for t in self.state.closed_trades
+        )
+        if self.state.position != "FLAT":
+            ledger_sum += self.state.realized_pnl - self.state.realized_at_entry
+        raw_anchor = state_blob.get("ledger_anchor")
+        if raw_anchor is None:
+            self.state.ledger_anchor = self.state.realized_pnl - ledger_sum
+            logger.info(
+                "ledger anchor self-set to ₹%.2f (first restore with "
+                "reconciliation; absorbs pre-2026-07-11 rows that exclude "
+                "entry costs) — future drift from this point warns",
+                self.state.ledger_anchor)
+        else:
+            self.state.ledger_anchor = float(raw_anchor)
+        reconcile_ledger(self.state.realized_pnl,
+                         self.state.ledger_anchor + ledger_sum,
+                         logger, self.name)
         # Re-baseline session deltas against the restored cumulative figures.
         self._capture_session_baseline()
         # M-S1: warn if the reseeded spread distribution has drifted enough
@@ -1476,10 +1526,10 @@ class PairTradingStrategy(BaseStrategy):
         self.state.effective_stop_z = max(
             self.stop_z, abs(self.state.entry_z) + self.safety_buffer,
         )
-        # M-S4: snapshot the cumulative P&L / cost baselines so _record_close
-        # can write a per-trade delta row instead of a running total.
-        self.state.realized_at_entry = self.state.realized_pnl
-        self.state.tx_costs_at_entry = self.state.total_transaction_costs
+        # M-S4 baselines are NOT captured here: this runs after the entry
+        # fills booked their costs, which would exclude them from the trade's
+        # delta (they are captured at entry-batch start in execute_proposals;
+        # code-review follow-up 2026-07-11).
 
     def _update_unrealized(self, prices: Dict[str, float]) -> None:
         unrealized = 0.0

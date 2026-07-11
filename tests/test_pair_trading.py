@@ -684,22 +684,74 @@ class TestStrategyMediums:
         # Cumulative preserved as a separate column
         assert row["cumulative_realized_pnl"] == 800.0
 
-    def test_entry_snapshots_pnl_baseline(self):
-        # _set_position_from_legs must capture realized/tx baselines so a
-        # later _record_close reports the right per-trade delta.
+    def test_entry_baseline_captured_before_entry_fills(self):
+        # Code-review follow-up 2026-07-11: the M-S4 baseline must be the
+        # headline BEFORE the entry legs' fills book their costs. The old
+        # _set_position_from_legs placement snapshotted after the fills, so
+        # every closed row structurally excluded its own entry costs and the
+        # per-trade ledger could never sum to the headline.
         s = _make_strategy(hedge_ratio=0.5)
-        s._spread_history = [-1.0, 1.0] * 30
         s.state.realized_pnl = 1000.0  # prior trades
         s.state.total_transaction_costs = 200.0
-        s.state.legs = [
-            PairLeg(symbol="AAA", tradingsymbol="AAA26APRFUT", lot_size=100,
-                    quantity=1, entry_price=1000.0),
-            PairLeg(symbol="BBB", tradingsymbol="BBB26APRFUT", lot_size=200,
-                    quantity=-1, entry_price=2000.0),
-        ]
-        s._set_position_from_legs()
-        assert s.state.realized_at_entry == 1000.0
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2018.0)
+        s._spread_history = [-2.0, 2.0] * 30   # std=2 → z=-4.5, inside bands
+        s.execute_proposals(s.scan_and_propose())
+        assert s.state.position != "FLAT"
+        assert s.state.realized_at_entry == 1000.0, "baseline = PRE-fill headline"
+        assert s.state.realized_pnl < 1000.0, "entry costs booked after baseline"
         assert s.state.tx_costs_at_entry == 200.0
+
+    def test_round_trip_ledger_reconciles_with_headline(self):
+        # THE identity the baseline fix exists for: after a full open→close
+        # round trip, Σ closed-row deltas == headline realized (entry costs,
+        # rehedges and exit all inside one delta window). Fails under the
+        # pre-2026-07-11 semantics by exactly the entry costs.
+        s = _make_strategy(hedge_ratio=0.5)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2018.0)
+        s._spread_history = [-2.0, 2.0] * 30
+        s.execute_proposals(s.scan_and_propose())
+        assert s.state.position != "FLAT"
+        exits = s._build_exit_proposals(
+            reason="MAX_HOLD", z=0.0, prices={"AAA": 1000.0, "BBB": 2000.0})
+        s.execute_proposals(exits)
+        assert s.state.position == "FLAT" and len(s.state.closed_trades) == 1
+        ledger = sum(r["realized_pnl"] for r in s.state.closed_trades)
+        assert ledger == pytest.approx(s.state.realized_pnl), \
+            "per-trade ledger must sum to the headline (incl. entry costs)"
+
+    def test_restore_self_anchors_legacy_state_then_warns_on_new_drift(self, caplog):
+        import logging as _logging
+        # Legacy state (pre-anchor, rows exclude entry costs → headline ≠
+        # ledger): the FIRST restore self-anchors silently — the live book
+        # must not cry wolf over known history. A LATER headline change with
+        # no matching row (surgery / bug) must warn.
+        s = _make_strategy(hedge_ratio=0.5)
+        s.state.realized_pnl = 500.0
+        s.state.closed_trades = [{
+            "exit_time": s._clock(), "entry_time": s._clock(),
+            "entry_z": -2.5, "entry_spread": -5.0,
+            "realized_pnl": 100.0, "transaction_costs": 50.0,
+            "cumulative_realized_pnl": 500.0, "position": "LONG_SPREAD",
+        }]
+        assert s.state.ledger_anchor is None      # never restored = legacy
+        blob = s.serialize_state()
+
+        first = _make_strategy(hedge_ratio=0.5)
+        with caplog.at_level(_logging.WARNING):
+            first.restore_state(blob)
+        assert not any("LEDGER DRIFT" in r.message for r in caplog.records), \
+            "first restore must self-anchor, not warn about known history"
+        assert first.state.ledger_anchor == pytest.approx(400.0)
+
+        # Surgery after anchoring: headline moves, no row explains it.
+        first.state.realized_pnl += 123.0
+        blob2 = first.serialize_state()
+        second = _make_strategy(hedge_ratio=0.5)
+        caplog.clear()
+        with caplog.at_level(_logging.WARNING):
+            second.restore_state(blob2)
+        assert any("LEDGER DRIFT" in r.message for r in caplog.records), \
+            "post-anchor drift must warn on the live book"
 
 
 class TestBrokerMediums:

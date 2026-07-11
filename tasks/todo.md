@@ -2101,3 +2101,20 @@ ledger drift ₹42.8k vs headline; no stop-loss existed; P&L noise ≫ modeled
       buy_on_gap. pair_trading NOT wired: realized_at_entry is snapshotted
       AFTER entry fills book costs, so its per-trade deltas structurally
       exclude entry costs — needs a baseline fix first (follow-up).
+
+## 2026-07-11 — pair_trading realized_at_entry baseline fix (review follow-up)
+
+- [x] M-S4 baselines captured at entry-batch START in execute_proposals
+      (before fills book entry costs), removed from _set_position_from_legs
+      → per-trade rows now include their own entry costs.
+- [x] PairState.ledger_anchor (serialized): headline ≡ anchor + Σ rows +
+      open delta. First restore self-anchors (absorbs pre-fix rows + old
+      history, no false alarms on the LIVE book); afterwards NEW drift
+      (surgery / bugs / aborted-entry reversal costs) warns via the shared
+      reconcile_ledger.
+- [x] Tests: baseline-before-fills, round-trip Σrows==headline identity,
+      legacy self-anchor + post-anchor drift warning (124 pair tests green;
+      221 across pair-adjacent files).
+- [x] Live-state smoke (read-only): all 6 persistent pairs restore, zero
+      warnings, zero residuals; anchors absorb ₹3,371 of legacy entry costs.
+- [x] Full suite (1261 passed) → PR → merge.
