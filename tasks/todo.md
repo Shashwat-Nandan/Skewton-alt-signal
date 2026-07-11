@@ -2034,4 +2034,23 @@ Plan (user-directed start; findings context in #99 comment):
       regression, unknown MAJOR, ENTRY-reopen violation, unknown-group
       exit, TTL asymmetry).
 - [x] Run against the real bus (seq 0–2) and record the outcome.
-- [ ] PR; merge on green per session pattern.
+- [x] PR; merge on green per session pattern.
+
+## 2026-07-11 — Buy-on-gap review + fine-tune (user-approved 3 items)
+
+Review findings (context): forward book 0/5 wins −₹39.3k; backtest parity
+reproduces the same 5 trades (not a bug — the edge decayed: ₹/trade
+1,161→1,218→204 by year; 2026 ≈ noise). Big gaps are the HISTORICAL profit
+source (+₹208k from gaps ≤−4%) so no signal-param re-tuning.
+
+Plan:
+- [x] Cut deployed capital ₹1M → ₹300k (`--total-capital 300000` in the
+      systemd unit template + installed unit) so the kill rule adjudicates
+      on the win-rate leg (15 trades <35%), not the ₹ floor.
+- [x] Entry-fill honesty (live path only; backtest keeps open-fill):
+      fill at scan-time LTP, anchor stop to the fill, and check the stop
+      against LTP (not the day-low, which includes pre-entry prints).
+- [x] 5-min-ish forward capture: persist per-tick {ts, sym, ltp, low} for
+      the day's gap candidates + open positions (issue #63 forward-capture).
+- [x] Tests for all three live-path behaviours; full suite green.
+- [x] PR → merge → install unit change + daemon-reload.

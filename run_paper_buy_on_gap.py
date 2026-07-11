@@ -329,6 +329,33 @@ def fetch_today_quotes(kite, universe: List[str], log: logging.Logger) -> Dict[s
     return out
 
 
+def append_intraday_capture(strategy, quotes: Dict[str, dict], today: date,
+                            system: str, log: logging.Logger) -> None:
+    """Persist this tick's marks for the day's qualifying gappers + open
+    positions (issue #63: no 5-min equity data exists — capture forward).
+    A handful of symbols at 60s cadence ≈ a few KB/day; a future backtest can
+    replay the real intraday path instead of approximating stops by the
+    day-low. Append-only TSV, one file per day; best-effort (a write failure
+    must never take down the session)."""
+    syms = set(strategy.last_scan_candidates) | set(strategy.positions)
+    if not syms:
+        return
+    suffix = "" if system == "baseline" else f"-{system}"
+    path = DATA_CACHE / f"buy_on_gap_intraday{suffix}_{today.isoformat()}.tsv"
+    ts = datetime.now().isoformat(timespec="seconds")
+    try:
+        write_header = not path.exists()
+        with open(path, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("ts\tsymbol\tltp\tday_low\n")
+            for sym in sorted(syms):
+                q = quotes.get(sym)
+                if q and q.get("ltp") is not None:
+                    f.write(f"{ts}\t{sym}\t{q['ltp']}\t{q.get('low', '')}\n")
+    except Exception as e:
+        log.warning("intraday capture append failed (%s): %s", path.name, e)
+
+
 def _now_hm() -> dtime:
     n = datetime.now()
     return dtime(n.hour, n.minute)
@@ -556,6 +583,9 @@ def main():
                 except Exception as e:
                     errored = True
                     log.exception("check_and_rehedge failed: %s", e)
+
+            if quotes:
+                append_intraday_capture(strategy, quotes, today, args.system, log)
 
             n_ran = 0 if halt_state.halt_all else 1
             if heartbeat.record_tick(n_ran=n_ran, n_errored=1 if errored else 0):

@@ -138,3 +138,39 @@ def test_kill_rule_pins_entry_halt_for_the_whole_session(tmp_path, monkeypatch):
     plain = r.GapHaltState()
     plain.refresh(LOG)
     assert not plain.halt_new
+
+
+def test_intraday_capture_writes_candidates_and_positions(tmp_path, monkeypatch):
+    # Issue #63 forward capture: the tick loop must persist marks for the
+    # day's qualifying candidates AND open positions — and nothing else — so
+    # a future backtest can replay the real intraday path. Missing quotes are
+    # skipped, repeat calls append (no header duplication).
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    s = _strategy()
+    s.last_scan_candidates = ["AAA", "BBB"]
+    s.positions["CCC"] = GapPosition(
+        symbol="CCC", entry_dt=pd.Timestamp("2026-07-13"), entry_px=100.0,
+        qty=10, stop_px=95.0, gap_ret=-0.03, gap_z=-1.5, rationale="x")
+    quotes = {"AAA": {"open": 10.0, "ltp": 9.9, "low": 9.8},
+              "CCC": {"open": 100.0, "ltp": 101.0, "low": 99.0},
+              "ZZZ": {"open": 1.0, "ltp": 1.0, "low": 1.0}}  # not tracked
+    today = date(2026, 7, 13)
+    r.append_intraday_capture(s, quotes, today, "baseline", LOG)
+    r.append_intraday_capture(s, quotes, today, "baseline", LOG)  # 2nd tick
+    path = tmp_path / "buy_on_gap_intraday_2026-07-13.tsv"
+    lines = path.read_text().strip().splitlines()
+    assert lines[0] == "ts\tsymbol\tltp\tday_low"
+    rows = [ln.split("\t") for ln in lines[1:]]
+    assert [row[1] for row in rows] == ["AAA", "CCC"] * 2  # BBB no quote; ZZZ untracked
+    assert rows[0][2] == "9.9" and rows[1][2] == "101.0"
+
+
+def test_intraday_capture_noop_before_scan(tmp_path, monkeypatch):
+    # Before the entry scan there are no candidates/positions: nothing must be
+    # written (no empty files littering data_cache on no-signal days).
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    s = _strategy()
+    r.append_intraday_capture(
+        s, {"AAA": {"open": 1.0, "ltp": 1.0, "low": 1.0}}, date(2026, 7, 13),
+        "baseline", LOG)
+    assert list(tmp_path.iterdir()) == []

@@ -206,6 +206,9 @@ class BuyOnGapStrategy(BaseStrategy):
         # Data-health flag for the runner's silent-fail heartbeat: True once a
         # scan has actually observed a non-empty universe of quotes.
         self.last_universe_observed: int = 0
+        # Symbols that qualified at today's scan (session-transient, set by
+        # scan_and_propose) — the runner captures their intraday marks.
+        self.last_scan_candidates: List[str] = []
 
     # ── Public hooks (backtest + live runner) ──────────────────────────────
 
@@ -325,6 +328,12 @@ class BuyOnGapStrategy(BaseStrategy):
         if bar is None:
             return None
         open_px = bar["open"]
+        # The SIGNAL is defined on the open (gap vs prev_close), but the FILL is
+        # what's actually tradeable: the scan runs 09:20–09:45, so in live the
+        # open printed minutes ago and only the LTP is attainable. Backtest has
+        # no scan-time LTP (daily bars) and keeps the open as its fill
+        # approximation — the documented resolution limit, not a logic fork.
+        fill_px = bar["px"] if self._today_quotes is not None else open_px
         gap_ret = (open_px - prev_close) / prev_close
 
         # Must be an unusually large gap-DOWN, but not a blowup (news/halt/
@@ -342,17 +351,19 @@ class BuyOnGapStrategy(BaseStrategy):
                 return None
 
         gap_z = gap_ret / ret_std  # negative; more negative = more oversold
-        stop_px = open_px * (1.0 - self.params["stop_loss_pct"] / 100.0)
+        # Stop anchors to the FILL (what we pay), not the open — in backtest the
+        # two coincide, so this only changes the live book.
+        stop_px = fill_px * (1.0 - self.params["stop_loss_pct"] / 100.0)
         ma_note = f"; open>{ma_long:.2f}MA" if not pd.isna(ma_long) else ""
         rationale = (
             f"gap-down {gap_ret*100:.2f}% = {gap_z:.2f}σ "
-            f"(σ={ret_std*100:.2f}%, prev_close={prev_close:.2f}, open={open_px:.2f})"
-            f"{ma_note}; exit@close, stop=₹{stop_px:.2f}"
+            f"(σ={ret_std*100:.2f}%, prev_close={prev_close:.2f}, open={open_px:.2f}, "
+            f"fill={fill_px:.2f}); exit@close, stop=₹{stop_px:.2f}{ma_note}"
         )
         return {
             "gap_ret": gap_ret, "gap_z": gap_z, "open": open_px,
-            "stop_px": stop_px, "ret_std": ret_std, "ma_long": ma_long,
-            "rationale": rationale,
+            "fill_px": fill_px, "stop_px": stop_px, "ret_std": ret_std,
+            "ma_long": ma_long, "rationale": rationale,
         }
 
     def _size(self, open_px: float) -> int:
@@ -389,6 +400,10 @@ class BuyOnGapStrategy(BaseStrategy):
             n_observed if self._today_quotes is not None else len(self._universe or [])
         )
         scored.sort(key=lambda t: t[0])  # most negative gap_z first
+        # Session-transient hook for the runner's intraday capture (issue #63):
+        # every name that QUALIFIED today, not just the top N — the counter-
+        # factual entries matter for a future intraday-path backtest.
+        self.last_scan_candidates = [sym for _, sym, _ in scored]
         if not scored:
             logger.info("scan @ %s: no qualifying gap-downs (universe=%d)",
                         self._current_date.date(), len(self._universe or []))
@@ -396,19 +411,19 @@ class BuyOnGapStrategy(BaseStrategy):
 
         proposals: List[TradeProposal] = []
         for _, sym, sig in scored[:slots_left]:
-            qty = self._size(sig["open"])
+            qty = self._size(sig["fill_px"])
             if qty <= 0:
                 logger.info("scan @ %s: skip %s — sized to 0", self._current_date.date(), sym)
                 continue
             proposals.append(TradeProposal(
                 tradingsymbol=sym, instrument_token=0, strike=0.0, expiry="",
-                option_type="EQ", lot_size=1, quantity=qty, price=sig["open"],
+                option_type="EQ", lot_size=1, quantity=qty, price=sig["fill_px"],
                 transaction_type="BUY", iv=0.0, bid_ask_spread_pct=0.0,
-                margin_required=sig["open"] * qty,
+                margin_required=sig["fill_px"] * qty,
                 rationale=f"{sig['rationale']}; qty={qty}",
                 greeks_snapshot={
                     "stop_px": sig["stop_px"], "gap_ret": sig["gap_ret"],
-                    "gap_z": sig["gap_z"], "entry": sig["open"],
+                    "gap_z": sig["gap_z"], "entry": sig["fill_px"],
                 },
             ))
         return proposals
@@ -442,8 +457,16 @@ class BuyOnGapStrategy(BaseStrategy):
     def _intraday_exit(self, pos: GapPosition, bar: dict) -> tuple:
         """Single source of truth for the exit decision (Rule 7). The
         catastrophic stop takes priority over the close so a stop that fires
-        intraday is honoured even on the close tick."""
-        if bar["low"] <= pos.stop_px:
+        intraday is honoured even on the close tick.
+
+        Stop trigger: in live the quote's day-low includes prints from BEFORE
+        entry (the scan runs 09:20–09:45), so a pre-entry dip must not fire the
+        stop — the 60s LTP is the honest post-entry mark. The backtest's daily
+        bar has only the day-low (conservative approximation, documented in the
+        harness). Both book the exit AT the stop level, modelling an SL order
+        sitting at that price."""
+        stop_mark = bar["px"] if self._today_quotes is not None else bar["low"]
+        if stop_mark <= pos.stop_px:
             return "CATASTROPHIC_STOP", pos.stop_px
         if self._force_close:
             return "CLOSE", bar["px"]

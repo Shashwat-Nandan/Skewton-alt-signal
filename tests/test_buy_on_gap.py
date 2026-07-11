@@ -173,6 +173,43 @@ class TestSignal:
         assert len(props) == 1
         assert props[0].price == pytest.approx(prev_close * 0.97)
 
+    def test_live_fill_at_ltp_not_open(self):
+        # The scan runs 09:20-09:45: the open printed minutes ago and only the
+        # LTP is attainable. The SIGNAL stays defined on the open (gap vs
+        # prev_close) but the FILL, sizing and stop must anchor to the LTP —
+        # entry at the open is a price nobody can trade (changed 2026-07-11).
+        df = _build_symbol("AAA", n=40)
+        today = df["date"].iloc[-1] + pd.tseries.offsets.BDay(1)
+        prev_close = df["close"].iloc[-1]
+        open_px, ltp = prev_close * 0.97, prev_close * 0.985  # gap half-reverted
+        quotes = {"AAA": {"open": open_px, "ltp": ltp, "low": open_px * 0.999}}
+        s = _strategy({"use_trend_filter": 0, "stop_loss_pct": 5.0})
+        s.set_panel(df)
+        s.prepare_live_session(today)
+        s._ensure_features()
+        s.set_today_quotes(quotes); s.set_current_date(today)
+        props = s.scan_and_propose()
+        assert len(props) == 1, "gap is still defined on the open"
+        p = props[0]
+        assert p.price == pytest.approx(ltp), "fill must be the attainable LTP"
+        assert (p.greeks_snapshot or {})["stop_px"] == pytest.approx(ltp * 0.95), \
+            "stop anchors to the fill, not the open"
+
+    def test_scan_records_all_qualifying_candidates(self):
+        # The intraday-capture hook must see every name that QUALIFIED, not
+        # just the top-N entered — counterfactuals matter for a future
+        # intraday-path backtest.
+        df_a = _build_symbol("AAA", gap_day=30, gap_ret=-0.03)
+        df_b = _build_symbol("BBB", gap_day=30, gap_ret=-0.04)
+        panel = pd.concat([df_a, df_b], ignore_index=True)
+        s = _strategy({"use_trend_filter": 0, "max_positions": 1})
+        s.set_panel(panel)
+        s._ensure_features()
+        s.set_current_date(df_a["date"].iloc[30])
+        props = s.scan_and_propose()
+        assert len(props) == 1, "only one slot"
+        assert set(s.last_scan_candidates) == {"AAA", "BBB"}
+
     def test_prepare_live_session_idempotent(self):
         # Post-close cache already contains today → no duplicate row.
         df = _build_symbol("AAA", n=40)
@@ -239,11 +276,45 @@ class TestExit:
         s.positions["AAA"] = pos
         s._force_close = True  # even on the close tick, the stop wins
         s.set_current_date(pd.Timestamp("2024-02-01"))
-        # low 94 < stop 95 → must fill at the stop, not the (higher) close.
-        s.set_today_quotes({"AAA": {"open": 100.0, "ltp": 102.0, "low": 94.0}})
+        # LIVE path: LTP 94 < stop 95 → must fill AT the stop level (SL-order
+        # model), not the lower LTP, and must beat the force_close exit.
+        s.set_today_quotes({"AAA": {"open": 100.0, "ltp": 94.0, "low": 94.0}})
         exits = s.check_and_rehedge()
         assert exits[0].price == pytest.approx(95.0)
         assert (exits[0].greeks_snapshot or {})["exit_reason"] == "CATASTROPHIC_STOP"
+
+    def test_pre_entry_low_does_not_fire_stop_live(self):
+        # The quote's day-low includes prints from BEFORE the 09:20-09:45 entry
+        # scan. A pre-entry dip below the stop must NOT stop out a position the
+        # price has since recovered above — only the live LTP may trigger it.
+        # (This was the old day-low behaviour, changed 2026-07-11.)
+        pos = GapPosition(symbol="AAA", entry_dt=pd.Timestamp("2024-02-01"),
+                          entry_px=100.0, qty=100, stop_px=95.0, gap_ret=-0.03,
+                          gap_z=-1.5, rationale="x")
+        s = _strategy()
+        s.positions["AAA"] = pos
+        s._force_close = False
+        s.set_current_date(pd.Timestamp("2024-02-01"))
+        s.set_today_quotes({"AAA": {"open": 100.0, "ltp": 102.0, "low": 94.0}})
+        assert s.check_and_rehedge() == [], "pre-entry low must not fire the stop"
+        # At the close the same book flattens at the LTP, not the stop.
+        s._force_close = True
+        exits = s.check_and_rehedge()
+        assert (exits[0].greeks_snapshot or {})["exit_reason"] == "CLOSE"
+        assert exits[0].price == pytest.approx(102.0)
+
+    def test_backtest_path_still_stops_on_day_low(self):
+        # Daily bars have no scan-time LTP: the day-low remains the (conservative)
+        # stop trigger in backtest — the harness documents this approximation.
+        df = _build_symbol("AAA", gap_day=30, gap_ret=-0.03, stop_breach=True)
+        s = _strategy({"use_trend_filter": 0})
+        s.set_panel(df)
+        s._ensure_features()
+        s.set_current_date(df["date"].iloc[30])
+        s._force_close = True
+        s.execute_proposals(s.scan_and_propose())
+        s.execute_proposals(s.check_and_rehedge())
+        assert s.closed_positions[0].exit_reason == "CATASTROPHIC_STOP"
 
     def test_no_exit_intraday_without_stop_or_close(self):
         pos = GapPosition(symbol="AAA", entry_dt=pd.Timestamp("2024-02-01"),
