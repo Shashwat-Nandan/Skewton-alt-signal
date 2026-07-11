@@ -197,3 +197,34 @@ class BaseStrategy(ABC):
             "status": "SIGNAL_LOGGED",
             "mode": "signals",
         }
+
+
+def reconcile_ledger(headline_realized: float, ledger_sum: float,
+                     logger: logging.Logger, strategy_name: str,
+                     tolerance: float = 1.0) -> float:
+    """Warn when a strategy's headline realized P&L and its per-trade ledger
+    disagree (Rule 12; review 2026-07-11). The two are updated in lockstep by
+    each strategy's fill path, so any drift means state surgery or an
+    accounting bug — e.g. the arbitrage book accumulated ~₹43k of drift from
+    the JUN-2026 expiry repairs before this check existed. Shared here so
+    every strategy's restore path gets the identical check instead of
+    copy-paste variants that drift in threshold/wording.
+
+    Callers pass their own ledger_sum because the per-trade shape differs
+    per strategy (arbitrage: closed rows + open trades' realized; buy_on_gap:
+    closed pnl − open entry costs). NOTE pair_trading cannot be wired yet:
+    its realized_at_entry baseline is snapshotted AFTER entry fills book
+    costs (_set_position_from_legs), so its per-trade deltas structurally
+    exclude entry costs and can never sum to the headline — fix the baseline
+    capture point first.
+
+    Returns the drift (headline − ledger) so callers/tests can assert on it.
+    """
+    drift = headline_realized - ledger_sum
+    if abs(drift) > tolerance:
+        logger.warning(
+            "LEDGER DRIFT [%s]: headline realized ₹%.0f vs per-trade ledger "
+            "₹%.0f (drift ₹%.0f) — do not grade the experiment on the "
+            "headline alone; segment the per-trade ledger instead",
+            strategy_name, headline_realized, ledger_sum, drift)
+    return drift

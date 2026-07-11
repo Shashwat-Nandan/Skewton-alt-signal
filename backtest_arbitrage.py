@@ -277,6 +277,22 @@ def make_strategy(
     # would mean N DAYS — not the ~N-minute intraday noise filter it is live.
     s.calendar_cost_hurdle_mult = 2.0
     s.calendar_exit_debounce_ticks = 1
+    # This builder bypasses __init__ via __new__, so EVERY attribute the
+    # strategy dereferences MUST be set here — a missing one kills every
+    # backtest tick with a swallowed AttributeError (code-review 2026-07-11:
+    # calendar_stop_loss_mult was missing from day one, and
+    # calendar_margin_pct had been missing since 2026-06-17, i.e. the
+    # backtest had been silently dead for weeks). test_arbitrage.py's
+    # builder-parity test now sweeps __init__'s attribute list via AST, so
+    # the next omission fails CI instead of returning flat P&L.
+    # calendar_entry_min_dte needs nothing: it is a @property derived from
+    # calendar_min_dte_near / calendar_max_holding_days above.
+    s.calendar_stop_loss_mult = 1.0     # production default (thesis stop)
+    s.calendar_margin_pct = 0.06        # production default (2026-06-17 fix)
+    # Session-delta baselines (read by generate_eod_report; latent here only
+    # because the backtest never called it — set for parity anyway).
+    s._session_start_realized = 0.0
+    s._session_start_unrealized = 0.0
     s.disable_calendar = False
     s.lots_per_leg = lots_per_leg
     s.max_open_calendars = max_open_calendars
@@ -334,6 +350,8 @@ def run_backtest(
 
     pnl_curve: List[dict] = []
     basis_events: List[dict] = []
+    n_ticks = 0
+    n_tick_errors = 0
 
     while True:
         try:
@@ -359,6 +377,8 @@ def run_backtest(
                 s.execute_proposals(exits)
         except Exception as e:
             logger.warning("tick %s failed: %s", mock.current_date, e)
+            n_tick_errors += 1
+        n_ticks += 1
 
         pnl_curve.append({
             "date": mock.current_date,
@@ -389,6 +409,15 @@ def run_backtest(
             "total": s.state.realized_pnl + s.state.unrealized_pnl,
             "n_open": len(s.state.open_calendars),
         })
+
+    # Fail LOUD when every tick errored (Rule 12; code-review 2026-07-11): a
+    # systematic bug (e.g. an attribute missing from the __new__ bootstrap)
+    # used to be swallowed per-tick above and returned as a clean 0-trade,
+    # flat-P&L result that sweeps then treated as a real measurement.
+    if n_ticks > 0 and n_tick_errors == n_ticks:
+        raise RuntimeError(
+            f"ALL {n_ticks} backtest ticks raised — this is a harness/strategy "
+            "bug, not a no-trade market; see the per-tick warnings above.")
 
     pnl_df = pd.DataFrame(pnl_curve).set_index("date")
     return {

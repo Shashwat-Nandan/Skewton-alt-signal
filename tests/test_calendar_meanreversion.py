@@ -62,6 +62,7 @@ def _make_strategy(
     s.calendar_max_holding_days = 999
     s.calendar_min_dte_near = 999
     s.calendar_max_leg_basis = 0.0
+    s.calendar_stop_loss_mult = 0.0   # parent stop unused; mirror the builder
     s.disable_calendar = True
     s.lots_per_leg = 1
     s.max_open_calendars = 5

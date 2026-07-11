@@ -337,6 +337,7 @@ def append_intraday_capture(strategy, quotes: Dict[str, dict], today: date,
     replay the real intraday path instead of approximating stops by the
     day-low. Append-only TSV, one file per day; best-effort (a write failure
     must never take down the session)."""
+    global _capture_fail_streak
     syms = set(strategy.last_scan_candidates) | set(strategy.positions)
     if not syms:
         return
@@ -351,9 +352,29 @@ def append_intraday_capture(strategy, quotes: Dict[str, dict], today: date,
             for sym in sorted(syms):
                 q = quotes.get(sym)
                 if q and q.get("ltp") is not None:
-                    f.write(f"{ts}\t{sym}\t{q['ltp']}\t{q.get('low', '')}\n")
+                    # `low` KEY always exists (fetch_today_quotes sets it, maybe
+                    # None) — `q.get('low','')` would render the string "None"
+                    # into the column (code-review 2026-07-11).
+                    lo = q.get("low")
+                    f.write(f"{ts}\t{sym}\t{q['ltp']}\t{'' if lo is None else lo}\n")
+        _capture_fail_streak = 0
     except Exception as e:
-        log.warning("intraday capture append failed (%s): %s", path.name, e)
+        # Best-effort by design (a write failure must never take down the
+        # session) — but a PERSISTENT failure means the capture's sole
+        # deliverable is silently not being collected, so escalate once per
+        # streak instead of warning forever (Rule 12, code-review 2026-07-11).
+        _capture_fail_streak += 1
+        if _capture_fail_streak == CAPTURE_FAIL_ESCALATE_AT:
+            log.error("intraday capture has failed %d consecutive ticks "
+                      "(%s: %s) — today's forward-capture file is NOT being "
+                      "written; check disk/permissions",
+                      _capture_fail_streak, path.name, e)
+        else:
+            log.warning("intraday capture append failed (%s): %s", path.name, e)
+
+
+_capture_fail_streak = 0
+CAPTURE_FAIL_ESCALATE_AT = 10
 
 
 def _now_hm() -> dtime:

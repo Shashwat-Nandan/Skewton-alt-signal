@@ -174,3 +174,17 @@ def test_intraday_capture_noop_before_scan(tmp_path, monkeypatch):
         s, {"AAA": {"open": 1.0, "ltp": 1.0, "low": 1.0}}, date(2026, 7, 13),
         "baseline", LOG)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_intraday_capture_writes_blank_not_none_for_missing_low(tmp_path, monkeypatch):
+    # fetch_today_quotes always sets the `low` KEY (possibly None), so a
+    # .get(default) never applies — a None low must land as an empty cell,
+    # not the literal string "None" (code-review 2026-07-11).
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    s = _strategy()
+    s.last_scan_candidates = ["AAA"]
+    quotes = {"AAA": {"open": 10.0, "ltp": 9.9, "low": None}}
+    r.append_intraday_capture(s, quotes, date(2026, 7, 13), "baseline", LOG)
+    lines = (tmp_path / "buy_on_gap_intraday_2026-07-13.tsv").read_text().splitlines()
+    assert lines[1] == "2026-07-13T00:00:00\tAAA\t9.9\t" or lines[1].endswith("\tAAA\t9.9\t"), lines
+    assert "None" not in lines[1]

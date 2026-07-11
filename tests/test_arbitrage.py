@@ -57,9 +57,8 @@ def _make_strategy(
     # written for; the rupee-hurdle/debounce tests enable them explicitly.
     s.calendar_cost_hurdle_mult = 0.0
     s.calendar_exit_debounce_ticks = 1
-    # Test-friendly window (real __init__ computes max(min_dte, max_hold+2));
-    # the expiry-safe-window tests set 17 explicitly.
-    s.calendar_entry_min_dte = 4
+    # calendar_entry_min_dte is a @property (= max(min_dte, max_hold+2) = 17
+    # with the values above) — entry-test snaps use dte_near=25 to clear it.
     s.calendar_stop_loss_mult = 0.0
     s.disable_calendar = disable_calendar
     s.lots_per_leg = 1
@@ -228,7 +227,9 @@ class TestCalendarEntry:
             "symbol": symbol, "spot": 99.5,
             "near": {"tradingsymbol": f"{symbol}26APRFUT", "lot_size": 100,
                      "expiry": "2026-04-28", "instrument_token": 1},
-            "near_price": near_px, "dte_near": 11,
+            # 25 ≥ the derived entry window (max_hold 15 + 2 = 17) so these
+            # tests exercise the gates they were written for, not the window.
+            "near_price": near_px, "dte_near": 25,
             "next": {"tradingsymbol": f"{symbol}26MAYFUT", "lot_size": 100,
                      "expiry": "2026-05-26", "instrument_token": 2},
             "next_price": next_px, "dte_next": 39,
@@ -1331,7 +1332,7 @@ class TestReview20260711:
 
     def test_entry_blocked_inside_expiry_window(self):
         s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
-        s.calendar_entry_min_dte = 17          # max_hold 15 + 2
+        # derived window = max(4, 15 + 2) = 17 via the property
         snap = self._snap(dte_near=11, carry_diff=0.05)
         s._observe_universe = lambda: [snap]
         props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
@@ -1339,7 +1340,6 @@ class TestReview20260711:
 
     def test_entry_allowed_with_full_runway(self):
         s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
-        s.calendar_entry_min_dte = 17
         snap = self._snap(dte_near=20, carry_diff=0.05)
         s._observe_universe = lambda: [snap]
         props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
@@ -1430,3 +1430,134 @@ class TestReview20260711:
         with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
             fresh.restore_state(blob)
         assert any("LEDGER DRIFT" in r.message for r in caplog.records)
+
+
+# ──────────────────────────────────────────────────────────
+# Code-review 2026-07-11 fixes: builder parity, None-quote guard,
+# latch reset, stop boundary
+# ──────────────────────────────────────────────────────────
+
+class TestReviewFixes20260711:
+    """Each test pins a fix from the 2026-07-11 code review and fails if the
+    guard is removed (Rule 9)."""
+
+    # Reuse TestReview20260711's fixtures via composition.
+    _open_calendar = TestReview20260711._open_calendar
+    _snap = TestReview20260711._snap
+
+    # ── F1: backtest __new__ builders must satisfy every dereference ──────
+
+    def test_backtest_builder_supports_scan_and_stop_paths(self):
+        # backtest_arbitrage.make_strategy bypasses __init__ via __new__; a
+        # new __init__-only attribute silently killed every backtest tick
+        # (AttributeError swallowed per-tick → clean 0-trade result). The
+        # builder must produce an instance whose scan/rehedge paths run.
+        import backtest_arbitrage as ba
+        import pandas as pd
+        from datetime import date as _date
+        panel = pd.DataFrame([
+            {"date": pd.Timestamp("2026-01-05"), "symbol": "AAA",
+             "tradingsymbol": "AAA26JANFUT", "lot_size": 100,
+             "expiry": _date(2026, 1, 29), "close": 100.0, "spot": 99.5},
+            {"date": pd.Timestamp("2026-01-05"), "symbol": "AAA",
+             "tradingsymbol": "AAA26FEBFUT", "lot_size": 100,
+             "expiry": _date(2026, 2, 26), "close": 101.0, "spot": 99.5},
+        ])
+        s = ba.make_strategy(
+            ba.MockKiteArb(panel), ["AAA"],
+            risk_free_rate=0.07, dividend_yield=0.0, basis_entry_annual=9.99,
+            calendar_entry_annual=0.02, calendar_exit_annual=0.005,
+            calendar_max_holding_days=15, calendar_min_dte_near=4,
+            calendar_max_leg_basis=9.99, basis_min_dte=99, lots_per_leg=1,
+            max_open_calendars=5, max_leg_notional=None)
+        assert s.calendar_entry_min_dte == 17          # property, not attr
+        assert s.calendar_stop_loss_mult == 1.0        # set by the builder
+        # AST sweep: EVERY attribute ArbitrageStrategy.__init__ assigns must
+        # exist on the __new__-built instance, so the NEXT __init__ addition
+        # fails here instead of dying as a swallowed per-tick AttributeError
+        # (this sweep is what exposed calendar_margin_pct as already missing
+        # since 2026-06-17 — the backtest had been silently dead for weeks).
+        import ast, inspect
+        from strategies import arbitrage as _arb_mod
+        tree = ast.parse(inspect.getsource(_arb_mod))
+        cls = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.ClassDef) and n.name == "ArbitrageStrategy")
+        init = next(n for n in cls.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        assigned = {t.attr for n in ast.walk(init) for t in ast.walk(n)
+                    if isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Store)
+                    and isinstance(t.value, ast.Name) and t.value.id == "self"}
+        missing = {a for a in assigned if not hasattr(s, a)}
+        assert not missing, f"make_strategy misses __init__ attrs: {missing}"
+        # Fat carry on big notional so the builder's hardcoded 2.0x cost
+        # hurdle can't mask the path under test (mirrors the fat-carry
+        # fixture in TestCalendarCostHurdle).
+        s._observe_universe = lambda: [self._snap(
+            dte_near=25, carry_diff=0.50, near_price=2000.0, next_price=2020.0)]
+        props = s.scan_and_propose()                   # must not AttributeError
+        assert len([p for p in props if p.option_type == "FUT"]) == 2
+        self._open_calendar(s, expected_harvest=2000.0)
+        s.check_and_rehedge()                          # must not AttributeError
+
+    def test_backtest_all_ticks_failing_raises(self, monkeypatch):
+        # Rule 12: a systematic per-tick failure (the AttributeError class of
+        # bug) must raise at the end, not return a clean flat 0-trade result
+        # that sweeps then treat as a measurement.
+        import backtest_arbitrage as ba
+        import pandas as pd
+        from datetime import date as _date
+        days = [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")]
+        rows = []
+        for d in days:
+            for ts, exp, px in (("AAA26JANFUT", _date(2026, 1, 29), 100.0),
+                                ("AAA26FEBFUT", _date(2026, 2, 26), 101.0)):
+                rows.append({"date": d, "symbol": "AAA", "tradingsymbol": ts,
+                             "lot_size": 100, "expiry": exp, "close": px,
+                             "spot": 99.5})
+        panel = pd.DataFrame(rows)
+
+        def _boom(self):
+            raise AttributeError("simulated missing-attribute bug")
+        monkeypatch.setattr(ArbitrageStrategy, "scan_and_propose", _boom)
+        with pytest.raises(RuntimeError, match="ticks raised"):
+            ba.run_backtest(panel)
+
+    # ── F3: None next-month quote must not abort the tick ─────────────────
+
+    def test_none_next_price_holds_mark_instead_of_crashing(self):
+        s = _make_strategy(mode="paper")
+        trade = self._open_calendar(s)
+        far = trade.legs[1]
+        far.current_price = 103.0                      # last known mark
+        snap = self._snap(carry_diff=0.05)
+        snap["next_price"] = None                      # transient quote gap
+        s._observe_universe = lambda: [snap]
+        s.check_and_rehedge()                          # used to TypeError
+        assert far.current_price == 103.0, "stale mark must hold, not become None/0"
+
+    # ── F4: pnl_verified latch resets per exit attempt ─────────────────────
+
+    def test_pnl_verified_latch_resets_on_clean_exit(self):
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        trade = self._open_calendar(s)
+        trade.pnl_verified = False       # a previous aborted attempt latched it
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        s.execute_proposals(s.check_and_rehedge())     # clean CONVERGE exit
+        assert s.state.closed_trades[-1]["pnl_verified"] is True, \
+            "a clean exit must not inherit a stale False latch"
+
+    # ── F8: legacy-fallback stop boundary (pins the reconstruction) ───────
+
+    def test_legacy_stop_boundary_pins_fallback_formula(self):
+        # fallback expected = (0.04 − 0.005) × 10,100 × 15/365 ≈ ₹14.53.
+        # Just above the line holds; just below fires. A ~100x inflation or
+        # deflation of the reconstruction breaks one of the two assertions.
+        s = _make_strategy(mode="paper")
+        s.calendar_stop_loss_mult = 1.0
+        self._open_calendar(s, expected_harvest=None)
+        # far leg short 1 lot of 100: mtm = (px − 101) × (−100)
+        s._observe_universe = lambda: [self._snap(next_price=101.10)]  # mtm −10
+        assert s.check_and_rehedge() == [], "−10 > −14.53: must hold"
+        s._observe_universe = lambda: [self._snap(next_price=101.20)]  # mtm −20
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2 and all("STOP_LOSS" in p.rationale for p in exits)

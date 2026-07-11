@@ -2073,3 +2073,31 @@ ledger drift ₹42.8k vs headline; no stop-loss existed; P&L noise ≫ modeled
 - [x] Tests: 13 new, 99 arbitrage-suite green; real host-state restore
       smoke verified (drift warning + fallback stops preview).
 - [x] PR → merge (timer deploys from main).
+
+## 2026-07-11 — /code-review fixes (10 findings, PRs #105/#107 scope)
+
+- [x] F1 backtest_arbitrage.make_strategy: add calendar_stop_loss_mult +
+      calendar_margin_pct (MISSING SINCE 2026-06-17 — backtest silently dead)
+      + session baselines; meanreversion builder synced; run_backtest now
+      RAISES when all ticks error; AST builder-parity test guards the future.
+- [x] F2 buy_on_gap: blowup cap re-checked at the FILL price (falling-knife
+      guard for post-open drift).
+- [x] F3 arbitrage._update_unrealized: None next-quote no longer TypeErrors
+      the exit-management tick; marks hold at last known; _leg_mtm helper
+      shared by stop + both unrealized maintainers.
+- [x] F4 pnl_verified reset to True per exit attempt (no more one-way latch).
+- [x] F5 capture: candidates serialized (dated, same-day restore only);
+      None low → blank cell not "None"; persistent write-failure escalates
+      at 10 consecutive ticks.
+- [x] F6 live stop also fires on a NEW post-entry day-low ≤ stop (intra-poll
+      touches caught again; pre-entry dips still excluded).
+- [x] F7 calendar_entry_min_dte → @property (tracks max_hold retunes; exists
+      on __new__ instances); calendar_min_dte_near shadowing documented.
+- [x] F8 legacy-stop boundary test pins the fallback formula (was 206x slack).
+- [x] F9 stale comments fixed: hurdle horizon now dte−2 (matches DTE≤2 exit),
+      runner docstring, buy_on_gap module header no longer claims "never
+      diverge".
+- [x] F10 shared reconcile_ledger in strategies/base.py; wired arbitrage +
+      buy_on_gap. pair_trading NOT wired: realized_at_entry is snapshotted
+      AFTER entry fills book costs, so its per-trade deltas structurally
+      exclude entry costs — needs a baseline fix first (follow-up).

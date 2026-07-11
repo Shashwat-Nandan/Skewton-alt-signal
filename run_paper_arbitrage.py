@@ -455,7 +455,7 @@ def end_of_session(strategy, today: date, args, log: logging.Logger) -> None:
     (settlement risk); (2) honour --force-flatten-on-exit; (3) refresh MTM from
     live quotes; (4) persist state; (5) write the EOD sidecar.
 
-    The intraday dte_near<=1 check in check_and_rehedge is the first line of
+    The intraday dte_near<=2 check in check_and_rehedge is the first line of
     defence, but once a near contract actually expires it rolls off the
     instruments list and snap["near"] becomes the NEXT month — so the held leg
     stops matching that branch. This EOD pass keys off each leg's OWN expiry

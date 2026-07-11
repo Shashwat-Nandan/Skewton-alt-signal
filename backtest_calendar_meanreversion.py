@@ -169,6 +169,10 @@ def make_strategy(
     s.calendar_max_holding_days = 999
     s.calendar_min_dte_near = 999
     s.calendar_max_leg_basis = 0.0
+    s.calendar_stop_loss_mult = 0.0   # parent stop unused (check_and_rehedge
+    # is overridden; this subclass has its own SD-based stop) — set anyway so
+    # any parent code path that reads it cannot AttributeError (2026-07-11).
+    s.calendar_margin_pct = 0.06      # ditto (parent entry builder reads it)
     s.disable_calendar = True
     s.lots_per_leg = 1
     s.max_open_calendars = 5

@@ -428,3 +428,108 @@ class TestBacktest:
         summ = bt.run()
         assert summ["total_trades"] == 0
         assert summ["score"] == ZERO_TRADE_PENALTY
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Code-review 2026-07-11 fixes
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestReviewFixes20260711:
+    """Each test pins a fix from the 2026-07-11 code review (Rule 9)."""
+
+    def test_blowup_cap_binds_the_fill_not_just_the_open(self):
+        # Open gaps −3% (passes the 20% cap) but by the scan the LTP has
+        # collapsed −25% vs prev_close: a live news crash. The cap must bind
+        # the attainable FILL, not only the stale open, or the strategy buys
+        # the falling knife the cap exists to exclude.
+        df = _build_symbol("AAA", n=40)
+        today = df["date"].iloc[-1] + pd.tseries.offsets.BDay(1)
+        prev_close = df["close"].iloc[-1]
+        quotes = {"AAA": {"open": prev_close * 0.97, "ltp": prev_close * 0.75,
+                          "low": prev_close * 0.74}}
+        s = _strategy({"use_trend_filter": 0, "max_gap_down_pct": 20.0})
+        s.set_panel(df)
+        s.prepare_live_session(today)
+        s._ensure_features()
+        s.set_today_quotes(quotes); s.set_current_date(today)
+        assert s.scan_and_propose() == [], \
+            "a fill below the blowup cap must not be bought"
+
+    def test_new_post_entry_day_low_fires_stop_between_polls(self):
+        # A dip through the stop BETWEEN 60s polls (LTP recovered by the next
+        # poll) would have filled a resting SL order. The running day-low
+        # making a NEW low ≤ stop since entry must fire it; booked at level.
+        pos = GapPosition(symbol="AAA", entry_dt=pd.Timestamp("2024-02-01"),
+                          entry_px=100.0, qty=100, stop_px=95.0, gap_ret=-0.03,
+                          gap_z=-1.5, rationale="x", day_low_at_entry=98.0)
+        s = _strategy()
+        s.positions["AAA"] = pos
+        s.set_current_date(pd.Timestamp("2024-02-01"))
+        # LTP recovered to 99, but the day low printed 94 < 98 post-entry.
+        s.set_today_quotes({"AAA": {"open": 100.0, "ltp": 99.0, "low": 94.0}})
+        exits = s.check_and_rehedge()
+        assert len(exits) == 1 and exits[0].price == pytest.approx(95.0)
+        assert (exits[0].greeks_snapshot or {})["exit_reason"] == "CATASTROPHIC_STOP"
+
+    def test_pre_entry_day_low_still_does_not_fire(self):
+        # The same low that existed AT entry (pre-entry dip) must not fire —
+        # only a NEW low counts as a post-entry print.
+        pos = GapPosition(symbol="AAA", entry_dt=pd.Timestamp("2024-02-01"),
+                          entry_px=100.0, qty=100, stop_px=95.0, gap_ret=-0.03,
+                          gap_z=-1.5, rationale="x", day_low_at_entry=94.0)
+        s = _strategy()
+        s.positions["AAA"] = pos
+        s.set_current_date(pd.Timestamp("2024-02-01"))
+        s.set_today_quotes({"AAA": {"open": 100.0, "ltp": 102.0, "low": 94.0}})
+        assert s.check_and_rehedge() == []
+
+    def test_entry_records_day_low_and_it_roundtrips(self):
+        df = _build_symbol("AAA", n=40)
+        today = df["date"].iloc[-1] + pd.tseries.offsets.BDay(1)
+        prev_close = df["close"].iloc[-1]
+        lo = prev_close * 0.965
+        quotes = {"AAA": {"open": prev_close * 0.97, "ltp": prev_close * 0.975,
+                          "low": lo}}
+        s = _strategy({"use_trend_filter": 0})
+        s.set_panel(df)
+        s.prepare_live_session(today)
+        s._ensure_features()
+        s.set_today_quotes(quotes); s.set_current_date(today)
+        s.execute_proposals(s.scan_and_propose())
+        pos = s.positions["AAA"]
+        assert pos.day_low_at_entry == pytest.approx(lo)
+        restored = GapPosition.from_dict(pos.to_dict())
+        assert restored.day_low_at_entry == pytest.approx(lo, abs=0.01)
+        # Pre-upgrade blob (no key) → -inf → LTP-only stop semantics.
+        blob = pos.to_dict(); blob.pop("day_low_at_entry")
+        assert GapPosition.from_dict(blob).day_low_at_entry == float("-inf")
+
+    def test_scan_candidates_survive_same_day_restore_only(self):
+        # Mid-session restart goes exit-only and never rescans: the candidate
+        # list must survive a SAME-DAY restore (else the intraday capture
+        # silently drops the counterfactual names), but yesterday's list must
+        # not pollute a fresh session.
+        s = _strategy()
+        s.set_current_date(pd.Timestamp("2026-07-13"))
+        s.last_scan_candidates = ["AAA", "BBB"]
+        blob = s.serialize_state()
+
+        same_day = _strategy()
+        same_day.set_current_date(pd.Timestamp("2026-07-13"))
+        same_day.restore_state(blob)
+        assert same_day.last_scan_candidates == ["AAA", "BBB"]
+
+        next_day = _strategy()
+        next_day.set_current_date(pd.Timestamp("2026-07-14"))
+        next_day.restore_state(blob)
+        assert next_day.last_scan_candidates == []
+
+    def test_restore_warns_on_ledger_drift(self, caplog):
+        import logging as _logging
+        s = _strategy()
+        s.realized_pnl = 5000.0          # headline says +5k, ledger says 0
+        blob = s.serialize_state()
+        fresh = _strategy()
+        with caplog.at_level(_logging.WARNING):
+            fresh.restore_state(blob)
+        assert any("LEDGER DRIFT" in r.message for r in caplog.records)

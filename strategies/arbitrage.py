@@ -189,14 +189,6 @@ class ArbitrageStrategy(BaseStrategy):
         self.calendar_exit_annual = float(cfg.get("calendar_exit_annual", 0.005))
         self.calendar_max_holding_days = int(cfg.get("calendar_max_holding_days", 15))
         self.calendar_min_dte_near = int(cfg.get("calendar_min_dte_near", 4))
-        # Expiry-safe entry window (review 2026-07-11): a hold entered with
-        # dte_near < max_hold + 2 can live into the roll zone, where exit legs
-        # drop out of the snapshot and get priced at last-known marks — the
-        # source of the ±₹16k "approximate P&L" artifacts around the JUN-2026
-        # expiry (and the regime of the 06-19 loss). Require enough runway at
-        # ENTRY that the full max-hold ends before the DTE≤2 force-exit.
-        self.calendar_entry_min_dte = max(
-            self.calendar_min_dte_near, self.calendar_max_holding_days + 2)
         # Thesis-invalidation stop (review 2026-07-11): exit when the spread's
         # MTM is down more than this multiple of the ENTRY-TIME expected
         # harvest — if the trade has lost more than it could ever have made,
@@ -204,6 +196,7 @@ class ArbitrageStrategy(BaseStrategy):
         # forward book's multi-day bleeders ran −₹11k…−₹22k against ~₹2-4k
         # expectations with no stop below them. 0 disables.
         self.calendar_stop_loss_mult = float(cfg.get("calendar_stop_loss_mult", 1.0))
+
         # Rupee cost hurdle at entry (efficiency review 2026-07-05 §2.3/E2).
         # The % gate above is in annualized-carry units — blind to whether a
         # 1-lot spread can MONETIZE the carry: the June 2026 forward record
@@ -271,6 +264,31 @@ class ArbitrageStrategy(BaseStrategy):
     # ══════════════════════════════════════════════════════════
     # PUBLIC API (BaseStrategy interface)
     # ══════════════════════════════════════════════════════════
+
+
+    @property
+    def calendar_entry_min_dte(self) -> int:
+        """Expiry-safe entry window (review 2026-07-11): a hold entered with
+        dte_near < max_hold + 2 can live into the roll zone, where exit legs
+        drop out of the snapshot and get priced at last-known marks — the
+        source of the ±₹16k "approximate P&L" artifacts around the JUN-2026
+        expiry (and the regime of the 06-19 loss). Require enough runway at
+        ENTRY that the full max-hold ends before the DTE≤2 force-exit.
+
+        A property, not an __init__ constant (code-review 2026-07-11): it must
+        track calendar_max_holding_days if that is retuned post-construction,
+        and it must exist on instances the backtests build via __new__.
+        NOTE this makes calendar_min_dte_near non-binding for entries unless
+        it exceeds max_hold + 2 (17 at defaults) — see config_template.ini.
+        """
+        return max(self.calendar_min_dte_near, self.calendar_max_holding_days + 2)
+
+    @staticmethod
+    def _leg_mtm(leg: CalendarLeg) -> float:
+        """One leg's mark-to-market ₹. The SINGLE formula shared by the
+        unrealized-P&L maintainers and the STOP_LOSS trigger, so the stop can
+        never fire on a different MTM than the ledger reports."""
+        return (leg.current_price - leg.entry_price) * leg.quantity * leg.lot_size
 
     def scan_and_propose(self) -> List[TradeProposal]:
         proposals: List[TradeProposal] = []
@@ -374,9 +392,7 @@ class ArbitrageStrategy(BaseStrategy):
                                     for l in trade.legs), default=0.0)
                     expected = (max(abs(trade.entry_carry_diff) - self.calendar_exit_annual, 0.0)
                                 * notional * self.calendar_max_holding_days / 365.0)
-                mtm = trade.realized + sum(
-                    (l.current_price - l.entry_price) * l.quantity * l.lot_size
-                    for l in trade.legs)
+                mtm = trade.realized + sum(self._leg_mtm(l) for l in trade.legs)
                 if expected > 0 and mtm <= -self.calendar_stop_loss_mult * expected:
                     logger.warning(
                         "%s calendar: MTM ₹%.0f ≤ -%.1fx expected harvest ₹%.0f "
@@ -626,24 +642,18 @@ class ArbitrageStrategy(BaseStrategy):
                 trade.realized = -open_costs
             open_calendars[trade.symbol] = trade
         self.state.open_calendars = open_calendars
-        # Ledger reconciliation (Rule 12, review 2026-07-11): the headline
-        # realized_pnl and the per-trade ledger are updated in lockstep by
-        # _apply_fill, so any drift means state surgery or an accounting bug.
-        # As of 2026-07-11 ~₹39k of historical drift exists from the JUN-2026
-        # expiry repairs — the warning makes any CHANGE in the number visible,
-        # and says loudly that the headline alone must not grade the book.
+        # Ledger reconciliation via the shared helper (Rule 12, review
+        # 2026-07-11): headline and per-trade ledger are updated in lockstep
+        # by _apply_fill, so drift means state surgery or an accounting bug.
+        # ~₹43k of historical drift exists from the JUN-2026 expiry repairs —
+        # the warning makes any CHANGE in the number visible.
+        from .base import reconcile_ledger
         ledger = (
             sum(float(t.get("realized_pnl", 0.0) or 0.0)
                 for t in self.state.closed_trades)
             + sum(t.realized for t in open_calendars.values())
         )
-        drift = self.state.realized_pnl - ledger
-        if abs(drift) > 1.0:
-            logger.warning(
-                "LEDGER DRIFT: headline realized ₹%.0f vs per-trade ledger "
-                "₹%.0f (drift ₹%.0f) — do not grade the experiment on the "
-                "headline alone; segment closed_trades by pnl_verified/era",
-                self.state.realized_pnl, ledger, drift)
+        reconcile_ledger(self.state.realized_pnl, ledger, logger, self.name)
         # Session start = this restore point, so session_*_delta measures only
         # what happens after restore. Capturing it here (not in the runner)
         # means every caller of generate_eod_report gets correct per-session
@@ -1022,7 +1032,14 @@ class ArbitrageStrategy(BaseStrategy):
         # convergence completes only partially before a forced exit (the
         # dte_near − 1 matches the EXPIRY force-exit in check_and_rehedge).
         # The gate is therefore conservative: it under-, never over-states.
-        horizon_days = min(max(float(snap["dte_near"]) - 1.0, 0.0),
+        # dte_near − 2 matches the EXPIRY force-exit (DTE≤2) in
+        # check_and_rehedge, so the horizon never counts a day the trade
+        # cannot be held (was dte−1 when the force-exit was DTE≤1 — kept in
+        # lockstep, code-review 2026-07-11). Today the entry gate
+        # (calendar_entry_min_dte ≥ max_hold+2) makes the min() clamp to
+        # max_hold anyway, but expected_pnl also feeds the STOP_LOSS
+        # yardstick, so the truncation must stay correct on its own.
+        horizon_days = min(max(float(snap["dte_near"]) - 2.0, 0.0),
                            float(self.calendar_max_holding_days))
         harvest_annual = max(abs(cd) - self.calendar_exit_annual, 0.0)
         notional = max(one_lot_near, one_lot_next) * qty
@@ -1080,8 +1097,12 @@ class ArbitrageStrategy(BaseStrategy):
             f"now_diff={(snap.get('carry_diff') or 0):.3f})"
         )
         # Stamp the exit conditions on the trade so _apply_fill archives them
-        # onto the closed_trades row (paper fills are same-tick, so the stamp
-        # and the archive can't interleave with another exit decision).
+        # onto the closed_trades row. pnl_verified describes THIS attempt, so
+        # reset it first (code-review 2026-07-11): it is serialized, and a
+        # previous attempt that latched False and then failed to fill (quote
+        # gap + interrupt, live rejection) must not mislabel a later clean
+        # exit as approximate — every path re-stamps all three fields here.
+        trade.pnl_verified = True
         trade.exit_reason = reason
         trade.exit_carry_diff = snap.get("carry_diff")
         proposals: List[TradeProposal] = []
@@ -1272,7 +1293,7 @@ class ArbitrageStrategy(BaseStrategy):
         _update_unrealized), so it needs no fresh quotes and is safe to call
         from _apply_fill. An empty book correctly yields 0.0."""
         self.state.unrealized_pnl = sum(
-            (leg.current_price - leg.entry_price) * leg.quantity * leg.lot_size
+            self._leg_mtm(leg)
             for trade in self.state.open_calendars.values()
             for leg in trade.legs
         )
@@ -1282,26 +1303,28 @@ class ArbitrageStrategy(BaseStrategy):
         for symbol, trade in self.state.open_calendars.items():
             snap = snapshots.get(symbol)
             for leg in trade.legs:
-                matched = False
-                cur = leg.current_price
+                cur = None
                 if snap:
                     if snap.get("near") and snap["near"]["tradingsymbol"] == leg.tradingsymbol:
                         cur = snap["near_price"]
-                        matched = True
                     elif snap.get("next") and snap["next"] and snap["next"]["tradingsymbol"] == leg.tradingsymbol:
+                        # next_price can be None while the instrument is still
+                        # listed (transient quote gap / rate limit) — treat
+                        # that the same as unmatched, NOT as a ₹0 mark: a None
+                        # here used to raise TypeError below and abort the
+                        # whole exit-management tick (code-review 2026-07-11).
                         cur = snap["next_price"]
-                        matched = True
-                if not matched:
-                    # Same shape as _build_calendar_exit: contract has rolled
-                    # off the instruments list. Mark-to-market is now stale;
-                    # log once per refresh so operators can see why MTM stops
-                    # moving on a leg.
+                if cur is None:
+                    # Contract rolled off the instruments list OR its quote
+                    # gapped this tick. Mark-to-market holds at the last-known
+                    # mark; log so operators can see why MTM stops moving.
                     logger.debug(
-                        "%s: leg %s not in current snapshot — MTM stale at %.2f",
-                        symbol, leg.tradingsymbol, cur,
+                        "%s: leg %s has no usable quote this tick — MTM stale "
+                        "at %.2f", symbol, leg.tradingsymbol, leg.current_price,
                     )
-                leg.current_price = cur
-                unrealized += (cur - leg.entry_price) * leg.quantity * leg.lot_size
+                else:
+                    leg.current_price = cur
+                unrealized += self._leg_mtm(leg)
         self.state.unrealized_pnl = unrealized
 
     def _symbol_from_tradingsymbol(self, tradingsymbol: str) -> str:

@@ -34,7 +34,13 @@ open/LTP/low per symbol via ``set_today_quotes()`` from ``kite.quote``; the
 historical features still come from yesterday's bhavcopy panel.
 
 Both paths flow through ``_gap_signal_at`` (entry) and ``_intraday_exit``
-(exit) so backtest and live never diverge (Rule 7).
+(exit) so the DECISION LOGIC never forks (Rule 7). The prices differ by
+data regime, deliberately (2026-07-11): live fills at the scan-time LTP
+(the open printed minutes before the 09:20–09:45 scan and is not
+attainable) and stops on post-entry marks; the backtest's daily bars have
+neither, so it fills at the open and approximates the stop with the
+day-low. Forward paper results are therefore NOT directly comparable to
+the backtest's fill model — grade them separately.
 
 Modes
 -----
@@ -81,6 +87,11 @@ class GapPosition:
     gap_ret: float          # signed gap return at entry, e.g. -0.031
     gap_z: float            # gap_ret / ret_std (more negative = more oversold)
     rationale: str
+    # Day-low observed AT entry (code-review 2026-07-11): lets the live stop
+    # fire on a NEW post-entry day-low ≤ stop (a print between 60s polls that
+    # a resting SL order would have filled) without re-admitting pre-entry
+    # dips. -inf on restored pre-upgrade positions = LTP-only stop (safe).
+    day_low_at_entry: float = float("-inf")
     # mutable
     last_mtm_px: float = field(default=0.0)
     last_mtm_dt: Optional[pd.Timestamp] = None
@@ -103,6 +114,10 @@ class GapPosition:
             "stop_px": round(self.stop_px, 2),
             "gap_ret_pct": round(self.gap_ret * 100, 3),
             "gap_z": round(self.gap_z, 3),
+            # -inf is not JSON-representable; None round-trips to the same
+            # LTP-only stop semantics via from_dict's default.
+            "day_low_at_entry": (round(self.day_low_at_entry, 2)
+                                 if self.day_low_at_entry != float("-inf") else None),
             "last_mtm_px": round(self.last_mtm_px, 2),
             "last_mtm_dt": self.last_mtm_dt.isoformat() if self.last_mtm_dt else None,
             "status": self.status,
@@ -124,6 +139,9 @@ class GapPosition:
             gap_ret=float(d.get("gap_ret_pct", 0.0)) / 100.0,
             gap_z=float(d.get("gap_z", 0.0)),
             rationale=d.get("rationale", ""),
+            day_low_at_entry=(float(d["day_low_at_entry"])
+                              if d.get("day_low_at_entry") is not None
+                              else float("-inf")),
         )
         pos.last_mtm_px = float(d.get("last_mtm_px", pos.entry_px))
         if d.get("last_mtm_dt"):
@@ -343,6 +361,15 @@ class BuyOnGapStrategy(BaseStrategy):
             return None
         if gap_ret < -self.params["max_gap_down_pct"] / 100.0:
             return None
+        # The blowup cap must also bind the FILL (code-review 2026-07-11):
+        # the gap gates above are defined on the open, but the live fill is
+        # the scan-time LTP with no bound on post-open drift — a name that
+        # opened −3% and is −22% by the 09:20–09:45 scan is a live news
+        # crash, exactly the regime this cap exists to exclude. Backtest is
+        # unaffected (fill_px == open_px there).
+        fill_ret = (fill_px - prev_close) / prev_close
+        if fill_ret < -self.params["max_gap_down_pct"] / 100.0:
+            return None
 
         # Trend filter: trade gap-downs only in names still above the long MA.
         ma_long = row["ma_long"]
@@ -363,7 +390,7 @@ class BuyOnGapStrategy(BaseStrategy):
         return {
             "gap_ret": gap_ret, "gap_z": gap_z, "open": open_px,
             "fill_px": fill_px, "stop_px": stop_px, "ret_std": ret_std,
-            "ma_long": ma_long, "rationale": rationale,
+            "ma_long": ma_long, "day_low": bar["low"], "rationale": rationale,
         }
 
     def _size(self, open_px: float) -> int:
@@ -424,6 +451,7 @@ class BuyOnGapStrategy(BaseStrategy):
                 greeks_snapshot={
                     "stop_px": sig["stop_px"], "gap_ret": sig["gap_ret"],
                     "gap_z": sig["gap_z"], "entry": sig["fill_px"],
+                    "day_low_at_entry": sig["day_low"],
                 },
             ))
         return proposals
@@ -459,14 +487,21 @@ class BuyOnGapStrategy(BaseStrategy):
         catastrophic stop takes priority over the close so a stop that fires
         intraday is honoured even on the close tick.
 
-        Stop trigger: in live the quote's day-low includes prints from BEFORE
-        entry (the scan runs 09:20–09:45), so a pre-entry dip must not fire the
-        stop — the 60s LTP is the honest post-entry mark. The backtest's daily
-        bar has only the day-low (conservative approximation, documented in the
-        harness). Both book the exit AT the stop level, modelling an SL order
-        sitting at that price."""
-        stop_mark = bar["px"] if self._today_quotes is not None else bar["low"]
-        if stop_mark <= pos.stop_px:
+        Stop trigger, live: fires on the 60s LTP, OR on a NEW post-entry
+        day-low ≤ stop — i.e. the running day-low has printed strictly below
+        the level it stood at entry (code-review 2026-07-11: a dip between
+        polls that recovers would fill a resting SL order, and must not be
+        missed; a dip from BEFORE the 09:20–09:45 entry must not fire).
+        Backtest: the daily bar's day-low (conservative approximation,
+        documented in the harness). Both book the exit AT the stop level,
+        modelling an SL order sitting at that price."""
+        if self._today_quotes is not None:
+            hit = (bar["px"] <= pos.stop_px
+                   or (bar["low"] <= pos.stop_px
+                       and bar["low"] < pos.day_low_at_entry))
+        else:
+            hit = bar["low"] <= pos.stop_px
+        if hit:
             return "CATASTROPHIC_STOP", pos.stop_px
         if self._force_close:
             return "CLOSE", bar["px"]
@@ -506,6 +541,7 @@ class BuyOnGapStrategy(BaseStrategy):
                 gap_ret=float(snap.get("gap_ret", 0.0)),
                 gap_z=float(snap.get("gap_z", 0.0)),
                 rationale=proposal.rationale,
+                day_low_at_entry=float(snap.get("day_low_at_entry", float("-inf"))),
             )
             self.positions[sym] = pos
             logger.info("[PAPER OPEN] %s qty=%d @ ₹%.2f stop=₹%.2f gap=%.2fσ",
@@ -587,6 +623,16 @@ class BuyOnGapStrategy(BaseStrategy):
             "transaction_costs": self.transaction_costs,
             "positions": {s: p.to_dict() for s, p in self.positions.items()},
             "closed_positions": [p.to_dict() for p in self.closed_positions],
+            # Dated so a restore can tell today's candidates from yesterday's
+            # (code-review 2026-07-11): a mid-session restart goes exit-only
+            # and never rescans, so without this the intraday capture silently
+            # loses the qualifying-but-not-entered names for the rest of the
+            # day — the counterfactual data the capture exists to collect.
+            "scan_candidates": {
+                "date": (self._current_date.date().isoformat()
+                         if self._current_date is not None else None),
+                "symbols": list(self.last_scan_candidates),
+            },
         }
 
     def restore_state(self, blob: Dict) -> None:
@@ -596,3 +642,21 @@ class BuyOnGapStrategy(BaseStrategy):
                           for s, d in (blob.get("positions") or {}).items()}
         self.closed_positions = [GapPosition.from_dict(d)
                                  for d in (blob.get("closed_positions") or [])]
+        # Restore today's scan candidates only — yesterday's must not pollute
+        # today's capture file (the entry scan overwrites them anyway, but the
+        # pre-scan ticks would capture stale names).
+        sc = blob.get("scan_candidates") or {}
+        today = (self._current_date.date().isoformat()
+                 if self._current_date is not None else None)
+        if sc.get("date") is not None and sc.get("date") == today:
+            self.last_scan_candidates = [str(s) for s in (sc.get("symbols") or [])]
+        # Ledger reconciliation (shared helper; Rule 12, code-review
+        # 2026-07-11). Identity: headline booked −entry_cost at every open and
+        # (gross − exit_cost) at every close, while pos.pnl nets BOTH legs'
+        # costs — so headline = Σ closed pnl − Σ open positions' entry costs.
+        from .base import reconcile_ledger
+        ledger = (
+            sum(p.pnl for p in self.closed_positions)
+            - sum(self._cost(p.entry_px * p.qty) for p in self.positions.values())
+        )
+        reconcile_ledger(self.realized_pnl, ledger, logger, self.name)
