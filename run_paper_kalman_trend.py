@@ -56,7 +56,7 @@ COST_PER_UNIT_POINTS = 2.5
 # refuses to trade and exits 0 without an EOD sidecar, which the loop
 # orchestrator already records as "no_session". Extending the runway is a
 # deliberate act: move the date in a commit, don't delete the gate.
-KILL_DATE = date(2026, 8, 1)
+KILL_DATE = date(2026, 8, 30)
 
 logger = logging.getLogger("paper-kalman-trend")
 
