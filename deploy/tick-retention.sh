@@ -5,8 +5,10 @@
 # ticks-*.jsonl uncompressed, zstd-compress the rest, delete .zst
 # archives older than KEEP_ARCHIVE_DAYS.
 #
-# 2026-07-02: backtest.list_captured_sessions / _open_tape now read the
-# .zst archives directly (`zstd -dc`), so compressing a session no longer
+# 2026-07-02: backtest.list_captured_sessions / load_captured_tape read
+# the .zst archives directly (DuckDB read_ndjson decompresses natively
+# since 2026-07-12; `zstd -t` still integrity-gates each archive before
+# replay), so compressing a session no longer
 # hides it from autoresearch — the replay window is bounded by
 # KEEP_ARCHIVE_DAYS, not KEEP_RAW. KEEP_RAW stays count-based to spare
 # the most-replayed (recent) sessions the per-run decompression cost.

@@ -1,3 +1,100 @@
+# DuckDB tape reader + analytics surface (PLAN, 2026-07-12)
+
+Increments 2 + 4 of docs/research/parquet-duckdb-storage-evaluation-2026-07-12.md
+(user-approved recommendation). Increment 3 (parquet tape sidecar) stays
+deferred per the report's own criterion.
+
+## Design (increment 2 — load_captured_tape)
+
+DuckDB replaces ONLY the parse phase (json.loads loop + chunked resample
+from #110); the pandas resample + instrument-master enrich pipeline stays
+byte-identical, so tie-break/ordering semantics are inherited, not
+re-implemented:
+
+- `read_ndjson(path, columns={token,ts,price}, ignore_errors)` scans raw
+  .jsonl AND .jsonl.zst natively (~1.4-2.1 s/session vs ~40 s/M ticks);
+  preserve_insertion_order keeps file order, which the resample's
+  last-in-bucket tie-break depends on.
+- Session header (token→symbol map) also read via DuckDB (`instruments`
+  column, LIMIT 1) — _open_tape's early-exit on .zst would false-positive
+  its corrupt-archive guard (EPIPE), and with both reads in DuckDB,
+  _open_tape + _TAPE_CHUNK_ROWS + the chunk merge machinery are DELETED.
+- Out-of-session filter (epoch-zero ticks, #110) becomes a mask on the
+  parsed frame — same semantics as startswith(date_iso), same warning.
+- Resolution 'tick' path unchanged (no resample).
+
+## Parity gate (the merge condition, per the arbitrage-dead-code lesson)
+
+- Host run: old loader (main's backtest.py imported as a legacy module)
+  vs new loader on 3 REAL sessions — one .zst archive, two raw July
+  sessions (incl. ticks-2026-07-06, the epoch-zero OOM tape) — must be
+  assert_frame_equal-identical at 1min AND tick resolutions.
+- tests/test_backtest.py TestTapeChunkedStreaming: fixture kept, chunk
+  monkeypatch bits replaced (machinery gone); still pins file-order-last,
+  tick completeness, epoch-drop warning.
+
+## Checklist
+- [x] duckdb==1.5.4 pinned (requirements.in + hash lock, no --upgrade) + .venv
+- [x] backtest.py: DuckDB parse + header; deleted _open_tape/_TAPE_CHUNK_ROWS/
+      chunk merge; enrich pipeline untouched. NOTE vs plan: NO ns cast —
+      legacy pd.to_datetime on pandas 3 yields datetime64[us], same as
+      DuckDB, and the first gate run caught my cast as the only mismatch
+- [x] tests updated: TestTapeParseSemantics (fixture + same-second tie
+      case), TestZstTapeArchives re-pinned at the loader surface
+- [x] Parity gate PASSED 4/4 IDENTICAL: 2026-05-13.zst (1min AND tick),
+      2026-07-06 raw (epoch tape — both loaders drop the same 164 ticks),
+      2026-07-10 raw
+- [x] Timing: 5 GB raw session 143s→28s (5.1x end-to-end; the parse phase
+      is the ~30x part, the shared resample+enrich now dominates)
+- [x] Increment 4: scripts/duckdb_analytics.py — dash ATTACH read-only +
+      signals view + parquet by path; verified against live dashboard.db
+      (49,416 trade proposals) and the real signal bus (3 pair_trading
+      signals). Scoreboard stays stdlib-only BY DESIGN (Rule 7: surfaced,
+      not blended)
+- [x] Full suite green → commit, push, PR
+
+## Review (2026-07-12)
+
+- Parity gate 4/4 IDENTICAL against main's loader on real sessions
+  (.zst 1min+tick, two raw 5 GB days incl. the epoch-zero tape). The
+  gate EARNED its keep: the first run caught a real defect — my
+  datetime64[ns] cast, added to match an assumed legacy dtype that
+  pandas 3 doesn't actually produce (legacy gives us-resolution, same
+  as DuckDB; removing the cast was the fix).
+- Net deletion in backtest.py: _open_tape (zstd subprocess + EPIPE
+  bookkeeping), _TAPE_CHUNK_ROWS, per-chunk resample, cross-chunk merge
+  — all replaced by two DuckDB queries + the pre-#110 single-shot
+  resample, now safe because the epoch filter runs before it.
+- Full suite 1284 passed in 5:35 vs ~15-17 min before — the tape reader
+  sped the SUITE up ~3x (replay tests dominate its wall time).
+- Weekly-sweep impact: a 15-session replay pass drops from ~30 min of
+  loading to ~6 min; per-session 143s→28s on raw 5 GB days.
+- Increment 3 (parquet tape sidecar) stays deferred; revisit only if
+  sweep volume rises per the report's criterion.
+- /code-review (high) 2026-07-12: 10 findings (8 confirmed) — all applied:
+  zstd -t gate (a TRUNCATED .zst silently partial-read under
+  ignore_errors — the parity gate can't see this, healthy tapes only);
+  header now read via readline (kills a measured 6.14s/session full-scan
+  AND restores loud failure on corrupt/missing headers, strengthened to
+  reject headerless tapes); unparseable timestamps back in the drop
+  count; SET preserve_insertion_order=true made explicit; signals view
+  ignore_errors (bus mid-write line); stale _open_tape comments in 2
+  deploy scripts; broken_load test uses a real duckdb exception; shared
+  _write_tape_session builder; connect() docstring de-advertised.
+  Refuted: loader-raise-on-empty (would undo #111's stillborn design),
+  todo.md archive fold (intended convention). Post-fix: parity gate
+  re-run 4/4 IDENTICAL, suite 1287 passed.
+
+---
+
+# ARCHIVE — prior tasks' plans & reviews (accumulated record)
+
+Kept because source files cite dated entries here (screen_pairs.py,
+strategies/pair_trading.py, compare_paper_systems.py, autoresearch_loop.py,
+loop_engine/__init__.py, tests/test_runner_live_gate.py, …). Do not prune
+without fixing those references.
+
+
 # Parquet increment 1 — chains/bars/bhavcopy (PLAN, 2026-07-12)
 
 Implements increment 1 of docs/research/parquet-duckdb-storage-evaluation-2026-07-12.md
@@ -83,14 +180,8 @@ prototype_kalman_signal_exit.py (frozen one-offs).
   astype(str) does NOT nan-ify on the venv's pandas 3.0.3; ArrowInvalid
   subclasses ValueError (live guard already catches corrupt parquet).
 
+
 ---
-
-# ARCHIVE — prior tasks' plans & reviews (accumulated record)
-
-Kept because source files cite dated entries here (screen_pairs.py,
-strategies/pair_trading.py, compare_paper_systems.py, autoresearch_loop.py,
-loop_engine/__init__.py, tests/test_runner_live_gate.py, …). Do not prune
-without fixing those references.
 
 
 # Issue #90 increment 1 — signal plane for pair_trading persistent (PLAN, 2026-07-07)

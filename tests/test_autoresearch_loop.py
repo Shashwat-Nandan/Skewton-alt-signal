@@ -374,15 +374,21 @@ class TestTapeCache:
         # binary) is an infrastructure failure shared by every experiment.
         # Scoring it -999999 flattened entire sweeps (baseline included)
         # with the root cause buried in per-cycle warnings — it must raise.
+        # The loader's real failure shapes since the DuckDB reader:
+        # duckdb.InvalidInputException on a corrupt file, RuntimeError
+        # from the zstd -t archive gate — use the former so this exercises
+        # a genuine (non-fabricated) error type.
         self._patch_tape(monkeypatch, ["2026-01-01"])
+        import duckdb
 
         def broken_load(date_iso, underlying):
-            raise RuntimeError("zstd -dc ticks-2026-01-01.jsonl.zst exited 1")
+            raise duckdb.InvalidInputException(
+                'Malformed JSON in file "ticks-2026-01-01.jsonl.zst"')
 
         monkeypatch.setattr("backtest.load_captured_tape", broken_load)
         loop = _run_loop(eval_cycles=1)
         before = copy.deepcopy(loop.hedger.tunable_params)
-        with pytest.raises(RuntimeError, match="zstd"):
+        with pytest.raises(duckdb.InvalidInputException, match="Malformed"):
             loop._run_experiment({"gamma_scalp_band_pct": 9.9})
         # ...and the propagating error must not leak the mutation into the
         # hedger (the try/finally restore).

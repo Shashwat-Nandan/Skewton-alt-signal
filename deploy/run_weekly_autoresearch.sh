@@ -99,7 +99,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # On a 5-session window most tunables never flip a single entry/routing/
   # rehedge decision, so mutations tie at identical fitness and the hill-
   # climber starves (06-20: 0/40 accepted; 06-27: 29/40 identical). 15
-  # sessions became reachable once list_captured_sessions/_open_tape
+  # sessions became reachable once list_captured_sessions/_tape_path
   # learned to read the .jsonl.zst archives tick-retention.sh keeps for
   # 90 days (only 8 sessions stay raw). Experiment budget cut above pays
   # the runtime bill.

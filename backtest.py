@@ -15,7 +15,6 @@ If no data file is provided, generates synthetic data for a smoke test.
 """
 
 import argparse
-import contextlib
 import logging
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -291,59 +290,71 @@ def _find_instruments_csv(date_iso: str, underlying: str = "NIFTY") -> Optional[
     return candidates[-1] if candidates else None
 
 
-@contextlib.contextmanager
-def _open_tape(date_iso: str):
-    """Yield a text stream over ticks-<date>.jsonl, transparently
-    decompressing the .jsonl.zst archive when only that exists.
+def _tape_path(date_iso: str) -> Path:
+    """Path of the session tape: the raw ticks-<date>.jsonl when present,
+    else the .jsonl.zst archive tick-retention.sh leaves behind (DuckDB's
+    ndjson reader decompresses zstd natively — no external binary).
 
     tick-retention.sh keeps just the newest KEEP_RAW (8) sessions raw and
-    zstd-compresses the rest — without this, list_captured_sessions /
-    load_captured_tape could never replay more than ~a week of tape, which
-    capped the autoresearch fitness window at 5 sessions (the 2026-06-27
-    flat-plateau sweep). Decompression shells out to the system `zstd`
-    binary that tick-retention.sh already hard-depends on; no pip dep.
-
-    Prefers the raw file when both exist. Raises FileNotFoundError when
-    neither exists, RuntimeError when zstd exits non-zero (corrupt
-    archive must not silently truncate a replay — Rule 12)."""
-    import io
-    import subprocess
+    zstd-compresses the rest — without the archive fallback,
+    list_captured_sessions / load_captured_tape could never replay more
+    than ~a week of tape, which capped the autoresearch fitness window at
+    5 sessions (the 2026-06-27 flat-plateau sweep). Prefers the raw file
+    when both exist. Raises FileNotFoundError when neither exists."""
     raw = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
     if raw.exists():
-        with raw.open() as f:
-            yield f
-        return
+        return raw
     zst = raw.with_name(raw.name + ".zst")
     if not zst.exists():
         raise FileNotFoundError(f"Tick capture not found: {raw}[.zst]")
-    proc = subprocess.Popen(
-        ["zstd", "-dc", str(zst)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    consumed_ok = False
-    try:
-        yield io.TextIOWrapper(proc.stdout, encoding="utf-8")
-        consumed_ok = True
-    finally:
-        proc.stdout.close()
-        stderr = proc.stderr.read().decode(errors="replace")
-        proc.stderr.close()
-        rc = proc.wait()
-        # Raise only on a clean read that zstd itself failed — if the
-        # consumer raised, closing stdout EPIPEs zstd and a non-zero rc
-        # is expected noise that must not mask the original error.
-        if consumed_ok and rc != 0:
+    return zst
+
+
+# Session-header lines carry the full instrument map (100s of KB). The
+# tick scan still has to PARSE that line before NULLing its requested
+# columns, so give DuckDB's ndjson reader ample headroom over its 16 MB
+# default or a grown instrument map would abort the whole scan.
+_TAPE_MAX_OBJECT_SIZE = 33_554_432
+
+
+def _read_tape_header(tick_path: Path) -> dict:
+    """First line of the tape (the session header), parsed. For a .zst
+    archive, `zstd -t` integrity-checks the WHOLE file first: DuckDB's
+    ndjson reader under ignore_errors silently returns a PARTIAL result
+    for a truncated-but-valid archive (verified 2026-07-12: 94,932 of
+    200,000 rows, no error), and a silently short session would bias
+    every sweep it enters — the fail-loud guarantee the old zstd
+    subprocess reader gave (Rule 12). The zstd binary is already a hard
+    dependency of tick-retention.sh on this host.
+
+    Raises json.JSONDecodeError on a malformed/missing header line (the
+    pre-DuckDB loader's behavior), RuntimeError on a corrupt archive."""
+    import json
+    import subprocess
+    if tick_path.suffix == ".zst":
+        probe = subprocess.run(
+            ["zstd", "-t", str(tick_path)],
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
             raise RuntimeError(
-                f"zstd -dc {zst} exited {rc}: {stderr.strip()}"
+                f"zstd -t {tick_path} exited {probe.returncode}: "
+                f"{probe.stderr.strip()} — corrupt/truncated archive "
+                "must not silently truncate a replay (Rule 12)"
             )
-
-
-# Tick lines buffered before an incremental resample flush in
-# load_captured_tape. ~1M (token, ts_str, price) tuples ≈ 400 MB peak —
-# small enough to coexist with the live stack on the 23 GB host, large
-# enough that per-chunk resample overhead stays negligible vs JSON
-# parsing (a raw ~5 GB session is ~50 chunks).
-_TAPE_CHUNK_ROWS = 1_000_000
+        proc = subprocess.Popen(
+            ["zstd", "-dc", str(tick_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        try:
+            first_line = proc.stdout.readline().decode("utf-8")
+        finally:
+            proc.stdout.close()
+            proc.terminate()
+            proc.wait()
+        return json.loads(first_line)
+    with tick_path.open() as f:
+        return json.loads(f.readline())
 
 
 def load_captured_tape(
@@ -357,7 +368,7 @@ def load_captured_tape(
     Args:
         date_iso: ISO date string ('2026-05-22'); reads
             data_cache/ticks/ticks-<date>.jsonl, or the .jsonl.zst
-            archive tick-retention.sh leaves behind (see _open_tape)
+            archive tick-retention.sh leaves behind (see _tape_path)
         underlying: NIFTY / BANKNIFTY / etc; chooses the instrument
             master CSV to join against
         resolution: pandas offset alias for downsampling ('1min',
@@ -369,16 +380,12 @@ def load_captured_tape(
 
     Raises FileNotFoundError if either the tick file or the instruments
     master is absent — fail loud rather than silently degrade (Rule 12)."""
-    import json
 
-    # Probe the tape BEFORE the instrument-master lookup so a missing
+    # Resolve the tape BEFORE the instrument-master lookup so a missing
     # session is attributed to the missing session — the master error's
     # remediation (fetch instruments) would be wrong, and the master is a
-    # multi-MB read that shouldn't run first. _open_tape re-checks when it
-    # actually opens.
-    tick_base = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
-    if not tick_base.exists() and not tick_base.with_name(tick_base.name + ".zst").exists():
-        raise FileNotFoundError(f"Tick capture not found: {tick_base}[.zst]")
+    # multi-MB read that shouldn't run first.
+    tick_path = _tape_path(date_iso)
 
     instr_csv = _find_instruments_csv(date_iso, underlying)
     if instr_csv is None:
@@ -391,89 +398,89 @@ def load_captured_tape(
     instr = pd.read_csv(instr_csv)
     instr = instr.set_index("instrument_token")
 
-    def _resample_chunk(chunk_rows: list) -> pd.DataFrame:
-        df = pd.DataFrame(
-            chunk_rows, columns=["instrument_token", "timestamp", "last_price"],
+    # Header line (token → tradingsymbol map, used for the spot token
+    # which isn't in the NFO instrument master) is read directly — a
+    # DuckDB LIMIT-1 scan does NOT short-circuit and re-read the whole
+    # 5 GB file (measured 6.14 s, 2026-07-12 review). For archives this
+    # also runs the zstd integrity check. Fails loud on a malformed
+    # header, corrupt archive, or truncated archive.
+    header = _read_tape_header(tick_path)
+    if "instruments" not in header:
+        raise ValueError(
+            f"ticks-{date_iso}: first line is not a session header (no "
+            "'instruments' key) — without the token→symbol map the spot "
+            "stream is unresolvable and the whole replay would carry NaN "
+            "underlying_price (Rule 12: fail here, not there)"
         )
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        if resolution != "tick" and not df.empty:
-            # Bucket to the requested resolution per (token); keep LAST
-            # tick in each bucket (Kite's last_price is by convention
-            # "last trade").
-            df = (
-                df.set_index("timestamp")
-                  .groupby("instrument_token")["last_price"]
-                  .resample(resolution).last()
-                  .dropna()
-                  .reset_index()
-            )
-        return df
-
-    # Stream the JSONL in bounded chunks. Buffering the whole session
-    # into one list before resampling peaks at several × file size —
-    # ~16 GB for a raw ~5 GB session, which OOM-killed the 2026-07-11
-    # weekly autoresearch sweep once its replay window held 8 raw
-    # sessions. Flushing every _TAPE_CHUNK_ROWS lines keeps the peak
-    # at O(chunk) + O(buckets) regardless of session size. Header maps
-    # tokens → tradingsymbols (used for the spot token which isn't in
-    # the NFO instrument master).
-    rows = []
-    parts = []
-    out_of_session = 0
     header_token_to_symbol = {}
-    with _open_tape(date_iso) as f:
-        header = json.loads(f.readline())
-        for entry in header.get("instruments", []):
-            header_token_to_symbol[int(entry["token"])] = entry["tradingsymbol"]
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                t = json.loads(line)
-            except json.JSONDecodeError:
-                # Truncated tail line at the end of a session is normal
-                # if the watchdog cut the WebSocket mid-write.
-                continue
-            tok = t.get("instrument_token")
-            ts = t.get("exchange_timestamp")
-            lp = t.get("last_price")
-            if tok is None or ts is None or lp is None:
-                continue
-            if not ts.startswith(date_iso):
-                # Kite full-mode packets carry an epoch-zero
-                # exchange_timestamp ("1970-01-01T05:30:00") for a
-                # token's pre-first-trade snapshot. ONE such tick makes
-                # resample() materialize minute bins from 1970 to the
-                # session date (~30M bins) for that token — 164 of them
-                # in ticks-2026-07-06 is what actually OOM-killed the
-                # 2026-07-11 weekly sweep. A session tape must only
-                # contain its own date; drop and count anything else.
-                out_of_session += 1
-                continue
-            rows.append((tok, ts, lp))
-            if len(rows) >= _TAPE_CHUNK_ROWS:
-                parts.append(_resample_chunk(rows))
-                rows = []
-    if rows or not parts:
-        parts.append(_resample_chunk(rows))
+    for entry in header["instruments"]:
+        header_token_to_symbol[int(entry["token"])] = entry["tradingsymbol"]
+
+    # Parse via DuckDB's ndjson reader (storage-evaluation increment 2):
+    # ~30x faster than the json.loads loop it replaces and reads the
+    # .jsonl.zst archives natively, which also retires the #110
+    # chunked-resample machinery — the compact 3-column result frame
+    # (~150 MB for a 5M-tick session) feeds ONE resample, and DuckDB
+    # bounds its own scan memory. Malformed lines (a truncated tail when
+    # the watchdog cut the WebSocket mid-write) are skipped by
+    # ignore_errors, as json.JSONDecodeError was before. The resample's
+    # last-in-bucket tie-break depends on FILE order — insertion-order
+    # preservation is pinned explicitly below; do not add
+    # parallel-reordering clauses to this query.
+    import duckdb
+    con = duckdb.connect()
+    try:
+        con.execute("SET preserve_insertion_order=true")
+        df = con.execute(
+            """
+            SELECT instrument_token, exchange_timestamp AS timestamp,
+                   last_price
+            FROM read_ndjson(?, columns={instrument_token: 'BIGINT',
+                                         exchange_timestamp: 'TIMESTAMP',
+                                         last_price: 'DOUBLE'},
+                             ignore_errors=true, maximum_object_size=?)
+            WHERE instrument_token IS NOT NULL
+              AND last_price IS NOT NULL
+            """, [str(tick_path), _TAPE_MAX_OBJECT_SIZE],
+        ).df()
+    finally:
+        con.close()
+    # DuckDB hands back datetime64[us] — the same resolution
+    # pd.to_datetime gives the string timestamps on pandas 3, so no cast.
+
+    # Kite full-mode packets carry an epoch-zero exchange_timestamp
+    # ("1970-01-01T05:30:00") for a token's pre-first-trade snapshot.
+    # ONE such tick makes resample() materialize minute bins from 1970
+    # to the session date (~30M bins) for that token — 164 of them in
+    # ticks-2026-07-06 is what OOM-killed the 2026-07-11 weekly sweep.
+    # A session tape must only contain its own date; drop and count
+    # anything else. Unparseable timestamps arrive as NaT (the SQL keeps
+    # them so they land in this count, as the pre-DuckDB loader counted
+    # its startswith() misses) — NaT compares False on both bounds.
+    session_start = pd.Timestamp(date_iso)
+    in_session = (df["timestamp"] >= session_start) & (
+        df["timestamp"] < session_start + pd.Timedelta(days=1))
+    out_of_session = int((~in_session).sum())
     if out_of_session:
         logger.warning(
             "ticks-%s: dropped %d ticks whose exchange_timestamp is "
             "outside the session date (epoch-zero pre-first-trade "
-            "snapshots and the like).", date_iso, out_of_session,
+            "snapshots, unparseable timestamps and the like).",
+            date_iso, out_of_session,
         )
+        df = df[in_session].reset_index(drop=True)
 
-    df = pd.concat(parts, ignore_index=True)
-    if resolution != "tick" and len(parts) > 1:
-        # A bucket straddling a chunk boundary appears once per chunk;
-        # groupby(sort=True).last() keeps the LATER chunk's value (file
-        # order) — the same row the single-shot resample's .last() would
-        # have kept — and restores the (token, time)-sorted order the
-        # per-chunk resample already produces for a single chunk.
-        df = df.groupby(
-            ["instrument_token", "timestamp"], as_index=False,
-        )["last_price"].last()
+    if resolution != "tick" and not df.empty:
+        # Bucket to the requested resolution per (token); keep LAST
+        # tick in each bucket (Kite's last_price is by convention
+        # "last trade").
+        df = (
+            df.set_index("timestamp")
+              .groupby("instrument_token")["last_price"]
+              .resample(resolution).last()
+              .dropna()
+              .reset_index()
+        )
 
     # Join the NFO instrument master for strike/expiry/lot_size on
     # derivatives, then patch the spot token (which lives on NSE and
@@ -549,7 +556,7 @@ def list_captured_sessions(underlying: str = "NIFTY",
                            include_today: bool = False) -> List[str]:
     """Return ISO date strings for which tick captures exist — raw
     .jsonl or the .jsonl.zst archives tick-retention.sh produces (a date
-    with both counts once; _open_tape prefers the raw file).
+    with both counts once; _tape_path prefers the raw file).
 
     TODAY's session is excluded by default: during market hours that JSONL
     is still being appended by tick-capture, so replaying it means parsing

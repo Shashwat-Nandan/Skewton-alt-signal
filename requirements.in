@@ -26,6 +26,7 @@ scipy
 statsmodels
 cmaes                   # CMA-ES optimizer for the Kalman trend-following fit
 pyarrow                 # Parquet engine for data_cache tables (storage increment 1)
+duckdb                  # tape reader (read_ndjson over ticks-*.jsonl[.zst]) + read-only analytics (increments 2+4)
 
 # Auth
 pyotp

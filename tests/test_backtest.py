@@ -295,6 +295,44 @@ class TestCapturedTapeReplay:
         )
 
 
+def _write_tape_session(cache_dir, date_iso, ce_ticks,
+                        spot_price=23000.0, header=True):
+    """Write the smallest replayable session: instruments master + tape
+    with (optional) header, one spot tick, and `ce_ticks` as a list of
+    (ts_suffix, price) for the CE token. Shared by the archive and
+    parse-semantics test classes so the master schema lives ONCE."""
+    import json as _json
+    ticks_dir = cache_dir / "ticks"
+    ticks_dir.mkdir(parents=True, exist_ok=True)
+    ymd = date_iso.replace("-", "")
+    (cache_dir / f"instruments_NIFTY_{ymd}.csv").write_text(
+        "instrument_token,exchange_token,tradingsymbol,name,last_price,"
+        "expiry,strike,tick_size,lot_size,instrument_type,segment,exchange\n"
+        "111,1,NIFTY26JAN23000CE,NIFTY,0.0,2026-01-27,23000.0,0.05,65,"
+        "CE,NFO-OPT,NFO\n"
+    )
+    lines = []
+    if header:
+        lines.append(_json.dumps({"instruments": [
+            {"token": 999, "tradingsymbol": "NIFTY 50"},
+            {"token": 111, "tradingsymbol": "NIFTY26JAN23000CE"},
+        ]}))
+    lines.append(_json.dumps({
+        "instrument_token": 999,
+        "exchange_timestamp": f"{date_iso} 09:15:00",
+        "last_price": spot_price,
+    }))
+    for ts_suffix, price in ce_ticks:
+        lines.append(_json.dumps({
+            "instrument_token": 111,
+            "exchange_timestamp": f"{date_iso} {ts_suffix}",
+            "last_price": price,
+        }))
+    raw = ticks_dir / f"ticks-{date_iso}.jsonl"
+    raw.write_text("\n".join(lines) + "\n")
+    return raw
+
+
 class TestZstTapeArchives:
     """2026-07-02: tick-retention.sh keeps only the newest 8 sessions as
     raw .jsonl and zstd-compresses the rest. list_captured_sessions used
@@ -328,33 +366,80 @@ class TestZstTapeArchives:
             "2026-01-05", "2026-01-06", "2026-01-07",
         ]
 
-    def test_open_tape_prefers_raw_over_archive(self, ticks_dir):
+    def _write_minimal_session(self, ticks_dir, date_iso):
+        return _write_tape_session(ticks_dir.parent, date_iso,
+                                   ce_ticks=[("09:15:01", 101.5)])
+
+    def test_tape_path_prefers_raw_over_archive(self, ticks_dir):
         (ticks_dir / "ticks-2026-01-07.jsonl").write_text('{"src": "raw"}\n')
         (ticks_dir / "ticks-2026-01-07.jsonl.zst").write_bytes(b"not zstd")
-        with backtest._open_tape("2026-01-07") as f:
-            assert "raw" in f.readline()
+        assert backtest._tape_path("2026-01-07").suffix == ".jsonl"
 
-    def test_open_tape_streams_archive(self, ticks_dir, zstd_bin):
+    def test_archive_is_replayable(self, ticks_dir, zstd_bin):
+        """An archived-only session must load end-to-end — DuckDB's ndjson
+        reader decompresses the .zst directly (no zstd subprocess)."""
         import subprocess
-        raw = ticks_dir / "ticks-2026-01-06.jsonl"
-        raw.write_text('{"line": 1}\n{"line": 2}\n')
+        raw = self._write_minimal_session(ticks_dir, "2026-01-06")
         subprocess.run(
             [zstd_bin, "-q", str(raw), "-o", f"{raw}.zst"], check=True,
         )
         raw.unlink()
-        with backtest._open_tape("2026-01-06") as f:
-            assert f.read().splitlines() == ['{"line": 1}', '{"line": 2}']
+        df = load_captured_tape("2026-01-06")
+        assert df[df["symbol"] == "NIFTY26JAN23000CE"]["last_price"].tolist() == [101.5]
 
-    def test_open_tape_corrupt_archive_fails_loud(self, ticks_dir, zstd_bin):
+    def test_corrupt_archive_fails_loud(self, ticks_dir, zstd_bin):
+        """A corrupt archive must raise, not truncate a replay into a fake
+        0-trade session (Rule 12)."""
+        self._write_minimal_session(ticks_dir, "2026-01-06")
+        (ticks_dir / "ticks-2026-01-06.jsonl").unlink()
         (ticks_dir / "ticks-2026-01-06.jsonl.zst").write_bytes(b"garbage")
-        with pytest.raises(RuntimeError, match="zstd"):
-            with backtest._open_tape("2026-01-06") as f:
-                f.read()
+        with pytest.raises(Exception,
+                           match="(?i)zst|compress|invalid|malformed|frame"):
+            load_captured_tape("2026-01-06")
 
-    def test_open_tape_missing_raises(self, ticks_dir):
+    def test_truncated_archive_fails_loud(self, ticks_dir, zstd_bin):
+        """2026-07-12 review finding: a TRUNCATED (partially decompressible)
+        archive is the case DuckDB's ignore_errors silently PARTIAL-READS —
+        94,932 of 200,000 rows with no error. The zstd -t gate must catch
+        it before the scan, or a silently short session biases every sweep
+        it enters (Rule 12)."""
+        import subprocess
+        raw = self._write_minimal_session(ticks_dir, "2026-01-06")
+        # Pad the session so truncation lands mid-stream, then cut ~40%.
+        with raw.open("a") as f:
+            for i in range(5000):
+                f.write('{"instrument_token": 111, "exchange_timestamp": '
+                        f'"2026-01-06 09:{16 + i // 60 % 40:02d}:{i % 60:02d}", '
+                        '"last_price": 100.0}\n')
+        subprocess.run([zstd_bin, "-q", str(raw), "-o", f"{raw}.zst"], check=True)
+        raw.unlink()
+        zst = ticks_dir / "ticks-2026-01-06.jsonl.zst"
+        blob = zst.read_bytes()
+        zst.write_bytes(blob[: int(len(blob) * 0.6)])
+        with pytest.raises(RuntimeError, match="zstd -t"):
+            load_captured_tape("2026-01-06")
+
+    def test_missing_header_fails_loud(self, ticks_dir):
+        """2026-07-12 review finding: a tape whose header line is corrupt
+        or absent used to load with an empty token→symbol map, silently
+        dropping the spot stream (all-NaN underlying_price downstream).
+        Both failure shapes must raise at the load site: a MISSING header
+        (first line is a valid tick — the old json.loads accepted it
+        silently) and a CORRUPT first line."""
+        import json
+        _write_tape_session(ticks_dir.parent, "2026-01-06",
+                            ce_ticks=[("09:15:01", 101.5)], header=False)
+        with pytest.raises(ValueError, match="not a session header"):
+            load_captured_tape("2026-01-06")
+
+        tape = ticks_dir / "ticks-2026-01-06.jsonl"
+        tape.write_text('{"instruments": [TRUNCATED\n' + tape.read_text())
+        with pytest.raises(json.JSONDecodeError):
+            load_captured_tape("2026-01-06")
+
+    def test_tape_path_missing_raises(self, ticks_dir):
         with pytest.raises(FileNotFoundError):
-            with backtest._open_tape("2099-01-01"):
-                pass
+            backtest._tape_path("2099-01-01")
 
 
 # ── Fix B (2026-05-31): IV/skew seeding so autoresearch tunables can bind ──
@@ -475,79 +560,50 @@ class TestRunBacktestSeeding:
         assert seen_skew["skew"] == 0
 
 
-class TestTapeChunkedStreaming:
-    """2026-07-11 weekly-sweep OOM fix: load_captured_tape streams the
-    JSONL in _TAPE_CHUNK_ROWS-line chunks (per-chunk resample + cross-
-    chunk last-merge) instead of buffering every tick line in one list —
-    a raw ~5 GB session peaked >15 GB and SIGKILLed the autoresearch
-    sweep. These tests pin the MERGE semantics, not just the schema: a
-    chunked run must be indistinguishable from an unchunked one."""
+class TestTapeParseSemantics:
+    """load_captured_tape's parse phase (DuckDB read_ndjson since the
+    2026-07-12 storage increment 2; chunked json.loads before that) must
+    keep the resample's contract: last tick IN FILE ORDER per bucket,
+    'tick' resolution returns every line, out-of-session timestamps drop
+    loudly. File order is what DuckDB's insertion-order preservation
+    provides — a parallel-reordering regression in the parse query would
+    silently rewrite session prices and reshuffle every sweep ranking."""
 
     SESSION = "2026-01-05"
 
     @pytest.fixture
     def synthetic_session(self, tmp_path, monkeypatch):
-        import json
-        cache = tmp_path / "data_cache"
-        ticks = cache / "ticks"
-        ticks.mkdir(parents=True)
-        # Instrument master: one CE token the tick rows join against.
-        (cache / "instruments_NIFTY_20260105.csv").write_text(
-            "instrument_token,exchange_token,tradingsymbol,name,last_price,"
-            "expiry,strike,tick_size,lot_size,instrument_type,segment,exchange\n"
-            "111,1,NIFTY26JAN23000CE,NIFTY,0.0,2026-01-27,23000.0,0.05,65,"
-            "CE,NFO-OPT,NFO\n"
-        )
-        header = {"instruments": [
-            {"token": 999, "tradingsymbol": "NIFTY 50"},
-            {"token": 111, "tradingsymbol": "NIFTY26JAN23000CE"},
-        ]}
-        lines = [json.dumps(header)]
-        lines.append(json.dumps({
-            "instrument_token": 999,
-            "exchange_timestamp": "2026-01-05 09:15:00",
-            "last_price": 23000.0,
-        }))
         # Seven CE ticks inside ONE 1-min bucket. Prices are chosen so
         # the correct answer (3.0, last in file order) differs from
-        # first-seen (5.0), max (9.0), and min (1.0) — a merge that
-        # keeps any of those is caught, not just an unlucky reorder.
-        for sec, price in enumerate([5.0, 2.0, 9.0, 1.0, 4.0, 8.0, 3.0], 1):
-            lines.append(json.dumps({
-                "instrument_token": 111,
-                "exchange_timestamp": f"2026-01-05 09:15:{sec:02d}",
-                "last_price": price,
-            }))
-        (ticks / f"ticks-{self.SESSION}.jsonl").write_text(
-            "\n".join(lines) + "\n"
+        # first-seen (5.0), max (9.0), and min (1.0) — a parse that
+        # reorders and keeps any of those is caught, not just an unlucky
+        # reorder. The final two ticks share the SAME second: Kite's
+        # exchange_timestamp is second-granular, so same-second ticks are
+        # routine, and only FILE order (not timestamp order) can break
+        # that tie the way the pre-DuckDB parser did.
+        _write_tape_session(
+            tmp_path / "data_cache", self.SESSION,
+            ce_ticks=[(f"09:15:{s:02d}", p) for s, p in
+                      [(1, 5.0), (2, 2.0), (3, 9.0), (4, 1.0),
+                       (5, 4.0), (7, 8.0), (7, 3.0)]],
         )
         monkeypatch.chdir(tmp_path)
         return self.SESSION
 
-    def test_chunk_boundary_keeps_file_order_last(
-        self, synthetic_session, monkeypatch,
-    ):
-        """WHY: with a 2-line chunk size, the 1-min bucket's ticks
-        straddle several flushes, so the bucket appears in multiple
-        per-chunk frames. The cross-chunk merge must resolve it to the
-        last tick in FILE order — the row the pre-fix single-shot
-        resample kept. Keeping first-seen/max/min instead would silently
-        rewrite session prices and reshuffle every sweep ranking."""
-        import pandas as pd
-        unchunked = load_captured_tape(self.SESSION)
-        monkeypatch.setattr(backtest, "_TAPE_CHUNK_ROWS", 2)
-        chunked = load_captured_tape(self.SESSION)
-        pd.testing.assert_frame_equal(chunked, unchunked)
-        ce = chunked[chunked["symbol"] == "NIFTY26JAN23000CE"]
+    def test_bucket_keeps_file_order_last(self, synthetic_session):
+        """WHY: the 1-min bucket must resolve to the last tick in FILE
+        order — including across the same-second tie in the fixture
+        (8.0 then 3.0 at :07). Keeping first-seen/max/min/tie-reordered
+        instead would silently rewrite session prices and reshuffle
+        every sweep ranking."""
+        df = load_captured_tape(self.SESSION)
+        ce = df[df["symbol"] == "NIFTY26JAN23000CE"]
         assert ce["last_price"].tolist() == [3.0]
 
-    def test_tick_resolution_not_collapsed_by_chunking(
-        self, synthetic_session, monkeypatch,
-    ):
-        """WHY: resolution='tick' must return every line; the cross-chunk
-        last-merge is a resampling concern and must NOT deduplicate
-        same-bucket tick rows when no resampling was requested."""
-        monkeypatch.setattr(backtest, "_TAPE_CHUNK_ROWS", 2)
+    def test_tick_resolution_returns_every_line(self, synthetic_session):
+        """WHY: resolution='tick' must return every line — bucket-last
+        is a resampling concern and must NOT deduplicate same-bucket
+        (or same-second) tick rows when no resampling was requested."""
         df = load_captured_tape(self.SESSION, resolution="tick")
         ce = df[df["symbol"] == "NIFTY26JAN23000CE"]
         assert len(ce) == 7
@@ -579,6 +635,32 @@ class TestTapeChunkedStreaming:
         )
         assert any("dropped 1 ticks" in r.message for r in caplog.records), (
             "Silent drop: the out-of-session filter must warn (Rule 12)."
+        )
+
+    def test_unparseable_timestamp_counted_in_drop_warning(
+        self, synthetic_session, tmp_path, caplog,
+    ):
+        """WHY (2026-07-12 review finding): a tick whose exchange_timestamp
+        fails the TIMESTAMP cast is NULLed by ignore_errors; filtering it
+        in SQL made it vanish from the 'dropped N ticks' count the old
+        loader reported. A capture-format regression that mangles
+        timestamps must stay operator-visible in that warning."""
+        import json
+        import logging
+        tape = tmp_path / "data_cache" / "ticks" / f"ticks-{self.SESSION}.jsonl"
+        with tape.open("a") as f:
+            f.write(json.dumps({
+                "instrument_token": 111,
+                "exchange_timestamp": "not-a-timestamp",
+                "last_price": 6.5,
+            }) + "\n")
+        with caplog.at_level(logging.WARNING, logger="backtest"):
+            df = load_captured_tape(self.SESSION)
+        ce = df[df["symbol"] == "NIFTY26JAN23000CE"]
+        assert ce["last_price"].tolist() == [3.0]  # bucket-last unaffected
+        assert any("dropped 1 ticks" in r.message for r in caplog.records), (
+            "Unparseable-timestamp tick dropped without being counted "
+            "in the warning (Rule 12)."
         )
 
 
