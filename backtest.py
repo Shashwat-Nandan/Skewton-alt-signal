@@ -336,6 +336,14 @@ def _open_tape(date_iso: str):
             )
 
 
+# Tick lines buffered before an incremental resample flush in
+# load_captured_tape. ~1M (token, ts_str, price) tuples ≈ 400 MB peak —
+# small enough to coexist with the live stack on the 23 GB host, large
+# enough that per-chunk resample overhead stays negligible vs JSON
+# parsing (a raw ~5 GB session is ~50 chunks).
+_TAPE_CHUNK_ROWS = 1_000_000
+
+
 def load_captured_tape(
     date_iso: str, underlying: str = "NIFTY",
     resolution: str = "1min",
@@ -381,9 +389,35 @@ def load_captured_tape(
     instr = pd.read_csv(instr_csv)
     instr = instr.set_index("instrument_token")
 
-    # Stream the JSONL. Header maps tokens → tradingsymbols (used for
-    # the spot token which isn't in the NFO instrument master).
+    def _resample_chunk(chunk_rows: list) -> pd.DataFrame:
+        df = pd.DataFrame(
+            chunk_rows, columns=["instrument_token", "timestamp", "last_price"],
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        if resolution != "tick" and not df.empty:
+            # Bucket to the requested resolution per (token); keep LAST
+            # tick in each bucket (Kite's last_price is by convention
+            # "last trade").
+            df = (
+                df.set_index("timestamp")
+                  .groupby("instrument_token")["last_price"]
+                  .resample(resolution).last()
+                  .dropna()
+                  .reset_index()
+            )
+        return df
+
+    # Stream the JSONL in bounded chunks. Buffering the whole session
+    # into one list before resampling peaks at several × file size —
+    # ~16 GB for a raw ~5 GB session, which OOM-killed the 2026-07-11
+    # weekly autoresearch sweep once its replay window held 8 raw
+    # sessions. Flushing every _TAPE_CHUNK_ROWS lines keeps the peak
+    # at O(chunk) + O(buckets) regardless of session size. Header maps
+    # tokens → tradingsymbols (used for the spot token which isn't in
+    # the NFO instrument master).
     rows = []
+    parts = []
+    out_of_session = 0
     header_token_to_symbol = {}
     with _open_tape(date_iso) as f:
         header = json.loads(f.readline())
@@ -404,21 +438,40 @@ def load_captured_tape(
             lp = t.get("last_price")
             if tok is None or ts is None or lp is None:
                 continue
+            if not ts.startswith(date_iso):
+                # Kite full-mode packets carry an epoch-zero
+                # exchange_timestamp ("1970-01-01T05:30:00") for a
+                # token's pre-first-trade snapshot. ONE such tick makes
+                # resample() materialize minute bins from 1970 to the
+                # session date (~30M bins) for that token — 164 of them
+                # in ticks-2026-07-06 is what actually OOM-killed the
+                # 2026-07-11 weekly sweep. A session tape must only
+                # contain its own date; drop and count anything else.
+                out_of_session += 1
+                continue
             rows.append((tok, ts, lp))
-
-    df = pd.DataFrame(rows, columns=["instrument_token", "timestamp", "last_price"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    if resolution != "tick":
-        # Bucket to the requested resolution per (token); keep LAST tick
-        # in each bucket (Kite's last_price is by convention "last trade").
-        df = (
-            df.set_index("timestamp")
-              .groupby("instrument_token")["last_price"]
-              .resample(resolution).last()
-              .dropna()
-              .reset_index()
+            if len(rows) >= _TAPE_CHUNK_ROWS:
+                parts.append(_resample_chunk(rows))
+                rows = []
+    if rows or not parts:
+        parts.append(_resample_chunk(rows))
+    if out_of_session:
+        logger.warning(
+            "ticks-%s: dropped %d ticks whose exchange_timestamp is "
+            "outside the session date (epoch-zero pre-first-trade "
+            "snapshots and the like).", date_iso, out_of_session,
         )
+
+    df = pd.concat(parts, ignore_index=True)
+    if resolution != "tick" and len(parts) > 1:
+        # A bucket straddling a chunk boundary appears once per chunk;
+        # groupby(sort=True).last() keeps the LATER chunk's value (file
+        # order) — the same row the single-shot resample's .last() would
+        # have kept — and restores the (token, time)-sorted order the
+        # per-chunk resample already produces for a single chunk.
+        df = df.groupby(
+            ["instrument_token", "timestamp"], as_index=False,
+        )["last_price"].last()
 
     # Join the NFO instrument master for strike/expiry/lot_size on
     # derivatives, then patch the spot token (which lives on NSE and

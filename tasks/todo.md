@@ -2118,3 +2118,35 @@ ledger drift ₹42.8k vs headline; no stop-loss existed; P&L noise ≫ modeled
 - [x] Live-state smoke (read-only): all 6 persistent pairs restore, zero
       warnings, zero residuals; anchors absorb ₹3,371 of legacy entry costs.
 - [x] Full suite (1261 passed) → PR → merge.
+
+## 2026-07-11 — load_captured_tape streaming parse (weekly-sweep OOM fix)
+
+Failure: taleb-autoresearch.service OOM-killed (exit 137, RSS ~16 GB)
+parsing ticks-2026-07-06.jsonl.
+
+ACTUAL root cause (found by reproducing the kill against the new
+streaming loader): 164 ticks in ticks-2026-07-06 carry epoch-zero
+exchange_timestamp ("1970-01-01T05:30:00" — Kite full-mode
+pre-first-trade snapshots, one per token). resample('1min') then
+materializes per-token minute bins from 1970 to 2026 (~30M bins/token)
+→ 16 GB. Only 07-06 is poisoned (07-01..05, 07-07..10 and all .zst
+sessions are clean) — which is why the sweep survived sessions 1–10
+and died on session 11, and why the 2026-07-04 sweep passed. The
+"8 raw ~5 GB files" theory was wrong: raw size alone loads at ~0.5 GB.
+
+- [x] Out-of-session timestamp filter in load_captured_tape (drop +
+      count + WARN, Rule 12) — the actual OOM fix.
+- [x] Chunked streaming parse (_TAPE_CHUNK_ROWS=1M flushes, cross-chunk
+      groupby.last() keeps file-order parity) — hardening: peak parse
+      memory now O(chunk)+O(buckets) instead of O(session).
+- [x] Tests encoding intent: chunk-boundary bucket keeps LAST tick in
+      file order (≠ first/max/min); tick-resolution not deduped;
+      epoch-zero tick dropped + warned, all output timestamps within
+      session date.
+- [x] Parity on real .zst session 2026-06-25: new output byte-identical
+      to pre-fix loader (39,670 rows).
+- [x] Memory on real raw 5.4 GB poisoned session 2026-07-06: pre-fix
+      16 GB → SIGKILL (reproduced); post-fix peak RSS 0.49 GB, 62,175
+      rows, 164-tick drop warning emitted.
+- [x] Full test suite (1264 passed) → PR → merge → relaunch
+      taleb-autoresearch (supervised).

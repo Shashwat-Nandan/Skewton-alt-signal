@@ -473,3 +473,110 @@ class TestRunBacktestSeeding:
         run_backtest(data, underlying="NIFTY", tunable_params=dict(band),
                      seed_iv_history=[0.15] * 40)
         assert seen_skew["skew"] == 0
+
+
+class TestTapeChunkedStreaming:
+    """2026-07-11 weekly-sweep OOM fix: load_captured_tape streams the
+    JSONL in _TAPE_CHUNK_ROWS-line chunks (per-chunk resample + cross-
+    chunk last-merge) instead of buffering every tick line in one list —
+    a raw ~5 GB session peaked >15 GB and SIGKILLed the autoresearch
+    sweep. These tests pin the MERGE semantics, not just the schema: a
+    chunked run must be indistinguishable from an unchunked one."""
+
+    SESSION = "2026-01-05"
+
+    @pytest.fixture
+    def synthetic_session(self, tmp_path, monkeypatch):
+        import json
+        cache = tmp_path / "data_cache"
+        ticks = cache / "ticks"
+        ticks.mkdir(parents=True)
+        # Instrument master: one CE token the tick rows join against.
+        (cache / "instruments_NIFTY_20260105.csv").write_text(
+            "instrument_token,exchange_token,tradingsymbol,name,last_price,"
+            "expiry,strike,tick_size,lot_size,instrument_type,segment,exchange\n"
+            "111,1,NIFTY26JAN23000CE,NIFTY,0.0,2026-01-27,23000.0,0.05,65,"
+            "CE,NFO-OPT,NFO\n"
+        )
+        header = {"instruments": [
+            {"token": 999, "tradingsymbol": "NIFTY 50"},
+            {"token": 111, "tradingsymbol": "NIFTY26JAN23000CE"},
+        ]}
+        lines = [json.dumps(header)]
+        lines.append(json.dumps({
+            "instrument_token": 999,
+            "exchange_timestamp": "2026-01-05 09:15:00",
+            "last_price": 23000.0,
+        }))
+        # Seven CE ticks inside ONE 1-min bucket. Prices are chosen so
+        # the correct answer (3.0, last in file order) differs from
+        # first-seen (5.0), max (9.0), and min (1.0) — a merge that
+        # keeps any of those is caught, not just an unlucky reorder.
+        for sec, price in enumerate([5.0, 2.0, 9.0, 1.0, 4.0, 8.0, 3.0], 1):
+            lines.append(json.dumps({
+                "instrument_token": 111,
+                "exchange_timestamp": f"2026-01-05 09:15:{sec:02d}",
+                "last_price": price,
+            }))
+        (ticks / f"ticks-{self.SESSION}.jsonl").write_text(
+            "\n".join(lines) + "\n"
+        )
+        monkeypatch.chdir(tmp_path)
+        return self.SESSION
+
+    def test_chunk_boundary_keeps_file_order_last(
+        self, synthetic_session, monkeypatch,
+    ):
+        """WHY: with a 2-line chunk size, the 1-min bucket's ticks
+        straddle several flushes, so the bucket appears in multiple
+        per-chunk frames. The cross-chunk merge must resolve it to the
+        last tick in FILE order — the row the pre-fix single-shot
+        resample kept. Keeping first-seen/max/min instead would silently
+        rewrite session prices and reshuffle every sweep ranking."""
+        import pandas as pd
+        unchunked = load_captured_tape(self.SESSION)
+        monkeypatch.setattr(backtest, "_TAPE_CHUNK_ROWS", 2)
+        chunked = load_captured_tape(self.SESSION)
+        pd.testing.assert_frame_equal(chunked, unchunked)
+        ce = chunked[chunked["symbol"] == "NIFTY26JAN23000CE"]
+        assert ce["last_price"].tolist() == [3.0]
+
+    def test_tick_resolution_not_collapsed_by_chunking(
+        self, synthetic_session, monkeypatch,
+    ):
+        """WHY: resolution='tick' must return every line; the cross-chunk
+        last-merge is a resampling concern and must NOT deduplicate
+        same-bucket tick rows when no resampling was requested."""
+        monkeypatch.setattr(backtest, "_TAPE_CHUNK_ROWS", 2)
+        df = load_captured_tape(self.SESSION, resolution="tick")
+        ce = df[df["symbol"] == "NIFTY26JAN23000CE"]
+        assert len(ce) == 7
+
+    def test_epoch_zero_ticks_dropped(
+        self, synthetic_session, tmp_path, caplog,
+    ):
+        """WHY: Kite full-mode sends exchange_timestamp 1970-01-01 for a
+        token's pre-first-trade snapshot. ONE such tick makes resample()
+        materialize per-token minute bins from 1970 to the session date
+        (~30M bins) — 164 of them in ticks-2026-07-06 ballooned
+        load_captured_tape to 16 GB and OOM-killed the 2026-07-11 weekly
+        autoresearch sweep. Out-of-session timestamps must be dropped
+        BEFORE resampling, and loudly (Rule 12)."""
+        import json
+        import logging
+        tape = tmp_path / "data_cache" / "ticks" / f"ticks-{self.SESSION}.jsonl"
+        with tape.open("a") as f:
+            f.write(json.dumps({
+                "instrument_token": 111,
+                "exchange_timestamp": "1970-01-01T05:30:00",
+                "last_price": 6.5,
+            }) + "\n")
+        with caplog.at_level(logging.WARNING, logger="backtest"):
+            df = load_captured_tape(self.SESSION)
+        assert df["timestamp"].dt.strftime("%Y-%m-%d").eq(self.SESSION).all(), (
+            "Out-of-session timestamps leaked into the replay frame — "
+            "resample() will span decades of minute bins and OOM."
+        )
+        assert any("dropped 1 ticks" in r.message for r in caplog.records), (
+            "Silent drop: the out-of-session filter must warn (Rule 12)."
+        )
