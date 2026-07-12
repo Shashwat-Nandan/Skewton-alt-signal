@@ -626,6 +626,18 @@ def run_backtest(
 
     Returns a dict with P/L curve, metrics, and trade log.
     """
+    # Fail LOUD on an empty frame (2026-07-12): a stillborn tape session
+    # whose ticks were all filtered out reaches here as 0 rows and used to
+    # die deep inside MockKite as "single positional indexer is
+    # out-of-bounds" — which the autoresearch per-cycle except then scored
+    # as -999999 fitness, flattening a whole 25-experiment sweep. An empty
+    # replay is an infrastructure error, not a score.
+    if data.empty:
+        raise ValueError(
+            "run_backtest received an EMPTY data frame — usually a "
+            "stillborn/filtered-out tape session (e.g. ticks-2026-06-26: "
+            "epoch-zero snapshots only). Refusing to run."
+        )
     # Strip timezone info if present — greeks_engine uses naive datetimes
     data = data.copy()
     if hasattr(data["timestamp"].dt, "tz") and data["timestamp"].dt.tz is not None:

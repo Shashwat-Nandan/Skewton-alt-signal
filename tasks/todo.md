@@ -2150,3 +2150,21 @@ and died on session 11, and why the 2026-07-04 sweep passed. The
       rows, 164-tick drop warning emitted.
 - [x] Full test suite (1264 passed) → PR → merge → relaunch
       taleb-autoresearch (supervised).
+
+## 2026-07-12 — flat-sweep root cause: stillborn tape session (3 fixes)
+
+All 25 experiments scored the −999999 HARD-FAILURE sentinel: cycle 5 =
+ticks-2026-06-26.jsonl.zst, an 8 KB stillborn capture (header + 166
+epoch-zero snapshots, capture died pre-open). Post-filter it parses to
+0 rows → run_backtest iloc IndexError → per-cycle except → sentinel →
+whole sweep flat.
+
+- [x] Replay-window pre-flight in autoresearch_loop: empty-parsing
+      sessions excluded LOUDLY + back-filled with older sessions
+      (infrastructure must not masquerade as fitness).
+- [x] run_backtest refuses an empty frame with a clear ValueError.
+- [x] Quarantined ticks-2026-06-26.jsonl.zst → .stillborn (out of the
+      replay universe + retention globs; forensic copy kept).
+- [x] Tests: pre-flight exclude+backfill, all-stillborn fallback, empty
+      frame fail-loud, quarantine-suffix convention (38 green).
+- [x] Full suite (1268 passed) → merge → re-run sweep (supervised).

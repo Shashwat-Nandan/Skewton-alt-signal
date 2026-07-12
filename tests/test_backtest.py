@@ -580,3 +580,27 @@ class TestTapeChunkedStreaming:
         assert any("dropped 1 ticks" in r.message for r in caplog.records), (
             "Silent drop: the out-of-session filter must warn (Rule 12)."
         )
+
+
+class TestEmptyDataFailsLoud:
+    def test_run_backtest_refuses_empty_frame(self):
+        """2026-07-12: an empty (fully-filtered stillborn) tape used to die
+        deep in MockKite as 'single positional indexer is out-of-bounds',
+        which autoresearch's per-cycle except scored as -999999 — flattening
+        the whole sweep. Empty input must be a clear, immediate error."""
+        import pandas as pd
+        with pytest.raises(ValueError, match="EMPTY data frame"):
+            run_backtest(pd.DataFrame())
+
+    def test_list_captured_sessions_ignores_quarantined_tapes(
+        self, tmp_path, monkeypatch,
+    ):
+        """Quarantine convention: renaming a stillborn tape to *.stillborn
+        must remove it from the replay universe (and from tick-retention's
+        globs) without deleting the forensic evidence."""
+        ticks = tmp_path / "data_cache" / "ticks"
+        ticks.mkdir(parents=True)
+        (ticks / "ticks-2026-06-25.jsonl.zst").write_bytes(b"x")
+        (ticks / "ticks-2026-06-26.jsonl.zst.stillborn").write_bytes(b"x")
+        monkeypatch.chdir(tmp_path)
+        assert list_captured_sessions() == ["2026-06-25"]

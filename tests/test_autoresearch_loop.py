@@ -484,3 +484,59 @@ class TestSweepQualityMethod:
         q = self._loop_with([], best=float("-inf")).sweep_quality(0.0)
         assert q["experiments"] == 0
         assert q["informative"] is False
+
+
+class TestReplayWindowPreflight:
+    """2026-07-12: a stillborn tape (parses to 0 rows) inside the replay
+    window raised in EVERY experiment's cycle loop, was converted to the
+    -999999 hard-failure sentinel by the per-cycle except, and flattened
+    the entire 25-experiment sweep. The pre-flight must exclude such
+    sessions and back-fill with older ones so infrastructure defects
+    cannot masquerade as fitness."""
+
+    def _patch_tapes(self, monkeypatch, sessions, empty=()):
+        import pandas as pd
+
+        def fake_list(u):
+            return list(sessions)
+
+        def fake_load(session, underlying):
+            if session in empty:
+                return pd.DataFrame()
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-01 09:15:00"]),
+                                 "last_price": [100.0]})
+
+        monkeypatch.setattr("backtest.list_captured_sessions", fake_list)
+        monkeypatch.setattr("backtest.load_captured_tape", fake_load)
+        monkeypatch.setattr("backtest.load_iv_skew_seed",
+                            lambda u, drop_recent=0: ([], []))
+        monkeypatch.setattr(
+            "backtest.run_backtest",
+            lambda *a, **k: {"metrics": {"gamma_theta_ratio": 1.0,
+                                         "total_trades": 3,
+                                         "max_drawdown": 0.0}})
+
+    def test_stillborn_session_excluded_and_backfilled(self, monkeypatch, caplog):
+        import logging
+        loop = _run_loop(eval_cycles=3)
+        self._patch_tapes(monkeypatch,
+                          sessions=["s1", "s2", "s3", "s4", "s5"],
+                          empty=("s4",))
+        with caplog.at_level(logging.WARNING, logger="autoresearch_loop"):
+            fitness = loop._run_experiment({"gamma_scalp_band_pct": 1.2})
+        # newest-first walk: s5 ok, s4 EMPTY (skip), s3 ok, s2 back-fills.
+        assert loop._replay_sessions == ["s2", "s3", "s5"]
+        assert "s4" not in loop._tape_cache
+        assert any("stillborn" in r.message for r in caplog.records)
+        assert fitness != -999999.0, \
+            "a stillborn session must not flatten the sweep to the sentinel"
+
+    def test_all_sessions_stillborn_falls_back_loudly(self, monkeypatch):
+        # Degenerate case: every tape empty → no replay sessions → the
+        # synthetic-GBM fallback path, not a crash and not the sentinel.
+        loop = _run_loop(eval_cycles=2)
+        self._patch_tapes(monkeypatch, sessions=["s1", "s2"], empty=("s1", "s2"))
+        monkeypatch.setattr("backtest.generate_synthetic_data", lambda **k: object())
+        fitness = loop._run_experiment({"gamma_scalp_band_pct": 1.2})
+        assert loop._replay_sessions == []
+        assert fitness != -999999.0

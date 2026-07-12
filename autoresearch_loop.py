@@ -437,7 +437,39 @@ class HedgeResearchLoop:
         # half-written live capture file).
         if self._replay_sessions is None:
             captured = list_captured_sessions(underlying)
-            self._replay_sessions = captured[-self.eval_cycles:] if captured else []
+            # Pre-flight the window (2026-07-12): walk BACKWARD from the
+            # most recent session, parsing each tape into the sweep cache,
+            # until eval_cycles VALID sessions are collected. A tape that
+            # parses to an EMPTY frame (stillborn capture — ticks-2026-06-26
+            # was 8 KB of epoch-zero snapshots and nothing else) is an
+            # infrastructure defect shared by every experiment: inside the
+            # cycle loop it raised, hit the per-cycle except, and flattened
+            # the ENTIRE sweep to -999999 (25/25 experiments, 2026-07-12).
+            # Same philosophy as the load-failure comment at the cache site
+            # below: infrastructure must not masquerade as fitness. Excluding
+            # the session here and back-filling with the next-older one keeps
+            # every experiment on eval_cycles real market days; parse cost is
+            # unchanged (each session was parsed once per sweep anyway — this
+            # just fronts it). Hard LOAD failures still propagate and kill
+            # the run with the real error.
+            valid_newest_first = []
+            for session in reversed(captured):
+                if len(valid_newest_first) >= self.eval_cycles:
+                    break
+                if session not in self._tape_cache:
+                    self._tape_cache[session] = load_captured_tape(
+                        session, underlying,
+                    )
+                if self._tape_cache[session].empty:
+                    del self._tape_cache[session]
+                    logger.warning(
+                        "session %s: tape parses to 0 rows (stillborn "
+                        "capture) — excluded from the replay window, "
+                        "back-filling with the next-older session", session,
+                    )
+                    continue
+                valid_newest_first.append(session)
+            self._replay_sessions = list(reversed(valid_newest_first))
             if self._replay_sessions:
                 logger.info(
                     "Replaying %d captured sessions: %s",
