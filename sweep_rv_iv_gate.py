@@ -11,6 +11,7 @@ import logging
 import pandas as pd
 
 from backtest import run_backtest
+from data_cache_io import read_table
 
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
@@ -22,7 +23,7 @@ def main():
     parser.add_argument("--underlying", type=str, default="NIFTY")
     args = parser.parse_args()
 
-    data = pd.read_csv(args.data, parse_dates=["timestamp"])
+    data = read_table(args.data, parse_dates=["timestamp"])
     if data["timestamp"].dt.tz is not None:
         data["timestamp"] = data["timestamp"].dt.tz_localize(None)
 

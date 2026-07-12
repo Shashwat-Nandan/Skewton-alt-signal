@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Fetch daily index closes → data_cache/<SYMBOL>_daily.csv (date,close).
-=====================================================================
+Fetch daily index closes → data_cache/<SYMBOL>_daily.parquet (date,close).
+==========================================================================
 Feeds the Kalman trend-following correctness gate (`validate_kalman_trend.py`)
-and backtest, which read `data_cache/<SYMBOL>_daily.csv`. Indices (NIFTY,
+and backtest, which read `data_cache/<SYMBOL>_daily.{parquet,csv}`. Indices (NIFTY,
 BANKNIFTY, …) are spot series — there is no F&O bhavcopy underlying for BANKNIFTY
 cached, so pull them from Kite `historical_data` at the 'day' interval.
 
@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from data_cache_io import write_table
 from kite_auth import KiteAuthManager
 
 CACHE = Path("data_cache")
@@ -139,10 +140,10 @@ def main() -> int:
     stem = args.symbol if args.interval == "day" else f"{args.symbol}_{args.interval}"
     suffix = "daily" if args.interval == "day" else args.interval
     out = (Path(args.output) if args.output
-           else CACHE / (f"{args.symbol}_daily.csv" if args.interval == "day"
-                         else f"{stem}.csv"))
+           else CACHE / (f"{args.symbol}_daily.parquet" if args.interval == "day"
+                         else f"{stem}.parquet"))
     out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out, index=False)
+    out = write_table(df, out)
     tcol = df.columns[0]
     print(f"wrote {len(df)} {suffix} bars for {args.symbol} "
           f"({df[tcol].iloc[0]} → {df[tcol].iloc[-1]}, "

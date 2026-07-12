@@ -52,6 +52,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backtest_pairs import load_lot_sizes
+from data_cache_io import read_table
 from screen_pairs import (
     NIFTY_50, _half_life, load_front_month_panel, screen_pairs, screen_pairs_book,
 )
@@ -185,14 +186,14 @@ def run_replay(symbol_a, symbol_b, lot_a, lot_b,
 
 def load_5min_panel(symbols, directory: Path = STF_5MIN_DIR) -> "pd.DataFrame":
     """Wide close panel (index=5-min datetime, columns=symbol) from the per-symbol
-    CSVs written by fetch_5min_stf.py. Sorted; per-pair alignment is via dropna."""
+    tables written by fetch_5min_stf.py. Sorted; per-pair alignment is via dropna."""
     frames = {}
     for s in symbols:
-        p = directory / f"{s}.csv"
-        if not p.exists():
+        try:
+            df = read_table(directory / f"{s}.parquet", parse_dates=["date"])
+        except FileNotFoundError:
             continue
-        ser = pd.read_csv(p, parse_dates=["date"]).set_index("date")["close"]
-        frames[s] = ser
+        frames[s] = df.set_index("date")["close"]
     if not frames:
         return pd.DataFrame()
     return pd.DataFrame(frames).sort_index()

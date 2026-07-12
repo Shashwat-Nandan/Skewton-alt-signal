@@ -32,6 +32,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from data_cache_io import find_tables, read_table
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
@@ -125,12 +127,12 @@ class MockKitePair:
 # ──────────────────────────────────────────────────────────
 
 def load_lot_sizes(symbols: List[str], raw_dir: Path = RAW_DIR) -> Dict[str, int]:
-    """Read STF lot sizes from the most recent bhavcopy CSV (lots are stable)."""
-    files = sorted(raw_dir.glob("bhavcopy_fo_*.csv"))
+    """Read STF lot sizes from the most recent bhavcopy day (lots are stable)."""
+    files = find_tables(raw_dir, "bhavcopy_fo_*")
     if not files:
-        raise RuntimeError(f"No bhavcopy CSVs in {raw_dir}")
+        raise RuntimeError(f"No bhavcopy tables in {raw_dir}")
     latest = files[-1]
-    df = pd.read_csv(
+    df = read_table(
         latest,
         usecols=["FinInstrmTp", "TckrSymb", "NewBrdLotQty"],
         dtype={"TckrSymb": str, "FinInstrmTp": str},

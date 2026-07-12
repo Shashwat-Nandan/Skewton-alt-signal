@@ -19,6 +19,8 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+from data_cache_io import read_table
+
 
 def compute_daily_atm_iv(df: pd.DataFrame, min_tte_days: int = 2) -> pd.DataFrame:
     """
@@ -161,7 +163,7 @@ def main():
     windows = [int(x) for x in args.rv_windows.split(",")]
     thresholds = [float(x) for x in args.thresholds.split(",")]
 
-    df = pd.read_csv(args.data, parse_dates=["timestamp"])
+    df = read_table(args.data, parse_dates=["timestamp"])
     if df["timestamp"].dt.tz is not None:
         df["timestamp"] = df["timestamp"].dt.tz_localize(None)
 

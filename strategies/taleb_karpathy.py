@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, fields
 import numpy as np
 import pandas as pd
 
+from data_cache_io import find_tables, read_table
 from greeks_engine import (
     GreeksEngine, OptionContract, PortfolioGreeks,
     implied_volatility_bisect, time_to_expiry,
@@ -2368,17 +2369,21 @@ class TalebKarpathyStrategy(BaseStrategy):
         cache_dir = Path("data_cache")
         if not cache_dir.exists():
             return
-        candidates = sorted(cache_dir.glob(f"{self.underlying}_*_eod.csv"))
+        candidates = find_tables(cache_dir, f"{self.underlying}_*_eod")
         if not candidates:
             return
         path = candidates[-1]  # filenames embed end-date YYYYMMDD; lex sort = recency
         try:
-            df = pd.read_csv(path, usecols=["timestamp", "underlying_price"])
+            df = read_table(path, usecols=["timestamp", "underlying_price"])
+            # One row per option per snapshot — dedupe to one row per date.
+            # The timestamp column is a string in CSVs/backfilled parquet but
+            # a real datetime in freshly fetched parquet; normalise before
+            # slicing. Inside the try: a malformed timestamp must degrade
+            # gracefully, not crash strategy startup.
+            df["date"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d")
         except (OSError, ValueError, pd.errors.ParserError) as e:
             logger.warning("Could not load spot history from %s: %s", path, e)
             return
-        # CSV has one row per option per snapshot — dedupe to one row per date.
-        df["date"] = df["timestamp"].str[:10]
         df = df.drop_duplicates(subset="date", keep="last").sort_values("date")
         seeded = []
         for _, row in df.iterrows():

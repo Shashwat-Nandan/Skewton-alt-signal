@@ -3,8 +3,9 @@ Equity OHLCV loader for the Varsity equity-swing strategy and its backtest.
 
 Data is read from one of two sources, in priority order:
 
-1. **Per-symbol cache CSVs** under ``data_cache/equity_ohlcv/<SYMBOL>.csv``
-   (canonical schema: ``date,open,high,low,close,volume``). This is what
+1. **Per-symbol cache tables** under ``data_cache/equity_ohlcv/<SYMBOL>.parquet``
+   (legacy ``.csv`` still honored; canonical schema:
+   ``date,open,high,low,close,volume``). This is what
    ``fetch_bhavcopy_eq.py`` writes once the operator runs it on a host where
    NSE archives are reachable.
 
@@ -31,6 +32,8 @@ from typing import Iterable, List, Optional
 
 import pandas as pd
 
+from data_cache_io import find_tables, read_table
+
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./data_cache")
@@ -54,11 +57,11 @@ def load_universe(path: Path = CACHE_DIR / "nifty200.csv") -> List[str]:
 
 
 def _load_eq_cache(symbol: str) -> Optional[pd.DataFrame]:
-    """Load a single per-symbol cache CSV; return None if absent."""
-    p = EQ_CACHE_DIR / f"{symbol}.csv"
-    if not p.exists():
+    """Load a single per-symbol cache table; return None if absent."""
+    try:
+        df = read_table(EQ_CACHE_DIR / f"{symbol}.parquet", parse_dates=["date"])
+    except FileNotFoundError:
         return None
-    df = pd.read_csv(p, parse_dates=["date"])
     df["symbol"] = symbol
     return df[CANONICAL_COLS]
 
@@ -79,7 +82,7 @@ def _load_stf_proxy(
     so downstream liquidity gates are unit-correct (lessons.md: unit
     mismatches silently empty the universe).
     """
-    files = sorted(raw_dir.glob("bhavcopy_fo_*.csv"))
+    files = find_tables(raw_dir, "bhavcopy_fo_*")
     if not files:
         raise RuntimeError(
             f"No F&O bhavcopy files in {raw_dir} and no per-symbol equity cache "
@@ -90,7 +93,7 @@ def _load_stf_proxy(
     universe_set = set(universe)
     rows: List[pd.DataFrame] = []
     for f in files:
-        df = pd.read_csv(
+        df = read_table(
             f,
             usecols=[
                 "TradDt", "FinInstrmTp", "TckrSymb", "XpryDt",

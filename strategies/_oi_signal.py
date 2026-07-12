@@ -40,6 +40,8 @@ from typing import Iterable, List
 
 import pandas as pd
 
+from data_cache_io import find_tables, read_table
+
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./data_cache")
@@ -68,7 +70,7 @@ def load_total_oi(
     OI unit: **contracts** (lessons.md: unit-bearing fields declare units).
     Returns an empty frame if the archive is empty.
     """
-    files = sorted(raw_dir.glob("bhavcopy_fo_*.csv"))
+    files = find_tables(raw_dir, "bhavcopy_fo_*")
     if not files:
         logger.warning("No F&O bhavcopy files in %s — OI gate will be neutral", raw_dir)
         return pd.DataFrame(columns=["date", "symbol", "close", "oi"])
@@ -79,15 +81,15 @@ def load_total_oi(
     # universe has zero overlap (typical in tests with synthetic symbols),
     # skip the 125-file walk entirely. Cuts test-suite time from ~90s back
     # to ~5s without hiding real coverage gaps.
-    sample = pd.read_csv(files[-1], usecols=["FinInstrmTp", "TckrSymb"],
-                          dtype={"TckrSymb": str, "FinInstrmTp": str})
+    sample = read_table(files[-1], usecols=["FinInstrmTp", "TckrSymb"],
+                        dtype={"TckrSymb": str, "FinInstrmTp": str})
     sample_universe = set(sample[sample["FinInstrmTp"] == "STF"]["TckrSymb"].unique())
     if not (universe_set & sample_universe):
         return pd.DataFrame(columns=["date", "symbol", "close", "oi"])
 
     rows: List[pd.DataFrame] = []
     for f in files:
-        df = pd.read_csv(
+        df = read_table(
             f,
             usecols=["TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "ClsPric", "OpnIntrst"],
             dtype={"TckrSymb": str, "FinInstrmTp": str},

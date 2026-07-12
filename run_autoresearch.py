@@ -24,6 +24,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 
 from backtest import generate_synthetic_data, MockKite, run_backtest
+from data_cache_io import read_table
 from strategies import TalebKarpathyStrategy
 from autoresearch_loop import HedgeResearchLoop, ZERO_TRADE_PENALTY
 
@@ -136,7 +137,7 @@ def main():
     holdout_data = None
     if args.data:
         logger.info("Loading historical data from %s", args.data)
-        historical_data = pd.read_csv(args.data, parse_dates=["timestamp"])
+        historical_data = read_table(args.data, parse_dates=["timestamp"])
         holdout_days = args.window_days  # Reserve 1 window worth of days for holdout
         historical_windows, holdout_data = _split_data_into_windows(
             historical_data, args.window_days, holdout_days=holdout_days,
@@ -394,7 +395,7 @@ def main():
     try:
         val_seed_iv, val_seed_skew = None, None
         if args.validation_data:
-            val_data = pd.read_csv(args.validation_data, parse_dates=["timestamp"])
+            val_data = read_table(args.validation_data, parse_dates=["timestamp"])
             val_label = (f"separate validation set ({args.validation_data}, "
                          f"{val_data['timestamp'].min().date()} — "
                          f"{val_data['timestamp'].max().date()}, "

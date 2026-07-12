@@ -37,12 +37,18 @@ import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from data_cache_io import read_table, table_exists, write_table
 from greeks_engine import implied_volatility_bisect, time_to_expiry
 
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./data_cache")
 RAW_DIR = CACHE_DIR / "bhavcopy_raw"
+
+# Columns every raw-bhavcopy consumer forces to str on read (screen_pairs,
+# _eq_data, _oi_signal, backtest_arbitrage). The parquet day cache must store
+# them as str so those readers see the same dtypes the CSVs gave them.
+RAW_STR_COLS = {"TckrSymb": str, "FinInstrmTp": str, "FinInstrmNm": str}
 UDIFF_URL = (
     "https://archives.nseindia.com/content/fo/"
     "BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
@@ -89,12 +95,12 @@ def trading_days(from_date: datetime, to_date: datetime, holidays: set) -> List[
     return days
 
 
-def _build_today_stfs_via_kite(target_date: datetime) -> Optional[bytes]:
+def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
     """When NSE bhavcopy hasn't been published yet for `target_date` AND
     `target_date` is today, fall back to Kite historical_data to fetch
     today's front-month STF closes for the NIFTY-50 universe.
 
-    Returns a UDiFF-shaped CSV containing only STF rows (no IDO rows —
+    Returns a UDiFF-shaped frame containing only STF rows (no IDO rows —
     so the IV-history side of the bhavcopy pipeline still treats today
     as "no options data", same as a genuinely missing bhavcopy). The
     pair screener (screen_pairs.load_front_month_panel) gets the STF
@@ -180,14 +186,21 @@ def _build_today_stfs_via_kite(target_date: datetime) -> Optional[bytes]:
 
     logger.info("Kite fallback synthesised %d STF rows for %s",
                 len(rows), target.isoformat())
-    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+    return pd.DataFrame(rows).astype({c: t for c, t in RAW_STR_COLS.items()
+                                      if c in rows[0]})
 
 
-def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[bytes]:
+def _read_raw_day(base: Path) -> pd.DataFrame:
+    """Read a cached raw day (parquet, or a legacy/pre-migration CSV)."""
+    return read_table(base, dtype=RAW_STR_COLS)
+
+
+def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[pd.DataFrame]:
     """
     Download the UDiFF F&O bhav copy zip for a single date.
 
-    Caches the raw zip to RAW_DIR. A successful NSE download is authoritative
+    Caches the parsed day to RAW_DIR as parquet (legacy .csv caches are
+    still honored on read). A successful NSE download is authoritative
     and short-circuits all subsequent runs. If NSE 404s for *today* (common
     when run before NSE publishes around 18:00-20:00 IST), falls back to
     kite.historical_data for STF closes only and marks the cache with a
@@ -195,12 +208,13 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[by
     cache upgrades to authoritative once NSE publishes.
     """
     yyyymmdd = date.strftime("%Y%m%d")
-    cache_file = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.csv"
+    cache_base = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.parquet"
+    legacy_csv = cache_base.with_suffix(".csv")
     sentinel = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
 
     # Authoritative cache hit: real NSE bhavcopy already on disk.
-    if cache_file.exists() and not sentinel.exists():
-        return cache_file.read_bytes()
+    if table_exists(cache_base) and not sentinel.exists():
+        return _read_raw_day(cache_base)
 
     url = UDIFF_URL.format(yyyymmdd=yyyymmdd)
     try:
@@ -216,14 +230,17 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[by
                 if not names:
                     logger.warning("No CSV inside zip for %s", yyyymmdd)
                 else:
-                    csv_bytes = zf.read(names[0])
-                    RAW_DIR.mkdir(parents=True, exist_ok=True)
-                    cache_file.write_bytes(csv_bytes)
+                    day_df = pd.read_csv(io.BytesIO(zf.read(names[0])),
+                                         dtype=RAW_STR_COLS)
+                    write_table(day_df, cache_base)
                     if sentinel.exists():
                         sentinel.unlink()
+                        # The superseded synthetic CSV would only shadow the
+                        # authoritative parquet in tooling that greps *.csv.
+                        legacy_csv.unlink(missing_ok=True)
                         logger.info("Upgraded %s cache from Kite-fallback to "
                                     "authoritative NSE bhavcopy", yyyymmdd)
-                    return csv_bytes
+                    return day_df
         except zipfile.BadZipFile:
             logger.warning("Bad zip returned for %s", yyyymmdd)
 
@@ -236,34 +253,34 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[by
     # NSE didn't deliver. If a Kite-fallback cache from an earlier run
     # exists, use it (avoids re-spending the Kite quota on a re-run for
     # the same day).
-    if cache_file.exists():
-        return cache_file.read_bytes()
+    if table_exists(cache_base):
+        return _read_raw_day(cache_base)
 
     # First-time miss on today: try the Kite fallback. Older days that
     # are genuinely missing get None as before (no point asking Kite for
     # last week's STF closes — bhavcopy will eventually backfill).
     if date.date() == datetime.now().date():
         logger.info("Trying Kite-historical fallback for today's STF closes...")
-        csv_bytes = _build_today_stfs_via_kite(date)
-        if csv_bytes is not None:
+        day_df = _build_today_stfs_via_kite(date)
+        if day_df is not None:
             RAW_DIR.mkdir(parents=True, exist_ok=True)
-            cache_file.write_bytes(csv_bytes)
+            write_table(day_df, cache_base)
             sentinel.write_text("synthesised_via_kite_historical_data\n")
-            return csv_bytes
+            return day_df
     return None
 
 
 def _parse_udiff_day(
-    csv_bytes: bytes,
+    day_df: pd.DataFrame,
     date: datetime,
     underlying: str,
     nearest_expiry_only: bool,
 ) -> pd.DataFrame:
     """
-    Parse one day's UDiFF F&O bhav copy into rows with the backtest schema.
-    Keeps index options for `underlying` plus one synthetic IDX row.
+    Reshape one day's UDiFF F&O bhav copy frame into rows with the backtest
+    schema. Keeps index options for `underlying` plus one synthetic IDX row.
     """
-    df = pd.read_csv(io.BytesIO(csv_bytes))
+    df = day_df
 
     # UDiFF column names — see NSE circular on bhav copy format change.
     required = {"TckrSymb", "FinInstrmTp", "XpryDt", "StrkPric", "OptnTp",
@@ -377,10 +394,10 @@ def fetch_bhavcopy_range(
     frames = []
     for i, day in enumerate(days, 1):
         logger.info("  [%d/%d] %s", i, len(days), day.strftime("%Y-%m-%d"))
-        csv_bytes = _download_bhavcopy(day, session)
-        if csv_bytes is None:
+        raw_day = _download_bhavcopy(day, session)
+        if raw_day is None:
             continue
-        day_df = _parse_udiff_day(csv_bytes, day, underlying, nearest_expiry_only)
+        day_df = _parse_udiff_day(raw_day, day, underlying, nearest_expiry_only)
         if not day_df.empty:
             frames.append(day_df)
         time.sleep(RATE_LIMIT_DELAY)
@@ -434,10 +451,10 @@ def main():
         tag = "_nearest" if args.nearest_expiry_only else ""
         output_path = str(
             CACHE_DIR
-            / f"{args.underlying}_{from_date.strftime('%Y%m%d')}_{to_date.strftime('%Y%m%d')}_eod{tag}.csv"
+            / f"{args.underlying}_{from_date.strftime('%Y%m%d')}_{to_date.strftime('%Y%m%d')}_eod{tag}.parquet"
         )
 
-    data.to_csv(output_path, index=False)
+    output_path = str(write_table(data, output_path))
     print(f"\nSaved {len(data):,} rows to {output_path}")
     print(f"  Days:     {data['timestamp'].dt.date.nunique()}")
     print(f"  Symbols:  {data['symbol'].nunique()}")

@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 import optimize_kalman_trend as o
+from data_cache_io import find_tables, read_table, table_exists
 
 CACHE = Path("data_cache")
 # Index level treated as continuous: one "tick" = one index point.
@@ -38,25 +39,28 @@ TICK_SIZE = 1.0
 def load_daily_closes(symbol: str) -> tuple[list, np.ndarray]:
     """Return (dates, closes) of daily closes for `symbol`.
 
-    BANKNIFTY (and any non-NIFTY symbol) loads from data_cache/<symbol>_daily.csv
+    BANKNIFTY (and any non-NIFTY symbol) loads from data_cache/<symbol>_daily.{parquet,csv}
     with columns (date, close). NIFTY is extracted from the cached F&O EOD
     snapshot's per-day underlying price. Fails loud if the data is missing."""
-    simple = CACHE / f"{symbol}_daily.csv"
-    if simple.exists():
-        df = pd.read_csv(simple)
+    simple = CACHE / f"{symbol}_daily.parquet"
+    if table_exists(simple):
+        df = read_table(simple)
         cols = {c.lower(): c for c in df.columns}
         if "date" not in cols or "close" not in cols:
             raise ValueError(f"{simple} must have 'date' and 'close' columns")
         df = df[[cols["date"], cols["close"]]].dropna()
-        return df[cols["date"]].tolist(), df[cols["close"]].to_numpy(float)
+        # Fresh parquet stores real dates; CSVs stored strings. Normalise so
+        # callers keep getting the 'YYYY-MM-DD' labels they always did.
+        dates = df[cols["date"]].astype(str).tolist()
+        return dates, df[cols["close"]].to_numpy(float)
 
     if symbol == "NIFTY":
-        # Widest-span NIFTY_*_eod.csv → daily underlying close.
-        eod = sorted(CACHE.glob("NIFTY_*_eod.csv"),
+        # Widest-span NIFTY_*_eod table → daily underlying close.
+        eod = sorted(find_tables(CACHE, "NIFTY_*_eod"),
                      key=lambda p: p.stat().st_size, reverse=True)
         if not eod:
-            raise FileNotFoundError("no NIFTY_*_eod.csv in data_cache")
-        df = pd.read_csv(eod[0], usecols=["timestamp", "underlying_price"])
+            raise FileNotFoundError("no NIFTY_*_eod.{parquet,csv} in data_cache")
+        df = read_table(eod[0], usecols=["timestamp", "underlying_price"])
         df["d"] = pd.to_datetime(df["timestamp"]).dt.date
         g = df.groupby("d")["underlying_price"].last()
         return list(g.index), g.to_numpy(float)
@@ -146,7 +150,7 @@ def main() -> int:
     seeds = list(range(args.seeds))
 
     if args.csv:
-        df = pd.read_csv(args.csv)
+        df = read_table(args.csv)
         cols = {c.lower(): c for c in df.columns}
         jobs = [(Path(args.csv).stem, df[cols["close"]].to_numpy(float))]
     else:

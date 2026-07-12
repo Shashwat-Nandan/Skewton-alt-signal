@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from strategies.arbitrage import ArbitrageState, ArbitrageStrategy
 from backtest_timeframe import warn_coarse_timeframe
+from data_cache_io import find_tables, read_table, table_columns
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,9 @@ def load_stf_panel(
     arm in `[arbitrage]` would be meaningless on indices anyway because the
     cash-and-carry trade isn't replicable on an index.
     """
-    files = sorted(raw_dir.glob("bhavcopy_fo_*.csv"))
+    files = find_tables(raw_dir, "bhavcopy_fo_*")
     if not files:
-        raise RuntimeError(f"No bhavcopy CSVs in {raw_dir}")
+        raise RuntimeError(f"No bhavcopy tables in {raw_dir}")
 
     base_cols = ["TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "FinInstrmNm",
                  "ClsPric", "UndrlygPric", "NewBrdLotQty"]
@@ -85,13 +86,13 @@ def load_stf_panel(
     for f in files:
         # Probe header so we don't blow up on archives missing TtlTradgVol.
         try:
-            header = pd.read_csv(f, nrows=0).columns.tolist()
+            header = table_columns(f)
         except Exception as e:
             logger.warning("skip %s: %s", f.name, e)
             continue
         cols = base_cols + [c for c in optional_cols if c in header]
         try:
-            df = pd.read_csv(f, usecols=cols, dtype={"TckrSymb": str, "FinInstrmNm": str})
+            df = read_table(f, usecols=cols, dtype={"TckrSymb": str, "FinInstrmNm": str})
         except Exception as e:
             logger.warning("skip %s: %s", f.name, e)
             continue

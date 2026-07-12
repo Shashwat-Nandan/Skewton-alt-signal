@@ -37,6 +37,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from data_cache_io import read_table
+
 from greeks_engine import GreeksEngine
 from strategies.taleb_karpathy import (
     TalebKarpathyStrategy, _INDEX_SPOT_SYMBOLS,
@@ -849,7 +851,7 @@ if __name__ == "__main__":
 
     if args.data:
         logger.info("Loading historical data from %s", args.data)
-        data = pd.read_csv(args.data, parse_dates=["timestamp"])
+        data = read_table(args.data, parse_dates=["timestamp"])
         # Strip timezone info — greeks_engine uses naive datetimes
         if data["timestamp"].dt.tz is not None:
             data["timestamp"] = data["timestamp"].dt.tz_localize(None)

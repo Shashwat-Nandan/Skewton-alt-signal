@@ -4,11 +4,12 @@ fallback for today's missing F&O bhavcopy.
 NSE publishes the F&O bhavcopy ~18:00–20:00 IST (sometimes later). The
 weekday screen-pairs.timer fires at 19:00 IST, so on a fast night it tries
 to fetch today's file before NSE has published it (404). The fallback
-synthesises a UDiFF-shaped CSV from kite.historical_data so the pair
+synthesises a UDiFF-shaped frame from kite.historical_data so the pair
 screener sees today's STF closes anyway. These tests pin the contract:
 
-  - the synthesised CSV roundtrips through screen_pairs.load_front_month_panel
-  - the synthesised CSV has the columns _parse_udiff_day's required-cols check needs
+  - the synthesised day (cached as parquet) roundtrips through
+    screen_pairs.load_front_month_panel
+  - the synthesised frame has the columns _parse_udiff_day's required-cols check needs
   - a Kite-fallback cache is sentinel-marked, so a later run upgrades it
     once NSE finally publishes
   - auth/instrument/historical_data failures all degrade to "return None"
@@ -99,7 +100,7 @@ def _instruments_for(symbols_with_expiry):
 class TestBuildTodayStfsViaKite:
 
     def test_returns_csv_with_required_columns(self, today, expiries):
-        """Synth CSV must carry every column both consumers read:
+        """Synth frame must carry every column both consumers read:
         screen_pairs.load_front_month_panel reads TradDt/FinInstrmTp/TckrSymb/XpryDt/ClsPric;
         fetch_bhavcopy._parse_udiff_day's required-cols guard checks
         TckrSymb/FinInstrmTp/XpryDt/StrkPric/OptnTp/ClsPric/UndrlygPric/NewBrdLotQty.
@@ -115,10 +116,9 @@ class TestBuildTodayStfsViaKite:
 
         with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
              patch("screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
-            csv_bytes = _build_today_stfs_via_kite(today)
+            df = _build_today_stfs_via_kite(today)
 
-        assert csv_bytes is not None
-        df = pd.read_csv(io.BytesIO(csv_bytes))
+        assert df is not None
         required = {"TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "ClsPric",
                     "StrkPric", "OptnTp", "UndrlygPric", "NewBrdLotQty"}
         assert required.issubset(set(df.columns)), f"missing: {required - set(df.columns)}"
@@ -130,7 +130,7 @@ class TestBuildTodayStfsViaKite:
 
     def test_picks_front_month_when_multiple_expiries(self, today, expiries):
         """If an instrument has multiple expiries listed, only the
-        nearest-future one should appear in the synth CSV."""
+        nearest-future one should appear in the synth frame."""
         front, mid, far = expiries
         instruments = _instruments_for([
             ("RELIANCE", front, 1001, 250),
@@ -142,9 +142,8 @@ class TestBuildTodayStfsViaKite:
 
         with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
              patch("screen_pairs.NIFTY_50", ["RELIANCE"]):
-            csv_bytes = _build_today_stfs_via_kite(today)
+            df = _build_today_stfs_via_kite(today)
 
-        df = pd.read_csv(io.BytesIO(csv_bytes))
         assert len(df) == 1
         assert df.iloc[0]["XpryDt"] == front
         assert df.iloc[0]["ClsPric"] == pytest.approx(1327.00)
@@ -163,9 +162,8 @@ class TestBuildTodayStfsViaKite:
 
         with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
              patch("screen_pairs.NIFTY_50", ["RELIANCE"]):
-            csv_bytes = _build_today_stfs_via_kite(today)
+            df = _build_today_stfs_via_kite(today)
 
-        df = pd.read_csv(io.BytesIO(csv_bytes))
         assert len(df) == 1
         assert df.iloc[0]["XpryDt"] == future
 
@@ -186,7 +184,7 @@ class TestBuildTodayStfsViaKite:
     def test_no_nifty50_futures_returns_none(self, today):
         """Defensive: if NFO dump has no NIFTY-50 futures (shouldn't happen
         in production but possible during a market structure change), return
-        None rather than synthesise an empty CSV that downstream consumers
+        None rather than synthesise an empty frame that downstream consumers
         would misinterpret as "no data today"."""
         kite = _mk_kite(instruments_list=[], candle_close_by_token={})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
@@ -213,9 +211,8 @@ class TestBuildTodayStfsViaKite:
 
         with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
              patch("screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
-            csv_bytes = _build_today_stfs_via_kite(today)
+            df = _build_today_stfs_via_kite(today)
 
-        df = pd.read_csv(io.BytesIO(csv_bytes))
         assert len(df) == 1
         assert df.iloc[0]["TckrSymb"] == "INFY"
 
@@ -243,15 +240,48 @@ class TestDownloadBhavcopyFallback:
         return s
 
     def test_authoritative_cache_hit_short_circuits(self, isolated_raw_dir, today):
-        """If a cached CSV exists and there's no sentinel, return it without
-        hitting NSE or Kite."""
+        """If a cached day exists (parquet, or a legacy pre-migration CSV)
+        and there's no sentinel, return it without hitting NSE or Kite."""
         yyyymmdd = today.strftime("%Y%m%d")
         cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
-        cache_file.write_text("AUTHORITATIVE_NSE_CONTENT")
+        cache_file.write_text("TckrSymb,ClsPric\nAUTH,1.0\n")
         s = self._stub_404_session()
         out = _download_bhavcopy(today, s)
-        assert out == b"AUTHORITATIVE_NSE_CONTENT"
+        assert out is not None and out.iloc[0]["TckrSymb"] == "AUTH"
         s.get.assert_not_called()
+
+    def test_authoritative_parquet_cache_hit_short_circuits(self, isolated_raw_dir, today):
+        """Same short-circuit for the parquet cache new downloads write."""
+        yyyymmdd = today.strftime("%Y%m%d")
+        pd.DataFrame({"TckrSymb": ["AUTH"], "ClsPric": [1.0]}).to_parquet(
+            isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.parquet", index=False)
+        s = self._stub_404_session()
+        out = _download_bhavcopy(today, s)
+        assert out is not None and out.iloc[0]["TckrSymb"] == "AUTH"
+        s.get.assert_not_called()
+
+    def test_raw_cache_round_trips_full_frame(self, isolated_raw_dir, today):
+        """The parquet raw cache replaced a byte-preserving CSV cache; this
+        pins its successor invariant: EVERY column (str-forced or inferred,
+        including numeric-looking strings and untouched extras) comes back
+        from the cache exactly as parsing NSE's bytes produced it — not just
+        one spot-checked cell."""
+        import io as _io
+        csv_bytes = (
+            b"TckrSymb,FinInstrmTp,FinInstrmNm,XpryDt,ClsPric,OpnIntrst,ISIN\n"
+            b"360ONE,STF,360ONE26JULFUT,2026-07-30,1050.5,1200,INE466L01038\n"
+            b"123,STF,123FUT,2026-07-30,10.0,0,INE000A01010\n"  # numeric-looking symbol
+        )
+        s = self._stub_zip_session(csv_bytes)
+        out = _download_bhavcopy(today, s)
+
+        expected = pd.read_csv(_io.BytesIO(csv_bytes), dtype=fetch_bhavcopy.RAW_STR_COLS)
+        yyyymmdd = today.strftime("%Y%m%d")
+        cached = pd.read_parquet(isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.parquet")
+        pd.testing.assert_frame_equal(out, expected)
+        pd.testing.assert_frame_equal(cached, expected)
+        # the str-forcing must hold even for the all-numeric symbol
+        assert cached["TckrSymb"].tolist() == ["360ONE", "123"]
 
     def test_nse_404_today_triggers_kite_fallback(self, isolated_raw_dir, today, expiries):
         """On NSE 404 for today, the Kite fallback should fire and the
@@ -267,10 +297,10 @@ class TestDownloadBhavcopyFallback:
             out = _download_bhavcopy(today, s)
 
         assert out is not None
-        assert b"RELIANCE" in out
-        assert b"STF" in out
+        assert "RELIANCE" in set(out["TckrSymb"])
+        assert set(out["FinInstrmTp"]) == {"STF"}
         # Both cache file AND sentinel must exist
-        cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
+        cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.parquet"
         sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
         assert cache_file.exists()
         assert sentinel.exists()
@@ -292,18 +322,21 @@ class TestDownloadBhavcopyFallback:
     ):
         """The sentinel forces a fresh NSE attempt on the next run; if NSE
         now returns 200, the cache is overwritten with the authoritative
-        bhavcopy and the sentinel is removed."""
+        bhavcopy, the sentinel is removed, and the stale synthetic CSV is
+        removed so it can't shadow the authoritative parquet."""
         yyyymmdd = today.strftime("%Y%m%d")
-        cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
+        legacy_csv = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
         sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
-        cache_file.write_text("STALE_KITE_FALLBACK_CONTENT")
+        legacy_csv.write_text("TckrSymb,ClsPric\nSTALE,0.0\n")
         sentinel.write_text("synthesised_via_kite_historical_data\n")
 
-        s = self._stub_zip_session(b"AUTHORITATIVE_NSE_CONTENT")
+        s = self._stub_zip_session(b"TckrSymb,ClsPric\nAUTH,1.0\n")
         out = _download_bhavcopy(today, s)
-        assert out == b"AUTHORITATIVE_NSE_CONTENT"
-        assert cache_file.read_bytes() == b"AUTHORITATIVE_NSE_CONTENT"
+        assert out.iloc[0]["TckrSymb"] == "AUTH"
+        back = pd.read_parquet(isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.parquet")
+        assert back.iloc[0]["TckrSymb"] == "AUTH"
         assert not sentinel.exists()
+        assert not legacy_csv.exists()
 
     def test_sentinel_cache_kept_when_nse_still_404(
         self, isolated_raw_dir, today,
@@ -314,13 +347,13 @@ class TestDownloadBhavcopyFallback:
         yyyymmdd = today.strftime("%Y%m%d")
         cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
         sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
-        cache_file.write_text("EXISTING_KITE_FALLBACK_CONTENT")
+        cache_file.write_text("TckrSymb,ClsPric\nKITE_FB,1.0\n")
         sentinel.write_text("synthesised_via_kite_historical_data\n")
 
         s = self._stub_404_session()
         with patch("fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
             out = _download_bhavcopy(today, s)
-        assert out == b"EXISTING_KITE_FALLBACK_CONTENT"
+        assert out.iloc[0]["TckrSymb"] == "KITE_FB"
         mock_fallback.assert_not_called()
 
 
@@ -330,12 +363,13 @@ class TestDownloadBhavcopyFallback:
 
 class TestSynthCsvIsScreenerCompatible:
 
-    def test_load_front_month_panel_consumes_synth_csv(self, tmp_path, today, expiries):
+    def test_load_front_month_panel_consumes_synth_day(self, tmp_path, today, expiries):
         """The whole point of the fallback is that screen_pairs.py reads
-        the synth CSV cleanly. Verify end-to-end."""
+        the synth day cleanly. Verify end-to-end via the parquet cache the
+        fallback now writes."""
         from screen_pairs import load_front_month_panel
 
-        # Synthesise today's CSV via the fallback
+        # Synthesise today's frame via the fallback
         instruments = _instruments_for([
             ("RELIANCE", expiries[0], 1001, 250),
             ("INFY", expiries[0], 1002, 400),
@@ -344,12 +378,12 @@ class TestSynthCsvIsScreenerCompatible:
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
         with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
              patch("screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
-            csv_bytes = _build_today_stfs_via_kite(today)
-        assert csv_bytes is not None
+            df = _build_today_stfs_via_kite(today)
+        assert df is not None
 
-        # Write into a tmp raw_dir as bhavcopy_fo_YYYYMMDD.csv (today's date)
+        # Write into a tmp raw_dir as bhavcopy_fo_YYYYMMDD.parquet (today's date)
         yyyymmdd = today.strftime("%Y%m%d")
-        (tmp_path / f"bhavcopy_fo_{yyyymmdd}.csv").write_bytes(csv_bytes)
+        df.to_parquet(tmp_path / f"bhavcopy_fo_{yyyymmdd}.parquet", index=False)
 
         panel = load_front_month_panel(
             ["RELIANCE", "INFY"], raw_dir=tmp_path, min_coverage=0.0,

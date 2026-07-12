@@ -25,6 +25,7 @@ pandas
 scipy
 statsmodels
 cmaes                   # CMA-ES optimizer for the Kalman trend-following fit
+pyarrow                 # Parquet engine for data_cache tables (storage increment 1)
 
 # Auth
 pyotp

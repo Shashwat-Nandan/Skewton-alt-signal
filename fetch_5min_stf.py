@@ -35,7 +35,6 @@ after market close, reusing that session:
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 import re
 import sys
@@ -44,8 +43,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
+
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
+
+from data_cache_io import read_table, write_table  # noqa: E402
 
 logger = logging.getLogger("fetch_5min_stf")
 
@@ -155,17 +158,25 @@ def rows_from_candles(candles: List[dict], contract: str) -> Dict[str, list]:
 
 
 def load_existing(path: Path) -> Dict[str, list]:
-    """Read a previously-written CSV into {ts_iso: [o,h,l,c,v,contract]}. Returns
-    {} if absent. Legacy rows without a `contract` column default to ""."""
-    if not path.exists():
+    """Read a previously-written table (parquet, or a legacy pre-migration CSV)
+    into {ts_iso: [o,h,l,c,v,contract]}. Returns {} if absent. Legacy rows
+    without a `contract` column default to "". The `date` column is stored as
+    the ISO string Kite returned — the roll merge dedupes on these exact keys,
+    so the format must not drift between formats."""
+    try:
+        df = read_table(path)
+    except FileNotFoundError:
         return {}
     rows: Dict[str, list] = {}
-    with open(path, newline="") as f:
-        r = csv.DictReader(f)
-        for d in r:
-            rows[d["date"]] = [float(d["open"]), float(d["high"]), float(d["low"]),
-                               float(d["close"]), int(float(d.get("volume") or 0)),
-                               d.get("contract") or ""]
+    for d in df.to_dict("records"):
+        # Blank cells arrive as NaN (truthy!) here, not the "" the old
+        # csv.DictReader gave — normalise explicitly or `or`-defaults break.
+        vol = d.get("volume")
+        ct = d.get("contract")
+        rows[str(d["date"])] = [float(d["open"]), float(d["high"]), float(d["low"]),
+                                float(d["close"]),
+                                0 if vol is None or pd.isna(vol) else int(float(vol)),
+                                "" if ct is None or pd.isna(ct) else str(ct)]
     return rows
 
 
@@ -250,16 +261,15 @@ def backadjust_merge(existing: Dict[str, list], new: Dict[str, list],
     return merged, f"{tag} {prev_contract}→{new_contract} offset={offset:+.2f}"
 
 
-def write_csv(path: Path, rows: Dict[str, list]) -> int:
-    """Write {ts: [o,h,l,c,v,contract]} sorted by timestamp; prices rounded to 2dp."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(CSV_HEADER)
-        for ts in sorted(rows):
-            op, hi, lo, cl, v, ct = rows[ts]
-            w.writerow([ts, round(op, 2), round(hi, 2), round(lo, 2), round(cl, 2),
-                        int(v), ct])
+def write_table_rows(path: Path, rows: Dict[str, list]) -> int:
+    """Write {ts: [o,h,l,c,v,contract]} as parquet sorted by timestamp; prices
+    rounded to 2dp; `date` kept as ISO string (see load_existing)."""
+    records = []
+    for ts in sorted(rows):
+        op, hi, lo, cl, v, ct = rows[ts]
+        records.append([ts, round(op, 2), round(hi, 2), round(lo, 2),
+                        round(cl, 2), int(v), ct])
+    write_table(pd.DataFrame(records, columns=CSV_HEADER), path)
     return len(rows)
 
 
@@ -298,7 +308,7 @@ def main() -> int:
             skipped += 1
             continue
         new_rows = rows_from_candles(candles, tsym)
-        path = out_dir / f"{sym}.csv"
+        path = out_dir / f"{sym}.parquet"
         merged, note = backadjust_merge(load_existing(path), new_rows, tsym)
         incomplete = False
         if note == "ROLL-NO-OVERLAP":
@@ -318,7 +328,7 @@ def main() -> int:
                            "the true front month. Run monthly+ to capture each roll",
                            sym, tsym, note)
             incomplete = True
-        n = write_csv(path, merged)
+        n = write_table_rows(path, merged)
         if failed_chunks:
             # Fail loud: the fetch has a hole — do NOT report it as a clean write.
             logger.warning("%s (%s): wrote %d 5-min bars but %d chunk(s) FAILED — "

@@ -161,9 +161,9 @@ def main() -> int:
                           "data_cache/NIFTY_5minute.csv for a 5-min run (issue #63)")
 
     if args.csv:
-        import pandas as pd
         from pathlib import Path
-        df = pd.read_csv(args.csv)
+        from data_cache_io import read_table
+        df = read_table(args.csv)
         cols = {c.lower(): c for c in df.columns}
         jobs = [(Path(args.csv).stem, df[cols["close"]].to_numpy(float))]
     else:

@@ -1,3 +1,98 @@
+# Parquet increment 1 — chains/bars/bhavcopy (PLAN, 2026-07-12)
+
+Implements increment 1 of docs/research/parquet-duckdb-storage-evaluation-2026-07-12.md
+(user-approved). Writers go parquet-only; ONE shared reader helper prefers
+.parquet and falls back to legacy .csv (deprecation window). CSVs are NOT
+deleted in this increment.
+
+## Families in scope
+1. EOD option chains (`data_cache/<U>_*_eod*.csv`, 535 MB) — writers
+   fetch_bhavcopy.py / fetch_historical_data.py
+2. F&O bhavcopy raw day cache (`bhavcopy_raw/bhavcopy_fo_*.csv`, 3.5 GB) —
+   writer fetch_bhavcopy._download_bhavcopy (kite-fallback sentinel logic
+   must survive unchanged)
+3. EQ bhavcopy raw day cache + per-symbol `equity_ohlcv/` — fetch_bhavcopy_eq.py
+4. STF 5-min per-symbol (`stf_5min/`) — fetch_5min_stf.py
+5. Index daily/intraday bars (`<SYM>_daily.csv`, `<SYM>_5minute.csv`) —
+   fetch_index_daily.py
+
+Explicitly OUT of scope: instruments master CSVs, pair_candidates.csv,
+nifty200/holidays, fii_dii, *.tsv logs, dashboard.db, replay_2026_05_06.py,
+prototype_kalman_signal_exit.py (frozen one-offs).
+
+## Parity rules (the correctness core)
+- Backfill reads CSVs with plain read_csv inference (strings stay strings,
+  symbol cols forced str) so parquet == what consumers see today; verifies
+  each file round-trip with assert_frame_equal before counting it done.
+- read_table() applies parse_dates AFTER load → same frames from .csv and
+  .parquet; usecols→columns; dtype applied on both paths.
+- Readers doing string ops on date cols (taleb_karpathy._load_spot_history,
+  validate_kalman_trend.load_daily_closes) become dtype-tolerant because NEW
+  writer parquet carries real datetimes.
+
+## Checklist
+- [x] data_cache_io.py — read_table / write_table / table_columns /
+      find_tables (parquet-first, csv fallback) + tests/test_data_cache_io.py
+- [x] pyarrow: requirements.in + hash-pinned lock recompile (NO --upgrade)
+      + install into .venv (pyarrow==25.0.0, lock diff purely additive)
+- [x] Writers → parquet: fetch_bhavcopy.py (raw cache = parquet day frames,
+      _parse_udiff_day takes df; explicit --output *.csv still honored),
+      fetch_bhavcopy_eq.py, fetch_historical_data.py (eod output only),
+      fetch_index_daily.py, fetch_5min_stf.py
+- [x] Readers → read_table/find_tables: all sites ported. Notes vs plan:
+      validate_kalman_filter --csv is ad-hoc user data, NOT a converted
+      family → left as read_csv; backtest_pairs_rule/sweep_top only pass
+      RAW_DIR into already-ported loaders → no edits; screen_pairs
+      filename-date parse fixed to f.stem (was .removesuffix(".csv"))
+- [x] scripts/backfill_parquet_data_cache.py — one-shot, per-family kwargs,
+      round-trip parity check per file, skip+report failures, keep CSVs
+- [x] Full test suite green: 1281 passed (incl. arbitrage AST-parity test)
+- [x] Run backfill for real; smoke: backtest.py on a parquet eod file,
+      screen_pairs panel load, taleb spot-history seed
+- [x] docs/data_pipeline/bhavcopy_ingestion.md touch-up (formats changed)
+
+## Review (2026-07-12)
+
+- Backfill: 1,452/1,452 CSVs converted, ZERO round-trip parity failures.
+  4,585 MB csv → 1,190 MB parquet (3.9x). CSVs retained (deprecation
+  window); deleting them later reclaims ~4.5 GB.
+- End-to-end verification on real data (all through CLIs, not unit calls):
+  backtest.py loaded the chains via parquet given a .csv path, given a
+  parquet-only dir, and given the .parquet path (260 ticks each);
+  missing-both fails loud naming both candidates; the LIVE strategy seeded
+  43 spot samples from `NIFTY_20260511_20260710_eod.parquet`;
+  screen_pairs produced a sane candidates file over the converted raw tree
+  in 23 s (last_data_date = 2026-07-10).
+- Deviations from plan, called out in-line in the checklist: kite-fallback
+  synthetic frames now keep OptnTp as "" (CSV round-trip used to turn it
+  into NaN) — no consumer reads OptnTp from STF-only fallback days;
+  validate_kalman_filter --csv left on read_csv (ad-hoc user data, not a
+  converted family).
+- Operator follow-ups (NOT in this increment): delete legacy CSVs after
+  the deprecation window — use the backfill's deletion-safety report (it
+  lists CSVs no family covers) and verify a parquet sibling per file; fetch
+  timers need no unit changes (same entrypoints); redeploy.sh pip-sync
+  installs pyarrow from the lock.
+- /code-review (high) 2026-07-12: 10 findings (7 confirmed) — all applied:
+  load_existing NaN normalization (+ regression test), this file's ARCHIVE
+  restored (Rule 3 repeat!), compression="zstd" + --force re-backfill,
+  parse_dates fail-loud, table_exists() replacing hand-rolled probes,
+  RAW_STR_COLS imported by backfill (copies deleted), taleb to_datetime
+  moved inside its degrade guard, **csv_kwargs dropped, deletion-safety
+  stray report, raw-cache full-frame fidelity test. Notable refutations:
+  astype(str) does NOT nan-ify on the venv's pandas 3.0.3; ArrowInvalid
+  subclasses ValueError (live guard already catches corrupt parquet).
+
+---
+
+# ARCHIVE — prior tasks' plans & reviews (accumulated record)
+
+Kept because source files cite dated entries here (screen_pairs.py,
+strategies/pair_trading.py, compare_paper_systems.py, autoresearch_loop.py,
+loop_engine/__init__.py, tests/test_runner_live_gate.py, …). Do not prune
+without fixing those references.
+
+
 # Issue #90 increment 1 — signal plane for pair_trading persistent (PLAN, 2026-07-07)
 
 Scope (user decision): build the §4 signal contract + file-backed publisher and
@@ -387,13 +482,7 @@ several forward windows are short (kalman pairs 5 sessions).
 
 ---
 
-# ARCHIVE — prior tasks' plans & reviews (accumulated record)
-
-Kept because source files cite dated entries here (screen_pairs.py,
-strategies/pair_trading.py, compare_paper_systems.py, autoresearch_loop.py,
-loop_engine/__init__.py, tests/test_runner_live_gate.py, …). Do not prune
-without fixing those references.
-
+---
 # Taleb BANKNIFTY variant, issue #62 (PLAN, 2026-07-04)
 
 DECISIONS (AskUserQuestion 2026-07-04):

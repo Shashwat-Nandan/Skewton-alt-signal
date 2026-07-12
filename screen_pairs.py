@@ -30,6 +30,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+
+from data_cache_io import find_tables, read_table
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
 from statsmodels.tsa.stattools import coint
@@ -72,15 +74,15 @@ def load_front_month_panel(
     Drops symbols whose coverage (non-NaN trading days / total trading days)
     is below `min_coverage`.
     """
-    files = sorted(raw_dir.glob("bhavcopy_fo_*.csv"))
+    files = find_tables(raw_dir, "bhavcopy_fo_*")
     if not files:
-        raise RuntimeError(f"No bhavcopy CSVs found in {raw_dir}")
+        raise RuntimeError(f"No bhavcopy tables found in {raw_dir}")
     logger.info("Reading %d bhavcopy files from %s", len(files), raw_dir)
 
     universe_set = set(universe)
     rows = []
     for f in files:
-        df = pd.read_csv(
+        df = read_table(
             f,
             usecols=["TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "ClsPric"],
             dtype={"TckrSymb": str, "FinInstrmTp": str},
@@ -142,8 +144,7 @@ def load_front_month_panel(
     # data-pipeline problem worth investigating before trading.
     if len(panel) > 0:
         latest_bhav_date = max(
-            pd.to_datetime(f.name.removeprefix("bhavcopy_fo_").removesuffix(".csv"),
-                           format="%Y%m%d")
+            pd.to_datetime(f.stem.removeprefix("bhavcopy_fo_"), format="%Y%m%d")
             for f in files
         )
         gap_days = (latest_bhav_date - panel.index[-1]).days

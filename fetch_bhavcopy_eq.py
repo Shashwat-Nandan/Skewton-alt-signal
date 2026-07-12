@@ -2,7 +2,7 @@
 Fetch NSE Cash-Market (EQ) Bhav Copy — daily equity OHLCV
 =========================================================
 Mirror of ``fetch_bhavcopy.py`` (F&O) for the cash market segment. Writes
-one CSV per symbol under ``data_cache/equity_ohlcv/<SYMBOL>.csv`` with the
+one table per symbol under ``data_cache/equity_ohlcv/<SYMBOL>.parquet`` with the
 canonical schema ``date,open,high,low,close,volume`` consumed by
 ``strategies/_eq_data.py``.
 
@@ -36,6 +36,8 @@ from typing import List, Optional, Set
 import pandas as pd
 import requests
 
+from data_cache_io import read_table, table_exists, write_table
+
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./data_cache")
@@ -56,6 +58,11 @@ REQUEST_HEADERS = {
 }
 IST = timezone(timedelta(hours=5, minutes=30))
 RATE_LIMIT_DELAY = 0.4
+
+# Symbol/series columns stored as str in the raw parquet cache so consumers
+# see the dtypes the CSVs gave them (the EQ counterpart of
+# fetch_bhavcopy.RAW_STR_COLS; the backfill script imports both).
+RAW_STR_COLS = {"TckrSymb": str, "SctySrs": str, "FinInstrmNm": str}
 
 
 def load_holidays(path: str = "holidays.csv") -> Set:
@@ -84,11 +91,11 @@ def trading_days(from_date: datetime, to_date: datetime, holidays: Set) -> List[
     return out
 
 
-def _download_one(date: datetime, session: requests.Session) -> Optional[bytes]:
+def _download_one(date: datetime, session: requests.Session) -> Optional[pd.DataFrame]:
     yyyymmdd = date.strftime("%Y%m%d")
-    cache_file = RAW_EQ_DIR / f"bhavcopy_eq_{yyyymmdd}.csv"
-    if cache_file.exists():
-        return cache_file.read_bytes()
+    cache_file = RAW_EQ_DIR / f"bhavcopy_eq_{yyyymmdd}.parquet"
+    if table_exists(cache_file):
+        return read_table(cache_file, dtype=RAW_STR_COLS)
 
     url = UDIFF_URL.format(yyyymmdd=yyyymmdd)
     try:
@@ -110,14 +117,13 @@ def _download_one(date: datetime, session: requests.Session) -> Optional[bytes]:
             csv_bytes = zf.read(names[0])
     except zipfile.BadZipFile:
         return None
-    RAW_EQ_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file.write_bytes(csv_bytes)
-    return csv_bytes
+    day_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=RAW_STR_COLS)
+    write_table(day_df, cache_file)
+    return day_df
 
 
-def _parse_eq_day(csv_bytes: bytes, date: datetime, universe: Set[str]) -> pd.DataFrame:
-    """Filter UDiFF CM file to EQ-series rows for the universe; return canonical columns."""
-    df = pd.read_csv(io.BytesIO(csv_bytes))
+def _parse_eq_day(df: pd.DataFrame, date: datetime, universe: Set[str]) -> pd.DataFrame:
+    """Filter a UDiFF CM day frame to EQ-series rows for the universe; return canonical columns."""
     required = {"TckrSymb", "SctySrs", "OpnPric", "HghPric", "LwPric", "ClsPric", "TtlTradgVol"}
     missing = required - set(df.columns)
     if missing:
@@ -148,11 +154,11 @@ def fetch_eq_range(
     frames: List[pd.DataFrame] = []
     for i, day in enumerate(days, 1):
         logger.info("  [%d/%d] %s", i, len(days), day.strftime("%Y-%m-%d"))
-        csv_bytes = _download_one(day, session)
-        if csv_bytes is None:
+        raw_day = _download_one(day, session)
+        if raw_day is None:
             continue
         try:
-            day_df = _parse_eq_day(csv_bytes, day, universe_set)
+            day_df = _parse_eq_day(raw_day, day, universe_set)
         except ValueError as e:
             logger.warning("Parse error on %s: %s", day.strftime("%Y-%m-%d"), e)
             continue
@@ -166,21 +172,21 @@ def fetch_eq_range(
 
 
 def write_per_symbol(df: pd.DataFrame, out_dir: Path = EQ_OUT_DIR) -> int:
-    """Merge `df` into per-symbol cache CSVs, dedupe by date. Returns symbol count."""
+    """Merge `df` into per-symbol cache tables, dedupe by date. Returns symbol count."""
     out_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for sym, group in df.groupby("symbol"):
-        path = out_dir / f"{sym}.csv"
-        if path.exists():
-            existing = pd.read_csv(path, parse_dates=["date"])
+        path = out_dir / f"{sym}.parquet"
+        try:
+            existing = read_table(path, parse_dates=["date"])
             merged = pd.concat([existing, group], ignore_index=True)
-        else:
+        except FileNotFoundError:
             merged = group
         merged = (merged.drop_duplicates(subset=["date"], keep="last")
                           .sort_values("date")
                           .reset_index(drop=True))
-        merged[["date", "open", "high", "low", "close", "volume"]].to_csv(
-            path, index=False
+        write_table(
+            merged[["date", "open", "high", "low", "close", "volume"]], path
         )
         n += 1
     return n

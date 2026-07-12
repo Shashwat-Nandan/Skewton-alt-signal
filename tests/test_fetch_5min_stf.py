@@ -19,7 +19,7 @@ from fetch_5min_stf import (
     _is_immediate_successor,
     backadjust_merge,
     load_existing,
-    write_csv,
+    write_table_rows,
 )
 
 
@@ -110,12 +110,41 @@ def test_roll_without_overlap_is_flagged_not_silently_joined():
     assert merged["2026-07-28T09:15:00"][3] == 103.0
 
 
-def test_csv_roundtrip_preserves_contract_column(tmp_path):
-    p = tmp_path / "X.csv"
+def test_roundtrip_preserves_contract_column(tmp_path):
+    p = tmp_path / "X.parquet"
     rows = {"2026-07-01T09:15:00": _row(100.123, "X26JULFUT"),
             "2026-07-01T09:20:00": _row(100.567, "X26JULFUT")}
-    write_csv(p, rows)
+    write_table_rows(p, rows)
     back = load_existing(p)
-    # prices round-trip at 2dp; contract label survives so the next run detects rolls.
+    # prices round-trip at 2dp; contract label survives so the next run detects
+    # rolls; the ts keys stay the exact ISO strings the merge dedupes on.
     assert back["2026-07-01T09:15:00"][3] == 100.12
     assert back["2026-07-01T09:20:00"][5] == "X26JULFUT"
+
+
+def test_load_existing_reads_legacy_csv(tmp_path):
+    # Pre-migration series must merge seamlessly: same keys, same row shape.
+    p = tmp_path / "X.csv"
+    p.write_text(
+        "date,open,high,low,close,volume,contract\n"
+        "2026-07-01T09:15:00,100.0,100.0,100.0,100.12,100,X26JULFUT\n"
+    )
+    back = load_existing(tmp_path / "X.parquet")  # parquet absent → csv fallback
+    assert back["2026-07-01T09:15:00"][3] == 100.12
+    assert back["2026-07-01T09:15:00"][5] == "X26JULFUT"
+
+
+def test_load_existing_normalizes_blank_cells_like_dictreader(tmp_path):
+    """Blank cells in a legacy CSV arrive as NaN through read_table (the old
+    csv.DictReader gave \"\"). NaN is truthy, so the `or`-defaults alone can't
+    normalize it: volume must become 0 (not crash int(NaN)) and contract must
+    become \"\" (not poison the roll-merge keys with NaN)."""
+    p = tmp_path / "X.csv"
+    p.write_text(
+        "date,open,high,low,close,volume,contract\n"
+        "2026-07-01T09:15:00,100.0,100.0,100.0,100.12,,\n"
+    )
+    back = load_existing(tmp_path / "X.parquet")
+    row = back["2026-07-01T09:15:00"]
+    assert row[4] == 0
+    assert row[5] == ""

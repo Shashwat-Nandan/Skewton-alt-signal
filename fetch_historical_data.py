@@ -28,6 +28,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from data_cache_io import write_table
 from greeks_engine import implied_volatility_bisect, time_to_expiry
 from kite_auth import KiteAuthManager
 
@@ -553,10 +554,10 @@ def main():
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         output_path = str(
             CACHE_DIR
-            / f"{args.underlying}_{from_date.strftime('%Y%m%d')}_{to_date.strftime('%Y%m%d')}.csv"
+            / f"{args.underlying}_{from_date.strftime('%Y%m%d')}_{to_date.strftime('%Y%m%d')}.parquet"
         )
 
-    data.to_csv(output_path, index=False)
+    output_path = str(write_table(data, output_path))
     logger.info("Saved %d rows to %s", len(data), output_path)
 
     # Summary

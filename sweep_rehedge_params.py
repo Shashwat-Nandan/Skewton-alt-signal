@@ -25,6 +25,7 @@ from backtest import (
     load_iv_skew_seed,
     run_backtest,
 )
+from data_cache_io import read_table
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -43,7 +44,7 @@ def _replay_frames(args) -> list:
         print(f"Replaying {len(sessions)} captured sessions: "
               f"{sessions[0]} → {sessions[-1]}")
         return [(s, load_captured_tape(s, args.underlying)) for s in sessions]
-    data = pd.read_csv(args.data, parse_dates=["timestamp"])
+    data = read_table(args.data, parse_dates=["timestamp"])
     if data["timestamp"].dt.tz is not None:
         data["timestamp"] = data["timestamp"].dt.tz_localize(None)
     return [(args.data, data)]

@@ -1,7 +1,7 @@
 # bhavcopy ingestion — NSE EOD cash + F&O archive
 
 One-line: two scripts that download NSE's daily UDiFF bhavcopy files
-(cash-market EQ and F&O), parse them, and emit per-symbol CSVs for the
+(cash-market EQ and F&O), parse them, and emit per-symbol Parquet tables for the
 strategies. Cash flow runs nightly under a systemd timer; F&O flow is
 manual / on-demand.
 
@@ -42,8 +42,8 @@ Source: `fetch_bhavcopy.py` (F&O, 451 lines) and `fetch_bhavcopy_eq.py`
 | Script | `fetch_bhavcopy_eq.py` | `fetch_bhavcopy.py` |
 | Timer | `fetch-bhavcopy-eq.timer` @ 18:00 IST Mon–Fri | (no timer — manual / on-demand) |
 | Service | `fetch-bhavcopy-eq.service` | none deployed |
-| Raw cache | `data_cache/bhavcopy_eq_raw/bhavcopy_eq_<yyyymmdd>.csv` | `data_cache/bhavcopy_raw/bhavcopy_<yyyymmdd>.csv` (or zip) |
-| Parsed output | `data_cache/equity_ohlcv/<SYMBOL>.csv` (one file per symbol) | (in-memory, loaded by screener / `_eq_data._build_front_month_panel`) |
+| Raw cache | `data_cache/bhavcopy_eq_raw/bhavcopy_eq_<yyyymmdd>.parquet` | `data_cache/bhavcopy_raw/bhavcopy_fo_<yyyymmdd>.parquet` |
+| Parsed output | `data_cache/equity_ohlcv/<SYMBOL>.parquet` (one file per symbol) | (in-memory, loaded by screener / `_eq_data._build_front_month_panel`) |
 | Schema | `date,open,high,low,close,volume` | UDiFF F&O native (TradDt, TckrSymb, OptnTp, StrkPric, XpryDt, OpnPric, HghPric, LwPric, ClsPric, OpnIntrst, ChngInOpnIntrst, TtlTradgVol, …) |
 | Volume per day | ~2k EQ rows (NSE listed) | ~50k F&O rows (all expiries × strikes × types) |
 
@@ -88,12 +88,12 @@ RandomizedDelaySec=120
 hard-depends on a fresh EQ panel.
 
 ### Download (`_download_one`, line 88)
-1. If `data_cache/bhavcopy_eq_raw/bhavcopy_eq_<yyyymmdd>.csv` exists →
+1. If `data_cache/bhavcopy_eq_raw/bhavcopy_eq_<yyyymmdd>.parquet` (or a legacy pre-migration `.csv`) exists →
    short-circuit (idempotent).
 2. GET `UDIFF_URL.format(...)` with the Chrome headers.
 3. 404 → log "likely holiday/weekend" and return None (skip).
 4. Non-200 → log warning, return None.
-5. 200 → unzip in-memory, extract first `.csv`, cache to disk, return
+5. 200 → unzip in-memory, extract first `.csv`, parse, cache to disk as parquet, return
    bytes.
 
 ### Parse (`_parse_eq_day`, line 119+)
@@ -108,7 +108,7 @@ per ticker). For each symbol in the universe (defaults to
 - Cast types appropriately.
 
 ### Output
-One CSV per symbol at `data_cache/equity_ohlcv/<SYMBOL>.csv`,
+One table per symbol at `data_cache/equity_ohlcv/<SYMBOL>.parquet`,
 schema:
 ```
 date,open,high,low,close,volume
@@ -140,7 +140,7 @@ its 508-day rolling panel needs fresh files.
 
 ### Download
 Same `_download_one` pattern as EQ. Cache at
-`data_cache/bhavcopy_raw/bhavcopy_<yyyymmdd>.csv` (or `.csv.zip`).
+`data_cache/bhavcopy_raw/bhavcopy_fo_<yyyymmdd>.parquet` (legacy `.csv` honored).
 
 ### Schema (UDiFF F&O native)
 
@@ -179,7 +179,7 @@ flags. Used for IV-percentile history seeding in
 
 Both pipelines are designed to be safely re-runnable:
 - Raw downloads are short-circuited if the cache file exists.
-- Output CSVs merge by `date`; re-fetching a date is a no-op.
+- Output tables merge by `date`; re-fetching a date is a no-op.
 - A partial-day failure (e.g. parser crash) leaves the raw cache
   populated; re-running picks up from parse.
 
@@ -211,10 +211,10 @@ worst case) with a warning at >1 day.
 
 | Consumer | Reads from |
 |---|---|
-| `strategies/_eq_data.load_equity_panel` | `data_cache/equity_ohlcv/<SYMBOL>.csv` |
+| `strategies/_eq_data.load_equity_panel` | `data_cache/equity_ohlcv/<SYMBOL>.parquet` (legacy `.csv` honored) |
 | `strategies/varsity_equity_swing` (entire strategy) | via `_eq_data` |
 | `backtest_varsity_equity.py` | via `_eq_data` |
-| `strategies/_oi_signal.build_oi_panel` | `data_cache/bhavcopy_raw/bhavcopy_<yyyymmdd>.csv` (F&O) |
+| `strategies/_oi_signal.build_oi_panel` | `data_cache/bhavcopy_raw/bhavcopy_fo_<yyyymmdd>.parquet` (F&O) |
 | `screen_pairs.py` | `data_cache/bhavcopy_raw/` (508-day panel build) |
 | `strategies/pair_trading` (init seeding) | via `screen_pairs.load_front_month_panel` |
 | `analyze_rv_iv_regime.py` | both raw caches |
@@ -244,7 +244,7 @@ entries for the current year.
 | NSE archive URL changes | All fetches fail | Update `UDIFF_URL` template; NSE has rotated formats historically (legacy → UDiFF in July 2024) |
 | Partial / corrupt download | `BadZipFile` caught at line 113, returns None | Re-fetch on next timer fire |
 | `holidays.csv` out of date | Fetcher attempts downloads on holidays; downstream runners refuse to start | Update `holidays.csv` from NSE annual circular |
-| Per-symbol CSV missing for a known symbol | `_eq_data` returns empty panel for that symbol; strategy proceeds with smaller universe (degrades gracefully) | Re-run fetcher with explicit `--from-date` |
+| Per-symbol table missing for a known symbol | `_eq_data` returns empty panel for that symbol; strategy proceeds with smaller universe (degrades gracefully) | Re-run fetcher with explicit `--from-date` |
 | EQ panel stale at close-scan | Runner refuses, fires Telegram alert | Manual investigation; re-run fetcher; re-run scan |
 
 ## Logging and monitoring
