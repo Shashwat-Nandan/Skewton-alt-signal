@@ -37,7 +37,11 @@ from data_cache_io import find_tables, read_table
 sys.path.insert(0, str(Path(__file__).parent))
 
 from screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
-from strategies.pair_trading import PairState, PairTradingStrategy
+from strategies.pair_trading import (
+    DEFAULT_MARGIN_HEADROOM,
+    PairState,
+    PairTradingStrategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +204,9 @@ def make_strategy(
     # P&L. The debounce is an intraday-noise filter; a daily close is already
     # settled, so use 1 (exit on first in-band bar) for a faithful daily replay.
     s.stop_cooldown_minutes = 60
+    # Live-only precheck knob (backtest is paper, never calls it), but mirror
+    # the __init__ default so the bootstrap stays complete.
+    s._margin_headroom = DEFAULT_MARGIN_HEADROOM
     s.paper_slippage_bps = 5.0
     s.exit_debounce_ticks = 1
     s.max_book_notional = None

@@ -68,6 +68,13 @@ PAIR_CANDIDATES_PATH = Path("data_cache/pair_candidates.csv")
 HEDGE_RATIO_MIN = 0.1
 HEDGE_RATIO_MAX = 10.0
 
+# Headroom over the broker-quoted entry margin: LTP (and hence SPAN) drifts
+# between the precheck and leg placement; 2026-07-13 the HDFCLIFE leg rejected
+# on a shortfall that opened up within seconds. Operator-overridable via
+# config `margin_headroom` (read in __init__); the module default here also
+# serves __new__-built test/backtest instances that skip __init__.
+DEFAULT_MARGIN_HEADROOM = 1.05
+
 HOLIDAYS_PATH = Path(__file__).resolve().parent.parent / "holidays.csv"
 
 
@@ -324,6 +331,13 @@ class PairTradingStrategy(BaseStrategy):
         # max_entry_z). Only STOP exits arm the gate.
         self.stop_cooldown_minutes = int(cfg.get("stop_cooldown_minutes", 60))
 
+        # Broker-quoted-margin headroom (see DEFAULT_MARGIN_HEADROOM). Operator
+        # knob so widening/tightening after a margin incident is a config edit,
+        # not a code PR + session restart on the live order path.
+        self._margin_headroom = float(
+            cfg.get("margin_headroom", DEFAULT_MARGIN_HEADROOM)
+        )
+
         # Optional per-leg notional cap (₹). Without it, high-β pairs can
         # silently deploy huge amounts (e.g. β=10 with 1 lot of A → ~10 lots
         # of B by notional). When set, sizing scales BOTH legs down so the
@@ -559,7 +573,13 @@ class PairTradingStrategy(BaseStrategy):
         backoff_active = (not self.is_paper_mode
                           and self._place_order_skip_ticks_left > 0)
 
-        if is_entry_batch and not self.is_paper_mode and proposals:
+        # Skipped during an M-B5 backoff window: _live_execute fails every
+        # leg regardless, so the precheck's two broker round-trips would be
+        # pure waste against the client that is already the thing most likely
+        # to be broken (matches the "doesn't burn a margins() call" intent
+        # of the cooldown ordering above).
+        if (is_entry_batch and not self.is_paper_mode and proposals
+                and not backoff_active):
             if not self._margin_precheck_ok(proposals):
                 return []
 
@@ -1657,34 +1677,156 @@ class PairTradingStrategy(BaseStrategy):
             return True
 
         try:
-            # live_balance is free CASH only — Zerodha reports pledged
-            # holdings separately under available.collateral, and a fully
-            # pledged account shows live_balance=0 even with lakhs of usable
-            # margin (2026-06-11: blocked every entry on a collateral-funded
-            # account). Futures margin can be posted from collateral, so
-            # count both. Caveat (operator-accepted): the exchange's 50:50
-            # rule means cash short of 50% of margin accrues Zerodha
-            # delayed-payment interest (~0.035%/day) while a position is on.
-            avail_blob = margins["equity"]["available"]
-            cash = float(avail_blob["live_balance"])
+            # Prefer equity.net: Zerodha's own free-margin figure. It includes
+            # pledged collateral (preserving the 2026-06-11 fix — a fully
+            # pledged account shows live_balance=0 with all usable margin
+            # under available.collateral) AND subtracts utilised debits.
+            # The previous live_balance+collateral sum double-counted
+            # collateral already consumed by open positions (2026-07-13:
+            # ₹690k computed vs ₹464k actual net). Caveat (operator-
+            # accepted): the exchange's 50:50 rule means cash short of 50%
+            # of margin accrues Zerodha delayed-payment interest
+            # (~0.035%/day) while a position is on.
+            equity = margins["equity"]
+            if not isinstance(equity, dict):
+                # None / non-dict blob (degraded payload): raise into the
+                # shape-guard below rather than let equity.get(...) throw an
+                # AttributeError that escapes this handler.
+                raise TypeError("equity blob is not a dict")
+            net = equity.get("net")
+            # cash/collateral are for the log breakdown only; read them
+            # defensively so a missing/renamed available blob can NEVER
+            # discard a valid `net` (the actual gating figure).
+            avail_blob = equity.get("available")
+            if not isinstance(avail_blob, dict):
+                avail_blob = {}
+            cash = float(avail_blob.get("live_balance") or 0)
             collateral = float(avail_blob.get("collateral") or 0)
-            available = cash + collateral
-        except (KeyError, TypeError, ValueError) as e:
+            if net is not None:
+                available = float(net)
+                gate_source = "net"
+            else:
+                # No net figure — gate on cash+collateral, which needs a
+                # usable available blob; nothing to gate on otherwise.
+                if not avail_blob:
+                    raise KeyError("margins() has neither 'net' nor 'available'")
+                available = cash + collateral
+                gate_source = "cash+collateral"
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
             logger.warning(
                 "%s/%s: margins() shape unexpected (%s) — proceeding without "
                 "margin precheck", self.symbol_a, self.symbol_b, e,
             )
             return True
 
-        required = sum(float(p.margin_required or 0) for p in proposals)
+        required = self._batch_margin_required(proposals)
         if required > available:
             logger.warning(
                 "%s/%s: insufficient margin — required ₹%.0f > available ₹%.0f "
-                "(cash ₹%.0f + collateral ₹%.0f). Skipping entry batch (H15).",
-                self.symbol_a, self.symbol_b, required, available, cash, collateral,
+                "(%s; cash ₹%.0f, collateral ₹%.0f). Skipping entry batch (H15).",
+                self.symbol_a, self.symbol_b, required, available, gate_source,
+                cash, collateral,
             )
             return False
         return True
+
+    def _batch_margin_required(self, proposals: List[TradeProposal]) -> float:
+        """Broker-quoted margin for the entry batch, with estimate fallback.
+
+        kite.basket_order_margins(consider_positions=True) returns what the
+        RMS will actually demand for these orders given existing positions —
+        the only number that is correct for cross-stock pairs, where SPAN
+        nets nothing and the 0.20×notional proposal estimate understates
+        high-vol legs by up to ~35% (2026-07-03: ADANIENT/RELIANCE real
+        ₹511k vs estimated ₹328k; 2026-07-13: SBILIFE/HDFCLIFE rejected at
+        the broker after the estimate passed). max(initial, final) is used
+        because legs are placed sequentially: the peak (pre-benefit)
+        requirement must clear, not just the settled basket figure.
+
+        Any API failure or shape surprise falls back to the Σ estimate —
+        same don't-block-on-flake philosophy as the margins() call; the C2
+        batch reversal remains the backstop for a post-fact broker reject.
+        """
+        estimate = sum(float(p.margin_required or 0) for p in proposals)
+        # getattr default covers __new__-built backtest/test instances that
+        # skip __init__ (same pattern as _signal_publisher etc.).
+        headroom = getattr(self, "_margin_headroom", DEFAULT_MARGIN_HEADROOM)
+        # Built outside the try: a bug in the proposal fields (None price,
+        # etc.) is a code error, not an "API flake", and must not be silently
+        # reclassified into the estimate fallback.
+        params = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": p.tradingsymbol,
+                "transaction_type": p.transaction_type,
+                "variety": "regular",
+                "product": "NRML",
+                "order_type": "LIMIT",
+                "quantity": int(abs(p.quantity)) * int(p.lot_size),
+                "price": float(p.price),
+            }
+            for p in proposals
+        ]
+
+        def _quote() -> float:
+            basket = self.kite.basket_order_margins(params, consider_positions=True)
+            # max(initial, final): legs are placed sequentially, so the peak
+            # (pre-netting-benefit) requirement must clear, not just the
+            # settled basket figure.
+            return max(
+                float(basket["initial"]["total"]),
+                float(basket["final"]["total"]),
+            )
+
+        try:
+            raw = _quote()
+        except _TokenException as e:
+            # Mirror the margins() sibling: refresh-and-retry once. Without
+            # this, a token invalidated between margins() and this call
+            # (2026-06-17 concurrent-login incident class) would silently
+            # degrade the gate to the understated Σ estimate — the exact
+            # 2026-07-13 failure this precheck exists to prevent.
+            if not self._try_refresh_kite("basket_order_margins", "entry_precheck", e):
+                logger.warning(
+                    "%s/%s: basket_order_margins TokenException, no refresh — "
+                    "falling back to Σ estimate ₹%.0f",
+                    self.symbol_a, self.symbol_b, estimate,
+                )
+                return estimate
+            try:
+                raw = _quote()
+            except Exception as e2:
+                logger.warning(
+                    "%s/%s: basket_order_margins failed after refresh (%s) — "
+                    "falling back to Σ estimate ₹%.0f",
+                    self.symbol_a, self.symbol_b, e2, estimate,
+                )
+                return estimate
+        except Exception as e:
+            logger.warning(
+                "%s/%s: basket_order_margins failed (%s) — falling back to "
+                "Σ estimate ₹%.0f (known to understate cross-stock pairs)",
+                self.symbol_a, self.symbol_b, e, estimate,
+            )
+            return estimate
+
+        if raw <= 0:
+            # Shape-valid but vacuous quote (zeroed totals from a degraded RMS
+            # response) would pass the gate trivially — trust the estimate
+            # instead rather than book a phantom-zero requirement.
+            logger.warning(
+                "%s/%s: basket_order_margins returned non-positive total "
+                "(₹%.0f) — falling back to Σ estimate ₹%.0f",
+                self.symbol_a, self.symbol_b, raw, estimate,
+            )
+            return estimate
+
+        required = raw * headroom
+        logger.info(
+            "%s/%s: broker basket margin ₹%.0f ×%.2f headroom → ₹%.0f (est ₹%.0f)",
+            self.symbol_a, self.symbol_b, raw, headroom, required, estimate,
+        )
+        return required
 
     def _try_refresh_kite(self, op: str, ctx: str, err: Exception) -> bool:
         # H8: refresh the kite client via the runner-supplied callback.

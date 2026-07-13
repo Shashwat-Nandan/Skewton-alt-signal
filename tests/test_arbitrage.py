@@ -1477,7 +1477,8 @@ class TestReviewFixes20260711:
         # fails here instead of dying as a swallowed per-tick AttributeError
         # (this sweep is what exposed calendar_margin_pct as already missing
         # since 2026-06-17 — the backtest had been silently dead for weeks).
-        import ast, inspect
+        import ast
+        import inspect
         from strategies import arbitrage as _arb_mod
         tree = ast.parse(inspect.getsource(_arb_mod))
         cls = next(n for n in ast.walk(tree)

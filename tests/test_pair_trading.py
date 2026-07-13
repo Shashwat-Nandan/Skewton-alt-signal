@@ -769,6 +769,12 @@ class TestBrokerMediums:
         s.kite.margins = MagicMock(return_value={
             "equity": {"available": {"live_balance": 10_000_000.0}},
         })
+        # Pin the basket call to the Σ-estimate fallback: an auto-MagicMock
+        # would float() to 1.0 and vacuously pass the gate (these classes
+        # test execution semantics, not margin quoting — see TestMarginPrecheck).
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=RuntimeError("basket margin not stubbed"),
+        )
         return s
 
     def _prop(self, qty=1, txn="BUY", price=1000.0,
@@ -1726,6 +1732,12 @@ class TestLiveExecuteConfirmation:
         s.kite.margins = MagicMock(return_value={
             "equity": {"available": {"live_balance": 10_000_000.0}},
         })
+        # Pin the basket call to the Σ-estimate fallback: an auto-MagicMock
+        # would float() to 1.0 and vacuously pass the gate (these classes
+        # test execution semantics, not margin quoting — see TestMarginPrecheck).
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=RuntimeError("basket margin not stubbed"),
+        )
         return s
 
     def _prop(self, qty=1, txn="BUY"):
@@ -1863,6 +1875,12 @@ class TestTokenRefresh:
         s.kite.margins = MagicMock(return_value={
             "equity": {"available": {"live_balance": 10_000_000.0}},
         })
+        # Pin the basket call to the Σ-estimate fallback: an auto-MagicMock
+        # would float() to 1.0 and vacuously pass the gate (these classes
+        # test execution semantics, not margin quoting — see TestMarginPrecheck).
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=RuntimeError("basket margin not stubbed"),
+        )
         s._kite_refresh = kite_refresh
         return s
 
@@ -1949,6 +1967,12 @@ class TestMarginPrecheck:
         s.kite.PRODUCT_NRML = "NRML"
         s.kite.ORDER_TYPE_MARKET = "MARKET"
         s.kite.VALIDITY_DAY = "DAY"
+        # Unstubbed basket_order_margins → estimate-fallback path (an
+        # auto-MagicMock would float() to 1.0 and vacuously pass the gate).
+        # Tests of the broker-quote path override this per-test.
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=RuntimeError("basket margin not stubbed"),
+        )
         return s
 
     def _props(self, margin_a=20000, margin_b=30000):
@@ -2038,6 +2062,159 @@ class TestMarginPrecheck:
         s.execute_proposals(self._props())
         s.kite.margins.assert_not_called()
 
+    def test_broker_basket_margin_beats_understated_estimate(self):
+        # 2026-07-13 incident: Σ 0.20×notional estimated ~₹265k so the
+        # precheck passed, but the RMS wanted ₹919k (cross-stock pairs get
+        # NO SPAN netting) against ₹820k free — leg B rejected after leg A
+        # filled and the C2 reversal ate the round-trip. The precheck must
+        # trust the broker's basket quote over the proposal estimates.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 820_090.0}},
+        })
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 918_886.0},
+            "final": {"total": 918_886.0},
+            "orders": [],
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props(margin_a=139_000, margin_b=126_000))
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+        # consider_positions=True: the quote must be incremental over the
+        # book, since it is compared against FREE margin.
+        _, kwargs = s.kite.basket_order_margins.call_args
+        assert kwargs.get("consider_positions") is True
+
+    def test_basket_margin_failure_falls_back_to_estimates(self):
+        # Basket API flake must not block trading (same philosophy as the
+        # margins() flake path) — fall back to the Σ estimate and let the
+        # broker + C2 reversal backstop a genuine shortfall.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"available": {"live_balance": 1_000_000.0}},
+        })
+        s.kite.basket_order_margins = MagicMock(side_effect=RuntimeError("net down"))
+        s.kite.place_order = MagicMock(return_value="ORD-OK")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals(self._props(margin_a=20_000, margin_b=30_000))
+        assert s.kite.place_order.call_count == 2
+
+    def test_net_preferred_over_cash_plus_collateral(self):
+        # live_balance + collateral double-counts collateral already
+        # consumed by utilised margin (2026-07-13: ₹690k computed vs ₹464k
+        # actual). When Zerodha supplies equity.net — its own free-margin
+        # figure — the precheck must gate on that.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {
+                "net": 464_547.0,
+                "available": {"live_balance": -108.0, "collateral": 690_488.0},
+            },
+        })
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 500_000.0},
+            "final": {"total": 500_000.0},
+            "orders": [],
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props())
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
+    def test_headroom_and_peak_leg_both_bind_the_gate(self):
+        # Rule 9: pin BOTH business-logic decisions in _batch_margin_required.
+        # net=500k free; broker quotes initial=480k, final=400k. The raw peak
+        # (max = 480k) is UNDER free margin, so only after ×1.05 headroom
+        # (504k) does the gate refuse. This test fails if either the headroom
+        # multiplier is removed (480k < 500k → would trade) OR max() is
+        # replaced by final-only (400k×1.05 = 420k < 500k → would trade),
+        # each of which silently re-opens the 2026-07-13 reject window.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={"equity": {"net": 500_000.0}})
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 480_000.0},
+            "final": {"total": 400_000.0},
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props())
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
+    def test_basket_token_exception_refreshes_and_retries(self):
+        # A token invalidated between margins() and the basket call must be
+        # recovered via the same _kite_refresh path every other kite call in
+        # the strategy uses — NOT silently degraded to the understated Σ
+        # estimate (which is exactly the pre-fix behaviour that let the
+        # 2026-07-13 batch through). After refresh the true ₹919k quote must
+        # gate against ₹820k free.
+        from kiteconnect.exceptions import TokenException
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={
+            "equity": {"net": 820_090.0},
+        })
+        fresh = MagicMock()
+        fresh.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 918_886.0}, "final": {"total": 918_886.0},
+        })
+        s._kite_refresh = MagicMock(return_value=fresh)
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=TokenException("api_key/access_token expired"),
+        )
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props(margin_a=139_000, margin_b=126_000))
+        assert s._kite_refresh.call_count == 1
+        fresh.basket_order_margins.assert_called_once()
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
+    def test_zeroed_basket_total_falls_back_to_estimate(self):
+        # A shape-valid but vacuous quote (zeroed totals from a degraded RMS
+        # response) must NOT pass the gate at required=0 — fall back to the Σ
+        # estimate. Here the estimate (₹900k) exceeds free (₹500k), so the
+        # batch is refused rather than let through on a phantom-zero.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={"equity": {"net": 500_000.0}})
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 0.0}, "final": {"total": 0.0},
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props(margin_a=500_000, margin_b=400_000))
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
+    def test_non_dict_equity_blob_fails_open(self):
+        # A degraded margins() payload (equity is None) must degrade to
+        # 'proceed without precheck' (the designed fail-open), NOT raise an
+        # AttributeError that escapes the precheck into the tick loop.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={"equity": None})
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 1.0}, "final": {"total": 1.0},
+        })
+        s.kite.place_order = MagicMock(return_value="ORD-OK")
+        s.kite.order_history = MagicMock(return_value=[
+            {"status": "COMPLETE", "filled_quantity": 100, "average_price": 1000.0},
+        ])
+        s.execute_proposals(self._props())  # must not raise
+        assert s.kite.place_order.call_count == 2
+
+    def test_net_survives_missing_available_blob(self):
+        # net is the gating figure; a missing 'available' sub-dict (used only
+        # for the log breakdown) must not discard it and skip the precheck.
+        # net=100k free, broker wants 900k → refuse.
+        s = self._live_strategy()
+        s.kite.margins = MagicMock(return_value={"equity": {"net": 100_000.0}})
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 900_000.0}, "final": {"total": 900_000.0},
+        })
+        s.kite.place_order = MagicMock()  # must not be called
+        s.execute_proposals(self._props())
+        s.kite.place_order.assert_not_called()
+        assert s.state.legs == []
+
 
 class TestProtectiveLimitOrders:
     """2026-06-11: Zerodha's API rejects naked MARKET orders on F&O
@@ -2059,6 +2236,12 @@ class TestProtectiveLimitOrders:
         s.kite.margins = MagicMock(return_value={
             "equity": {"available": {"live_balance": 10_000_000.0}},
         })
+        # Pin the basket call to the Σ-estimate fallback: an auto-MagicMock
+        # would float() to 1.0 and vacuously pass the gate (these classes
+        # test execution semantics, not margin quoting — see TestMarginPrecheck).
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=RuntimeError("basket margin not stubbed"),
+        )
         s.kite.instruments = MagicMock(return_value=[
             {"tradingsymbol": "AAA26APRFUT", "tick_size": 0.05},
         ])
@@ -2146,6 +2329,12 @@ class TestEntryBatchAtomicity:
         s.kite.margins = MagicMock(return_value={
             "equity": {"available": {"live_balance": 10_000_000.0}},
         })
+        # Pin the basket call to the Σ-estimate fallback: an auto-MagicMock
+        # would float() to 1.0 and vacuously pass the gate (these classes
+        # test execution semantics, not margin quoting — see TestMarginPrecheck).
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=RuntimeError("basket margin not stubbed"),
+        )
         s.kite.VARIETY_REGULAR = "regular"
         s.kite.TRANSACTION_TYPE_BUY = "BUY"
         s.kite.TRANSACTION_TYPE_SELL = "SELL"

@@ -1,3 +1,86 @@
+# Margin pre-check fix for cross-stock pairs (PLAN, 2026-07-13)
+
+Incident: 2026-07-13 09:15 SBILIFE/HDFCLIFE entry — H15 precheck passed
+(estimate Σ 0.20×notional ≈ ₹265k vs cash+collateral), broker rejected the
+HDFCLIFE leg ("required 918,886 vs available 820,090"), C2 reversal ate a
+−₹75 round-trip. Root causes (both in _margin_precheck_ok):
+1. required = Σ notional×0.20 understates cross-stock pairs — SPAN nets
+   only same-underlying spreads (2026-07-03 finding: ADANIENT/RELIANCE
+   real ₹511k vs code ₹328k).
+2. available = live_balance + collateral double-counts collateral already
+   consumed by utilised margin (today: ₹690k vs Zerodha net ₹464k).
+
+## Fix (strategies/pair_trading.py, _margin_precheck_ok only)
+
+- [x] required: ask the broker — kite.basket_order_margins(batch,
+      consider_positions=True), params mirroring order_executor placement
+      (NFO / NRML / LIMIT / regular, qty in shares, price=proposal price);
+      required = max(initial.total, final.total) × 1.05 headroom (LTP
+      drift between check and placement). Any basket failure/shape
+      surprise → WARN + fall back to Σ margin_required exactly as today
+      (flake must not block trading; C2 remains the backstop).
+- [x] available: prefer margins["equity"]["net"] (Zerodha's own free
+      margin: includes collateral, subtracts utilised — preserves the
+      2026-06-11 pledged-account fix without the double-count). Missing
+      "net" → fall back to cash+collateral as today.
+- [x] Leave the 0.20×notional proposal field itself untouched (feeds
+      signal publisher + fallback; raising it would ripple — Rule 3).
+- [x] Tests (TestMarginPrecheck): today's incident as a regression test
+      (basket says 919k, net 820k → no place_order); basket-flake
+      fallback; net-beats-cash+collateral case; existing tests must pass
+      unchanged (MagicMock basket → shape error → fallback path).
+- [x] Run tests/test_pair_trading.py full file.
+- [x] Branch + PR (touches the LIVE order path — operator merges).
+
+## Review (done 2026-07-13)
+
+- _margin_precheck_ok: available now prefers equity.net (falls back to
+  cash+collateral when absent); required now comes from
+  _batch_margin_required → kite.basket_order_margins(consider_positions=
+  True), max(initial,final) × 1.05, estimate-Σ fallback on any failure.
+- 0.20×notional proposal field untouched (publisher + fallback only).
+- Tests: 3 added (incident regression, basket-flake fallback, net-beats-
+  cash+collateral); helper stubs basket to RuntimeError so legacy tests
+  pin the fallback path (auto-MagicMock float()s to 1.0 = vacuous pass).
+  tests/test_pair_trading.py 127 passed; adjacent pair/kalman suites 104
+  passed.
+- Live read-only validation via cached session: basket quote for today's
+  actual legs = ₹234,689 (initial≈final=Σ legs → no netting confirmed).
+  Estimate for THIS pair was close (₹265k); today's decisive error was
+  the available side (cash+collateral ₹690k vs true net ₹464k intraday).
+- NOT deployed: live runner still holds pre-fix code until merge +
+  next session start.
+
+## Code-review round (high-effort, 2026-07-13)
+
+8-angle finder + verify pass on the PR; 11/12 candidates survived. Fixes
+applied on the branch (all in strategies/pair_trading.py unless noted):
+- C1/F2: basket_order_margins now refresh-and-retries on TokenException
+  (mirrors margins() sibling) — a token blip between the two calls no
+  longer silently degrades the gate to the understated Σ estimate.
+- C2: non-dict/None equity blob raises into the shape-guard (added
+  AttributeError to the caught tuple) instead of escaping as an unhandled
+  AttributeError into the tick loop.
+- C3: cash/collateral (log-only) read defensively so a missing 'available'
+  blob can't discard a valid 'net' and skip the gate.
+- F6: non-positive basket total → fall back to Σ estimate (no vacuous
+  required=0 pass).
+- E1: precheck skipped during an M-B5 backoff window (both round-trips
+  were pure waste — _live_execute fails every leg anyway).
+- F8/F9: WARN labels the actual gate source (net vs cash+collateral); INFO
+  logs the raw broker quote AND the headroom factor separately.
+- headroom is now an operator knob (cfg `margin_headroom`, default 1.05 via
+  module DEFAULT_MARGIN_HEADROOM; getattr-safe for __new__ instances).
+- Tests +5: headroom/max both-bind (Rule 9, mutation-verified — fails if
+  either is removed), token-refresh, zeroed-total fallback, non-dict-equity
+  fail-open, net-survives-missing-available; basket stub added to the other
+  5 _live_strategy fixtures (kills vacuous float(MagicMock)=1.0 traversal).
+  test_pair_trading.py 132 passed; adjacent pair/kalman suites 114 passed.
+- Deferred (noted, out of scope): taleb live path has the same estimate-only
+  gate + no batch-reversal (worse blast radius — naked leg) → follow-up;
+  shared basket-quote helper when a 2nd consumer (arbitrage/kalman live)
+  lands (Rule 2: single consumer today).
+
 # DuckDB tape reader + analytics surface (PLAN, 2026-07-12)
 
 Increments 2 + 4 of docs/research/parquet-duckdb-storage-evaluation-2026-07-12.md
