@@ -289,6 +289,7 @@ class KiteOrderExecutor:
         final_status = "PENDING"
         filled_qty = 0
         avg_price = 0.0
+        status_message = ""
         while time.monotonic() < deadline:
             try:
                 history = self.kite.order_history(order_id)
@@ -296,6 +297,12 @@ class KiteOrderExecutor:
                 final_status = latest.get("status", "PENDING")
                 filled_qty = int(latest.get("filled_quantity", 0))
                 avg_price = float(latest.get("average_price") or 0.0)
+                # Zerodha's human-readable reject/cancel reason (e.g.
+                # "Insufficient funds. Margin required: ..."). Surfaced in the
+                # failure path below so the reason lands in the runner logs
+                # instead of requiring a manual kite.orders() lookup.
+                status_message = (latest.get("status_message")
+                                  or latest.get("status_message_raw") or "")
                 if final_status in ("COMPLETE", "REJECTED", "CANCELLED"):
                     break
             except Exception as e:
@@ -335,8 +342,18 @@ class KiteOrderExecutor:
                     "filled_lots": filled_lots, "average_price": avg_price,
                     "mode": "live"}
 
-        # Non-COMPLETE terminal or timeout: best-effort cancel if still open
-        if final_status not in ("REJECTED", "CANCELLED"):
+        reason = status_message or "(no status_message from broker)"
+        if final_status in ("REJECTED", "CANCELLED"):
+            # Terminal broker rejection/cancel — the order settled fast, so
+            # don't mislabel it "non-terminal after Ns". Log and propagate the
+            # exchange reason so the caller's failure log carries it too.
+            logger.warning(
+                "Order %s %s by broker: %s",
+                order_id, final_status, reason,
+            )
+            error = f"{final_status}: {reason}"
+        else:
+            # Still open at timeout: best-effort cancel so it doesn't fill late.
             try:
                 self.kite.cancel_order(
                     variety=self.kite.VARIETY_REGULAR, order_id=order_id,
@@ -348,11 +365,11 @@ class KiteOrderExecutor:
             except Exception as e:
                 logger.warning("cancel_order failed for %s: %s",
                                order_id, e)
+            error = (f"non-terminal after {self.poll_timeout_s}s: "
+                     f"status={final_status}")
         return {"order_id": order_id, "status": "FAILED",
                 "filled_lots": 0, "average_price": 0.0,
-                "error": f"non-terminal after {self.poll_timeout_s}s: "
-                         f"status={final_status}",
-                "mode": "live"}
+                "error": error, "mode": "live"}
 
     def _emergency_reverse_partial(self, prop: TradeProposal,
                                     filled_shares: int,

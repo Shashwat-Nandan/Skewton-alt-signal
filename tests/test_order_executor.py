@@ -195,6 +195,31 @@ class TestNonTerminal:
         assert result["status"] == "FAILED"
         assert kite.cancelled == []
 
+    def test_reject_reason_surfaced_in_error(self):
+        # 2026-07-13: a margin reject's reason lived only in kite.orders(),
+        # never the runner logs. The broker's status_message must ride out on
+        # the FAILED result's error so the caller's failure log carries it,
+        # and a terminal reject must NOT be mislabeled "non-terminal after Ns".
+        kite = FakeKite(history=[
+            {"status": "REJECTED", "filled_quantity": 0, "average_price": 0.0,
+             "status_message": "Insufficient funds. Margin required: 918886.29"},
+        ])
+        result = _executor(kite).execute(_prop())
+        assert result["status"] == "FAILED"
+        assert "Insufficient funds" in result["error"]
+        assert "REJECTED" in result["error"]
+        assert "non-terminal" not in result["error"]
+        assert kite.cancelled == []
+
+    def test_reject_without_status_message_has_placeholder(self):
+        # Reason absent (older/edge broker payloads) must degrade to a clear
+        # placeholder, not an empty/misleading error.
+        kite = FakeKite(history=[
+            {"status": "REJECTED", "filled_quantity": 0, "average_price": 0.0},
+        ])
+        result = _executor(kite).execute(_prop())
+        assert result["error"] == "REJECTED: (no status_message from broker)"
+
 
 class TestPlaceExceptionTaxonomy:
     def test_order_exception_fails_without_retry(self):
