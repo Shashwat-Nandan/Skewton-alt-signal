@@ -296,6 +296,34 @@ orders** and consumes no capital. The decisive missing evidence remains a
 **down-regime** (§6, operator backfill); the kill switch is what makes it safe
 to run forward while that accumulates.
 
+### 5.4 Fine-tune experiments (2026-07-14, `mp_finetune.py`)
+
+Operator asked to raise profit-per-trade and optimise trade count. Four
+**pre-registered** hypotheses (stated in the script docstring before results),
+train/holdout as before, net of 25 bps:
+
+- **H1 breadth K — PASSES.** Per-trade net is monotone in K on the holdout:
+  K=3 → 25.6, K=6 → **42.0 bps** (win 54.2%, portfolio 36.3 bps/day, Sharpe
+  8.0), with train mildly supportive (22.2 vs 21.0) and no trade collapse
+  (48 holdout trades). Broader momentum days → stronger continuation.
+- **H2 top-N by one-timeframing run — REJECTED** (worse in both blocks).
+- **H3 poor-high filter — REJECTED** (train contradicts the Dalton story:
+  9.1 vs 26.5 bps for excess-high; the sign-flip was not adopted — that would
+  be fishing).
+- **H5 hold h=2 — promising, train-ambiguous.** Non-overlapping 2-day holds:
+  holdout **+125 net bps/trade** (t=3.6, 62% win) with **half the
+  round-trips**, and the beta check clears it (holdout drift was *negative*
+  −3.2 bps at h=2, so this is continuation, not market). But plain h=2 was
+  *worse* than h=1 on train (16.9 vs 21.0) — only the non-overlap cut improved
+  train. Single-regime caveat at maximum.
+
+**Decision: deployed runner stays K=3 / h=1.** The K=3 book is a strict
+superset of every K≥k book (same names, subset of days), so the live paper
+runner is the maximal data collector; K=6 and h=2 are re-cut **offline** from
+the same book by re-running `mp_finetune.py` as forward days accrue. Promote a
+lever only when the forward window confirms it — this holdout is semi-worn from
+repeated reads and no longer counts as fresh OOS.
+
 The genuinely tradeable *same-day* question — does an open type fixed from the
 **first K periods** predict the rest-of-day move from an IB-close entry — is a
 separate build (the current label uses the full-day close, so it can't answer

@@ -1,0 +1,35 @@
+[Unit]
+Description=Weekly MP trend_up fine-tune report — re-cut K/hold-horizon levers on forward data
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+# Measurement only: re-runs mp_finetune.py over mp_features and snapshots the
+# forward paper book. No Kite auth, no trading. Output → journald + dated log.
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+Environment=PROJECT_DIR=/opt/taleb-karpathy-kite
+ExecStart=/bin/bash /opt/taleb-karpathy-kite/deploy/run_mp_finetune_report.sh
+# -------------------------------
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache
+# NOTE: do NOT set ProtectHome=true if WorkingDirectory is under /root or /home
+# (status=200/CHDIR before ExecStart). See tasks/lessons.md (2026-05-12).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

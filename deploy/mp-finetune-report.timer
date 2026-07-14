@@ -1,0 +1,14 @@
+[Unit]
+Description=Fire mp-finetune-report.service Saturdays 10:00 IST (week's paper days all booked)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# Saturday morning: the week's mp-features (nightly 18:45) and mp-paper
+# (nightly 18:55) runs are all in, markets closed. Idempotent — safe to catch up.
+OnCalendar=Sat *-*-* 10:00:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=120
+Unit=mp-finetune-report.service
+
+[Install]
+WantedBy=timers.target

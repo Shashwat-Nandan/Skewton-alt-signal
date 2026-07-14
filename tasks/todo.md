@@ -120,6 +120,23 @@ Remaining operator steps:
 - The decisive missing evidence is still a **down-regime backfill** (needs
   Kite) — the kill switch makes forward-running safe while that accumulates.
 
+## Deployed + fine-tune round (done 2026-07-14)
+
+- PR #119 MERGED (80a9263; CI ruff fix 4a58d07). Host: mp-features.timer
+  (18:45 IST) + mp-paper.timer (18:55 IST) installed/enabled (modeled on
+  equity-swing-close, ProtectHome=false); both smoke-tested green.
+  dashboard-backend restarted (/api/mp-trend live, 401-gated); frontend rebuilt
+  via deploy/build-frontend.sh (PROJECT_DIR=/root/...) — MP Trend tab verified
+  on the public URL.
+- `mp_finetune.py` (pre-registered H1/H2/H3/H5, train/holdout, net 25 bps):
+  H1 K≥6 PASSES (holdout 42 net bps/trade, port Sharpe 8.0, no collapse);
+  H2 top-N REJECTED; H3 poor-high REJECTED (train contradicts);
+  H5 hold-2d promising (+125 net bps non-overlap, NOT beta — holdout drift
+  negative) but train-ambiguous. Full table in book-analysis §5.4.
+- **Runner deliberately left at K=3/h=1**: the K=3 book is a superset of every
+  K≥k cut, so forward data re-cuts offline via mp_finetune.py. Promote K=6/h=2
+  only on forward confirmation (~4+ weeks of paper days).
+
 ## Dashboard tab + code-review round (done 2026-07-13)
 
 - Dashboard tab for the paper book: `backend/routers/mp_trend.py`
