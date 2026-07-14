@@ -136,6 +136,12 @@ Remaining operator steps:
 - **Runner deliberately left at K=3/h=1**: the K=3 book is a superset of every
   K≥k cut, so forward data re-cuts offline via mp_finetune.py. Promote K=6/h=2
   only on forward confirmation (~4+ weeks of paper days).
+- PR #120 MERGED (6ef25dd). Weekly re-cut wired: mp-finetune-report.timer
+  (Sat 10:00 IST) → deploy/run_mp_finetune_report.sh → journald + dated
+  logs/mp-finetune-report-<date>.log; installed + smoke-tested green.
+  Review checkpoint: read the Sat reports from ~mid-Aug 2026; if K≥6 (and/or
+  h=2 non-overlap) hold up on forward days, promote via mp-paper.service flag
+  (K) or a small runner change (h=2).
 
 ## Dashboard tab + code-review round (done 2026-07-13)
 
