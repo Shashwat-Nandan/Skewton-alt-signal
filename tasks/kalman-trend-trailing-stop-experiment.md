@@ -36,23 +36,23 @@ sign, not a win").
    from −₹506k to +₹719k. The bias scales with (bar range ÷ stop distance), NOT
    with holding overnight. It is the single biggest threat to ANY tight-stop
    variant, D included.
-2b. **DATA PREREQUISITE — code READY, data re-fetch OUTSTANDING (2026-07-14).**
-   `simulate` now takes optional `highs`/`lows`/`opens` and, when given them,
-   makes exits honest: a stop/target fires when the bar's range actually TOUCHED
-   the level (not merely when the close crossed it), and the fill is the level
-   when price traded through normally or the bar's OPEN when it gapped past.
-   `fetch_index_daily.fetch_closes` now persists OHLC (it was discarding the
-   o/h/l Kite already returned). Same-bar stop+target resolves to the STOP
-   (conservative, documented). The trail ratchets on the bar EXTREME but arms the
-   tightened stop only from the NEXT bar — ratcheting on a bar's own high and then
-   testing that bar's own low would assume the high came first, which OHLC cannot
-   tell you.
-   **STILL BLOCKING: the cached `data_cache/*_5minute.parquet` are close-only**
-   (`datetime, close`) — the OHLC columns only appear on a RE-FETCH, which needs
-   Kite (operator step; never fresh-login while a live runner is active). Until
-   then this experiment must not be re-run: the close-only path is exactly the
-   biased one that produced the fiction. Re-fetch, then re-run
-   `experiment_kalman_trail.py` passing highs/lows/opens.
+2b. **DATA PREREQUISITE — ✅ DONE 2026-07-14. Both blockers cleared.**
+   - *Engine + fetcher* (PR #126): `simulate(highs=, lows=, opens=)` fires a
+     stop/target when the bar's range actually TOUCHED the level and fills at the
+     level (normal trade-through) or the bar's OPEN (gap). OHLC is all-or-nothing
+     and integrity-checked (open/close within [low, high]) — a partial or
+     misaligned set raises rather than silently reverting to the biased path.
+     `fetch_index_daily.fetch_candles` persists OHLC.
+   - *Re-fetch* (operator, 2026-07-14 21:12 IST — markets closed, no runner
+     active, cached Kite session REUSED, backups in
+     `data_cache/_pre_ohlc_backup/`): **both tapes now carry OHLC and are
+     LONGER, not shorter** — 10,050 bars over 134 sessions,
+     2025-12-26 → 2026-07-14 (was 9,000 / 2025-12-30 → 2026-06-25). Guards pass
+     on the real Kite data; every close-only consumer is unaffected.
+   - **First measurement on honest fills:** same params, same tape, NIFTY —
+     close-only **1095.2 pts (130 trades)** vs honest OHLC **882.9 pts (132
+     trades)**: **−212.4 pts = −₹15,926**. The close-only cache was flattering
+     even the INCUMBENT wide-stop config, not just the tight trail.
 
 3. **Margin model.** 78/153 trades in the exploratory run went overnight →
    NRML (~₹1.2–1.5L/lot) not MIS (~₹40–50k). Sharpe is capital-blind; the
