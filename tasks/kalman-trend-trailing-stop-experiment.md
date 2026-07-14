@@ -36,18 +36,24 @@ sign, not a win").
    from −₹506k to +₹719k. The bias scales with (bar range ÷ stop distance), NOT
    with holding overnight. It is the single biggest threat to ANY tight-stop
    variant, D included.
-2b. **DATA PREREQUISITE (new, blocking).** Our 5-min cache
-   (`data_cache/*_5minute.parquet`) stores **`datetime, close` only** — no
-   high/low. Without OHLC we cannot know whether or where a stop was touched
-   intrabar; the honest fill is bounded by [triggering close, stop level] and
-   that band (13–36 pts) **exceeds the trail distance being tested**. Booking at
-   the close instead is not a fix — it swaps optimism for pessimism. **A tight
-   trail is not evaluable on this data at all.** Re-fetch 5-min OHLC from Kite
-   (it returns o/h/l/c; the cache discarded them) before re-running. Per
-   `feedback_data_resolution_over_backtest`: capture the right data, do not ship
-   a backtest "with caveats". NOTE the live book polls real prices intrabar via
-   `check_exit`, so live trailing would behave differently from ANY close-only
-   backtest — another reason the data must match.
+2b. **DATA PREREQUISITE — code READY, data re-fetch OUTSTANDING (2026-07-14).**
+   `simulate` now takes optional `highs`/`lows`/`opens` and, when given them,
+   makes exits honest: a stop/target fires when the bar's range actually TOUCHED
+   the level (not merely when the close crossed it), and the fill is the level
+   when price traded through normally or the bar's OPEN when it gapped past.
+   `fetch_index_daily.fetch_closes` now persists OHLC (it was discarding the
+   o/h/l Kite already returned). Same-bar stop+target resolves to the STOP
+   (conservative, documented). The trail ratchets on the bar EXTREME but arms the
+   tightened stop only from the NEXT bar — ratcheting on a bar's own high and then
+   testing that bar's own low would assume the high came first, which OHLC cannot
+   tell you.
+   **STILL BLOCKING: the cached `data_cache/*_5minute.parquet` are close-only**
+   (`datetime, close`) — the OHLC columns only appear on a RE-FETCH, which needs
+   Kite (operator step; never fresh-login while a live runner is active). Until
+   then this experiment must not be re-run: the close-only path is exactly the
+   biased one that produced the fiction. Re-fetch, then re-run
+   `experiment_kalman_trail.py` passing highs/lows/opens.
+
 3. **Margin model.** 78/153 trades in the exploratory run went overnight →
    NRML (~₹1.2–1.5L/lot) not MIS (~₹40–50k). Sharpe is capital-blind; the
    comparison MUST be return-on-margin, not points, or trailing wins on a

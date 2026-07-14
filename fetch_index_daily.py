@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Fetch daily index closes → data_cache/<SYMBOL>_daily.parquet (date,close).
+Fetch daily index candles → data_cache/<SYMBOL>_daily.parquet
+(date,open,high,low,close). Intraday intervals write <SYMBOL>_<interval>.parquet
+with a `datetime` column. OHLC (not just close) so a backtest can tell a stop
+that was TOUCHED intrabar from one the close merely crossed (#122).
 ==========================================================================
 Feeds the Kalman trend-following correctness gate (`validate_kalman_trend.py`)
 and backtest, which read `data_cache/<SYMBOL>_daily.{parquet,csv}`. Indices (NIFTY,
@@ -76,12 +79,27 @@ _INTERVAL_CHUNK_DAYS = {
 }
 
 
-def fetch_closes(kite, token: int, from_date: date, to_date: date,
-                 interval: str = "day") -> pd.DataFrame:
-    """Pull candles at `interval` in chunks; return a (ts, close) frame
-    sorted/deduped. The timestamp column is `date` for daily (one row/day) and
-    `datetime` for intraday (so the backtest's `close`-column reader is happy
-    either way)."""
+def fetch_candles(kite, token: int, from_date: date, to_date: date,
+                  interval: str = "day") -> pd.DataFrame:
+    """Pull candles at `interval` in chunks; return a (ts, open, high, low, close)
+    frame sorted/deduped. The timestamp column is `date` for daily (one row/day)
+    and `datetime` for intraday (so the backtest's `close`-column reader is happy
+    either way).
+
+    Named `fetch_candles`, not `fetch_closes`: it returns the whole candle. The
+    old name understated what it had in hand and is arguably why the o/h/l were
+    thrown away for so long — a name that undersells its payload invites
+    re-dropping it.
+
+    Why OHLC and not just the close (#122): Kite returns open/high/low/close and
+    this function used to throw o/h/l away. Without high/low a backtest cannot
+    know whether a stop was TOUCHED intrabar — it can only compare the close to
+    the level — so the honest fill is bounded by [triggering close, stop level].
+    That band was measured at 13–36 pts on 5-min index bars, i.e. WIDER than a
+    25-pt trailing stop, which made tight-stop strategies unevaluable and let
+    level-booking manufacture ₹1.2M of fiction on one tape. The columns are
+    additive: every existing reader selects `close` by name and is unaffected.
+    """
     chunk_days = _INTERVAL_CHUNK_DAYS.get(interval, 90)
     is_daily = interval == "day"
     rows = []
@@ -93,12 +111,13 @@ def fetch_closes(kite, token: int, from_date: date, to_date: date,
             ts = c["date"]
             if is_daily:
                 ts = ts.date() if hasattr(ts, "date") else ts
-            rows.append((ts, float(c["close"])))
+            rows.append((ts, float(c["open"]), float(c["high"]),
+                         float(c["low"]), float(c["close"])))
         cur = chunk_end + timedelta(days=1)
     if not rows:
         raise ValueError("Kite returned no candles for the requested range")
     col = "date" if is_daily else "datetime"
-    df = (pd.DataFrame(rows, columns=[col, "close"])
+    df = (pd.DataFrame(rows, columns=[col, "open", "high", "low", "close"])
           .drop_duplicates(col).sort_values(col).reset_index(drop=True))
     return df
 
@@ -135,7 +154,7 @@ def main() -> int:
 
     kite = KiteAuthManager(args.config).get_kite()
     token = resolve_index_token(kite, args.symbol, args.nse_symbol)
-    df = fetch_closes(kite, token, from_d, to_d, args.interval)
+    df = fetch_candles(kite, token, from_d, to_d, args.interval)
 
     stem = args.symbol if args.interval == "day" else f"{args.symbol}_{args.interval}"
     suffix = "daily" if args.interval == "day" else args.interval

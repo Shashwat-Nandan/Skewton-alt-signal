@@ -388,3 +388,114 @@ def test_end_of_series_force_close_charges_its_exit_cost_to_daily():
     assert res.realized_pnl == pytest.approx(-4.0)
     # daily must agree with realized once the trade is closed at the last bar
     assert float(res.daily_pnl.sum()) == pytest.approx(res.realized_pnl)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# OHLC fills (#122): touched-vs-closed-beyond, and gap-aware fill prices
+# ──────────────────────────────────────────────────────────────────────────
+def test_ohlc_stop_fires_when_TOUCHED_intrabar_even_if_the_close_recovers():
+    """The close-only engine misses a stop the bar traded through and recovered
+    from — it holds a position that was really stopped out. With high/low the
+    touch is seen. Entry 100, stop 90; the bar dips to 89 and closes at 99."""
+    close_only = o.simulate([100.0, 99.0], [1, 0], stop_ticks=10, target_ticks=999)
+    with_ohlc = o.simulate([100.0, 99.0], [1, 0], stop_ticks=10, target_ticks=999,
+                           highs=[100.0, 101.0], lows=[100.0, 89.0],
+                           opens=[100.0, 99.5])
+    assert close_only.n_trades == 1                    # only the end-of-series close
+    assert close_only.realized_pnl == pytest.approx(-1.0)   # rode to 99, never "stopped"
+    assert with_ohlc.realized_pnl == pytest.approx(-10.0)   # stopped at 90
+    assert with_ohlc.n_trades == 1
+
+
+def test_ohlc_gap_through_the_stop_fills_at_the_OPEN_not_the_level():
+    """The whole point: you do not get your stop price when the bar gaps past it.
+    Entry 100, stop 90, next bar OPENS at 80 → fill 80, not 90. Booking at the
+    level here is the bias that manufactured ₹1.2M on one tape."""
+    res = o.simulate([100.0, 82.0], [1, 0], stop_ticks=10, target_ticks=999,
+                     highs=[100.0, 83.0], lows=[100.0, 79.0], opens=[100.0, 80.0])
+    assert res.realized_pnl == pytest.approx(-20.0)    # 80 - 100, NOT -10
+    assert res.n_trades == 1
+
+
+def test_ohlc_normal_trade_through_fills_at_the_LEVEL():
+    """When the bar did NOT gap, price genuinely traded at the stop, so the level
+    IS the honest fill — OHLC makes level-booking correct rather than optimistic."""
+    res = o.simulate([100.0, 88.0], [1, 0], stop_ticks=10, target_ticks=999,
+                     highs=[100.0, 99.0], lows=[100.0, 87.0], opens=[100.0, 98.0])
+    assert res.realized_pnl == pytest.approx(-10.0)    # filled at 90
+
+
+def test_ohlc_same_bar_stop_and_target_assumes_the_STOP_first():
+    """Without tick data the order is unknowable; the conservative convention is
+    documented and pinned so it can never silently flip to the favourable one."""
+    res = o.simulate([100.0, 100.0], [1, 0], stop_ticks=10, target_ticks=10,
+                     highs=[100.0, 115.0], lows=[100.0, 85.0], opens=[100.0, 100.0])
+    assert res.realized_pnl == pytest.approx(-10.0)    # stop, not the +10 target
+
+
+def test_ohlc_short_side_mirrors():
+    # short from 100, stop 110: bar touches 112 without gapping -> fill at 110
+    res = o.simulate([100.0, 105.0], [-1, 0], stop_ticks=10, target_ticks=999,
+                     highs=[100.0, 112.0], lows=[100.0, 99.0], opens=[100.0, 101.0])
+    assert res.realized_pnl == pytest.approx(-10.0)
+
+
+def test_ohlc_trail_ratchets_on_the_bar_EXTREME_not_the_close():
+    """A trail follows the peak the market actually REACHED, not the peak close.
+
+    Asserts the CONTRAST, not just the OHLC branch: close-only sees peak 108 →
+    stop 98 → never exits (rides to the end); with highs the peak is 120 → stop
+    110 → the retrace to 109 exits there. Without both assertions a regression to
+    close-ratcheting could pass unnoticed.
+    """
+    prices = [100.0, 108.0, 109.0]
+    highs = [100.0, 120.0, 111.0]
+    lows = [100.0, 100.0, 109.0]
+    with_ohlc = o.simulate(prices, [1, 0, 0], stop_ticks=999, target_ticks=999,
+                           trail_ticks=10, highs=highs, lows=lows,
+                           opens=[100.0, 101.0, 110.0])
+    close_only = o.simulate(prices, [1, 0, 0], stop_ticks=999, target_ticks=999,
+                            trail_ticks=10)
+    assert with_ohlc.realized_pnl == pytest.approx(10.0)    # trailed to 110
+    # close-only never trails above 99 (peak=109 at the last bar), so it never
+    # stops out and rides to the final close: +9, NOT the honest +10.
+    assert close_only.realized_pnl == pytest.approx(9.0)
+    assert with_ohlc.realized_pnl != close_only.realized_pnl
+
+
+def test_partial_ohlc_is_refused_not_silently_downgraded():
+    """All-or-nothing (Rule 12). highs-without-lows silently fell back to the
+    close-only path, and highs+lows without opens silently booked GAPS at the
+    LEVEL — reinstating the exact bias OHLC exists to remove. The caller that
+    wires this (#122's fit/harness step) is the one that would trip it."""
+    for kw in ({"highs": [1.0, 2.0]},                       # lows+opens missing
+               {"highs": [1.0, 2.0], "lows": [0.5, 1.5]}):  # opens missing
+        with pytest.raises(ValueError, match="all-or-nothing"):
+            o.simulate([1.0, 2.0], [1, 0], stop_ticks=10, target_ticks=10, **kw)
+
+
+def test_ohlc_integrity_violation_fails_loud():
+    """Only lengths were checked, so a misaligned/shifted OHLC slice — a live risk
+    when threading highs[b:c] through walk-forward folds — silently mis-filled
+    every trade. A close outside its own bar's [low, high] must raise."""
+    with pytest.raises(ValueError, match="integrity"):
+        o.simulate([100.0, 50.0], [1, 0], stop_ticks=10, target_ticks=999,
+                   highs=[100.0, 101.0], lows=[100.0, 99.0], opens=[100.0, 100.0])
+    with pytest.raises(ValueError, match="integrity"):        # low > high
+        o.simulate([100.0, 100.0], [1, 0], stop_ticks=10, target_ticks=999,
+                   highs=[100.0, 99.0], lows=[100.0, 101.0], opens=[100.0, 100.0])
+
+
+def test_ohlc_length_mismatch_fails_loud():
+    with pytest.raises(ValueError, match="highs length"):
+        o.simulate([100.0, 101.0], [1, 0], stop_ticks=10, target_ticks=10,
+                   highs=[100.0], lows=[99.0, 98.0])
+
+
+def test_close_only_path_unchanged_when_ohlc_absent():
+    """Regression: every existing caller passes closes only and must be
+    byte-identical to before this change."""
+    a = o.simulate([100.0, 101.0, 130.0], [1, 0, 0], stop_ticks=50, target_ticks=25)
+    b = o.simulate([100.0, 101.0, 130.0], [1, 0, 0], stop_ticks=50, target_ticks=25,
+                   highs=None, lows=None, opens=None)
+    assert a.realized_pnl == b.realized_pnl == pytest.approx(25.0)

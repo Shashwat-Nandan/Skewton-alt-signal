@@ -11,17 +11,33 @@ Pure and I/O-free (no Kite, no disk) — the correctness gate
 (`validate_kalman_trend.py`) and the backtest call into it; tests exercise it
 directly.
 
-Daily-close approximation (Rule 12)
------------------------------------
+Fill models — OHLC (honest) vs daily-close approximation (Rule 12)
+-----------------------------------------------------------------
 The paper enters with a market order at the next OPEN and exits at a fixed
-profit-target / stop-loss in ticks intraday. Our cached series are daily CLOSES
-only, so we approximate faithfully but explicitly:
+profit-target / stop-loss in ticks intraday. `simulate` supports two fill models;
+which one you get depends ENTIRELY on whether you pass OHLC.
+
+**Preferred — pass `highs`/`lows`/`opens` (all three, or none):**
+  • a stop/target fires when the bar's RANGE actually touched the level,
+  • the fill is that level on a normal trade-through, or the bar's OPEN when the
+    bar gapped past it (you do not get your price through a gap).
+
+**Fallback — closes only (`highs=None`):** we can only see whether the CLOSE
+crossed the level, and must book AT the level:
   • the directional signal is decided causally at close t (uses data ≤ t),
   • entry fills at close t (the bar whose close produced the signal),
-  • a stop/target is hit when a later close crosses it, and the trade books at
-    the stop/target price (not the close).
-This understates intraday stop/target precision but keeps the comparison Kalman
-vs MA on an identical, look-ahead-free footing — which is what the gate needs.
+  • a stop/target is hit when a later close crosses it, booking at the level.
+This is FINE for a wide fixed stop (rarely triggers; overshoot is small next to
+the distance) and keeps Kalman vs MA on an identical, look-ahead-free footing —
+which is what the daily gates need. It is NOT fine for a tight stop/trail: the
+bias scales with (bar range ÷ stop distance) and manufactures money. Measured
+2026-07-14 on BANKNIFTY 5-min at trail=25, the mean overshoot (level − triggering
+close) was 35.9 pts — larger than the trail itself — flipping the tape from
+−₹506k to +₹719k. See `simulate`'s `highs` note and
+tasks/kalman-trend-trailing-stop-experiment.md §0.2.
+
+Our cached `*_5minute.parquet` are still close-only; `fetch_index_daily` now
+persists OHLC, so the columns appear on a re-fetch (#122).
 """
 from __future__ import annotations
 
@@ -157,6 +173,9 @@ def simulate(
     cost_per_unit: float = 0.0,
     session_ends=None,
     trail_ticks=None,
+    highs=None,
+    lows=None,
+    opens=None,
 ) -> SimResult:
     """Walk the series: enter (at close) on a nonzero `direction` when flat,
     manage a fixed-tick stop/target, mark to market each bar. `stop_ticks` and
@@ -169,21 +188,27 @@ def simulate(
     instead of a fixed level — the issue #122 candidate. Combine with
     `session_ends` for variant D (trail + keep the daily flatten).
 
-    ⚠️  TRAIL RESULTS ARE ONLY MEANINGFUL WHEN trail_ticks >> the bar's typical
-    range. Like every exit here, a trail books at the stop LEVEL. That is benign
-    for a WIDE fixed stop (rarely triggers; overshoot small vs the distance) but
-    manufactures money for a TIGHT trail on close-only data: measured 2026-07-14
-    on BANKNIFTY 5-min with trail=25, the mean overshoot (level − triggering
-    close) was **35.9 pts — larger than the 25-pt trail itself**, flipping the
-    full tape from −₹506k (realistic fill) to +₹719k (booked at level). NIFTY
-    gifted 13.2 pts/exit.
+    `highs` / `lows` / `opens`: optional per-bar OHLC (len == len(prices)). Supply
+    them and exits become HONEST (#122):
+      - a stop/target triggers when the bar's high/low actually TOUCHED the level
+        (not merely when the close crossed it), and
+      - the fill is the LEVEL when price traded through it normally, or the bar's
+        OPEN when the bar GAPPED past the level (you get the open, not your price).
+    Without them the engine can only compare the CLOSE to the level and must book
+    at the level, which is:
+      - benign for a WIDE fixed stop (rarely triggers; overshoot small vs the
+        distance), but
+      - money-manufacturing for a TIGHT stop/trail: measured 2026-07-14 on
+        BANKNIFTY 5-min with trail=25, the mean overshoot (level − triggering
+        close) was **35.9 pts — larger than the 25-pt trail itself**, flipping the
+        tape from −₹506k to +₹719k (NIFTY gifted 13.2 pts/exit).
+    The close-only bias scales with (bar range ÷ stop distance), NOT with holding
+    overnight. Booking at the close instead is not a fix — it swaps an optimistic
+    bias for a pessimistic one; only OHLC resolves it.
 
-    Root cause: our 5-min cache stores CLOSES ONLY, so we cannot know whether or
-    where the stop was touched intrabar — the honest fill is bounded by
-    [triggering close, stop level] and that band exceeds the signal. Evaluating a
-    tight trail needs 5-min OHLC (high/low). Do not "fix" this by booking at the
-    close instead: that just swaps an optimistic bias for a pessimistic one. See
-    tasks/kalman-trend-trailing-stop-experiment.md §0.
+    Same-bar stop AND target: without tick data the order is unknowable, so the
+    STOP is assumed first (the conservative convention). Documented rather than
+    silently favourable.
 
     `session_ends`: optional bool mask (len == len(prices)). Where True, any open
     position is force-closed at that bar's close — the INTRADAY runner's 15:25
@@ -209,11 +234,79 @@ def simulate(
         if len(session_ends) != n:
             raise ValueError(
                 f"session_ends length {len(session_ends)} != prices length {n}")
+    for _nm, _a in (("highs", highs), ("lows", lows), ("opens", opens)):
+        if _a is not None and len(_a) != n:
+            raise ValueError(f"{_nm} length {len(_a)} != prices length {n}")
+    # OHLC is ALL-OR-NOTHING (Rule 12). Accepting a partial set silently
+    # reinstates the very bias this engine exists to remove:
+    #   - highs without lows  -> has_ohlc False -> silently the close-only path;
+    #   - highs+lows w/o opens -> honest TOUCH detection but gaps still book at
+    #     the LEVEL (measured: a gap to open=80 through a 90 stop books -10
+    #     instead of the honest -20).
+    # The caller that will wire this (the #122 fit/harness step) is exactly the
+    # one that would trip it, so refuse rather than half-apply the fix.
+    _ohlc_given = {nm for nm, a in (("highs", highs), ("lows", lows),
+                                    ("opens", opens)) if a is not None}
+    if _ohlc_given and _ohlc_given != {"highs", "lows", "opens"}:
+        raise ValueError(
+            "OHLC must be all-or-nothing: pass highs, lows AND opens together "
+            f"(got {sorted(_ohlc_given)}; missing "
+            f"{sorted({'highs', 'lows', 'opens'} - _ohlc_given)}). A partial set "
+            "silently falls back to close-only fills or books gaps at the stop "
+            "LEVEL — the exact bias OHLC is here to fix.")
+    has_ohlc = bool(_ohlc_given)
+    if has_ohlc:
+        highs = np.asarray(highs, float)
+        lows = np.asarray(lows, float)
+        opens = np.asarray(opens, float)
+        # Integrity: every bar's open AND close must lie inside [low, high]. Only
+        # lengths were checked before, so a misaligned/shifted slice (highs[b:c]
+        # against closes[b-1:c-1] — a live risk when threading OHLC through the
+        # walk-forward folds) silently mis-filled every trade instead of erroring.
+        _p = np.asarray(prices, float)
+        _bad = (lows > highs) | (_p < lows) | (_p > highs) | (opens < lows) | (opens > highs)
+        if _bad.any():
+            i = int(np.argmax(_bad))
+            raise ValueError(
+                f"OHLC integrity violated at bar {i}: open={opens[i]}, "
+                f"high={highs[i]}, low={lows[i]}, close={_p[i]} — open/close must "
+                "lie within [low, high] and low <= high. Usually a misaligned or "
+                "shifted OHLC slice.")
     if n < 2:
         return SimResult(np.zeros(n), 0, 0.0, float("nan"))   # undefined, not a sentinel
     stop_d = abs(stop_ticks) * tick_size
     target_d = abs(target_ticks) * tick_size
     trail_d = abs(trail_ticks) * tick_size if trail_ticks is not None else None
+
+    # `has_ohlc` is loop-invariant, so bind the fill rule ONCE rather than branch
+    # per bar: simulate() is the CMA-ES fitness function (n_gen x popsize x folds
+    # x seeds calls), so a per-call closure + a per-bar Python call is real cost
+    # in the fit path.
+    if has_ohlc:
+        def _fill(level, side, t, *, is_stop):
+            """Honest fill: a level is reached when the bar's RANGE covers it; the
+            fill is that level, unless the bar OPENED beyond it (a gap) — then you
+            get the open, because you do not get your price through a gap."""
+            # For a long: stop is BELOW (needs lo), target ABOVE (needs hi).
+            # Short mirrors.
+            if (side > 0) == is_stop:
+                if lows[t] > level:                  # long stop / short target
+                    return None
+                return float(opens[t]) if opens[t] < level else level
+            if highs[t] < level:                     # long target / short stop
+                return None
+            return float(opens[t]) if opens[t] > level else level
+    else:
+        def _fill(level, side, t, *, is_stop):
+            """Legacy close-only fill: can only see whether the CLOSE crossed the
+            level, and must book AT the level — biased by (bar range / stop
+            distance). See the class-level note on `highs`."""
+            c_ = prices[t]
+            if is_stop:
+                reached = c_ <= level if side > 0 else c_ >= level
+            else:
+                reached = c_ >= level if side > 0 else c_ <= level
+            return level if reached else None
 
     daily = np.zeros(n)
     pos = 0          # -1 / 0 / +1
@@ -226,24 +319,29 @@ def simulate(
         if pos != 0 and t > 0:
             daily[t] += pos * (c - prices[t - 1])      # mark to close
         if pos != 0:
-            hit = None
-            if trail_d is not None:
-                # Ratchet the peak favourable excursion, then trail the stop
-                # behind it. Never loosens: a new peak moves the stop up (long)
-                # / down (short); a retrace of `trail_d` from the peak exits.
-                peak = max(peak, c) if pos > 0 else min(peak, c)
-                stop = peak - pos * trail_d
-                hit = stop if (c <= stop if pos > 0 else c >= stop) else None
-            elif pos > 0:
-                hit = stop if c <= stop else (tgt if c >= tgt else None)
-            else:
-                hit = stop if c >= stop else (tgt if c <= tgt else None)
+            # Check the stop/target IN FORCE for this bar — for a trail that is
+            # the level derived from the peak through t-1. Ratcheting on this
+            # bar's own extreme and then testing this bar's own low against the
+            # result would assume the high happened BEFORE the low, which is
+            # unknowable from OHLC: a bar would get stopped out by its own low at
+            # a stop derived from its own high. So: check, THEN ratchet.
+            hit = _fill(stop, pos, t, is_stop=True)
+            if hit is None and trail_d is None:
+                # Stop first when both are reachable in one bar (see docstring).
+                hit = _fill(tgt, pos, t, is_stop=False)
             if hit is not None:
                 daily[t] += pos * (hit - c)            # adjust close→exit price
                 daily[t] -= cost_per_unit
                 realized += pos * (hit - entry) - 2 * cost_per_unit
                 n_trades += 1
                 pos = 0
+            elif trail_d is not None:
+                # Survived the bar → ratchet the peak on this bar's favourable
+                # EXTREME (with OHLC; the close otherwise) and arm the tightened
+                # stop for the NEXT bar. Never loosens.
+                ext = (highs[t] if pos > 0 else lows[t]) if has_ohlc else c
+                peak = max(peak, ext) if pos > 0 else min(peak, ext)
+                stop = peak - pos * trail_d
         if pos == 0 and direction[t] != 0:
             pos = int(direction[t])
             entry = c
@@ -389,6 +487,9 @@ def fit_kalman_trend(
     n_gen: int = 200,
     seed: int = 0,
     session_ends=None,
+    highs=None,
+    lows=None,
+    opens=None,
 ) -> dict:
     """Joint CMA-ES fit of the model-1 Kalman trend strategy on `train_prices`,
     maximizing Sharpe − l1_lambda·‖p_filter‖₁ (paper §6) with the L1 taken in
@@ -411,7 +512,8 @@ def fit_kalman_trend(
         except (ValueError, NotImplementedError):
             return 1e12   # divergent filter → worst fitness
         res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
-                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
+                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
         penalty = l1_lambda * float(np.sum(np.abs(x[:5]) / fhi))
         return -(res.sharpe - penalty)
 
@@ -421,7 +523,8 @@ def fit_kalman_trend(
     p = _decision_to_pvector(best_x)
     direction = kalman_direction(prices, p, model=model, mu=best_x[5])
     res = simulate(prices, direction, stop_ticks=best_x[6], target_ticks=best_x[7],
-                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
+                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
     return {
         "filter_params": p.tolist(),
         "mu": float(best_x[5]),
@@ -451,6 +554,9 @@ def fit_ma_crossover(
     n_gen: int = 200,
     seed: int = 0,
     session_ends=None,
+    highs=None,
+    lows=None,
+    opens=None,
 ) -> dict:
     """Joint CMA-ES fit of the moving-average crossover baseline (Algorithm 5),
     maximizing train Sharpe — the paper optimizes the baseline's params too, for
@@ -468,7 +574,8 @@ def fit_ma_crossover(
         except ValueError:
             return 1e12
         res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
-                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
+                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
         return -res.sharpe
 
     x0 = np.array([10.0, 50.0, 0.5 * d, 5.0 * d, 10.0 * d])
@@ -477,7 +584,8 @@ def fit_ma_crossover(
     short, long, offset, stop, target = best_x
     direction = ma_direction(prices, short=short, long=long, offset=offset)
     res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
-                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
+                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
     return {
         "short": int(round(short)), "long": int(round(long)),
         "offset": float(offset), "stop_ticks": float(stop),
@@ -520,6 +628,9 @@ def fit_kalman_reduced(
     n_gen: int = 120,
     seed: int = 0,
     session_ends=None,
+    highs=None,
+    lows=None,
+    opens=None,
 ) -> dict:
     """Reduced 4-param CMA-ES fit (Option B). Returns model-2 filter params + the
     trade params + train Sharpe. Tagged `model=2` so `evaluate` reconstructs it."""
@@ -534,7 +645,8 @@ def fit_kalman_reduced(
         except (ValueError, NotImplementedError):
             return 1e12
         res = simulate(prices, direction, stop_ticks=x[2], target_ticks=x[3],
-                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
+                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
         return -res.sharpe
 
     x0 = np.array([0.2 * d, 0.2 * d, 5.0 * d, 10.0 * d])
@@ -543,7 +655,8 @@ def fit_kalman_reduced(
     p = _reduced_to_pvector(best_x, d)
     direction = kalman_direction(prices, p, model=2, mu=best_x[1])
     res = simulate(prices, direction, stop_ticks=best_x[2], target_ticks=best_x[3],
-                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
+                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
     return {
         "model": 2, "filter_params": p.tolist(), "s_vel": float(best_x[0]),
         "mu": float(best_x[1]), "stop_ticks": float(best_x[2]),
@@ -553,7 +666,8 @@ def fit_kalman_reduced(
 
 
 def evaluate(prices, *, kind: str, params: dict, tick_size: float = 1.0,
-             cost_per_unit: float = 0.0, session_ends=None) -> SimResult:
+             cost_per_unit: float = 0.0, session_ends=None,
+             highs=None, lows=None, opens=None) -> SimResult:
     """Run a fitted parameter set forward on `prices` (e.g. the test slice).
     `kind` ∈ {'kalman','ma'}. Causal — the signal is regenerated on this slice.
     Pass `session_ends` for an intraday series so the evaluation models the
@@ -569,4 +683,5 @@ def evaluate(prices, *, kind: str, params: dict, tick_size: float = 1.0,
         raise ValueError(f"unknown kind {kind!r}")
     return simulate(prices, d, stop_ticks=params["stop_ticks"],
                     target_ticks=params["target_ticks"], tick_size=tick_size,
-                    cost_per_unit=cost_per_unit, session_ends=session_ends)
+                    cost_per_unit=cost_per_unit, session_ends=session_ends,
+                       highs=highs, lows=lows, opens=opens)
