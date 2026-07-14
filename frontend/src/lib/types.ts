@@ -296,6 +296,45 @@ export type BuyOnGapResponse = {
   open_positions: BuyOnGapOpenPosition[];
 };
 
+// Market-Profile trend_up paper book (run_paper_mp.py → dashboard.db).
+export type MpTrendDailyRun = {
+  date: string;
+  n_trend_up: number;
+  n_opened: number;
+  n_closed: number;
+  day_net: number;
+  /** Cumulative realized net as of this run (already cumulative). */
+  cum_net: number;
+  halted: boolean;
+  reason: string | null;
+};
+
+export type MpTrendOpenPosition = {
+  symbol: string;
+  entry_date: string;
+  entry_px: number;
+  qty: number;
+  notional: number;
+};
+
+export type MpTrendSummary = {
+  net_pnl: number;
+  gross_pnl: number;
+  costs: number;
+  n_closed_trades: number;
+  n_open_positions: number;
+  win_rate: number;
+  latest_date: string | null;
+  halted: boolean;
+  halt_reason: string | null;
+};
+
+export type MpTrendResponse = {
+  summary: MpTrendSummary;
+  daily: MpTrendDailyRun[];
+  open_positions: MpTrendOpenPosition[];
+};
+
 // ── Kalman pairs (time-varying hedge ratio) ──
 
 export type KalmanPair = {

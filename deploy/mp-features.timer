@@ -1,0 +1,19 @@
+[Unit]
+Description=Fire mp-features.service nightly at 18:45 IST (after EOD bar backfill)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 18:45 IST — well after the 15:30 close and the intraday bar backfill, so the
+# day's 30-min bars are present in dashboard.db before we classify them. Runs
+# every day; weekends/holidays simply re-log the same (idempotent) rows.
+OnCalendar=*-*-* 18:45:00 Asia/Kolkata
+
+# If the VPS was asleep at 18:45, run once on wake to catch up. Safe: the logger
+# is idempotent (INSERT OR REPLACE on UNIQUE(source, instrument, day)).
+Persistent=true
+RandomizedDelaySec=120
+
+Unit=mp-features.service
+
+[Install]
+WantedBy=timers.target

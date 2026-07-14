@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink } from "react-router-dom";
 import {
-  LogOut, Menu, X, Activity, BarChart3, Briefcase, GitBranch, Layers, Scale,
-  Sigma, TrendingDown, TrendingUp,
+  LogOut, Menu, X, Activity, BarChart3, Briefcase, CandlestickChart, GitBranch,
+  Layers, Scale, Sigma, TrendingDown, TrendingUp,
   type LucideIcon,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -18,6 +18,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Strategies", end: true },
   { to: "/positions", label: "Positions", icon: Briefcase },
   { to: "/market-profile", label: "Market Profile", icon: BarChart3 },
+  { to: "/mp-trend", label: "MP Trend (paper)", icon: CandlestickChart },
   { to: "/pair-candidates", label: "Pair Candidates", icon: GitBranch, end: true },
   { to: "/pair-candidates/persistent", label: "Persistent Pairs", icon: Layers },
   { to: "/equity-swing", label: "Equity Swing", icon: TrendingUp },

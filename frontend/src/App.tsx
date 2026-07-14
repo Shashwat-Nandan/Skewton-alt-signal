@@ -11,6 +11,7 @@ import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { KalmanPairsPage } from "@/pages/KalmanPairsPage";
 import { KalmanTrendPage } from "@/pages/KalmanTrendPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
+import { MpTrendPage } from "@/pages/MpTrendPage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
 import { PositionsPage } from "@/pages/PositionsPage";
 import { RunPage } from "@/pages/RunPage";
@@ -64,6 +65,7 @@ export default function App() {
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />
+          <Route path="/mp-trend" element={<MpTrendPage />} />
           <Route path="/pair-candidates" element={<PairCandidatesPage />} />
           <Route
             path="/pair-candidates/persistent"

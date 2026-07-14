@@ -11,6 +11,7 @@ import type {
   KalmanTrendResponse,
   MarketProfileResponse,
   MarketProfileSymbol,
+  MpTrendResponse,
   PairCandidatesResponse,
   PaperCompareResponse,
   PositionsResponse,
@@ -123,6 +124,13 @@ export const api = {
     if (params.system) q.set("system", params.system);
     const qs = q.toString();
     return http<BuyOnGapResponse>(`/buy-on-gap-paper${qs ? `?${qs}` : ""}`);
+  },
+
+  mpTrend: (params: { days?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    const qs = q.toString();
+    return http<MpTrendResponse>(`/mp-trend${qs ? `?${qs}` : ""}`);
   },
 
   kalmanPairs: (params: { end?: string } = {}) => {

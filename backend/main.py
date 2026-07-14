@@ -27,6 +27,7 @@ from .routers import (
     kalman_pairs,
     kalman_trend,
     market_profile,
+    mp_trend,
     pair_candidates,
     pair_paper_compare,
     positions,
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(strategies.router, prefix="/api", dependencies=gated)
     app.include_router(runs.router, prefix="/api", dependencies=gated)
     app.include_router(market_profile.router, prefix="/api", dependencies=gated)
+    app.include_router(mp_trend.router, prefix="/api", dependencies=gated)
     app.include_router(pair_candidates.router, prefix="/api", dependencies=gated)
     app.include_router(pair_paper_compare.router, prefix="/api", dependencies=gated)
     app.include_router(kalman_pairs.router, prefix="/api", dependencies=gated)

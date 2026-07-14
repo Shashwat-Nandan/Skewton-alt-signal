@@ -1,0 +1,44 @@
+[Unit]
+Description=Market-Profile trend_up paper runner — EOD overnight-continuation (paper only)
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+# Ordering: needs the day's 30-min bars present. Run AFTER the nightly
+# fetch_bars.py --update (Kite) and after mp-features. If you template those as
+# units, add them here (After=/Requires=). Otherwise ensure the timer fires
+# late enough that the bar update has finished.
+OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# Type=oneshot: EOD batch. It reads already-stored bars and books paper fills at
+# the close — no Kite, no live quotes, no order path.
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+# No EnvironmentFile: paper runner needs NO Kite auth (reads dashboard.db only).
+# --min-signals 3 = the broad-momentum filter that made the edge net-positive
+# out-of-sample (docs/market-profile-book-analysis.md §5.1). Kill switch halts
+# new entries on drawdown/cum-loss automatically.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_mp.py --min-signals 3 --capital 1000000 --cost-bps 25
+# -------------------------------
+
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches mp-features.service)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

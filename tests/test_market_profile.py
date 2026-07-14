@@ -15,6 +15,8 @@ from market_profile import (
     auto_tick_size,
     compute_composite,
     compute_day_profile,
+    indicators_to_dict,
+    market_generated_indicators,
     period_letter,
     split_by_day,
 )
@@ -319,3 +321,220 @@ class TestApi:
         r = c.get("/api/market-profile/ABC")
         assert r.status_code == 404
         assert "No 30m bars" in r.json()["detail"]
+
+
+# ──────────────────────────────────────────────────────────
+# Market-generated indicators (Dalton, Markets in Profile)
+#
+# Each test reproduces the book's described geometry and asserts the CLASSIFIER
+# returns the book's label — so a test fails if the classification logic drifts,
+# not merely if it returns "something" (Rule 9).
+# ──────────────────────────────────────────────────────────
+
+def _prior(low: float, high: float) -> "object":
+    """A one-bar prior-day DayProfile spanning [low, high] for reference tests."""
+    return compute_day_profile(
+        _bars([((low + high) / 2, high, low, (low + high) / 2, 100)]),
+        tick_size=1.0,
+    )
+
+
+class TestOpenType:
+    def test_open_drive_up(self):
+        # Opens at the low and marches up, never trading back below the open
+        # (Fig 8.15 geometry, up direction). Highest-confidence open.
+        bars = _bars([
+            (100, 102, 100, 101, 50),
+            (101, 104, 101, 103, 60),
+            (103, 106, 103, 105, 70),
+            (105, 108, 105, 107, 80),
+            (107, 110, 107, 109, 90),
+        ])
+        ind = market_generated_indicators(bars)
+        assert ind.open_type == "open_drive_up"
+
+    def test_open_drive_down(self):
+        # Fig 8.15 as drawn: opens at the high, drives lower all day.
+        bars = _bars([
+            (110, 110, 108, 109, 50),
+            (109, 109, 106, 107, 60),
+            (107, 107, 104, 105, 70),
+            (105, 105, 102, 103, 80),
+            (103, 103, 100, 101, 90),
+        ])
+        ind = market_generated_indicators(bars)
+        assert ind.open_type == "open_drive_down"
+
+    def test_open_test_drive_up(self):
+        # Opens 100, first period tests BELOW the prior day's low (95), finds no
+        # business, reverses and drives up. The failed test secured the low.
+        bars = _bars([
+            (100, 101, 94, 99, 50),    # test down to 94 (< prior low 95)
+            (99, 103, 98, 102, 60),    # reverse up through the open
+            (102, 106, 101, 105, 70),
+            (105, 110, 104, 109, 80),
+        ])
+        ind = market_generated_indicators(bars, prior=_prior(95, 108))
+        assert ind.open_type == "open_test_drive_up"
+
+    def test_open_test_drive_down(self):
+        # Opens 115, first period pokes ABOVE the prior high (120), sellers step
+        # in, reverses and drives lower (Fig 8.18 geometry, down direction).
+        bars = _bars([
+            (115, 121, 115, 116, 50),   # test up to 121 (> prior high 120)
+            (116, 116, 110, 111, 60),   # reverse down through the open
+            (111, 112, 105, 106, 70),
+            (106, 107, 100, 101, 80),
+        ])
+        ind = market_generated_indicators(bars, prior=_prior(100, 120))
+        assert ind.open_type == "open_test_drive_down"
+
+    def test_open_rejection_reverse_up(self):
+        # Drives down off the open, gets rejected (single-print buying tail),
+        # reverses and closes up — but WITHOUT testing a prior reference, which
+        # is what separates it from an Open-Test-Drive (Fig 8.19).
+        bars = _bars([
+            (100, 101, 97, 98, 50),    # early low 97, no prior ref reached
+            (98, 103, 98, 102, 60),    # reverse up through the open
+            (102, 106, 101, 105, 70),
+            (105, 108, 104, 107, 80),
+        ])
+        ind = market_generated_indicators(bars, prior=_prior(90, 110))
+        assert ind.open_type == "open_rejection_reverse_up"
+
+    def test_open_auction(self):
+        # Rotates above and below the open with no conviction.
+        bars = _bars([
+            (100, 102, 98, 100, 50),
+            (100, 101, 99, 100, 50),
+            (100, 102, 98, 101, 50),
+            (100, 101, 99, 100, 50),
+        ])
+        ind = market_generated_indicators(bars)
+        assert ind.open_type == "open_auction"
+
+
+class TestDayShape:
+    def test_trend_up(self):
+        bars = _bars([
+            (100, 102, 100, 101, 50),
+            (101, 104, 101, 103, 60),
+            (103, 106, 103, 105, 70),
+            (105, 108, 105, 107, 80),
+            (107, 110, 107, 109, 90),
+        ])
+        ind = market_generated_indicators(bars)
+        assert ind.day_shape == "trend_up"
+        assert ind.one_timeframing == "up"
+
+    def test_neutral_two_sided_extension(self):
+        # IB (first 2 periods) = 100..105; later periods extend BOTH above and
+        # below → two-way indecision.
+        bars = _bars([
+            (102, 105, 100, 103, 50),   # IB
+            (103, 105, 101, 104, 50),   # IB
+            (104, 108, 104, 106, 60),   # extend up (108 > 105)
+            (106, 106, 97, 99, 60),     # extend down (97 < 100)
+        ])
+        ind = market_generated_indicators(bars)
+        assert ind.range_ext_up and ind.range_ext_down
+        assert ind.day_shape == "neutral"
+
+    def test_p_shape_short_covering(self):
+        # Fat value up top, thin single-print tail below, and NOT a clean trend
+        # (a late dip breaks the higher-low run) — Dalton's p / short-covering.
+        bars = _bars([
+            (108, 110, 100, 108, 50),   # early spike leaves a 100-107 tail
+            (108, 110, 108, 109, 90),
+            (109, 110, 108, 109, 90),
+            (108, 110, 106, 107, 90),   # dips: breaks the up one-timeframing
+        ], )
+        ind = market_generated_indicators(bars, tick_size=1.0)
+        assert ind.day_shape == "p_shape"
+        assert ind.profile_skew == "p"
+
+    def test_b_shape_long_liquidation(self):
+        # Fat value at the bottom, thin single-print tail above, non-trending.
+        bars = _bars([
+            (101, 102, 100, 101, 90),
+            (101, 102, 100, 101, 90),
+            (101, 109, 101, 102, 50),   # spike up leaves a 103-108 tail
+            (101, 102, 100, 101, 90),
+        ], )
+        ind = market_generated_indicators(bars, tick_size=1.0)
+        assert ind.day_shape == "b_shape"
+        assert ind.profile_skew == "b"
+
+
+class TestBalanceState:
+    def test_all_six_relationships(self):
+        from market_profile import _classify_balance
+        # prior value area = [100, 110]
+        assert _classify_balance(112, 120, 100, 110) == "higher"
+        assert _classify_balance(85, 95, 100, 110) == "lower"
+        assert _classify_balance(95, 115, 100, 110) == "outside"
+        assert _classify_balance(102, 108, 100, 110) == "inside"
+        assert _classify_balance(105, 115, 100, 110) == "overlapping_higher"
+        assert _classify_balance(95, 105, 100, 110) == "overlapping_lower"
+
+    def test_unknown_without_prior(self):
+        from market_profile import _classify_balance
+        assert _classify_balance(100, 110, None, None) == "unknown"
+
+    def test_in_balance_flag(self):
+        # Overlapping value = balance; disjoint (higher) = imbalance.
+        bal = market_generated_indicators(
+            _bars([(105, 108, 103, 106, 50), (106, 109, 104, 107, 50)]),
+            prior=_prior(100, 110), tick_size=1.0,
+        )
+        assert bal.in_balance is True
+
+
+class TestExcessAndPoor:
+    def test_excess_high_single_print_tail(self):
+        # One period spikes up leaving a single-print tail; the rest camp low.
+        bars = _bars([
+            (100, 110, 100, 101, 50),   # tail 102-110 = single prints
+            (100, 101, 99, 100, 90),
+            (100, 101, 99, 100, 90),
+            (100, 101, 99, 100, 90),
+        ])
+        ind = market_generated_indicators(bars, tick_size=1.0)
+        assert ind.excess_high is True
+        assert ind.poor_high is False
+        assert ind.single_print_count >= 2
+
+    def test_poor_high_multiple_prints_no_tail(self):
+        # Several periods print the exact same high — a flat, "poor" high that
+        # is likely to be revisited (no excess tail above it).
+        bars = _bars([
+            (108, 110, 106, 109, 90),
+            (108, 110, 106, 109, 90),
+            (108, 110, 106, 109, 90),
+        ])
+        ind = market_generated_indicators(bars, tick_size=1.0)
+        assert ind.excess_high is False
+        assert ind.poor_high is True
+
+
+class TestIndicatorsSerialization:
+    def test_to_dict_round_trips(self):
+        bars = _bars([
+            (100, 102, 100, 101, 50),
+            (101, 104, 101, 103, 60),
+            (103, 106, 103, 105, 70),
+        ])
+        ind = market_generated_indicators(bars, prior=_prior(95, 108))
+        d = indicators_to_dict(ind)
+        # Every dataclass field is represented, and the day is ISO-serialized.
+        assert d["day"] == "2026-04-17"
+        assert d["open_type"] == ind.open_type
+        assert d["profile_skew"] in {"p", "b", "balanced"}
+        assert set(d) >= {
+            "open_type", "day_shape", "profile_skew", "balance_state",
+            "in_balance", "range_ext_first", "excess_high", "one_timeframing",
+            "poc", "vah", "val",
+        }
+
+    def test_empty_bars_returns_none(self):
+        assert market_generated_indicators([]) is None

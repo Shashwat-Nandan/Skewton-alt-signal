@@ -1,3 +1,148 @@
+# Market Profile — Dalton book → profitable trades (PLAN, 2026-07-13)
+
+Source: James Dalton, *Markets in Profile*. Full plan:
+`/root/.claude/plans/cosmic-sauteeing-robin.md`. Evidence-first: build the
+missing intraday MP indicators + measure their edge on real tape BEFORE any
+order path (user decision: "NO orders until edge shown").
+
+## Phase 0 — analysis doc
+- [ ] `docs/market-profile-book-analysis.md`: four profit layers (reference
+      points / open-type conviction / balance-imbalance / excess) mapped to our
+      code, with a deterministic "profitable-use playbook" table.
+
+## Phase 1 — indicator layer (pure, in market_profile.py)
+- [ ] `DayIndicators` dataclass + `market_generated_indicators(bars, *, prior)`:
+      open_type, day_shape (incl p/b), balance_state (vs prior VA, Fig 4.5),
+      range_extension, excess/poor-high-low, single_prints, one_timeframing.
+- [ ] `to_dict()` for logging/API. No router/frontend contract change.
+- [ ] tests/test_market_profile.py: synthetic bars reproducing book figures
+      (Open-Drive 8.15, Open-Rejection-Reverse 8.19, trend/p/b shapes) assert
+      the book's label (Rule 9 — fail on drift).
+
+## Phase 2 — feature log + edge report (go/no-go gate)
+- [ ] `log_mp_features.py`: nightly read-only, NIFTY/BANKNIFTY (30-min bars.db)
+      + equity daily panel (warn_coarse_timeframe) → dashboard.db `mp_features`.
+- [ ] `deploy/mp-features.{service,timer}` template (NOT installed on host).
+- [ ] `mp_edge_report.py`: join features → forward outcomes, bucket hit-rate +
+      mean forward return by open_type/day_shape/balance_state.
+
+## Phase 3 — standalone MP paper strategy (GATED on Phase 2 edge)
+- [ ] Only if a bucket shows a cost-survivable edge: strategies/
+      market_profile_intraday.py + run_paper_mp.py (mirror run_paper_arbitrage),
+      backtest → paper → kill rule. Reject if 0 trades on hold-out / net-neg.
+
+## Review (Phases 0-2 done, 2026-07-13)
+
+Deliverables shipped (no order path touched — user's "NO orders until edge
+shown" honored):
+- Phase 0: `docs/market-profile-book-analysis.md` — four profit layers →
+  our code, deterministic playbook, + the measured verdict (§5).
+- Phase 1: `market_profile.py` gained `DayIndicators` +
+  `market_generated_indicators()` (open_type, day_shape, profile_skew,
+  balance_state, range extension, excess/poor, single prints, one-timeframing) —
+  pure geometry, no router/frontend change. 18 figure-reproducing tests added;
+  `tests/test_market_profile.py` = 40 passed.
+- Phase 2: `log_mp_features.py` (nightly, read-only) → `mp_features` table in
+  dashboard.db (5,184 intraday-30m rows on the host; daily balance-state pass
+  also works). `mp_edge_report.py` buckets forward returns.
+  `deploy/mp-features.{service,timer}` templates (NOT installed).
+
+Two honest findings (Rule 12):
+1. **Same-day "edge" is a definitional tautology** — the classifiers read
+   `close` and same_day=(close-open)/open, so *_up buckets are ~100% positive
+   by construction. Report auto-flags the leakage; same-day is descriptive only.
+2. **Honest next-day edge is weak + asymmetric.** Net of 15 bps: open_type =
+   no edge; balance_state = no edge (higher/lower mean-revert next-day);
+   day_shape = only `trend_up` positive (+23.5 net bps, 56.5%, n=437),
+   `trend_down` fails. One thin one-sided bucket over ~108 days of one regime.
+
+**Phase 3 NOT triggered** — user chose "strengthen evidence first" (no strategy
+code yet).
+
+## Phase 2.5 — trend_up robustness (done 2026-07-13)
+
+`mp_trend_robustness.py` stress-tested the one lead. `trend_up` next-day
+(n=437) is more robust than first feared:
+- Beats drift (baseline ~0.7 bps), broad (37/46 names +), persistent (5/6 mo).
+- **Not** tail-driven: survives trim 5%/5% (+31.7) and winsorize (+34.0).
+- Statistically real on sample: t-stat 4.51, win-rate z 2.73; survives dropping
+  best 5 names (+27.5).
+- BUT: breakeven cost 38.5 bps → only **+8–13 net bps** at realistic ~25–30 bps
+  overnight-delivery cost; **62% is the overnight gap** (requires overnight
+  hold + gap risk); one-sided (trend_down dead); single regime (2026 H1).
+
+Decisive missing evidence = a **down-regime backfill** (operator, needs Kite).
+Report now prints a drift baseline + `vs_drift_bps` so beta-vs-skill is standing.
+
+Remaining operator steps:
+- **Backfill more history (esp. a down-regime) into `bars`** — the one test that
+  can move trend_up from "candidate" to go/no-go; needs Kite auth.
+- Install `deploy/mp-features.{service,timer}` if nightly logging is wanted
+  (edit /opt paths → actual repo path; no Kite auth needed).
+- Backfill NIFTY/BANKNIFTY 30-min into `bars` for the book-faithful index path
+  (host currently has 30-min *equity* bars only).
+## Phase 3a — backtest gate (done 2026-07-13): FAILED
+
+`backtest_mp_trend.py` (long trend_up at close, exit next close, equal-weight
+per day, 25 bps overnight cost):
+- ALL: Sharpe -0.53, -4.8%. TRAIN: -0.14. **HOLDOUT: Sharpe -1.68, -3.5%,
+  -12 bps/day** — net loser out-of-sample. Holdout breakeven ~12 bps < realistic
+  25 bps. Per-month mostly negative.
+- The earlier "+13.5 net bps/trade" pooled trades (over-weighting high-count
+  days); the honest per-day portfolio loses. This is why the runner is gated on
+  a backtest, not the signal's raw correlation.
+
+Naive all-days portfolio does NOT graduate. But a pre-registered rescue does.
+
+## Phase 3 rescue + build (done 2026-07-13)
+
+`backtest_mp_trend.py --fit-min-signals`: fit a broad-momentum-day filter (≥K
+trend_up names) on TRAIN, confirm on HOLDOUT (leakage-free — count known at
+close). K=3 chosen on train (Sharpe 1.75); HOLDOUT K≥3 Sharpe 3.33, +17.3
+bps/day net, **monotone in K** (K=5 +27, K=6 +36). Consistent + economically
+sensible, but underpowered (holdout 16 days, daily t<1.4, one regime).
+
+Cleared the pre-registered bar → built as a **paper-only forward-capture harness
+with a kill switch** (the right vehicle for a consistent-but-underpowered edge):
+- `strategies/market_profile_intraday.py` — pure logic: broad-momentum filter,
+  equal-weight sizing, cost-aware P&L, `check_kill` (6% DD / ₹40k cum-loss after
+  ≥20 trades). Tested in `tests/test_mp_trend_strategy.py` (9 tests).
+- `run_paper_mp.py` — EOD paper runner (no Kite/order path) → mp_trend_positions
+  / mp_trend_runs in dashboard.db; `--replay` seeds from history.
+- `deploy/mp-paper.{service,timer}` — nightly template (NOT installed).
+
+**Parity:** `--replay` opens exactly 391 trades = backtest K≥3 count (306+85);
+cum net +₹94,366 (+9.4%) on ₹1M; kill never tripped. Paper only, no live orders.
+
+Remaining operator steps:
+- Install `deploy/mp-paper.{service,timer}` (after the nightly bar update +
+  mp-features) to run it forward; edit /opt → real path. Paper, no Kite.
+- The decisive missing evidence is still a **down-regime backfill** (needs
+  Kite) — the kill switch makes forward-running safe while that accumulates.
+
+## Dashboard tab + code-review round (done 2026-07-13)
+
+- Dashboard tab for the paper book: `backend/routers/mp_trend.py`
+  (`GET /api/mp-trend`, reads mp_trend_positions/mp_trend_runs, graceful empty
+  before first run) + `frontend/src/pages/MpTrendPage.tsx` (cum-P&L chart, open
+  positions, daily runs, HALTED badge). Wired into main.py / App.tsx / Header /
+  api.ts / types.ts. Tests: `test_mp_trend_router.py`.
+  NOTE: dashboard-backend has no auto-deploy — 404s until
+  `systemctl restart dashboard-backend.service`; frontend needs a rebuild.
+- `/code-review` high-effort found 6; all fixed (commit e40cff3): kill switch
+  now **latches** (was un-halting on recovery); no silent multi-day carry
+  (exit at next available close + delisting force-close + loud log); router
+  guards both tables; Open-Drive scans the opening bar; kill thresholds
+  CLI-exposed + scale with capital; O(dates²) prior recompute removed.
+  Tests: `test_mp_trend_runner.py` (latch + date helpers). 58 MP tests pass.
+
+Status: PR #119 open (3 commits). All remaining work is operator-gated
+(deploy restart, backfill) — see operator steps above.
+
+---
+
+# ARCHIVE
+
 # Margin pre-check fix for cross-stock pairs (PLAN, 2026-07-13)
 
 Incident: 2026-07-13 09:15 SBILIFE/HDFCLIFE entry — H15 precheck passed

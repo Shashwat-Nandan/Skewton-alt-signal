@@ -1,0 +1,17 @@
+[Unit]
+Description=Fire mp-paper.service nightly at 18:55 IST (after bars update + mp-features)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 18:55 IST — after the 30-min bar update (fetch_bars --update) and mp-features
+# (18:45), so the day's bars are present before the paper book is marked. The
+# runner is idempotent per date (mp_trend_runs PK), so a duplicate fire is a
+# no-op. Weekends/holidays: no new bars → nothing to process.
+OnCalendar=*-*-* 18:55:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=120
+
+Unit=mp-paper.service
+
+[Install]
+WantedBy=timers.target
