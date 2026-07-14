@@ -186,3 +186,65 @@ def test_experiment_expired_boundaries():
 def test_experiment_expired_honours_override():
     assert r.experiment_expired(date(2026, 1, 2), kill_date=date(2026, 1, 1))
     assert not r.experiment_expired(date(2026, 1, 1), kill_date=date(2027, 1, 1))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #121 stale-fit detection + in-place re-fit (the fix must reach the live book)
+# ──────────────────────────────────────────────────────────────────────────
+def test_fit_is_stale_flags_a_pre_121_book():
+    """restore() faithfully preserves whatever was serialized — including params
+    fit WITHOUT the 15:25 flatten. Without this check a persisted book trades the
+    mis-fit config forever and the #121 fix never reaches the live book."""
+    assert r.fit_is_stale({"symbol": "NIFTY"}) is True           # pre-#121: no marker
+    assert r.fit_is_stale({"fit_flatten_aware": False}) is True
+    assert r.fit_is_stale({"fit_flatten_aware": True}) is False
+
+
+def test_serialize_marks_the_fit_as_flatten_aware_and_roundtrips():
+    b = r.build_books("NIFTY", KAL, MA)
+    blob = b.serialize()
+    assert blob["fit_flatten_aware"] is True
+    assert r.fit_is_stale(blob) is False                          # fresh fits are current
+    assert r.InstrumentBooks.restore(blob).refit_at is None
+
+
+def test_reparam_swaps_params_but_PRESERVES_the_book():
+    """The whole point of re-fitting in place: adopt the corrected params without
+    destroying the accumulated A/B history (deleting sessions would be worse)."""
+    b = r.build_books("NIFTY", KAL, MA)
+    for px in (100.0, 101.0, 102.0, 103.0, 104.0, 130.0, 90.0, 95.0):
+        b.on_bar(px)
+    b.eod_close(95.0)
+    trades_before = len(b.ma.trades)
+    pnl_before = b.ma.realized_points
+    assert trades_before > 0, "fixture must have traded or the test is vacuous"
+
+    new_ma = {"short": 5, "long": 20, "offset": 1.5, "stop_ticks": 99, "target_ticks": 199}
+    assert b.reparam(KAL, new_ma) is True
+    assert b.ma.short == 5 and b.ma.long == 20 and b.ma.stop_ticks == 99
+    # book preserved
+    assert len(b.ma.trades) == trades_before
+    assert b.ma.realized_points == pnl_before
+
+
+def test_reparam_refuses_while_a_position_is_open():
+    """Swapping params under a live position would manage it to stop/target levels
+    it was never entered against. Defer to the next flat restart instead."""
+    b = r.build_books("NIFTY", KAL, MA)
+    for px in (100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0):
+        b.on_bar(px)
+    if b.ma.pos == 0 and b.kalman.pos == 0:
+        b.ma.pos = 1                                   # force the guarded state
+    stop_before = b.ma.stop_ticks
+    assert b.reparam(KAL, {"short": 5, "long": 20, "offset": 1.5,
+                           "stop_ticks": 99, "target_ticks": 199}) is False
+    assert b.ma.stop_ticks == stop_before              # unchanged
+
+
+def test_refit_seam_is_surfaced_in_the_eod_summary():
+    """The re-fit preserves trades, so cumulative P&L spans two configs. The seam
+    must be visible or the 2026-08-28 analysis would pool across it."""
+    b = r.build_books("NIFTY", KAL, MA)
+    b.refit_at = "2026-07-15T09:10:00"
+    assert b.summary()["refit_at"] == "2026-07-15T09:10:00"
+    assert b.serialize()["refit_at"] == "2026-07-15T09:10:00"

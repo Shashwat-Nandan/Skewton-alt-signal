@@ -46,11 +46,14 @@ def _pooled_sharpe(pnl: np.ndarray) -> float:
     return float(np.mean(pnl) / sd * np.sqrt(o.TRADING_DAYS)) if sd > 0 else float("nan")
 
 
-def _fold_oos(closes, a, b, c, *, kind, params, cost) -> o.SimResult:
+def _fold_oos(closes, a, b, c, *, kind, params, cost, session_ends=None) -> o.SimResult:
     """OOS SimResult on the test slice [b:c]; the signal is warmed up from the
     train start a (params were fit on [a:b] only — causal, no look-ahead).
     Returns the full SimResult (daily P&L + n_trades) so the caller can both
-    pool the P&L and require a real trade count for the verdict."""
+    pool the P&L and require a real trade count for the verdict.
+
+    `session_ends` (intraday runs only) is sliced to the test window so the OOS
+    evaluation models the runner's daily flatten (#121)."""
     seg = closes[a:c]
     if kind == "kalman":
         direction = o.kalman_direction(seg, params["filter_params"],
@@ -61,11 +64,13 @@ def _fold_oos(closes, a, b, c, *, kind, params, cost) -> o.SimResult:
     test_dir = direction[b - a:]
     return o.simulate(closes[b:c], test_dir, stop_ticks=params["stop_ticks"],
                       target_ticks=params["target_ticks"], tick_size=TICK_SIZE,
-                      cost_per_unit=cost)
+                      cost_per_unit=cost,
+                      session_ends=None if session_ends is None else session_ends[b:c])
 
 
 def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: int,
-                 step: int, seeds: list[int], n_gen: int, cost: float) -> dict:
+                 step: int, seeds: list[int], n_gen: int, cost: float,
+                 session_ends=None) -> dict:
     n = len(closes)
     starts = list(range(0, n - train_len - test_len + 1, step))
     if not starts:
@@ -84,12 +89,15 @@ def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: i
         for a in starts:
             b, c = a + train_len, a + train_len + test_len
             train = closes[a:b]
+            train_ends = None if session_ends is None else session_ends[a:b]
             kp = o.fit_kalman_reduced(train, tick_size=TICK_SIZE, cost_per_unit=cost,
-                                      n_gen=n_gen, seed=seed)
+                                      n_gen=n_gen, seed=seed, session_ends=train_ends)
             mp = o.fit_ma_crossover(train, tick_size=TICK_SIZE, cost_per_unit=cost,
-                                    n_gen=n_gen, seed=seed)
-            kr = _fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost)
-            mr = _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost)
+                                    n_gen=n_gen, seed=seed, session_ends=train_ends)
+            kr = _fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost,
+                           session_ends=session_ends)
+            mr = _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost,
+                           session_ends=session_ends)
             kal_pnls.append(kr.daily_pnl)
             ma_pnls.append(mr.daily_pnl)
             ks, ms = float(kr.daily_pnl.sum()), float(mr.daily_pnl.sum())
@@ -165,20 +173,44 @@ def main() -> int:
         from data_cache_io import read_table
         df = read_table(args.csv)
         cols = {c.lower(): c for c in df.columns}
-        jobs = [(Path(args.csv).stem, df[cols["close"]].to_numpy(float))]
+        # Build the session mask so the fit models the runner's 15:25 flatten
+        # (#121). Decide from the DATA, not the filename: >1 bar per calendar day
+        # means intraday. A filename heuristic would silently un-fix #121 the
+        # moment a file is named something else (e.g. the OHLC re-fetch #122
+        # requires) — the timestamps needed to do this correctly are right here.
+        # A daily table has exactly 1 bar/day -> None (holding across bars IS the
+        # daily strategy).
+        ts_col = next((cols[k] for k in ("datetime", "timestamp", "date") if k in cols), None)
+        ends = None
+        if ts_col is not None:
+            import pandas as _pd
+            _ts = _pd.to_datetime(df[ts_col])
+            _n_days = _ts.dt.date.nunique()
+            if len(_ts) > _n_days:                       # intraday: many bars/day
+                ends = o.session_ends_from_timestamps(_ts.tolist())
+                print(f"intraday source detected ({len(_ts)} bars over {_n_days} "
+                      f"days) — modelling the 15:25 session flatten (#121)")
+        if ends is None and _is_5min:
+            # Name says intraday but the data disagrees (or carries no usable
+            # timestamp): the fit would silently revert to multi-day holds.
+            print("WARNING: --csv looks intraday by name but no per-day session "
+                  "structure was found; the 15:25 flatten is NOT modelled (#121). "
+                  "Check the timestamp column.", file=sys.stderr)
+        jobs = [(Path(args.csv).stem, df[cols["close"]].to_numpy(float), ends)]
     else:
         jobs = []
         for sym in [s.strip() for s in args.symbols.split(",") if s.strip()]:
             try:
-                jobs.append((sym, load_daily_closes(sym)[1]))
+                jobs.append((sym, load_daily_closes(sym)[1], None))   # daily: no flatten
             except FileNotFoundError as e:
                 print(f"\nDATA MISSING for {sym}:\n{e}\n", file=sys.stderr)
                 return 2
 
     results, all_pass = [], True
-    for sym, closes in jobs:
+    for sym, closes, ends in jobs:
         r = walk_forward(sym, closes, train_len=args.train_len, test_len=args.test_len,
-                         step=args.step, seeds=seeds, n_gen=args.n_gen, cost=args.cost)
+                         step=args.step, seeds=seeds, n_gen=args.n_gen, cost=args.cost,
+                         session_ends=ends)
         results.append(r)
         all_pass &= r["passed"]
 

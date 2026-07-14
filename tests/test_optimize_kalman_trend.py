@@ -185,3 +185,206 @@ def test_reduced_fit_is_smaller_and_model2_and_evaluable():
     # mis-shape the param vector); reproduces the in-sample Sharpe.
     res = o.evaluate(prices, kind="kalman", params=fit)
     assert res.sharpe == pytest.approx(fit["train_sharpe"], rel=1e-6)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# session_ends: the fit must model the runner's 15:25 flatten (issue #121)
+# ──────────────────────────────────────────────────────────────────────────
+def test_session_ends_flattens_open_position_at_the_close():
+    """Without session_ends a position rides to its stop/target across bars; with
+    it, the bar marked True force-closes at that close. This is the whole point
+    of #121: the runner flattens daily, so the fit must too — otherwise it fits
+    targets that can never be reached inside a session."""
+    prices = [100.0, 101.0, 130.0]          # would reach a +25 target on bar 2
+    direction = [1, 0, 0]
+    held = o.simulate(prices, direction, stop_ticks=50, target_ticks=25)
+    flat = o.simulate(prices, direction, stop_ticks=50, target_ticks=25,
+                      session_ends=[False, True, False])
+    assert held.realized_pnl == pytest.approx(25.0)    # target hit on bar 2
+    assert flat.realized_pnl == pytest.approx(1.0)     # flattened at 101 on bar 1
+    assert flat.n_trades == 1
+
+
+def test_session_ends_charges_round_trip_on_a_closing_bar_entry():
+    """A signal on the session's last bar opens and is flattened at the same
+    price — the runner's on_bar()-then-eod_close() order. It must cost the round
+    trip, not be silently dropped (that would understate churn in the fit)."""
+    res = o.simulate([100.0, 100.0], [0, 1], stop_ticks=50, target_ticks=50,
+                     cost_per_unit=2.5, session_ends=[False, True])
+    assert res.n_trades == 1
+    assert res.realized_pnl == pytest.approx(-5.0)     # 2 x 2.5, zero price move
+
+
+def test_session_ends_length_must_match_prices():
+    with pytest.raises(ValueError, match="session_ends length"):
+        o.simulate([100.0, 101.0], [1, 0], stop_ticks=10, target_ticks=10,
+                   session_ends=[True])
+
+
+def test_daily_path_unchanged_when_session_ends_is_none():
+    """Regression guard: the daily gates pass session_ends=None and must behave
+    exactly as before the #121 fix (one bar == one day; holding across bars IS
+    the daily strategy)."""
+    prices = [100.0, 101.0, 130.0]
+    a = o.simulate(prices, [1, 0, 0], stop_ticks=50, target_ticks=25)
+    b = o.simulate(prices, [1, 0, 0], stop_ticks=50, target_ticks=25, session_ends=None)
+    assert a.realized_pnl == b.realized_pnl == pytest.approx(25.0)
+
+
+def test_session_ends_from_timestamps_marks_last_bar_of_each_day():
+    from datetime import datetime
+    ts = [datetime(2026, 5, 1, 9, 15), datetime(2026, 5, 1, 15, 25),
+          datetime(2026, 5, 4, 9, 15), datetime(2026, 5, 4, 15, 25)]
+    assert list(o.session_ends_from_timestamps(ts)) == [False, True, False, True]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PARITY GATE — simulate(session_ends) must equal the live intraday book
+# ──────────────────────────────────────────────────────────────────────────
+def _synthetic_intraday_tape(n_days=40, bars_per_day=75, seed=0):
+    """Deterministic multi-session 5-min-shaped tape: (prices, timestamps).
+
+    HERMETIC BY DESIGN. The parity property below is what guards #121, so it must
+    run in CI — and the real 5-min tape is gitignored, so a data-dependent test
+    would skip there and protect nothing exactly where regressions land. The
+    volatility is scaled so a 250/670 stop/target and the session flatten all
+    actually fire (a tape too quiet to trigger them would pass vacuously).
+    The real-tape reproduction (₹74,708 / 996.1 pts / 119 trades) is recorded as
+    evidence in tasks/kalman-trend-findings.md; it is not a regression guard.
+    """
+    from datetime import datetime, timedelta
+    rng = np.random.default_rng(seed)
+    prices, ts = [], []
+    px = 24000.0
+    day = datetime(2026, 5, 4, 9, 15)
+    for d in range(n_days):
+        if day.weekday() >= 5:
+            day += timedelta(days=2)
+        drift = rng.normal(0, 6.0)          # per-day regime: trends and chop
+        for b in range(bars_per_day):
+            px += rng.normal(drift, 18.0)   # 5-min step; big enough to hit stops
+            prices.append(px)
+            ts.append(day + timedelta(minutes=5 * b))
+        day += timedelta(days=1)
+    return np.array(prices, float), ts
+
+
+def test_simulate_with_session_ends_matches_live_intraday_book():
+    """PARITY GATE: the FIT engine and the LIVE book must book identical trades.
+
+    This is what stops fit and deploy silently diverging again — the exact
+    failure #121 documents (the fit held multi-day while the runner flattened at
+    15:25, so the fitted 670-pt target fired 0 times in 120 sessions). If this
+    test ever fails, the two exit models have drifted apart: fix that, do not
+    relax the assertion.
+    """
+    from strategies.kalman_trend_following import IntradayTrendStrategy
+
+    prices, ts = _synthetic_intraday_tape()
+    ends = o.session_ends_from_timestamps(ts)
+    P = dict(short=13, long=52, offset=51.44557346247022,
+             stop_ticks=250.0437334612003, target_ticks=669.8496641922126)
+    COST = 2.5
+
+    direction = o.ma_direction(prices, short=P["short"], long=P["long"],
+                               offset=P["offset"])
+    sim = o.simulate(prices, direction, stop_ticks=P["stop_ticks"],
+                     target_ticks=P["target_ticks"], tick_size=1.0,
+                     cost_per_unit=COST, session_ends=ends)
+
+    # live book, stepped exactly as the runner does: on_bar per bar, then the
+    # 15:25 eod_close, per session.
+    live = IntradayTrendStrategy(
+        signal_kind="ma", short=P["short"], long=P["long"], offset=P["offset"],
+        stop_ticks=P["stop_ticks"], target_ticks=P["target_ticks"],
+        tick_size=1.0, cost_per_unit=COST, lot_size=1)
+    start = 0
+    for i, is_end in enumerate(ends):
+        if not is_end:
+            continue
+        live.on_session_start()
+        for px in prices[start:i + 1]:
+            live.on_bar(float(px))
+        live.force_close(float(prices[i]))
+        start = i + 1
+
+    assert sim.n_trades == len(live.trades), "engines disagree on trade COUNT"
+    assert sim.realized_pnl == pytest.approx(live.realized_points, abs=1e-6)
+    # Guard against a vacuous pass: the tape must actually exercise the paths.
+    assert sim.n_trades > 10, "tape too quiet to be a real parity test"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# trail_ticks: ratcheting trailing stop (issue #122 candidate)
+# ──────────────────────────────────────────────────────────────────────────
+def test_trailing_stop_ratchets_and_exits_on_retrace():
+    """The trail must follow the peak UP and exit only on a retrace of the trail
+    distance from that peak — not from entry. Entry 100, peak 120, trail 10 →
+    exit at 110, banking +10, not the −0 a from-entry stop would give."""
+    prices = [100.0, 120.0, 109.0]
+    res = o.simulate(prices, [1, 0, 0], stop_ticks=999, target_ticks=999,
+                     trail_ticks=10)
+    assert res.n_trades == 1
+    assert res.realized_pnl == pytest.approx(10.0)     # 110 - 100
+
+
+def test_trailing_stop_does_not_exit_while_making_new_peaks():
+    """A monotonically rising series must never trip the trail — otherwise the
+    trail would cut winners, which is the opposite of its purpose."""
+    res = o.simulate([100.0, 105.0, 110.0, 115.0], [1, 0, 0, 0],
+                     stop_ticks=999, target_ticks=999, trail_ticks=10)
+    assert res.n_trades == 1                            # only the end-of-series close
+    assert res.realized_pnl == pytest.approx(15.0)      # rode to 115
+
+
+def test_trailing_stop_short_side_ratchets_down():
+    prices = [100.0, 80.0, 91.0]
+    res = o.simulate(prices, [-1, 0, 0], stop_ticks=999, target_ticks=999,
+                     trail_ticks=10)
+    assert res.realized_pnl == pytest.approx(10.0)      # 100 - 90
+
+
+def test_trail_ignores_fixed_stop_and_target():
+    """When trailing, the fixed levels must not fire — the trail replaces both.
+    A 5-pt target would otherwise cut this trade at 105 instead of trailing."""
+    res = o.simulate([100.0, 120.0, 109.0], [1, 0, 0],
+                     stop_ticks=1, target_ticks=5, trail_ticks=10)
+    assert res.realized_pnl == pytest.approx(10.0)
+
+
+def test_variant_d_trail_plus_session_flatten():
+    """Variant D: the trail manages the trade but the 15:25 flatten still closes
+    it — the combination that avoids overnight gap/margin exposure entirely."""
+    res = o.simulate([100.0, 105.0, 108.0], [1, 0, 0], stop_ticks=999,
+                     target_ticks=999, trail_ticks=50,
+                     session_ends=[False, True, False])
+    assert res.n_trades == 1
+    assert res.realized_pnl == pytest.approx(5.0)      # flattened at 105, trail never hit
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Code-review fixes (2026-07-14)
+# ──────────────────────────────────────────────────────────────────────────
+def test_session_ends_from_timestamps_rejects_unsorted_input():
+    """The mask is built from days[i+1] != days[i], so an order inversion invents
+    a session boundary and force-closes there — a silently wrong fit. Fail loud
+    (Rule 12) rather than return a plausible-looking wrong mask."""
+    from datetime import datetime
+    ts = [datetime(2026, 5, 4, 9, 15), datetime(2026, 5, 1, 9, 15)]   # inverted
+    with pytest.raises(ValueError, match="chronological"):
+        o.session_ends_from_timestamps(ts)
+
+
+def test_end_of_series_force_close_charges_its_exit_cost_to_daily():
+    """The final force-close increments n_trades and realized, so its exit cost
+    must also hit `daily` — _sharpe divides daily by a trade count that includes
+    this trade. Without it the daily series understates cost for any fold ending
+    with an open position (the DAILY gates' common case)."""
+    prices = [100.0, 101.0]
+    res = o.simulate(prices, [1, 0], stop_ticks=999, target_ticks=999,
+                     cost_per_unit=2.5)
+    assert res.n_trades == 1
+    # realized: +1 price move - 2x2.5 cost = -4.0
+    assert res.realized_pnl == pytest.approx(-4.0)
+    # daily must agree with realized once the trade is closed at the last bar
+    assert float(res.daily_pnl.sum()) == pytest.approx(res.realized_pnl)

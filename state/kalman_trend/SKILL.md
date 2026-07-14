@@ -34,6 +34,25 @@ to assert alpha.
   - kill_switch_drawdown_rupees: 20000
 
 ## Lessons
+- 2026-07-14 (#122): trailing stop REJECTED (plateau fails — T pins at the grid
+  floor, genuinely: n_unfittable=0; and the wins were a fill artifact). When
+  reporting a multi-seed experiment: trades must be PER-SEED and every metric on
+  ONE basis (per-seed pooled, median across seeds) — a first cut summed trades
+  ~5x and pooled the plateau cross-seed while A/D used per-seed-median. Booking a stop at its LEVEL is only
+  safe when stop distance >> bar range: a 25-pt trail gifted 35.9 pts/exit on
+  BANKNIFTY, flipping the tape +₹719k -> -₹506k. Our 5-min cache is CLOSE-ONLY,
+  so tight-stop variants are NOT evaluable — fetch 5-min OHLC first. The live
+  book polls intrabar, so it would differ from any close-only backtest anyway.
+- 2026-07-14 (#121): the fit MUST model the runner's 15:25 flatten
+  (`simulate(session_ends=)`, built from bar timestamps). It did not, so params
+  were fit for multi-day holds and deployed with a daily flatten — the 670-pt
+  target fired 0/120 sessions and the fit environment lost ₹322k with the params
+  it produced. A parity test now pins `simulate(session_ends)` to the live
+  `IntradayTrendStrategy`; keep it green or fit/deploy will silently diverge
+  again. Corollary: with the flatten modelled, `target_ticks` never binds and is
+  unidentifiable — drop it from the intraday fit rather than let CMA-ES drift it.
+- Restored books keep their serialized params: a fit fix does NOT reach the live
+  book until the runner state is cleared (which also resets the forward A/B).
 - Faithful single-split 8-param CMA-ES fit overfits: train Sharpe 2–5, OOS is
   seed luck (NIFTY median 0.20 vs MA 0.93). Do not promote on a single seed.
 - Same scar as buy-on-gap (train 2.71 → test −0.83): in-sample Sharpe

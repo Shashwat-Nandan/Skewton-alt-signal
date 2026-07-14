@@ -98,6 +98,12 @@ class InstrumentBooks:
     symbol: str
     kalman: IntradayTrendStrategy
     ma: IntradayTrendStrategy
+    # ISO timestamp of the last params swap (#121 re-fit), or None. The book's
+    # trades are PRESERVED across a re-fit — deleting 12 sessions of data would
+    # be worse — so the accumulated P&L spans two configs. This marks the seam so
+    # the A/B analysis (e.g. the 2026-08-28 MA decision) can segment on it and
+    # count only post-re-fit sessions as evidence for the corrected fit.
+    refit_at: Optional[str] = None
 
     def on_price(self, price: float) -> None:
         """Intraday tick: let either book hit its stop/target between bars."""
@@ -127,18 +133,69 @@ class InstrumentBooks:
 
     def summary(self) -> dict:
         return {"symbol": self.symbol,
+                # Surfaces the #121 re-fit seam in the EOD sidecar: the book's
+                # cumulative P&L spans two configs when this is set, so the A/B
+                # analysis must segment on it rather than pool across it.
+                "refit_at": self.refit_at,
                 "kalman": self.kalman.book_summary(),
                 "ma": self.ma.book_summary()}
 
+    def reparam(self, kal_params: dict, ma_params: dict) -> bool:
+        """Swap in freshly-fitted params, PRESERVING the book (trades, realized
+        P&L, bar count). Returns False and changes nothing if either book has an
+        open position — the stop/target levels were derived from the OLD params,
+        so swapping under a live position would manage it to levels it was never
+        entered against. The runner flattens at 15:25, so a restored book is
+        normally flat; a mid-session crash is the exception, and there the right
+        move is to defer the re-fit to the next clean start.
+        """
+        if self.kalman.pos != 0 or self.ma.pos != 0:
+            return False
+        self.kalman.filter_params = kal_params["filter_params"]
+        self.kalman.model = kal_params.get("model", 2)
+        self.kalman.mu = kal_params["mu"]
+        self.kalman.stop_ticks = kal_params["stop_ticks"]
+        self.kalman.target_ticks = kal_params["target_ticks"]
+        self.ma.short = ma_params["short"]
+        self.ma.long = ma_params["long"]
+        self.ma.offset = ma_params["offset"]
+        self.ma.stop_ticks = ma_params["stop_ticks"]
+        self.ma.target_ticks = ma_params["target_ticks"]
+        return True
+
     def serialize(self) -> dict:
         return {"symbol": self.symbol, "kalman": self.kalman.serialize(),
-                "ma": self.ma.serialize()}
+                "ma": self.ma.serialize(),
+                # Marks that these params came from a fit that MODELLED the 15:25
+                # flatten (#121). Absent/False => fitted by the pre-#121 code for
+                # multi-day holds while the runner flattens daily; the runner
+                # re-fits such a book on restore. Same pattern as the #77
+                # cost_per_unit re-assert below — restore() faithfully preserves
+                # whatever was serialized, including a stale config.
+                "fit_flatten_aware": True,
+                "refit_at": self.refit_at}
 
     @classmethod
     def restore(cls, blob: dict) -> "InstrumentBooks":
-        return cls(symbol=blob["symbol"],
-                   kalman=IntradayTrendStrategy.restore(blob["kalman"]),
-                   ma=IntradayTrendStrategy.restore(blob["ma"]))
+        b = cls(symbol=blob["symbol"],
+                kalman=IntradayTrendStrategy.restore(blob["kalman"]),
+                ma=IntradayTrendStrategy.restore(blob["ma"]))
+        b.refit_at = blob.get("refit_at")
+        return b
+
+
+def fit_is_stale(blob: dict) -> bool:
+    """True if a serialized book's params predate the #121 flatten-aware fit.
+
+    Pre-#121, `optimize_kalman_trend.simulate` held to stop/target across days
+    while this runner force-closes at 15:25, so params were fit for multi-day
+    holds and deployed with a daily flatten: the fitted 670-pt target fired 0
+    times in 120 sessions and the fit environment lost ₹322k with the params it
+    produced. `restore()` faithfully preserves that config, so without this check
+    a persisted book keeps trading the mis-fit params forever and the #121 fix
+    never reaches the live book.
+    """
+    return not blob.get("fit_flatten_aware", False)
 
 
 def build_books(symbol: str, kal_params: dict, ma_params: dict) -> InstrumentBooks:
@@ -172,20 +229,29 @@ def eod_report(books: List[InstrumentBooks], today: date) -> dict:
     }
 
 
-def fit_params(prices: np.ndarray, *, n_gen: int = 25, seed: int = 0) -> tuple[dict, dict]:
+def fit_params(prices: np.ndarray, *, session_ends=None,
+               n_gen: int = 25, seed: int = 0) -> tuple[dict, dict]:
     """Fit reduced-Kalman + MA params on a recent intraday window (warmup).
 
     The fit MUST charge the same per-side cost the book charges
     (COST_PER_UNIT_POINTS): at optimize's cost_per_unit=0.0 default, CMA-ES
     prefers hyper-tight stops whose churn the live book then pays for
     (2026-07-07 walk-forward: zero-cost fit −769 pts/seed OOS on NIFTY vs
-    +702 costed, at half the trade count)."""
+    +702 costed, at half the trade count).
+
+    The fit MUST also model the 15:25 flatten this runner applies
+    (`session_ends`, issue #121). Without it the optimizer fits multi-day holds
+    the book can never take: the previously-deployed 670-pt target was
+    unreachable inside one session and fired 0 times in 120 sessions, and the
+    no-flatten environment lost ₹322k with the params it produced. Callers on
+    intraday bars MUST pass session_ends; None is only correct for daily bars.
+    """
     kal = opt.fit_kalman_reduced(prices, tick_size=1.0,
                                  cost_per_unit=COST_PER_UNIT_POINTS,
-                                 n_gen=n_gen, seed=seed)
+                                 n_gen=n_gen, seed=seed, session_ends=session_ends)
     ma = opt.fit_ma_crossover(prices, tick_size=1.0,
                               cost_per_unit=COST_PER_UNIT_POINTS,
-                              n_gen=n_gen, seed=seed)
+                              n_gen=n_gen, seed=seed, session_ends=session_ends)
     return kal, ma
 
 
@@ -277,11 +343,62 @@ def main() -> int:  # pragma: no cover
             logger.warning("%s: no front-month future — skipping", sym)
             continue
         tradesym[sym] = fut["tradingsymbol"]
+
+        def _warmup_fit():
+            """Fetch recent 5-min history on the traded future and fit on it.
+            Returns (kal_params, ma_params, n_bars) or None if history is thin."""
+            hist = kite.historical_data(int(fut["instrument_token"]),
+                                        _days_ago(40), today, "5minute")
+            px = np.array([float(c["close"]) for c in hist], float)
+            # Session boundaries from the candle timestamps: the warmup fit must
+            # model the same 15:25 flatten this runner applies (#121), or it fits
+            # multi-day holds the book can never take.
+            ends = opt.session_ends_from_timestamps([c["date"] for c in hist])
+            if len(px) < 300:
+                logger.warning("%s: only %d warmup bars on the future — skipping",
+                               sym, len(px))
+                return None
+            kp, mp = fit_params(px[-1500:], session_ends=ends[-1500:])
+            return kp, mp, len(px)
+
         if sym in prior:
             b = InstrumentBooks.restore(prior[sym])
             # Re-assert cost: a book serialized before #77 carries cost_per_unit=0.0
             # and restore() faithfully preserves it, so override to the current cost.
             b.set_cost(COST_PER_UNIT_POINTS)
+            # Same class of staleness for the PARAMS (#121): restore() preserves
+            # whatever was serialized, so a book fitted before the flatten-aware
+            # fit would trade mis-fit params forever and the #121 fix would never
+            # reach the live book. Re-fit it, keeping the trade history.
+            if fit_is_stale(prior[sym]):
+                fitted = _warmup_fit()
+                if fitted is None:
+                    logger.error("%s: params are pre-#121 (fit without the 15:25 "
+                                 "flatten) but warmup history is too thin to "
+                                 "re-fit — SKIPPING rather than trade a known "
+                                 "mis-fit book.", sym)
+                    continue
+                kal_p, ma_p, _ = fitted
+                if b.reparam(kal_p, ma_p):
+                    b.refit_at = datetime.now().isoformat(timespec="seconds")
+                    logger.warning(
+                        "\n" + "=" * 72 + "\n"
+                        "  %s: params were fit WITHOUT the 15:25 flatten (#121) —\n"
+                        "  RE-FITTED in place. Trades/P&L are PRESERVED, so the book\n"
+                        "  now spans two configs; refit_at=%s marks the seam. Count\n"
+                        "  only post-seam sessions as evidence for the corrected fit\n"
+                        "  (e.g. the 2026-08-28 MA decision).\n"
+                        "  new: kal stop/tgt %.0f/%.0f, ma %d/%d\n"
+                        + "=" * 72,
+                        sym, b.refit_at, kal_p["stop_ticks"], kal_p["target_ticks"],
+                        ma_p["short"], ma_p["long"])
+                else:
+                    logger.error(
+                        "%s: params are pre-#121 but a position is OPEN (crash "
+                        "mid-session?) — NOT swapping params under a live position "
+                        "(its stop/target came from the old fit). Trading stale "
+                        "params today; the re-fit runs at the next flat restart.",
+                        sym)
             # The prior state is from yesterday's close → today's first bar spans
             # the overnight gap. Inflate now so the gap is absorbed as a level
             # jump, not one bar of velocity (the daily-restart path is the ONLY
@@ -292,17 +409,14 @@ def main() -> int:  # pragma: no cover
             logger.info("%s: restored books from prior state (session-start "
                         "inflate applied for the overnight gap)", sym)
             continue
-        hist = kite.historical_data(int(fut["instrument_token"]),
-                                    _days_ago(40), today, "5minute")
-        prices = np.array([float(c["close"]) for c in hist], float)
-        if len(prices) < 300:
-            logger.warning("%s: only %d warmup bars on the future — skipping",
-                           sym, len(prices))
+
+        fitted = _warmup_fit()
+        if fitted is None:
             continue
-        kal_p, ma_p = fit_params(prices[-1500:])
+        kal_p, ma_p, n_bars = fitted
         books.append(build_books(sym, kal_p, ma_p))
         logger.info("%s: warmup-fit on %d future bars (kal stop/tgt %.0f/%.0f, "
-                    "ma %d/%d)", sym, len(prices), kal_p["stop_ticks"],
+                    "ma %d/%d)", sym, n_bars, kal_p["stop_ticks"],
                     kal_p["target_ticks"], ma_p["short"], ma_p["long"])
 
     if not books:

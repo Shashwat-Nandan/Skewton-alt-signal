@@ -125,6 +125,28 @@ class SimResult:
     sharpe: float              # annualized, from daily_pnl
 
 
+def session_ends_from_timestamps(timestamps) -> np.ndarray:
+    """Bool mask marking the LAST bar of each trading session.
+
+    `timestamps` is any sequence of datetimes (or anything with `.date()`), one
+    per bar, chronological. Use this to build `simulate(..., session_ends=)` for
+    an INTRADAY series so the fit models the runner's 15:25 flatten (issue #121).
+    """
+    days = [t.date() if hasattr(t, "date") else t for t in timestamps]
+    n = len(days)
+    # Fail loud on unsorted input (Rule 12): the mask is built purely from
+    # days[i+1] != days[i], so ANY order inversion (a concatenation of two Kite
+    # fetches, a re-ordered parquet) silently invents session boundaries and
+    # force-closes at them — a wrong fit with no error.
+    for i in range(n - 1):
+        if days[i + 1] < days[i]:
+            raise ValueError(
+                f"timestamps must be chronological; bar {i + 1} ({days[i + 1]}) "
+                f"precedes bar {i} ({days[i]})")
+    return np.array([(i == n - 1) or (days[i + 1] != days[i]) for i in range(n)],
+                    dtype=bool)
+
+
 def simulate(
     prices,
     direction,
@@ -133,22 +155,69 @@ def simulate(
     target_ticks: float,
     tick_size: float = 1.0,
     cost_per_unit: float = 0.0,
+    session_ends=None,
+    trail_ticks=None,
 ) -> SimResult:
-    """Walk the daily series: enter (at close) on a nonzero `direction` when
-    flat, manage a fixed-tick stop/target, mark to market daily. `stop_ticks`
-    and `target_ticks` are in ticks; price distance = ticks · tick_size.
-    `cost_per_unit` is charged in price points on each entry and each exit."""
+    """Walk the series: enter (at close) on a nonzero `direction` when flat,
+    manage a fixed-tick stop/target, mark to market each bar. `stop_ticks` and
+    `target_ticks` are in ticks; price distance = ticks · tick_size.
+    `cost_per_unit` is charged in price points on each entry and each exit.
+
+    `trail_ticks`: when set, the exit becomes a RATCHETING trailing stop at that
+    distance from the position's peak favourable excursion, and `stop_ticks` /
+    `target_ticks` are ignored (the trail replaces both). Exits on trend failure
+    instead of a fixed level — the issue #122 candidate. Combine with
+    `session_ends` for variant D (trail + keep the daily flatten).
+
+    ⚠️  TRAIL RESULTS ARE ONLY MEANINGFUL WHEN trail_ticks >> the bar's typical
+    range. Like every exit here, a trail books at the stop LEVEL. That is benign
+    for a WIDE fixed stop (rarely triggers; overshoot small vs the distance) but
+    manufactures money for a TIGHT trail on close-only data: measured 2026-07-14
+    on BANKNIFTY 5-min with trail=25, the mean overshoot (level − triggering
+    close) was **35.9 pts — larger than the 25-pt trail itself**, flipping the
+    full tape from −₹506k (realistic fill) to +₹719k (booked at level). NIFTY
+    gifted 13.2 pts/exit.
+
+    Root cause: our 5-min cache stores CLOSES ONLY, so we cannot know whether or
+    where the stop was touched intrabar — the honest fill is bounded by
+    [triggering close, stop level] and that band exceeds the signal. Evaluating a
+    tight trail needs 5-min OHLC (high/low). Do not "fix" this by booking at the
+    close instead: that just swaps an optimistic bias for a pessimistic one. See
+    tasks/kalman-trend-trailing-stop-experiment.md §0.
+
+    `session_ends`: optional bool mask (len == len(prices)). Where True, any open
+    position is force-closed at that bar's close — the INTRADAY runner's 15:25
+    flatten. Build it with `session_ends_from_timestamps`.
+
+    Pass None for a DAILY series (one bar == one day, so holding across bars IS
+    the strategy — there is no intraday session to flatten).
+
+    Why this exists (issue #121): `run_paper_kalman_trend` force-closes every day
+    at 15:25, but this function used to hold to stop/target across days. Params
+    were therefore fit for multi-day holds and deployed with a daily flatten —
+    the fitted 670-pt target fired 0 times in 120 sessions, and the fit
+    environment lost ₹322k with the params it produced. Fit must model deploy.
+    The bar order below (mark → stop/target → entry → session flatten) mirrors
+    `IntradayTrendStrategy.on_bar()` then `eod_close()`; `tests/
+    test_optimize_kalman_trend.py` pins that equivalence on real tape.
+    """
     prices = np.asarray(prices, float)
     direction = np.asarray(direction, float)
     n = len(prices)
+    if session_ends is not None:
+        session_ends = np.asarray(session_ends, bool)
+        if len(session_ends) != n:
+            raise ValueError(
+                f"session_ends length {len(session_ends)} != prices length {n}")
     if n < 2:
         return SimResult(np.zeros(n), 0, 0.0, float("nan"))   # undefined, not a sentinel
     stop_d = abs(stop_ticks) * tick_size
     target_d = abs(target_ticks) * tick_size
+    trail_d = abs(trail_ticks) * tick_size if trail_ticks is not None else None
 
     daily = np.zeros(n)
     pos = 0          # -1 / 0 / +1
-    entry = stop = tgt = 0.0
+    entry = stop = tgt = peak = 0.0
     realized = 0.0
     n_trades = 0
 
@@ -158,7 +227,14 @@ def simulate(
             daily[t] += pos * (c - prices[t - 1])      # mark to close
         if pos != 0:
             hit = None
-            if pos > 0:
+            if trail_d is not None:
+                # Ratchet the peak favourable excursion, then trail the stop
+                # behind it. Never loosens: a new peak moves the stop up (long)
+                # / down (short); a retrace of `trail_d` from the peak exits.
+                peak = max(peak, c) if pos > 0 else min(peak, c)
+                stop = peak - pos * trail_d
+                hit = stop if (c <= stop if pos > 0 else c >= stop) else None
+            elif pos > 0:
                 hit = stop if c <= stop else (tgt if c >= tgt else None)
             else:
                 hit = stop if c >= stop else (tgt if c <= tgt else None)
@@ -171,12 +247,29 @@ def simulate(
         if pos == 0 and direction[t] != 0:
             pos = int(direction[t])
             entry = c
-            stop = entry - pos * stop_d
+            peak = c
+            stop = entry - pos * (trail_d if trail_d is not None else stop_d)
             tgt = entry + pos * target_d
             daily[t] -= cost_per_unit
+        # Session flatten (intraday only) — AFTER entry, mirroring the runner's
+        # on_bar()-then-eod_close(): a signal on the closing bar opens and is
+        # immediately flattened at the same price, costing the round trip. Close
+        # at `c`, which the mark-to-close above already credited, so only the
+        # exit cost is charged here.
+        if session_ends is not None and pos != 0 and session_ends[t]:
+            daily[t] -= cost_per_unit
+            realized += pos * (c - entry) - 2 * cost_per_unit
+            n_trades += 1
+            pos = 0
 
-    # Force-close any open position at the last close.
+    # Force-close any position still open at the last close (a session_ends mask
+    # whose final bar is True will already have closed it).
+    # `daily[-1]` must be debited too: it is already marked to prices[-1] by the
+    # loop, so the price move is accounted — but the exit COST is not, and
+    # n_trades counts this trade. Omitting it let _sharpe divide a P&L series
+    # that excluded the trade's cost by a trade count that included it.
     if pos != 0:
+        daily[-1] -= cost_per_unit
         realized += pos * (prices[-1] - entry) - 2 * cost_per_unit
         n_trades += 1
 
@@ -295,6 +388,7 @@ def fit_kalman_trend(
     l1_lambda: float = 0.1,
     n_gen: int = 200,
     seed: int = 0,
+    session_ends=None,
 ) -> dict:
     """Joint CMA-ES fit of the model-1 Kalman trend strategy on `train_prices`,
     maximizing Sharpe − l1_lambda·‖p_filter‖₁ (paper §6) with the L1 taken in
@@ -317,7 +411,7 @@ def fit_kalman_trend(
         except (ValueError, NotImplementedError):
             return 1e12   # divergent filter → worst fitness
         res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
-                       tick_size=tick_size, cost_per_unit=cost_per_unit)
+                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
         penalty = l1_lambda * float(np.sum(np.abs(x[:5]) / fhi))
         return -(res.sharpe - penalty)
 
@@ -327,7 +421,7 @@ def fit_kalman_trend(
     p = _decision_to_pvector(best_x)
     direction = kalman_direction(prices, p, model=model, mu=best_x[5])
     res = simulate(prices, direction, stop_ticks=best_x[6], target_ticks=best_x[7],
-                   tick_size=tick_size, cost_per_unit=cost_per_unit)
+                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
     return {
         "filter_params": p.tolist(),
         "mu": float(best_x[5]),
@@ -356,6 +450,7 @@ def fit_ma_crossover(
     cost_per_unit: float = 0.0,
     n_gen: int = 200,
     seed: int = 0,
+    session_ends=None,
 ) -> dict:
     """Joint CMA-ES fit of the moving-average crossover baseline (Algorithm 5),
     maximizing train Sharpe — the paper optimizes the baseline's params too, for
@@ -373,7 +468,7 @@ def fit_ma_crossover(
         except ValueError:
             return 1e12
         res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
-                       tick_size=tick_size, cost_per_unit=cost_per_unit)
+                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
         return -res.sharpe
 
     x0 = np.array([10.0, 50.0, 0.5 * d, 5.0 * d, 10.0 * d])
@@ -382,7 +477,7 @@ def fit_ma_crossover(
     short, long, offset, stop, target = best_x
     direction = ma_direction(prices, short=short, long=long, offset=offset)
     res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
-                   tick_size=tick_size, cost_per_unit=cost_per_unit)
+                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
     return {
         "short": int(round(short)), "long": int(round(long)),
         "offset": float(offset), "stop_ticks": float(stop),
@@ -424,6 +519,7 @@ def fit_kalman_reduced(
     cost_per_unit: float = 0.0,
     n_gen: int = 120,
     seed: int = 0,
+    session_ends=None,
 ) -> dict:
     """Reduced 4-param CMA-ES fit (Option B). Returns model-2 filter params + the
     trade params + train Sharpe. Tagged `model=2` so `evaluate` reconstructs it."""
@@ -438,7 +534,7 @@ def fit_kalman_reduced(
         except (ValueError, NotImplementedError):
             return 1e12
         res = simulate(prices, direction, stop_ticks=x[2], target_ticks=x[3],
-                       tick_size=tick_size, cost_per_unit=cost_per_unit)
+                       tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
         return -res.sharpe
 
     x0 = np.array([0.2 * d, 0.2 * d, 5.0 * d, 10.0 * d])
@@ -447,7 +543,7 @@ def fit_kalman_reduced(
     p = _reduced_to_pvector(best_x, d)
     direction = kalman_direction(prices, p, model=2, mu=best_x[1])
     res = simulate(prices, direction, stop_ticks=best_x[2], target_ticks=best_x[3],
-                   tick_size=tick_size, cost_per_unit=cost_per_unit)
+                   tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends)
     return {
         "model": 2, "filter_params": p.tolist(), "s_vel": float(best_x[0]),
         "mu": float(best_x[1]), "stop_ticks": float(best_x[2]),
@@ -457,9 +553,11 @@ def fit_kalman_reduced(
 
 
 def evaluate(prices, *, kind: str, params: dict, tick_size: float = 1.0,
-             cost_per_unit: float = 0.0) -> SimResult:
+             cost_per_unit: float = 0.0, session_ends=None) -> SimResult:
     """Run a fitted parameter set forward on `prices` (e.g. the test slice).
-    `kind` ∈ {'kalman','ma'}. Causal — the signal is regenerated on this slice."""
+    `kind` ∈ {'kalman','ma'}. Causal — the signal is regenerated on this slice.
+    Pass `session_ends` for an intraday series so the evaluation models the
+    runner's daily flatten (issue #121); None for daily bars."""
     prices = np.asarray(prices, float)
     if kind == "kalman":
         d = kalman_direction(prices, params["filter_params"],
@@ -471,4 +569,4 @@ def evaluate(prices, *, kind: str, params: dict, tick_size: float = 1.0,
         raise ValueError(f"unknown kind {kind!r}")
     return simulate(prices, d, stop_ticks=params["stop_ticks"],
                     target_ticks=params["target_ticks"], tick_size=tick_size,
-                    cost_per_unit=cost_per_unit)
+                    cost_per_unit=cost_per_unit, session_ends=session_ends)
