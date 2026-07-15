@@ -499,3 +499,39 @@ def test_close_only_path_unchanged_when_ohlc_absent():
     b = o.simulate([100.0, 101.0, 130.0], [1, 0, 0], stop_ticks=50, target_ticks=25,
                    highs=None, lows=None, opens=None)
     assert a.realized_pnl == b.realized_pnl == pytest.approx(25.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# OHLC bundle: the three arrays must travel and SLICE as one unit
+# ──────────────────────────────────────────────────────────────────────────
+def test_ohlc_bundle_slices_all_three_together():
+    """Slicing is where misalignment is born (highs[b:c] vs closes[b-1:c-1] in a
+    walk-forward fold). One slice() call moves all three, so a fold cannot
+    half-slice them."""
+    b = o.OHLC(opens=np.arange(10.0), highs=np.arange(10.0) + 1,
+               lows=np.arange(10.0) - 1)
+    s = b.slice(2, 5)
+    assert len(s) == 3
+    assert list(s.opens) == [2.0, 3.0, 4.0]
+    assert list(s.highs) == [3.0, 4.0, 5.0]
+    assert list(s.lows) == [1.0, 2.0, 3.0]
+
+
+def test_ohlc_kwargs_splats_into_simulate_and_none_is_close_only():
+    b = o.OHLC(opens=np.array([100.0, 99.5]), highs=np.array([100.0, 101.0]),
+               lows=np.array([100.0, 89.0]))
+    assert o._ohlc_kwargs(None) == {}                     # None -> close-only
+    kw = o._ohlc_kwargs(b)
+    assert set(kw) == {"opens", "highs", "lows"}          # all three, never partial
+    honest = o.simulate([100.0, 99.0], [1, 0], stop_ticks=10, target_ticks=999, **kw)
+    assert honest.realized_pnl == pytest.approx(-10.0)    # saw the touch at 90
+    sliced = o._ohlc_kwargs(b, 0, 1)
+    assert len(sliced["highs"]) == 1
+
+
+def test_ohlc_from_frame_rejects_a_close_only_table():
+    """A close-only tape must fail loud, not silently fall back to the biased
+    level-booking path that made the first variant-D run fiction."""
+    pd = pytest.importorskip("pandas")
+    with pytest.raises(ValueError, match="close-only"):
+        o.OHLC.from_frame(pd.DataFrame({"datetime": [1, 2], "close": [1.0, 2.0]}))

@@ -38,13 +38,16 @@ T_GRID = [25, 50, 75, 100, 150, 200, 250, 300]
 
 
 def load(symbol: str):
+    """(closes, session_ends, OHLC). Fails loud on a close-only tape: booking at
+    the stop LEVEL is what made the first D run fiction (#122)."""
     p = Path("data_cache") / f"{symbol}_5minute.parquet"
     if not p.exists():
         raise FileNotFoundError(p)
     df = pd.read_parquet(p)
     df["datetime"] = pd.to_datetime(df["datetime"])
     return (df["close"].to_numpy(float),
-            o.session_ends_from_timestamps(df["datetime"].tolist()))
+            o.session_ends_from_timestamps(df["datetime"].tolist()),
+            o.OHLC.from_frame(df))
 
 
 def _pooled_sharpe(pnl: np.ndarray) -> float:
@@ -52,7 +55,7 @@ def _pooled_sharpe(pnl: np.ndarray) -> float:
     return float(np.mean(pnl) / sd * np.sqrt(o.TRADING_DAYS)) if sd > 0 else float("nan")
 
 
-def _fit_trail_on_train(train, train_ends, mp, cost):
+def _fit_trail_on_train(train, train_ends, mp, cost, train_ohlc=None):
     """Fit T on TRAIN ONLY (grid, train-Sharpe argmax). No holdout peeking.
 
     Returns None when NO T yields a finite train Sharpe (nothing traded / zero
@@ -67,7 +70,7 @@ def _fit_trail_on_train(train, train_ends, mp, cost):
     for T in T_GRID:
         r = o.simulate(train, d, stop_ticks=mp["stop_ticks"], target_ticks=mp["target_ticks"],
                        tick_size=TICK, cost_per_unit=cost, session_ends=train_ends,
-                       trail_ticks=T)
+                       trail_ticks=T, **o._ohlc_kwargs(train_ohlc))
         s = r.sharpe
         if np.isfinite(s) and s > best_s:
             best_T, best_s = T, s
@@ -76,7 +79,7 @@ def _fit_trail_on_train(train, train_ends, mp, cost):
 
 def run(symbol: str, *, train_len: int, test_len: int, step: int, seeds: list[int],
         n_gen: int, cost: float) -> dict:
-    closes, ends = load(symbol)
+    closes, ends, ohlc = load(symbol)
     n = len(closes)
     starts = list(range(0, n - train_len - test_len + 1, step))
     seed_A, seed_D = [], []
@@ -94,9 +97,14 @@ def run(symbol: str, *, train_len: int, test_len: int, step: int, seeds: list[in
         for a in starts:
             b, c = a + train_len, a + train_len + test_len
             train, train_ends = closes[a:b], ends[a:b]
+            # FIT and EVAL share the fill model (#121-class mismatch otherwise);
+            # OHLC.slice moves all three arrays together so a fold cannot
+            # half-slice them.
+            train_ohlc = ohlc.slice(a, b)
             mp = o.fit_ma_crossover(train, tick_size=TICK, cost_per_unit=cost,
-                                    n_gen=n_gen, seed=seed, session_ends=train_ends)
-            T = _fit_trail_on_train(train, train_ends, mp, cost)
+                                    n_gen=n_gen, seed=seed, session_ends=train_ends,
+                                    **o._ohlc_kwargs(train_ohlc))
+            T = _fit_trail_on_train(train, train_ends, mp, cost, train_ohlc)
             if T is None:
                 # Nothing fitted on this train fold — drop it from BOTH arms so
                 # the comparison stays paired, and surface the count (Rule 12).
@@ -106,13 +114,15 @@ def run(symbol: str, *, train_len: int, test_len: int, step: int, seeds: list[in
             seg_dir = o.ma_direction(closes[a:c], short=mp["short"], long=mp["long"],
                                      offset=mp["offset"])[b - a:]
             test, test_ends = closes[b:c], ends[b:c]
+            test_kw = o._ohlc_kwargs(ohlc, b, c)
 
             rA = o.simulate(test, seg_dir, stop_ticks=mp["stop_ticks"],
                             target_ticks=mp["target_ticks"], tick_size=TICK,
-                            cost_per_unit=cost, session_ends=test_ends)
+                            cost_per_unit=cost, session_ends=test_ends, **test_kw)
             rD = o.simulate(test, seg_dir, stop_ticks=mp["stop_ticks"],
                             target_ticks=mp["target_ticks"], tick_size=TICK,
-                            cost_per_unit=cost, session_ends=test_ends, trail_ticks=T)
+                            cost_per_unit=cost, session_ends=test_ends,
+                            trail_ticks=T, **test_kw)
             A_pnl.append(rA.daily_pnl); D_pnl.append(rD.daily_pnl)
             chosen_T.append(T); n_tr_A += rA.n_trades; n_tr_D += rD.n_trades
 
@@ -122,7 +132,7 @@ def run(symbol: str, *, train_len: int, test_len: int, step: int, seeds: list[in
                     o.simulate(test, seg_dir, stop_ticks=mp["stop_ticks"],
                                target_ticks=mp["target_ticks"], tick_size=TICK,
                                cost_per_unit=cost, session_ends=test_ends,
-                               trail_ticks=Tf).daily_pnl)
+                               trail_ticks=Tf, **test_kw).daily_pnl)
         if not A_pnl:
             continue
         seed_A.append(_pooled_sharpe(np.concatenate(A_pnl)))
@@ -157,6 +167,7 @@ def main() -> None:
     args = ap.parse_args()
 
     print("\nIssue #122 variant D — trailing stop + KEEP the 15:25 flatten (MA arm)")
+    print("HONEST OHLC FILLS (touch detection + gap-aware); fit and eval share them.")
     print("Walk-forward, T fit on TRAIN only, short/long/offset held at incumbent.\n")
     for cost in [float(x) for x in args.costs.split(",")]:
         print(f"{'='*76}\nCOST {cost} pts/side\n{'='*76}")

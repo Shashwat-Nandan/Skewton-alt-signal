@@ -46,7 +46,8 @@ def _pooled_sharpe(pnl: np.ndarray) -> float:
     return float(np.mean(pnl) / sd * np.sqrt(o.TRADING_DAYS)) if sd > 0 else float("nan")
 
 
-def _fold_oos(closes, a, b, c, *, kind, params, cost, session_ends=None) -> o.SimResult:
+def _fold_oos(closes, a, b, c, *, kind, params, cost, session_ends=None,
+              ohlc=None) -> o.SimResult:
     """OOS SimResult on the test slice [b:c]; the signal is warmed up from the
     train start a (params were fit on [a:b] only — causal, no look-ahead).
     Returns the full SimResult (daily P&L + n_trades) so the caller can both
@@ -65,12 +66,13 @@ def _fold_oos(closes, a, b, c, *, kind, params, cost, session_ends=None) -> o.Si
     return o.simulate(closes[b:c], test_dir, stop_ticks=params["stop_ticks"],
                       target_ticks=params["target_ticks"], tick_size=TICK_SIZE,
                       cost_per_unit=cost,
-                      session_ends=None if session_ends is None else session_ends[b:c])
+                      session_ends=None if session_ends is None else session_ends[b:c],
+                      **o._ohlc_kwargs(ohlc, b, c))
 
 
 def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: int,
                  step: int, seeds: list[int], n_gen: int, cost: float,
-                 session_ends=None) -> dict:
+                 session_ends=None, ohlc=None) -> dict:
     n = len(closes)
     starts = list(range(0, n - train_len - test_len + 1, step))
     if not starts:
@@ -90,14 +92,20 @@ def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: i
             b, c = a + train_len, a + train_len + test_len
             train = closes[a:b]
             train_ends = None if session_ends is None else session_ends[a:b]
+            # The FIT gets the same fill model as the EVAL (o._ohlc_kwargs slices
+            # all three arrays together). Fitting close-only while evaluating with
+            # OHLC would be a fresh #121-class fit/deploy mismatch.
+            train_ohlc = o._ohlc_kwargs(ohlc, a, b)
             kp = o.fit_kalman_reduced(train, tick_size=TICK_SIZE, cost_per_unit=cost,
-                                      n_gen=n_gen, seed=seed, session_ends=train_ends)
+                                      n_gen=n_gen, seed=seed, session_ends=train_ends,
+                                      **train_ohlc)
             mp = o.fit_ma_crossover(train, tick_size=TICK_SIZE, cost_per_unit=cost,
-                                    n_gen=n_gen, seed=seed, session_ends=train_ends)
+                                    n_gen=n_gen, seed=seed, session_ends=train_ends,
+                                    **train_ohlc)
             kr = _fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost,
-                           session_ends=session_ends)
+                           session_ends=session_ends, ohlc=ohlc)
             mr = _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost,
-                           session_ends=session_ends)
+                           session_ends=session_ends, ohlc=ohlc)
             kal_pnls.append(kr.daily_pnl)
             ma_pnls.append(mr.daily_pnl)
             ks, ms = float(kr.daily_pnl.sum()), float(mr.daily_pnl.sum())
@@ -181,7 +189,7 @@ def main() -> int:
         # A daily table has exactly 1 bar/day -> None (holding across bars IS the
         # daily strategy).
         ts_col = next((cols[k] for k in ("datetime", "timestamp", "date") if k in cols), None)
-        ends = None
+        ends = ohlc = None
         if ts_col is not None:
             import pandas as _pd
             _ts = _pd.to_datetime(df[ts_col])
@@ -190,27 +198,34 @@ def main() -> int:
                 ends = o.session_ends_from_timestamps(_ts.tolist())
                 print(f"intraday source detected ({len(_ts)} bars over {_n_days} "
                       f"days) — modelling the 15:25 session flatten (#121)")
+                if {"open", "high", "low"} <= set(cols):
+                    ohlc = o.OHLC.from_frame(df)
+                    print("OHLC present — honest touch/gap fills (#122)")
+                else:
+                    print("WARNING: close-only tape — fills book at the stop LEVEL, "
+                          "which flatters tight stops. Re-fetch for OHLC (#122).",
+                          file=sys.stderr)
         if ends is None and _is_5min:
             # Name says intraday but the data disagrees (or carries no usable
             # timestamp): the fit would silently revert to multi-day holds.
             print("WARNING: --csv looks intraday by name but no per-day session "
                   "structure was found; the 15:25 flatten is NOT modelled (#121). "
                   "Check the timestamp column.", file=sys.stderr)
-        jobs = [(Path(args.csv).stem, df[cols["close"]].to_numpy(float), ends)]
+        jobs = [(Path(args.csv).stem, df[cols["close"]].to_numpy(float), ends, ohlc)]
     else:
         jobs = []
         for sym in [s.strip() for s in args.symbols.split(",") if s.strip()]:
             try:
-                jobs.append((sym, load_daily_closes(sym)[1], None))   # daily: no flatten
+                jobs.append((sym, load_daily_closes(sym)[1], None, None))  # daily: no flatten/OHLC
             except FileNotFoundError as e:
                 print(f"\nDATA MISSING for {sym}:\n{e}\n", file=sys.stderr)
                 return 2
 
     results, all_pass = [], True
-    for sym, closes, ends in jobs:
+    for sym, closes, ends, ohlc in jobs:
         r = walk_forward(sym, closes, train_len=args.train_len, test_len=args.test_len,
                          step=args.step, seeds=seeds, n_gen=args.n_gen, cost=args.cost,
-                         session_ends=ends)
+                         session_ends=ends, ohlc=ohlc)
         results.append(r)
         all_pass &= r["passed"]
 

@@ -34,15 +34,21 @@ to assert alpha.
   - kill_switch_drawdown_rupees: 20000
 
 ## Lessons
-- 2026-07-14 (#122): trailing stop REJECTED (plateau fails — T pins at the grid
-  floor, genuinely: n_unfittable=0; and the wins were a fill artifact). When
-  reporting a multi-seed experiment: trades must be PER-SEED and every metric on
-  ONE basis (per-seed pooled, median across seeds) — a first cut summed trades
-  ~5x and pooled the plateau cross-seed while A/D used per-seed-median. Booking a stop at its LEVEL is only
-  safe when stop distance >> bar range: a 25-pt trail gifted 35.9 pts/exit on
-  BANKNIFTY, flipping the tape +₹719k -> -₹506k. Our 5-min cache is CLOSE-ONLY,
-  so tight-stop variants are NOT evaluable — fetch 5-min OHLC first. The live
-  book polls intrabar, so it would differ from any close-only backtest anyway.
+- 2026-07-14 (#122 FINAL, on honest OHLC fills): trailing stop REJECTED on clean
+  evidence. D beats A by 0.02-0.05 Sharpe (nothing) at 1.3-3.3x the churn; both
+  arms ~0 at every cost. The close-only "win" was ~97% artifact: BANKNIFTY@2.5 D
+  3.00 -> 0.07, the grid-floor T pin vanished (T now fits 200-300), and T25
+  flipped from BEST to WORST. **Every pre-#126 kalman_trend number is optimistic**
+  — even the wide 250-pt incumbent stop drops +0.16 -> -0.03 (-Rs 15,926 on the
+  tape). Fills must use OHLC; fit and eval must share the fill model.
+- Booking a stop at its LEVEL is only safe when stop distance >> bar range: a
+  25-pt trail gifted 35.9 pts/exit on BANKNIFTY (flipping a tape +₹719k -> -₹506k).
+  The bias scales with (bar range / stop distance) — NOT with holding overnight.
+- Reporting a multi-seed experiment: trades must be PER-SEED and every metric on
+  ONE basis (per-seed pooled, median across seeds). A first cut summed trades ~5x
+  and pooled the plateau cross-seed while A/D used per-seed-median.
+- A grid fit that pins at a boundary is a red flag: check whether the fallback
+  (or a fill artifact) is manufacturing the pin before believing it.
 - 2026-07-14 (#121): the fit MUST model the runner's 15:25 flatten
   (`simulate(session_ends=)`, built from bar timestamps). It did not, so params
   were fit for multi-day holds and deployed with a daily flatten — the 670-pt
@@ -64,4 +70,6 @@ to assert alpha.
 ## Regime tags
 - trend: the strategy is built to make money here; this is its design regime.
 - chop: trend follower bleeds in range-bound/whipsaw regimes — expect rejections.
-- gap/event: backtest does not model intraday gap fills faithfully; low trust.
+- gap/event: gap fills ARE modelled now (OHLC re-fetch + #126: a stop fires when
+  the bar's range touched it; fills at the level, or the OPEN on a gap). Trust
+  restored — but ONLY for tapes carrying o/h/l; a close-only table fails loud.

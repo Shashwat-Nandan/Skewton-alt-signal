@@ -1,8 +1,11 @@
 # Experiment spec — trailing stop vs EOD flatten (kalman_trend MA arm)
 
-**Status:** **variant D RUN 2026-07-14 → REJECTED (twice over).** See §7. #121 is
-resolved (PR #124). Variants B/C remain blocked — and the blocker list below was
-found to be WRONG in an important way (§0.2), which §7 corrects.
+**Status:** **CLOSED — variant D REJECTED on honest OHLC fills (2026-07-14).**
+All blockers cleared: #121 resolved (PR #124), fills fixed (PR #126), OHLC
+re-fetched, fits+harness wired. Re-run on the full 10,050-bar tape: D beats A by
+0.02–0.05 Sharpe (i.e. nothing) at 1.3–3.3x the churn; both arms ~0 at every
+cost. The close-only 'win' was ~97% fill artifact — see findings §'Variant D on
+HONEST OHLC FILLS'. §7 below records the superseded close-only run.
 
 **Origin:** operator question 2026-07-14 ("why flatten EOD — can we trail
 instead?"). The exploratory replay (findings §"EOD-flatten vs the fitting

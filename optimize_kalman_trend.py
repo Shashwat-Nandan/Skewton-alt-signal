@@ -42,6 +42,7 @@ persists OHLC, so the columns appear on a re-fetch (#122).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Dict
 
 import numpy as np
 
@@ -139,6 +140,55 @@ class SimResult:
     n_trades: int
     realized_pnl: float        # sum of closed-trade P&L (after costs)
     sharpe: float              # annualized, from daily_pnl
+
+
+@dataclass(frozen=True)
+class OHLC:
+    """The three non-close bars, bundled so they travel and SLICE as one unit.
+
+    Why a bundle rather than three loose kwargs: `simulate` takes OHLC
+    all-or-nothing, and the fits/walk-forward have to slice it per fold. Passing
+    three parallel arrays through `fit_* -> simulate` and `closes[a:b]` folds is
+    exactly how you end up with `highs[b:c]` against `closes[b-1:c-1]` — a
+    misalignment that silently mis-fills every trade (simulate's integrity check
+    catches it, but not making the mistake is better). `slice()` moves all three
+    together, so a fold cannot half-slice them.
+    """
+    opens: np.ndarray
+    highs: np.ndarray
+    lows: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.opens)
+
+    def slice(self, lo: int, hi: int) -> "OHLC":
+        return OHLC(self.opens[lo:hi], self.highs[lo:hi], self.lows[lo:hi])
+
+    def as_kwargs(self) -> Dict[str, np.ndarray]:
+        """Splat into simulate(...): `**ohlc.as_kwargs()`."""
+        return {"opens": self.opens, "highs": self.highs, "lows": self.lows}
+
+    @classmethod
+    def from_frame(cls, df) -> "OHLC":
+        """Build from a candle frame (open/high/low columns, any case)."""
+        cols = {c.lower(): c for c in df.columns}
+        missing = {"open", "high", "low"} - set(cols)
+        if missing:
+            raise ValueError(
+                f"frame lacks {sorted(missing)} — it is a close-only table. "
+                "Re-fetch with fetch_index_daily.py (which now persists OHLC); "
+                "a close-only tape cannot tell a TOUCHED stop from a close "
+                "beyond it (#122).")
+        return cls(df[cols["open"]].to_numpy(float),
+                   df[cols["high"]].to_numpy(float),
+                   df[cols["low"]].to_numpy(float))
+
+
+def _ohlc_kwargs(ohlc, lo: int = None, hi: int = None) -> Dict[str, np.ndarray]:
+    """`**_ohlc_kwargs(ohlc)` → {} when None, else the (optionally sliced) arrays."""
+    if ohlc is None:
+        return {}
+    return (ohlc if lo is None else ohlc.slice(lo, hi)).as_kwargs()
 
 
 def session_ends_from_timestamps(timestamps) -> np.ndarray:

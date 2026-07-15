@@ -418,3 +418,66 @@ would ride — is **not supported**. The flatten remains the profitable exit
 and the apparent wins were a fill artifact. Variants B/C stay blocked (B already
 lost ₹322k with realistic fills); the burden of proof on "hold longer" is now
 high.
+
+
+---
+
+# Variant D on HONEST OHLC FILLS — the definitive run (2026-07-14)
+
+The close-only re-run above was the best we could do on a close-only tape. With
+the OHLC re-fetch (#122 blocker cleared) and the fits+harness wired to the honest
+fill model (fit and eval share it — a #121-class mismatch otherwise), variant D
+was re-run from scratch on the **full 10,050-bar / 134-session tape**.
+
+Sharpe = per-seed pooled OOS, median across seeds. Trades = per seed. 22 folds x
+5 seeds, T fit on TRAIN only, short/long/offset held at the incumbent.
+
+| cost | symbol | A (fixed+flatten) | D (trail+flatten) | trades/seed A→D | T median |
+|---|---|---|---|---|---|
+| 2.5 | NIFTY | −0.03 | −0.01 | 96.8 → 121.6 | 200 |
+| 2.5 | BANKNIFTY | 0.05 | 0.07 | 141.8 → 467.2 | 250 |
+| 8.0 | NIFTY | −0.08 | −0.05 | 86.8 → 108.0 | 250 |
+| 8.0 | BANKNIFTY | −0.07 | −0.02 | 105.6 → 277.0 | 300 |
+
+## The close-only result was ENTIRELY a fill artifact
+
+| | close-only | honest OHLC |
+|---|---|---|
+| NIFTY@2.5 A | +0.16 | **−0.03** |
+| NIFTY@2.5 D | **+0.69** | **−0.01** |
+| BANKNIFTY@2.5 D | **+3.00** | **+0.07** |
+| BANKNIFTY@8.0 D | **+1.68** | **−0.02** |
+| T chosen (all cells) | **25 = the grid FLOOR** | **200–300** |
+| plateau at T25 | **+0.86 / +2.97 (BEST)** | **−0.88 / −0.50 (WORST)** |
+
+Three independent signatures all invert:
+1. **The grid-floor pin is gone.** T now fits at 200–300 across every cell. The
+   optimizer only ever wanted T=25 because a 25-pt trail let level-booking gift
+   ~36 pts per exit; with honest fills a tight trail is the worst thing you can do.
+2. **T25 flips from best to worst** in every cell (BANKNIFTY@8.0: **−2.45**).
+   The plateau now slopes UP toward wide trails — the exact opposite shape.
+3. **BANKNIFTY's headline 3.00 collapses to 0.07.** That number was ~97% fiction.
+
+## VERDICT — variant D REJECTED (third time, now on clean evidence)
+
+D beats A by 0.02–0.05 Sharpe in every cell — i.e. **nothing**, at 1.3–3.3x the
+trade count. Both arms sit at ~0 on honest fills at every cost. There is no edge
+in either exit rule; the trail is not better, it is just churnier for the same
+nil.
+
+**Every previous kalman_trend number was optimistic.** Even variant A — the wide
+250-pt incumbent stop, where level-booking was assumed benign — drops
+NIFTY@2.5 **+0.16 → −0.03** and BANKNIFTY@8.0 **+0.27 → −0.07**. Measured
+directly on the incumbent config: **−212.4 pts = −₹15,926** over the tape. Read
+any pre-#126 kalman_trend figure as biased upward by an unknown amount.
+
+## Read
+
+The operator hypothesis ("the 15:25 flatten arbitrarily truncates trends a trail
+would ride") is **not supported** and is now closed on data that can actually
+answer it. The flatten remains the profitable exit (#121); the trail adds churn
+and no edge at every T on both instruments at both costs.
+
+This is what the whole #121→#126 chain bought: the question was answerable only
+after the fit modelled the flatten, the fills stopped being fiction, and the data
+carried high/low. The answer is still no — but it is now a real no.
