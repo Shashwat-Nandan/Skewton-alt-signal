@@ -34,6 +34,14 @@ to assert alpha.
   - kill_switch_drawdown_rupees: 20000
 
 ## Lessons
+- 2026-07-14 (#125): the intraday fit no longer fits `target_ticks` — under the
+  15:25 flatten it CANNOT bind (fitted 512-1410 pts across seeds, ZERO hits, vs a
+  max session excursion of 441), so CMA-ES was sampling a flat plateau at random.
+  MA 5->4 params, Kalman reduced 4->3. Intraday params now carry
+  target_ticks=None; the live book supports it (fit==deploy). DAILY gates keep
+  the target — a bar IS a day and it genuinely binds. Watch for this shape: a
+  param whose fitted value scatters wildly across seeds while nothing it controls
+  ever triggers is unidentifiable, not tuned.
 - 2026-07-14 (#122 FINAL, on honest OHLC fills): trailing stop REJECTED on clean
   evidence. D beats A by 0.02-0.05 Sharpe (nothing) at 1.3-3.3x the churn; both
   arms ~0 at every cost. The close-only "win" was ~97% artifact: BANKNIFTY@2.5 D

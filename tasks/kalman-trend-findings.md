@@ -481,3 +481,57 @@ and no edge at every T on both instruments at both costs.
 This is what the whole #121→#126 chain bought: the question was answerable only
 after the fit modelled the flatten, the fills stopped being fiction, and the data
 carried high/low. The answer is still no — but it is now a real no.
+
+
+---
+
+# #125 — target_ticks dropped from the intraday fit (2026-07-14)
+
+Re-verified on the HONEST-FILL tape before changing anything (the fill model had
+changed underneath the original evidence):
+
+| | close-only (original) | honest OHLC (re-verified) |
+|---|---|---|
+| fitted target across 6 seeds | 636–1558 | **512–1410** (spread 899) |
+| target hits, every seed | 0 | **0** (even with honest bar-high touch detection) |
+| max within-session favourable excursion | 391 pts | **440.8** (p100, using bar extremes) |
+
+The **smallest** fitted target (512) still exceeds the **largest** favourable
+excursion ever observed (441). Under the 15:25 flatten the target cannot bind:
+it is not an estimated parameter, it is a flat plateau CMA-ES samples at random.
+
+## Change
+
+`fit_target: bool = True` on all three fits. When False the target dimension is
+dropped from the CMA-ES vector entirely and `target_ticks` returns **None** (no
+target — not a magic large constant, so nothing has to guess a threshold).
+
+- **Intraday callers pass False**: the runner's warmup fit, the walk-forward
+  harness (when `session_ends` is given), and the trail experiment.
+- **The DAILY gates keep the target** (`session_ends=None`): a bar IS a day
+  there, holds run for days, and the target genuinely binds. Byte-identical.
+- **`simulate(target_ticks=None)`** and **`IntradayTrendStrategy.target_ticks:
+  Optional`** both support no-target — the live book MUST match the fit or
+  dropping it would be a fresh #121-class fit/deploy mismatch. The parity gate
+  still passes.
+
+MA fit: 5 params → **4**. Kalman reduced: 4 → **3**. Kalman full: 8 → **7**.
+
+## Honest note on the verification
+
+The issue predicted "intraday results unchanged (the target never fired)". That
+is **not quite right**: the target never *fires* either way, but removing a
+dimension changes the SEARCH, so CMA-ES lands on different params (seed 0:
+7/98 → 23/93). Train Sharpe is flat-to-slightly-lower (mean 0.665 → 0.640
+across 4 seeds) — which is the *expected and desired* direction for an
+anti-overfit change: a smaller space cannot chase the train window as hard. No
+trade changes for the same params; the param differences are CMA-ES search-path
+noise, which the multi-seed aggregation exists to absorb.
+
+## Why it mattered
+
+`target=755` was serialized into `kalman_trend_runner_state.json` and read as a
+tuned parameter. It was noise — and it was part of the config feeding the
+2026-08-28 MA decision. Per SKILL.md's core lesson (fewer free params = less
+overfit; `fit_kalman_reduced` exists precisely to cut 8→4), one of those params
+was provably inert intraday.

@@ -218,7 +218,7 @@ def simulate(
     direction,
     *,
     stop_ticks: float,
-    target_ticks: float,
+    target_ticks,          # float, or None = NO target (see #125)
     tick_size: float = 1.0,
     cost_per_unit: float = 0.0,
     session_ends=None,
@@ -325,7 +325,10 @@ def simulate(
     if n < 2:
         return SimResult(np.zeros(n), 0, 0.0, float("nan"))   # undefined, not a sentinel
     stop_d = abs(stop_ticks) * tick_size
-    target_d = abs(target_ticks) * tick_size
+    # target_ticks=None -> no target at all (#125). Under the 15:25 flatten a
+    # target cannot bind (fitted 512-1410 pts vs a max session excursion of 441),
+    # so it is not a parameter — it is a dead dimension CMA-ES drifts at random.
+    target_d = abs(target_ticks) * tick_size if target_ticks is not None else None
     trail_d = abs(trail_ticks) * tick_size if trail_ticks is not None else None
 
     # `has_ohlc` is loop-invariant, so bind the fill rule ONCE rather than branch
@@ -376,7 +379,7 @@ def simulate(
             # unknowable from OHLC: a bar would get stopped out by its own low at
             # a stop derived from its own high. So: check, THEN ratchet.
             hit = _fill(stop, pos, t, is_stop=True)
-            if hit is None and trail_d is None:
+            if hit is None and trail_d is None and target_d is not None:
                 # Stop first when both are reachable in one bar (see docstring).
                 hit = _fill(tgt, pos, t, is_stop=False)
             if hit is not None:
@@ -397,7 +400,7 @@ def simulate(
             entry = c
             peak = c
             stop = entry - pos * (trail_d if trail_d is not None else stop_d)
-            tgt = entry + pos * target_d
+            tgt = None if target_d is None else entry + pos * target_d
             daily[t] -= cost_per_unit
         # Session flatten (intraday only) — AFTER entry, mirroring the runner's
         # on_bar()-then-eod_close(): a signal on the closing bar opens and is
@@ -540,6 +543,7 @@ def fit_kalman_trend(
     highs=None,
     lows=None,
     opens=None,
+    fit_target: bool = True,
 ) -> dict:
     """Joint CMA-ES fit of the model-1 Kalman trend strategy on `train_prices`,
     maximizing Sharpe − l1_lambda·‖p_filter‖₁ (paper §6) with the L1 taken in
@@ -556,7 +560,8 @@ def fit_kalman_trend(
 
     def objective_min(x):
         p = _decision_to_pvector(x)
-        mu, stop, target = x[5], x[6], x[7]
+        mu, stop = x[5], x[6]
+        target = x[7] if fit_target else None
         try:
             direction = kalman_direction(prices, p, model=model, mu=mu)
         except (ValueError, NotImplementedError):
@@ -572,14 +577,15 @@ def fit_kalman_trend(
                           n_gen=n_gen, seed=seed)
     p = _decision_to_pvector(best_x)
     direction = kalman_direction(prices, p, model=model, mu=best_x[5])
-    res = simulate(prices, direction, stop_ticks=best_x[6], target_ticks=best_x[7],
+    _tgt = float(best_x[7]) if fit_target else None
+    res = simulate(prices, direction, stop_ticks=best_x[6], target_ticks=_tgt,
                    tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
                        highs=highs, lows=lows, opens=opens)
     return {
         "filter_params": p.tolist(),
         "mu": float(best_x[5]),
         "stop_ticks": float(best_x[6]),
-        "target_ticks": float(best_x[7]),
+        "target_ticks": _tgt,
         "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
         "l1_norm_normalized": float(np.sum(np.abs(best_x[:5]) / fhi)),
         "n_trades": res.n_trades,
@@ -607,16 +613,31 @@ def fit_ma_crossover(
     highs=None,
     lows=None,
     opens=None,
+    fit_target: bool = True,
 ) -> dict:
     """Joint CMA-ES fit of the moving-average crossover baseline (Algorithm 5),
     maximizing train Sharpe — the paper optimizes the baseline's params too, for
-    a fair comparison."""
+    a fair comparison.
+
+    `fit_target=False` (#125): drop `target_ticks` from the search entirely and
+    return None for it. Under the 15:25 flatten a target CANNOT bind — measured
+    on NIFTY 5-min, fitted targets scatter 512-1410 pts across seeds with ZERO
+    hits, while the largest within-session favourable excursion ever observed is
+    441 pts. So it is not an estimated parameter: it is a flat plateau CMA-ES
+    samples at random, wasting a dimension in a fit whose documented failure mode
+    is overfitting. Intraday callers pass False; the DAILY gates keep the target
+    (a bar IS a day, holds run for days, the target genuinely binds).
+    """
     prices = np.asarray(train_prices, float)
     d = _daily_scale(prices)
     bounds = _ma_bounds(d)
+    x0 = np.array([10.0, 50.0, 0.5 * d, 5.0 * d, 10.0 * d])
+    if not fit_target:
+        bounds, x0 = bounds[:4], x0[:4]
 
     def objective_min(x):
-        short, long, offset, stop, target = x
+        short, long, offset, stop = x[:4]
+        target = x[4] if fit_target else None
         if round(short) >= round(long):
             return 1e12   # require short < long
         try:
@@ -628,10 +649,10 @@ def fit_ma_crossover(
                        highs=highs, lows=lows, opens=opens)
         return -res.sharpe
 
-    x0 = np.array([10.0, 50.0, 0.5 * d, 5.0 * d, 10.0 * d])
     best_x, _ = run_cmaes(objective_min, x0, bounds=bounds, sigma=0.25,
                           n_gen=n_gen, seed=seed)
-    short, long, offset, stop, target = best_x
+    short, long, offset, stop = best_x[:4]
+    target = best_x[4] if fit_target else None
     direction = ma_direction(prices, short=short, long=long, offset=offset)
     res = simulate(prices, direction, stop_ticks=stop, target_ticks=target,
                    tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
@@ -639,7 +660,7 @@ def fit_ma_crossover(
     return {
         "short": int(round(short)), "long": int(round(long)),
         "offset": float(offset), "stop_ticks": float(stop),
-        "target_ticks": float(target), "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
+        "target_ticks": None if target is None else float(target), "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
         "n_trades": res.n_trades,
     }
 
@@ -681,6 +702,7 @@ def fit_kalman_reduced(
     highs=None,
     lows=None,
     opens=None,
+    fit_target: bool = True,
 ) -> dict:
     """Reduced 4-param CMA-ES fit (Option B). Returns model-2 filter params + the
     trade params + train Sharpe. Tagged `model=2` so `evaluate` reconstructs it."""
@@ -694,23 +716,27 @@ def fit_kalman_reduced(
             direction = kalman_direction(prices, p, model=2, mu=x[1])
         except (ValueError, NotImplementedError):
             return 1e12
-        res = simulate(prices, direction, stop_ticks=x[2], target_ticks=x[3],
+        res = simulate(prices, direction, stop_ticks=x[2],
+                       target_ticks=(x[3] if fit_target else None),
                        tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
                        highs=highs, lows=lows, opens=opens)
         return -res.sharpe
 
     x0 = np.array([0.2 * d, 0.2 * d, 5.0 * d, 10.0 * d])
+    if not fit_target:                      # #125: the target cannot bind intraday
+        bounds, x0 = bounds[:3], x0[:3]
     best_x, _ = run_cmaes(objective_min, x0, bounds=bounds, sigma=0.25,
                           n_gen=n_gen, seed=seed)
     p = _reduced_to_pvector(best_x, d)
     direction = kalman_direction(prices, p, model=2, mu=best_x[1])
-    res = simulate(prices, direction, stop_ticks=best_x[2], target_ticks=best_x[3],
+    _tgt = float(best_x[3]) if fit_target else None
+    res = simulate(prices, direction, stop_ticks=best_x[2], target_ticks=_tgt,
                    tick_size=tick_size, cost_per_unit=cost_per_unit, session_ends=session_ends,
                        highs=highs, lows=lows, opens=opens)
     return {
         "model": 2, "filter_params": p.tolist(), "s_vel": float(best_x[0]),
         "mu": float(best_x[1]), "stop_ticks": float(best_x[2]),
-        "target_ticks": float(best_x[3]), "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
+        "target_ticks": _tgt, "train_sharpe": float(res.sharpe) if np.isfinite(res.sharpe) else None,
         "n_trades": res.n_trades,
     }
 

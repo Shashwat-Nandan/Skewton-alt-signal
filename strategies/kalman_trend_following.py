@@ -51,7 +51,10 @@ class IntradayTrendStrategy:
     between bars for intraday stop/target fills."""
     signal_kind: SignalKind
     stop_ticks: float
-    target_ticks: float
+    # None = NO target (#125). Under the 15:25 flatten a target cannot bind, so
+    # the intraday fit no longer fits one — and the live book MUST match the fit
+    # or that is a fresh #121-class fit/deploy mismatch.
+    target_ticks: Optional[float]
     tick_size: float = 1.0
     cost_per_unit: float = 0.0          # per side, in price points
     lot_size: int = 1                   # ₹ per point per lot (for reporting)
@@ -74,7 +77,7 @@ class IntradayTrendStrategy:
     pos: int = 0
     entry_price: float = 0.0
     stop_price: float = 0.0
-    target_price: float = 0.0
+    target_price: Optional[float] = None
     realized_points: float = 0.0
     n_bars: int = 0
     trades: list = field(default_factory=list)
@@ -91,8 +94,10 @@ class IntradayTrendStrategy:
             self._closes = deque(maxlen=int(self.long))
         else:
             raise ValueError(f"unknown signal_kind {self.signal_kind!r}")
-        if not (self.stop_ticks > 0 and self.target_ticks > 0):
-            raise ValueError("stop_ticks and target_ticks must be > 0")
+        if not (self.stop_ticks > 0):
+            raise ValueError("stop_ticks must be > 0")
+        if self.target_ticks is not None and not (self.target_ticks > 0):
+            raise ValueError("target_ticks must be > 0 when set (None = no target)")
         # Index into `trades` where the current session began, so the EOD sidecar
         # can report just THIS session's fills (the book carries prior sessions'
         # trades across the daily restore). Fresh books start at 0 (all trades are
@@ -110,12 +115,12 @@ class IntradayTrendStrategy:
         if self.pos > 0:
             if price <= self.stop_price:
                 hit, reason = self.stop_price, "stop"
-            elif price >= self.target_price:
+            elif self.target_price is not None and price >= self.target_price:
                 hit, reason = self.target_price, "target"
         else:
             if price >= self.stop_price:
                 hit, reason = self.stop_price, "stop"
-            elif price <= self.target_price:
+            elif self.target_price is not None and price <= self.target_price:
                 hit, reason = self.target_price, "target"
         if hit is None:
             return None
@@ -165,9 +170,9 @@ class IntradayTrendStrategy:
             self.pos = direction
             self.entry_price = price
             stop_d = self.stop_ticks * self.tick_size
-            tgt_d = self.target_ticks * self.tick_size
             self.stop_price = price - direction * stop_d
-            self.target_price = price + direction * tgt_d
+            self.target_price = (None if self.target_ticks is None
+                                 else price + direction * self.target_ticks * self.tick_size)
             entered = direction
         return {"price": price, "signal": direction, "exit": exit_rec,
                 "entered": entered, "pos": self.pos}

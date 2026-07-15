@@ -243,3 +243,35 @@ def test_ma_serialize_restore_identity():
     restored = IntradayTrendStrategy.restore(s.serialize())
     for p in [112.0, 113.0, 111.0, 114.0]:
         assert s.on_bar(p)["signal"] == restored.on_bar(p)["signal"]
+
+
+def test_strategy_accepts_no_target_and_never_fires_one():
+    """#125: the intraday fit returns target_ticks=None, so the LIVE book must
+    accept it — if the fit drops the target but the book keeps one, that is a
+    fresh #121-class fit/deploy mismatch."""
+    from strategies.kalman_trend_following import IntradayTrendStrategy
+    s = IntradayTrendStrategy(signal_kind="ma", short=2, long=3, offset=0.0,
+                              stop_ticks=50, target_ticks=None, tick_size=1.0)
+    # warmup_bars=5 gates ENTRY, so feed past it or the test is vacuous
+    for px in (100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 300.0):
+        s.on_bar(px)
+    assert s.pos != 0 or s.trades, "fixture never entered — test would be vacuous"
+    assert all(t.reason != "target" for t in s.trades)   # a 300 move fires nothing
+    assert s.target_price is None
+
+    # the stop still works with no target
+    s2 = IntradayTrendStrategy(signal_kind="ma", short=2, long=3, offset=0.0,
+                               stop_ticks=5, target_ticks=None, tick_size=1.0)
+    for px in (100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0):
+        s2.on_bar(px)
+    assert s2.pos != 0, "fixture never entered — stop path untested"
+    rec = s2.check_exit(90.0)
+    assert rec is not None and rec.reason == "stop"
+
+
+def test_strategy_rejects_a_nonpositive_target_when_set():
+    from strategies.kalman_trend_following import IntradayTrendStrategy
+    import pytest as _p
+    with _p.raises(ValueError, match="target_ticks"):
+        IntradayTrendStrategy(signal_kind="ma", short=2, long=3, offset=0.0,
+                              stop_ticks=50, target_ticks=0, tick_size=1.0)

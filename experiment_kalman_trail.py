@@ -103,6 +103,7 @@ def run(symbol: str, *, train_len: int, test_len: int, step: int, seeds: list[in
             train_ohlc = ohlc.slice(a, b)
             mp = o.fit_ma_crossover(train, tick_size=TICK, cost_per_unit=cost,
                                     n_gen=n_gen, seed=seed, session_ends=train_ends,
+                                    fit_target=False,   # #125: cannot bind intraday
                                     **o._ohlc_kwargs(train_ohlc))
             T = _fit_trail_on_train(train, train_ends, mp, cost, train_ohlc)
             if T is None:

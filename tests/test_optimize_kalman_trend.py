@@ -535,3 +535,46 @@ def test_ohlc_from_frame_rejects_a_close_only_table():
     pd = pytest.importorskip("pandas")
     with pytest.raises(ValueError, match="close-only"):
         o.OHLC.from_frame(pd.DataFrame({"datetime": [1, 2], "close": [1.0, 2.0]}))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #125: target_ticks is unidentifiable under the flatten — drop it intraday
+# ──────────────────────────────────────────────────────────────────────────
+def test_simulate_target_none_means_no_target():
+    """target_ticks=None must mean NO target, not target=0 (which would exit
+    instantly) — the position rides past where a target would have fired."""
+    with_tgt = o.simulate([100.0, 130.0], [1, 0], stop_ticks=50, target_ticks=25)
+    no_tgt = o.simulate([100.0, 130.0], [1, 0], stop_ticks=50, target_ticks=None)
+    assert with_tgt.realized_pnl == pytest.approx(25.0)   # cut at the target
+    assert no_tgt.realized_pnl == pytest.approx(30.0)     # rode to the close
+    # the stop must still work with no target
+    assert o.simulate([100.0, 40.0], [1, 0], stop_ticks=50,
+                      target_ticks=None).realized_pnl == pytest.approx(-50.0)
+
+
+@pytest.mark.parametrize("fit_fn", ["fit_ma_crossover", "fit_kalman_reduced",
+                                    "fit_kalman_trend"])
+def test_fit_target_false_drops_the_dimension_and_returns_none(fit_fn):
+    """#125: under the 15:25 flatten a target cannot bind (fitted 512-1410 pts
+    across seeds with ZERO hits vs a max session excursion of 441), so CMA-ES was
+    sampling a flat plateau at random — a wasted dimension in a fit whose
+    documented failure mode is overfitting, and a meaningless number serialized
+    into the runner state where it read as tuned."""
+    rng = np.random.default_rng(0)
+    px = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    ends = np.zeros(400, bool); ends[::80] = True; ends[-1] = True
+    fn = getattr(o, fit_fn)
+    fitted = fn(px, n_gen=3, seed=0, session_ends=ends, fit_target=True)
+    dropped = fn(px, n_gen=3, seed=0, session_ends=ends, fit_target=False)
+    assert fitted["target_ticks"] is not None and fitted["target_ticks"] > 0
+    assert dropped["target_ticks"] is None          # no target, not a magic constant
+    assert dropped["stop_ticks"] > 0                # the stop is still fitted
+
+
+def test_daily_gates_keep_the_target_by_default():
+    """Regression: session_ends=None (the DAILY path) must still fit a target —
+    a bar IS a day there, holds run for days, and the target genuinely binds."""
+    rng = np.random.default_rng(0)
+    px = 100 + np.cumsum(rng.normal(0, 1.0, 300))
+    fitted = o.fit_ma_crossover(px, n_gen=3, seed=0)     # default fit_target=True
+    assert fitted["target_ticks"] is not None and fitted["target_ticks"] > 0

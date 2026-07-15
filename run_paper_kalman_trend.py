@@ -246,12 +246,19 @@ def fit_params(prices: np.ndarray, *, session_ends=None,
     no-flatten environment lost ₹322k with the params it produced. Callers on
     intraday bars MUST pass session_ends; None is only correct for daily bars.
     """
+    # fit_target=False (#125): this book flattens at 15:25, so a target can never
+    # bind — fitted targets scattered 512-1410 pts across seeds with ZERO hits vs
+    # a max session excursion of 441. Fitting it wasted a dimension and wrote a
+    # meaningless number into the state file that read as tuned. The live book
+    # gets target_ticks=None to match (fit == deploy, #121).
     kal = opt.fit_kalman_reduced(prices, tick_size=1.0,
                                  cost_per_unit=COST_PER_UNIT_POINTS,
-                                 n_gen=n_gen, seed=seed, session_ends=session_ends)
+                                 n_gen=n_gen, seed=seed, session_ends=session_ends,
+                                 fit_target=False)
     ma = opt.fit_ma_crossover(prices, tick_size=1.0,
                               cost_per_unit=COST_PER_UNIT_POINTS,
-                              n_gen=n_gen, seed=seed, session_ends=session_ends)
+                              n_gen=n_gen, seed=seed, session_ends=session_ends,
+                              fit_target=False)
     return kal, ma
 
 

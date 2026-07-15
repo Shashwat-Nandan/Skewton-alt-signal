@@ -96,12 +96,16 @@ def walk_forward(symbol: str, closes: np.ndarray, *, train_len: int, test_len: i
             # all three arrays together). Fitting close-only while evaluating with
             # OHLC would be a fresh #121-class fit/deploy mismatch.
             train_ohlc = o._ohlc_kwargs(ohlc, a, b)
+            # #125: intraday (a flatten is in force) -> the target cannot bind, so
+            # do not fit it. The DAILY gates keep it (a bar IS a day; holds run
+            # for days and the target genuinely binds).
+            fit_tgt = session_ends is None
             kp = o.fit_kalman_reduced(train, tick_size=TICK_SIZE, cost_per_unit=cost,
                                       n_gen=n_gen, seed=seed, session_ends=train_ends,
-                                      **train_ohlc)
+                                      fit_target=fit_tgt, **train_ohlc)
             mp = o.fit_ma_crossover(train, tick_size=TICK_SIZE, cost_per_unit=cost,
                                     n_gen=n_gen, seed=seed, session_ends=train_ends,
-                                    **train_ohlc)
+                                    fit_target=fit_tgt, **train_ohlc)
             kr = _fold_oos(closes, a, b, c, kind="kalman", params=kp, cost=cost,
                            session_ends=session_ends, ohlc=ohlc)
             mr = _fold_oos(closes, a, b, c, kind="ma", params=mp, cost=cost,
