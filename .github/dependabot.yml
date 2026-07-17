@@ -19,9 +19,13 @@ updates:
         update-types: ["minor", "patch"]
     labels: ["dependencies", "frontend"]
 
-  # GitHub Actions used in workflows
+  # GitHub Actions used in workflows — grouped into ONE PR so multiple action
+  # bumps don't each edit the same workflow file and conflict with each other.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
     labels: ["dependencies", "ci"]
