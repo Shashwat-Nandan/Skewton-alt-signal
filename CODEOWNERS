@@ -1,0 +1,38 @@
+# CODEOWNERS — who must review changes to which paths.
+#
+# Founders: @adigunners (Aditya) · @Shashwat-Nandan (Shashwat) · @sarinsaurabh (Saurabh).
+# (Consider switching to a @Skewton/core-devs team once that team is created.)
+#
+# NOTE ON ENFORCEMENT: "Require review from Code Owners" is only *enforced* on
+# private repos with a GitHub Team/Enterprise plan. On the current Free plan this
+# file documents ownership and auto-suggests reviewers; it becomes a hard gate the
+# moment the org upgrades. See AGENTS.md safety rule 5.
+
+# --- Default: every change needs a founder review ---
+*                       @adigunners @Shashwat-Nandan @sarinsaurabh
+
+# --- Money-affecting: the trading brain & execution (extra care) ---
+/strategies/            @adigunners @Shashwat-Nandan @sarinsaurabh
+/signal_plane/          @adigunners @Shashwat-Nandan @sarinsaurabh
+/loop_engine/           @adigunners @Shashwat-Nandan @sarinsaurabh
+/backend/               @adigunners @Shashwat-Nandan @sarinsaurabh
+/run_paper*.py          @adigunners @Shashwat-Nandan @sarinsaurabh
+/run_equity_swing.py    @adigunners @Shashwat-Nandan @sarinsaurabh
+/run_autoresearch.py    @adigunners @Shashwat-Nandan @sarinsaurabh
+/runner_common.py       @adigunners @Shashwat-Nandan @sarinsaurabh
+/greeks_engine.py       @adigunners @Shashwat-Nandan @sarinsaurabh
+/risk_analyzer.py       @adigunners @Shashwat-Nandan @sarinsaurabh
+/regime_classifier.py   @adigunners @Shashwat-Nandan @sarinsaurabh
+/kite_auth.py           @adigunners @Shashwat-Nandan @sarinsaurabh
+/kite_throttle.py       @adigunners @Shashwat-Nandan @sarinsaurabh
+
+# --- Governance, CI, deploy, dependencies (change deliberately) ---
+/.github/               @adigunners @Shashwat-Nandan @sarinsaurabh
+/deploy/                @adigunners @Shashwat-Nandan @sarinsaurabh
+/ruff.toml              @adigunners @Shashwat-Nandan @sarinsaurabh
+/requirements*.in       @adigunners @Shashwat-Nandan @sarinsaurabh
+/requirements*.lock     @adigunners @Shashwat-Nandan @sarinsaurabh
+/AGENTS.md              @adigunners @Shashwat-Nandan @sarinsaurabh
+/CLAUDE.md              @adigunners @Shashwat-Nandan @sarinsaurabh
+/CODEOWNERS             @adigunners @Shashwat-Nandan @sarinsaurabh
+/SECURITY.md            @adigunners @Shashwat-Nandan @sarinsaurabh

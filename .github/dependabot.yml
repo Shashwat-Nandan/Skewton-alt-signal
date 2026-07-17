@@ -1,0 +1,27 @@
+version: 2
+
+# Python note: dependencies are managed with pip-tools/uv hash-pinned lockfiles
+# (requirements.in -> requirements.lock with --require-hashes). Dependabot's pip
+# updater does not cleanly regenerate that hashed closure, so Python packages are
+# covered instead by (a) Dependabot *security alerts* (enabled at repo/org level)
+# and (b) the `pip-audit` job in .github/workflows/security.yml. Bump Python deps
+# manually via the requirements.in -> lockfile flow (see CONTRIBUTING.md).
+
+updates:
+  # Frontend dashboard (React/Vite/TS)
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      frontend-minor-patch:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies", "frontend"]
+
+  # GitHub Actions used in workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]
