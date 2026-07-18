@@ -24,13 +24,21 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # --top, --max-leg-notional and tunables live here so config changes don't
 # require a rebuild. Override on the VPS by `systemctl edit pair-paper.service`.
 #
-# --max-daily-loss-inr 100000000 (effectively unreachable): the HALT_* flags in
-# data_cache/ are SHARED across runners. While the persistent runner trades live
-# (pair-paper-persistent-live.service), a paper-side daily-loss breach here would
-# otherwise touch data_cache/HALT_DAILY_LOSS and halt the LIVE runner's entries.
-# Pinning baseline paper's breaker out of reach keeps the shared circuit breaker
-# owned solely by the live runner. See tasks/todo.md (2026-06-07) §3.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 12 --max-leg-notional 1000000 --max-daily-loss-inr 100000000
+# --max-daily-loss-inr 100000 (₹1 lakh, 2026-07-18): a real breaker for the
+# baseline paper book. This is now SAFE to make reachable because the runner's
+# daily-loss flag is namespaced per --system (run_paper_pairs.halt_daily_loss_path):
+# --system baseline touches data_cache/HALT_DAILY_LOSS_baseline, which the LIVE
+# persistent runner (canonical data_cache/HALT_DAILY_LOSS) does NOT read — so a
+# paper breach can no longer halt the live book. (The operator HALT_ALL /
+# HALT_NEW_ENTRIES switches stay shared by design.) Was 100000000/unreachable
+# back when the flag was shared; see tasks/todo.md (2026-07-18 baseline top-8).
+#
+# --top 8 (was 12, 2026-07-18): tighter top-8 cointegrated universe as the
+# paper-validation config ahead of a future live-alongside cutover. Stays PAPER
+# (no --mode live) until top-8 clears its own paper window (safety rule 3). The
+# host runs this via a systemd drop-in (pair-paper.service.d/10-top8.conf); see
+# tasks/todo.md (2026-07-18 baseline top-8) for the deferred live prerequisites.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 8 --max-leg-notional 1000000 --max-daily-loss-inr 100000
 # ------------------------------------
 
 # M-O5: auto-restart on segfault / non-zero exit. Successful exit (clean

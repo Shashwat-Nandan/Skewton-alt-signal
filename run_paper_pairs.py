@@ -92,11 +92,29 @@ DATA_CACHE = HERE / "data_cache"
 CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
 
 # HALT_ALL_PATH / HALT_NEW_ENTRIES_PATH are imported from runner_common
-# (shared kill switches; both runners share data_cache so either flag halts
-# both). Runner-set HALT_DAILY_LOSS_PATH is pair-specific and stays here:
-# set when --max-daily-loss-inr is breached, persists across restarts, and
-# the operator must `rm` to acknowledge and resume.
+# (shared kill switches; every runner shares data_cache, so an operator flag
+# halts ALL of them at once — that is the intended behaviour of a manual kill
+# switch). The runner-set daily-loss breaker is the opposite: it is PER-RUNNER
+# (see halt_daily_loss_path). Two pair runners share data_cache, so a single
+# shared flag would let one runner's loss breach freeze the other's entries —
+# the same isolation run_paper_arbitrage.py gets from HALT_ARBITRAGE_DAILY_LOSS.
+# HALT_DAILY_LOSS_PATH is the CANONICAL flag kept by the persistent (LIVE)
+# runner so its operator alert (deploy/pair-halt-alert.path) and `rm` runbook
+# stay valid unchanged; other --system tags get a suffixed flag.
 HALT_DAILY_LOSS_PATH = DATA_CACHE / "HALT_DAILY_LOSS"
+
+
+def halt_daily_loss_path(system: str) -> Path:
+    """Per-runner daily-loss breaker flag for a given --system tag.
+
+    The persistent runner (the live book) keeps the canonical HALT_DAILY_LOSS
+    so its Telegram alert and runbook are untouched; every other runner —
+    e.g. the baseline paper runner — gets HALT_DAILY_LOSS_<system>, so its own
+    breach touches only its own flag and cannot halt a co-running pair runner.
+    """
+    if system == "persistent":
+        return HALT_DAILY_LOSS_PATH
+    return DATA_CACHE / f"HALT_DAILY_LOSS_{system}"
 
 # 3.7 / M-6: how often to re-reconcile against the broker DURING a live
 # session. The startup gate alone leaves a drift window from one start to the
@@ -396,14 +414,17 @@ def build_strategies(
 class _HaltState:
     # Tracks halt-flag state across ticks so transitions are logged once.
     # Kill switch hierarchy: HALT_ALL implies HALT_NEW_ENTRIES.
-    def __init__(self):
+    def __init__(self, daily_loss_path: Path = HALT_DAILY_LOSS_PATH):
+        # Per-runner daily-loss flag (see halt_daily_loss_path). Defaults to the
+        # canonical flag so any caller/test that omits it keeps prior behaviour.
+        self.daily_loss_path = daily_loss_path
         self.halt_all = False
         self.halt_new = False
 
     def refresh(self, log: logging.Logger) -> None:
         prev_all, prev_new = self.halt_all, self.halt_new
         self.halt_all = HALT_ALL_PATH.exists()
-        halt_loss = HALT_DAILY_LOSS_PATH.exists()
+        halt_loss = self.daily_loss_path.exists()
         self.halt_new = (self.halt_all
                          or HALT_NEW_ENTRIES_PATH.exists()
                          or halt_loss)
@@ -503,14 +524,16 @@ def tick_one(strategy, log: logging.Logger,
 
 
 def check_daily_loss_limit(strategies, limit_inr: float,
-                            log: logging.Logger) -> None:
+                            log: logging.Logger,
+                            halt_path: Path = HALT_DAILY_LOSS_PATH) -> None:
     # Aggregates session ΔP&L across all in-flight strategies (matched +
-    # orphans). On breach, touches HALT_DAILY_LOSS — caught by _HaltState
-    # next tick → entries suspended, exits continue, persists across
-    # restart so the operator must explicitly acknowledge before resuming.
+    # orphans). On breach, touches this runner's own daily-loss flag
+    # (halt_path, per halt_daily_loss_path) — caught by _HaltState next tick →
+    # entries suspended, exits continue, persists across restart so the
+    # operator must explicitly acknowledge before resuming.
     if limit_inr <= 0:
         return
-    if HALT_DAILY_LOSS_PATH.exists():
+    if halt_path.exists():
         return
     session_delta = 0.0
     for s in strategies:
@@ -529,14 +552,14 @@ def check_daily_loss_limit(strategies, limit_inr: float,
             "₹%.0f. Touching %s — entries suspended; existing positions "
             "continue to exit. Operator: `rm %s` to acknowledge and "
             "resume entries.",
-            session_delta, -limit_inr, HALT_DAILY_LOSS_PATH,
-            HALT_DAILY_LOSS_PATH,
+            session_delta, -limit_inr, halt_path,
+            halt_path,
         )
         try:
-            HALT_DAILY_LOSS_PATH.touch()
+            halt_path.touch()
         except Exception as e:
             log.exception("Failed to write %s: %s",
-                          HALT_DAILY_LOSS_PATH, e)
+                          halt_path, e)
 
 
 def flatten_one(strategy, log: logging.Logger, reason: str = "EOD_CLOSE"):
@@ -1047,9 +1070,11 @@ def main():
     parser.add_argument("--max-daily-loss-inr", type=float, default=50_000.0,
                         help="Aggregate session ΔP&L floor (₹). When the "
                              "session loss across all in-flight strategies "
-                             "exceeds this, the runner touches "
-                             "data_cache/HALT_DAILY_LOSS — entries suspend, "
-                             "exits continue. Persists across restarts so "
+                             "exceeds this, the runner touches its own "
+                             "per-runner daily-loss flag (canonical "
+                             "data_cache/HALT_DAILY_LOSS for --system "
+                             "persistent, else HALT_DAILY_LOSS_<system>) — "
+                             "entries suspend, exits continue. Persists so "
                              "the operator must `rm` the flag to resume. "
                              "0 disables the check (NOT recommended for "
                              "live). Default: 50000.")
@@ -1378,10 +1403,14 @@ def main():
     log.info("Entering tick loop (every %ds until %s) over %d pair(s)",
              TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
 
-    halt_state = _HaltState()
+    halt_loss_path = halt_daily_loss_path(args.system)
+    halt_state = _HaltState(halt_loss_path)
     if args.max_daily_loss_inr <= 0:
         log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
                     "circuit breaker for runaway losses this session")
+    else:
+        log.info("Daily-loss breaker: ₹%.0f → touches %s (own flag; does not "
+                 "halt other runners)", args.max_daily_loss_inr, halt_loss_path)
     install_signal_handlers(log)
     heartbeat = HeartbeatTracker(
         threshold=SILENT_FAIL_THRESHOLD,
@@ -1426,7 +1455,8 @@ def main():
             if heartbeat.record_tick(n_ran=n_ran, n_errored=n_errored):
                 silent_fail = True
                 break
-            check_daily_loss_limit(strategies, args.max_daily_loss_inr, log)
+            check_daily_loss_limit(strategies, args.max_daily_loss_inr, log,
+                                   halt_loss_path)
             try:
                 write_state_file(strategies, args.system, log, archive=False,
                                  mode=args.mode)

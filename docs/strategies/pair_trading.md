@@ -404,8 +404,11 @@ simultaneously.
 
 Per-pair daily-loss circuit breaker (`cd711c3`): if a pair's
 intra-session realized P&L breaches `--max-daily-loss-inr`, the runner
-creates `HALT_DAILY_LOSS` and halts new entries for the rest of the
-day (existing positions still exit normally).
+creates its own daily-loss flag and halts new entries for the rest of the
+day (existing positions still exit normally). The flag is per-runner
+(`halt_daily_loss_path`): the persistent/live runner uses the canonical
+`HALT_DAILY_LOSS`; other runners (e.g. `--system baseline`) use
+`HALT_DAILY_LOSS_<system>`, so one runner's breach can't halt another.
 
 ## Parameter reference
 

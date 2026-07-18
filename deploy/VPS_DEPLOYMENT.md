@@ -782,11 +782,14 @@ sleep 70  # wait one tick
 journalctl -u pair-paper.service -n 5 | grep "Entries suspended"  # should match
 rm data_cache/HALT_NEW_ENTRIES
 
-# 2. Daily-loss auto-halt (simulated): manually touch the flag, verify
-touch data_cache/HALT_DAILY_LOSS
+# 2. Daily-loss auto-halt (simulated): manually touch the flag, verify.
+#    NOTE: the daily-loss flag is per-runner (run_paper_pairs.halt_daily_loss_path).
+#    The baseline unit (--system baseline) reads HALT_DAILY_LOSS_baseline; the
+#    live persistent runner keeps the canonical HALT_DAILY_LOSS.
+touch data_cache/HALT_DAILY_LOSS_baseline
 sleep 70
 journalctl -u pair-paper.service -n 5 | grep HALT_DAILY_LOSS
-rm data_cache/HALT_DAILY_LOSS
+rm data_cache/HALT_DAILY_LOSS_baseline
 
 # 3. Notify-failure smoke test (covered in §3.1)
 sudo /opt/taleb-karpathy-kite/deploy/notify-failure.sh pair-paper.service
@@ -901,11 +904,14 @@ quad-lock plus two persistent-specific flags:
    ```bash
    sudo systemctl disable --now pair-paper-persistent.timer
    ```
-4. **Decouple the baseline breaker.** The `HALT_*` flags in `data_cache/` are
-   shared across runners. `pair-paper.service` now carries
-   `--max-daily-loss-inr 100000000` so a paper-side loss can't touch
-   `HALT_DAILY_LOSS` and halt the live runner. Re-deploy the baseline unit if it
-   isn't already on this version, then `systemctl daemon-reload`.
+4. **Baseline breaker is namespaced, not disabled.** The operator `HALT_ALL` /
+   `HALT_NEW_ENTRIES` switches are shared across runners, but the automatic
+   daily-loss flag is per-runner (`run_paper_pairs.halt_daily_loss_path`):
+   `pair-paper.service` (`--system baseline`) touches
+   `HALT_DAILY_LOSS_baseline`, which the live persistent runner (canonical
+   `HALT_DAILY_LOSS`) does not read — so its `--max-daily-loss-inr 100000`
+   breaker can't halt the live book. Re-deploy the baseline unit if it isn't
+   already on this version, then `systemctl daemon-reload`.
 5. **Install the live unit:**
 
    ```bash

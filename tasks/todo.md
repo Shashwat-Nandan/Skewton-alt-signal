@@ -1,3 +1,43 @@
+# Baseline pair runner — top-8 paper validation, then live-alongside (PLAN 2026-07-18)
+
+Operator wants the **baseline** pair strategy (`pair-paper.service`,
+`run_paper_pairs.py`) to (a) trade a tighter **top-8** universe (was top-12) and
+(b) go **LIVE alongside** the existing persistent live runner
+(`pair-paper-persistent-live.service`, +₹107k). Two operator decisions locked
+2026-07-18: **run alongside** (not replace) persistent-live, and
+**paper-validate top-8 first**.
+
+Verified baseline paper is net **+~₹120k realized cumulative** over ~2 months —
+but entirely at **--top 12**. top-8 has zero paper history, so per safety rule 3
+it must clear its own paper window before any live cutover.
+
+## Done now (paper only, no real money)
+- [x] Host drop-in `pair-paper.service.d/10-top8.conf` → `--top 8` (PAPER, no
+      `--mode live`). `systemctl show` confirms effective ExecStart = top-8;
+      takes effect next fire Mon 2026-07-20 ~09:11 IST.
+- [x] Checked-in template `deploy/pair-paper.service` ExecStart 12→8 (source of
+      truth aligned).
+- [x] **Per-runner daily-loss breaker namespacing** (`halt_daily_loss_path` in
+      run_paper_pairs.py): `--system baseline` touches `HALT_DAILY_LOSS_baseline`;
+      the persistent/live runner keeps canonical `HALT_DAILY_LOSS` (alert +
+      runbook unchanged). Operator `HALT_ALL`/`HALT_NEW_ENTRIES` stay shared.
+      Tests in tests/test_runner_risk_mediums.py (isolation asserted). Docs
+      updated (VPS_DEPLOYMENT.md smoke test + §, pair_trading.md).
+- [x] **Baseline daily-loss cap → ₹100k** (`--max-daily-loss-inr 100000`), now
+      safe because of the namespacing above. Host drop-in + template updated.
+
+## Deferred — live-alongside cutover (do NOT start until top-8 paper window passes)
+- [ ] **Paper-validation window** for top-8 (~1–2 weeks / ~10 sessions). Success
+      = net-positive realized, no worse than top-12 on a per-session basis.
+- [ ] **Capital / margin sizing**: two live pair runners in one Kite account =
+      ~2× pair exposure + combined SPAN margin (no cross-runner netting). Size
+      baseline-live and confirm total margin headroom before cutover.
+- [ ] **Live-mode quad-lock** for a baseline-live unit: `--mode live` +
+      `ALLOW_LIVE_MODE=true` (.env, already armed) + `--force` + token. Do NOT
+      run a fresh Kite login while persistent-live is active (invalidates its
+      token). New live unit mirrors persistent-live hardening/watchdog/EOD/halt
+      wiring. Money-affecting → CODEOWNERS review + signed commit (safety rule 5).
+
 # Signal plane increment 2 — Redis Streams bus (#90 §6, PLAN 2026-07-18)
 
 Continues issue #90 after the pair runner was fully wired (PR #96/#101). Scope

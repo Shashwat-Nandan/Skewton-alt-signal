@@ -263,3 +263,67 @@ def test_mid_session_noop_for_paper(tmp_path, monkeypatch):
     assert rp.reconcile_mid_session([s], kite, logging.getLogger("test")) is False
     assert not halt.exists()
     kite.positions.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────
+# Per-runner daily-loss breaker isolation — a paper runner's loss breach
+# must NOT freeze a co-running live pair runner. Both pair runners share
+# data_cache, so the daily-loss flag is namespaced per --system while the
+# persistent (live) runner keeps the canonical flag its alert watches.
+# ──────────────────────────────────────────────────────────
+
+class _BreachStrategy:
+    """Minimal surface for check_daily_loss_limit: a fixed session ΔP&L of
+    (realized + unrealized) − (session-start realized + unrealized)."""
+    def __init__(self, session_delta):
+        self.state = SimpleNamespace(realized_pnl=session_delta,
+                                     unrealized_pnl=0.0)
+        self._session_start_realized = 0.0
+        self._session_start_unrealized = 0.0
+
+
+def test_halt_daily_loss_path_persistent_is_canonical():
+    import run_paper_pairs as rpp
+    # The LIVE (persistent) runner keeps the canonical flag so its Telegram
+    # alert (deploy/pair-halt-alert.path) and `rm` runbook stay valid unchanged.
+    assert rpp.halt_daily_loss_path("persistent") == rpp.HALT_DAILY_LOSS_PATH
+    assert rpp.halt_daily_loss_path("persistent").name == "HALT_DAILY_LOSS"
+
+
+def test_halt_daily_loss_path_baseline_is_namespaced():
+    import run_paper_pairs as rpp
+    p = rpp.halt_daily_loss_path("baseline")
+    # WHY: distinct from the canonical flag, so a baseline (paper) breach can
+    # never touch the live persistent runner's breaker.
+    assert p.name == "HALT_DAILY_LOSS_baseline"
+    assert p != rpp.HALT_DAILY_LOSS_PATH
+
+
+def test_baseline_breach_does_not_touch_live_flag(tmp_path):
+    # A baseline paper loss breach must touch ONLY its own flag; the canonical
+    # HALT_DAILY_LOSS the live persistent runner reads must stay absent —
+    # otherwise a paper loss would freeze the real-money book's entries.
+    import run_paper_pairs as rpp
+    live_flag = tmp_path / "HALT_DAILY_LOSS"
+    baseline_flag = tmp_path / "HALT_DAILY_LOSS_baseline"
+    breaching = _BreachStrategy(session_delta=-200_000.0)   # ₹2L loss > ₹1L cap
+    rpp.check_daily_loss_limit([breaching], 100_000.0,
+                               logging.getLogger("test"), baseline_flag)
+    assert baseline_flag.exists()      # own flag tripped
+    assert not live_flag.exists()      # live runner's breaker untouched
+
+
+def test_halt_state_reads_only_its_own_daily_loss_flag(tmp_path, monkeypatch):
+    # _HaltState bound to the baseline flag must ignore the canonical/live flag:
+    # a live-runner breach must not suspend the baseline runner and vice-versa.
+    import run_paper_pairs as rpp
+    monkeypatch.setattr(rpp, "HALT_ALL_PATH", tmp_path / "HALT_ALL")
+    monkeypatch.setattr(rpp, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES")
+    baseline_flag = tmp_path / "HALT_DAILY_LOSS_baseline"
+    (tmp_path / "HALT_DAILY_LOSS").touch()          # canonical/live flag present
+    hs = rpp._HaltState(baseline_flag)
+    hs.refresh(logging.getLogger("test"))
+    assert hs.halt_new is False                      # live flag ignored
+    baseline_flag.touch()                            # own flag now present
+    hs.refresh(logging.getLogger("test"))
+    assert hs.halt_new is True
