@@ -10,4 +10,5 @@
 
 pytest
 httpx                   # required by fastapi.testclient.TestClient
+fakeredis               # in-process Redis (incl. Streams) for signal-plane bus tests — no daemon in CI
 ruff==0.15.17

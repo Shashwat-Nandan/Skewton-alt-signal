@@ -123,11 +123,8 @@ class ReferenceConsumer:
         self.tolerate_gaps = tolerate_gaps
         self.as_of = as_of or datetime.now().astimezone()
         self.strategy_id: Optional[str] = None
-        # Next sequence we expect; §4.9's minimum is 0. Partial replay was
-        # deliberately dropped (PR #101 review): it belongs to the real
-        # replay primitive (issue #99), which owns burned-sequence
-        # semantics — a bolted-on --from-sequence produced false
-        # REGRESSION verdicts against a full bus dir.
+        # Next sequence we expect; §4.9's minimum is 0. A "since sequence N"
+        # Redis replay (§6) reseeds this in replay_redis(since=N) — see there.
         self.next_sequence = 0
         self.seen_ids: Set[str] = set()
         self.open_groups: Dict[str, str] = {}   # group -> entry signal_id
@@ -392,6 +389,29 @@ class ReferenceConsumer:
                     self.consume(record)
         return self.outcomes
 
+    def replay_redis(self, bus, since: int = 0) -> List[Outcome]:
+        """Consume the Redis Streams bus from `since` (§6 'all signals for
+        strategy X since sequence N'). Reseeds the expected sequence to `since`
+        so a MAXLEN-trimmed head (which legitimately starts above 0) is not
+        read as a gap — one knob, no separate start_sequence to keep in sync.
+        Group correlation still bootstraps: mutations for positions opened
+        before the window resolve as NOOP_UNKNOWN_GROUP / UNMATCHED_MUTATION,
+        the documented partial-replay caveat. Must be called on a fresh
+        consumer (nothing consumed yet)."""
+        if self.outcomes:
+            raise RuntimeError("replay_redis must run on a fresh consumer")
+        if since < 0:
+            raise ValueError(f"since must be >= 0 (§4.9 minimum), got {since}")
+        self.next_sequence = since
+        for record in bus.read_since(since):
+            self.consume(record)
+        if not self.outcomes:
+            raise FileNotFoundError(
+                f"no records at/after sequence {since} in Redis stream "
+                f"{getattr(bus, 'stream_key', '?')}"
+            )
+        return self.outcomes
+
     def ok(self) -> bool:
         return not self.gaps and not any(
             o.status in _VIOLATION_STATUSES for o in self.outcomes
@@ -419,8 +439,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Reference consumer: replay a strategy's signal bus and "
                     "verify the §3 consumption protocol end-to-end.")
-    parser.add_argument("bus_dir", type=Path,
-                        help="strategy bus dir, e.g. logs/signal-bus/pair_trading")
+    parser.add_argument("bus_dir", type=Path, nargs="?",
+                        help="file bus dir, e.g. logs/signal-bus/pair_trading "
+                             "(omit when using --redis-url)")
+    parser.add_argument("--redis-url",
+                        help="replay the Redis Streams bus instead of the file "
+                             "bus, e.g. redis://localhost:6379/0 "
+                             "(requires --strategy-id)")
+    parser.add_argument("--strategy-id",
+                        help="strategy_id for the Redis stream key (§6 "
+                             "partition), required with --redis-url")
+    parser.add_argument("--since", type=int, default=0,
+                        help="Redis replay: first sequence to consume (§6 "
+                             "'since sequence N'); pass the stream's first "
+                             "available sequence for a MAXLEN-trimmed stream")
     parser.add_argument("--tolerate-gaps", action="store_true",
                         help="record burned sequences and continue instead of "
                              "quarantining the stream at the first gap")
@@ -428,10 +460,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="suppress per-signal lines; print only the report")
     args = parser.parse_args(argv)
 
+    if bool(args.redis_url) == bool(args.bus_dir):
+        parser.error("give exactly one source: a bus_dir OR --redis-url")
+    if args.redis_url and not args.strategy_id:
+        parser.error("--redis-url requires --strategy-id")
+
     consumer = ReferenceConsumer(tolerate_gaps=args.tolerate_gaps)
     stream_error: Optional[Exception] = None
     try:
-        consumer.replay_dir(args.bus_dir)
+        if args.redis_url:
+            from signal_plane.bus import BusUnavailable, RedisStreamBus
+            try:
+                bus = RedisStreamBus(args.strategy_id, args.redis_url)
+            except BusUnavailable as e:
+                # A down/absent Redis is an operational condition, not a
+                # protocol violation — same class as "no bus files" (exit 3),
+                # so the watchdog does not confuse it with a real quarantine.
+                print(f"REDIS UNAVAILABLE: {e}", file=sys.stderr)
+                return 3
+            consumer.replay_redis(bus, since=args.since)
+        else:
+            consumer.replay_dir(args.bus_dir)
     except FileNotFoundError as e:
         # An absent/empty bus (holiday, publisher not enabled) is an
         # operational condition, not a protocol violation — a distinct

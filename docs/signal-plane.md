@@ -2,8 +2,10 @@
 
 **Issue:** #90 (Phase 0 of `docs/platform-architecture.md`) · **Scope
 decision (2026-07-07):** build the §4 contract + publisher and wire ONLY the
-persistent pair runner. The Redis bus, replay endpoint, dashboard tab,
-payload signing, and the other five strategies are later increments.
+persistent pair runner. Increment 2 (2026-07-18) adds the §6 Redis Streams
+bus as a rebuildable projection of the file (see below). The replay endpoint,
+dashboard tab, payload signing, and the other five strategies are later
+increments.
 
 ## What exists
 
@@ -23,12 +25,33 @@ payload signing, and the other five strategies are later increments.
 The schema dir doubles as the MVP schema registry (§6): consumers reject any
 MAJOR they don't have a checked-in schema for.
 
-## Bus (file-backed until §6's Redis Streams lands)
+## Bus (file anchor + optional Redis Streams projection, §6)
 
-`logs/signal-bus/pair_trading/YYYY-MM-DD.jsonl` — append-only, flock'd,
-fsync'd per record. One stream per `strategy_id` (the §6 partition key).
+`logs/signal-bus/pair_trading/YYYY-MM-DD.jsonl` (`signal_plane.bus.FileBus`) —
+append-only, flock'd, fsync'd per record. One stream per `strategy_id` (the §6
+partition key). This file is the **durability anchor and system of record**.
 The legacy `logs/signals-*.jsonl` written by `base._emit_signal` in signals
 mode is untouched and remains the dashboard's input.
+
+When `--publish-signals-redis <url>` is set (increment 2), the publisher also
+projects each record to a Redis Stream `skewton:signals:<strategy_id>`
+(`RedisStreamBus`, `MAXLEN ~100k`). Redis is a **rebuildable projection**, not
+a second source of truth: the file is fsync'd first, then Redis is `XADD`'d;
+on publisher startup Redis is reconciled from the file tail (records with
+`sequence` beyond Redis's last), so a flushed or restarted Redis catches up
+before the first publish. Consequences:
+- a failed `XADD` mid-session is logged at ERROR but **non-fatal** — the file
+  holds the record and Redis self-heals: the next publish reconciles the gap
+  from the file before appending (or, failing that, the next startup does).
+  A trading session never dies because a cache is down.
+- Redis unreachable **at startup** with `--publish-signals-redis` set is
+  fail-loud (the operator asked for it — a bad URL stops the session before
+  the open, not silently as a file-only run).
+- `MAXLEN` trims Redis to a bounded tail; the file remains the full archive.
+- replay (§6 "all signals for strategy X since sequence N"):
+  `python -m signal_plane.consumer --redis-url <url> --strategy-id pair_trading
+  --since N` — filters on the record's own `sequence`, seeding the consumer at
+  `N` so a trimmed head is not read as a gap.
 
 Publisher state (`data_cache/signal_publisher_pair_trading.json`) persists
 `last_sequence`, `open_groups`, `closed_groups`, and the idempotency window,
@@ -36,8 +59,10 @@ with the same tmp→fsync→replace→dir-fsync discipline as the runner's state
 file.
 
 **Crash discipline — gap, never duplicate (per-publish write ordering):**
-(1) sequence + signal_id persisted durably, (2) bus append, (3) group
-transition applied + persisted. A crash after (1) leaves a sequence gap,
+(1) sequence + signal_id persisted durably, (2) bus append — file fsync
+FIRST (the anchor), then the Redis `XADD` projection if configured (a Redis
+failure here is non-fatal; see the Bus section), (3) group transition applied
++ persisted. A crash after (1) leaves a sequence gap,
 which consumers detect and replay (§4.11) — never a duplicate sequence. The
 group transition deliberately waits for the append (PR #96 review): closing
 the group first meant a failed append lost the EXIT forever, because the
@@ -127,9 +152,27 @@ position correlates correctly.
 - Disk: signal volume is tens of KB/day (pair book); no retention policy
   needed yet — revisit when the bus carries all six strategies (issue #90 D).
 
+### Redis bus (increment 2) — operator steps, not done in-session
+
+The code + tests landed; the daemon and live cutover are operator steps so the
+running pair runner is never perturbed:
+
+1. `sudo apt-get install redis-server` (ships its own `redis-server.service`).
+2. Enable persistence — `appendonly yes` in `/etc/redis/redis.conf` — so a
+   restart keeps recent entries (reconcile from the file covers the rest).
+   Bind to loopback (`bind 127.0.0.1`); the OMS plane is a separate server and
+   out of scope for Phase 0.
+3. `redis` is in `requirements.in`; regenerate `requirements.lock`
+   (`uv pip compile`, per the lockfile-refresh runbook) and let `redeploy.sh`
+   install it. `fakeredis` is dev-only (`requirements-dev.in`).
+4. Add `--publish-signals-redis redis://127.0.0.1:6379/0` to the installed
+   `pair-paper-persistent-live` unit + `systemctl daemon-reload`. Verify next
+   session: `python -m signal_plane.consumer --redis-url redis://127.0.0.1:6379/0
+   --strategy-id pair_trading` exits 0.
+
 ## Deferred (later increments of #90)
 
-Durable bus transport (Redis Streams), replay endpoint ("all signals for
-strategy X since sequence N"), signed payloads/mTLS, dashboard signal tab,
-bus-retention ops, master-book policy decision (§5), the other five
-strategies' inventories, and the game-day kill-the-publisher drill.
+Replay endpoint as a service ("all signals for strategy X since sequence N" —
+the `read_since` primitive exists; a network façade does not), signed
+payloads/mTLS, dashboard signal tab, master-book policy decision (§5), the
+other five strategies' inventories, and the game-day kill-the-publisher drill.

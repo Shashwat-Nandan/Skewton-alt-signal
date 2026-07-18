@@ -25,9 +25,14 @@ Write ordering per publish (PR #96 review):
      suppressed and the EXIT lost forever; the worst case of a crash
      between 2 and 3 is a benign duplicate EXIT, which consumers no-op)
 
-Bus layout: logs/signal-bus/<strategy_id>/YYYY-MM-DD.jsonl, append-only,
-flock'd + fsync'd per record. This file IS the system of record until the
-Redis-Streams bus lands; the legacy logs/signals-*.jsonl mirror written by
+Bus layout: logs/signal-bus/<strategy_id>/YYYY-MM-DD.jsonl (FileBus), append-
+only, flock'd + fsync'd per record. This file IS the system of record and the
+durability anchor. When a RedisStreamBus is also supplied (§6), it is a
+rebuildable projection: the file is fsync'd first, then Redis is XADD'd; a
+Redis failure is loud-but-non-fatal and self-heals from the file — the next
+publish reconciles the gap before appending (or, failing that, the next
+startup reconciles from the file tail). The legacy logs/signals-*.jsonl
+mirror written by
 base._emit_signal is untouched.
 
 Concurrency: exactly ONE live publisher per strategy_id per host, enforced
@@ -39,7 +44,6 @@ assigning duplicate sequence numbers from its own stale in-memory state.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
@@ -48,6 +52,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from runner_common import acquire_lock, durable_write_text
+from signal_plane.bus import FileBus, RedisStreamBus
 from signal_plane.contract import SignalEnvelope, closes_group
 from signal_plane.validation import SignalValidationError, validate_signal
 
@@ -70,6 +75,7 @@ class SignalPublisher:
         strategy_id: str,
         bus_dir: Path,
         state_dir: Path,
+        redis_bus: Optional[RedisStreamBus] = None,
     ):
         if not strategy_id:
             raise ValueError("strategy_id must be non-empty")
@@ -86,6 +92,30 @@ class SignalPublisher:
             label=f"signal publisher (strategy_id={strategy_id})",
         )
         self._state = self._load_state()
+        # The file bus is the durability anchor (system of record); Redis, when
+        # configured, is a rebuildable projection reconciled from the file tail
+        # here — under the single-instance lock, before the first publish, so a
+        # flushed/restarted Redis catches up without a live consumer seeing a
+        # gap (§6). Reconcile happens AFTER the lock so two publishers can't
+        # both replay into one stream.
+        self._file_bus = FileBus(self.bus_dir)
+        self._redis_bus = redis_bus
+        # Set when a mid-session XADD fails: the next publish reconciles the
+        # gap from the file BEFORE appending, so Redis self-heals in-session
+        # instead of carrying a hole until the next restart.
+        self._redis_degraded = False
+        if self._redis_bus is not None:
+            self._reconcile_redis()
+
+    def _reconcile_redis(self) -> None:
+        """Bring Redis level with the file, cheaply. The publisher's own
+        last_sequence is the file's last sequence (state is persisted before
+        every append), so when Redis already holds it we skip the file scan
+        entirely — the healthy-Redis common case does no I/O beyond one
+        XREVRANGE. Only a behind/flushed Redis pays for read_all()."""
+        if self._redis_bus.last_sequence() >= self.last_sequence:
+            return
+        self._redis_bus.reconcile_from(self._file_bus.read_all())
 
     def close(self) -> None:
         """Release the single-instance lock. The runner never calls this
@@ -94,6 +124,8 @@ class SignalPublisher:
         if self._lock_fd is not None:
             os.close(self._lock_fd)
             self._lock_fd = None
+        if getattr(self, "_redis_bus", None) is not None:
+            self._redis_bus.close()
 
     # ── persisted publisher state ──
 
@@ -149,8 +181,7 @@ class SignalPublisher:
         return dict(self._state["open_groups"])
 
     def bus_file(self, day: Optional[datetime] = None) -> Path:
-        d = (day or datetime.now()).date().isoformat()
-        return self.bus_dir / f"{d}.jsonl"
+        return self._file_bus.path_for(day)
 
     # ── publish ──
 
@@ -197,10 +228,11 @@ class SignalPublisher:
         del ids[:-_PUBLISHED_ID_WINDOW]
         self._persist_state()
 
-        # Step 2: the append. If this raises, the group state is untouched:
-        # a failed EXIT append leaves the group OPEN so the next exit
-        # decision publishes a fresh EXIT (retry works); the burned
-        # sequence shows up as a detectable gap, never a duplicate.
+        # Step 2: the append. If the FILE append raises, the group state is
+        # untouched: a failed EXIT append leaves the group OPEN so the next
+        # exit decision publishes a fresh EXIT (retry works); the burned
+        # sequence shows up as a detectable gap, never a duplicate. The Redis
+        # projection is written after — and only after — the file is fsync'd.
         self._append_to_bus(record)
 
         # Step 3: the record is on the bus — now transition the group.
@@ -267,17 +299,33 @@ class SignalPublisher:
                 del closed[:-_PUBLISHED_ID_WINDOW]
 
     def _append_to_bus(self, record: Dict) -> None:
-        """Append one JSONL record under flock, fsync'd — the bus is the
-        system of record for what we told users; a lost line is a lost
-        signal."""
-        path = self.bus_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, separators=(",", ":")) + "\n"
-        with path.open("a", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        """Durably record one signal. The file is the system of record — a
+        lost line is a lost signal — so it is fsync'd FIRST and a failure here
+        propagates (aborting the publish with the group state untouched). The
+        Redis projection is written only after the file is durable; a Redis
+        failure is loud-but-non-fatal because Redis is rebuilt from the file
+        on the next startup reconcile, and a trading session must not die
+        because a rebuildable cache is unreachable."""
+        self._file_bus.append(record)
+        if self._redis_bus is not None:
             try:
-                f.write(line)
-                f.flush()
-                os.fsync(f.fileno())
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                if self._redis_degraded:
+                    # A prior XADD failed. The current record is already in the
+                    # file (appended just above), so reconcile_from re-projects
+                    # every missing record INCLUDING this one — do not also
+                    # append() it, or Redis gets a duplicate entry for this
+                    # sequence. Cleared only once reconcile fully succeeds.
+                    self._reconcile_redis()
+                    self._redis_degraded = False
+                else:
+                    self._redis_bus.append(record)
+            except Exception:  # noqa: BLE001 — any client/transport error
+                self._redis_degraded = True
+                logger.error(
+                    "[signal-bus %s] Redis XADD failed for seq=%s signal_id=%s "
+                    "— file bus holds the record; Redis will self-heal from the "
+                    "file on the next publish (or next startup). Session "
+                    "continues on the file bus.",
+                    self.strategy_id, record.get("sequence"),
+                    record.get("signal_id"), exc_info=True,
+                )

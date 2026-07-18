@@ -1069,6 +1069,14 @@ def main():
                              "signals to the file-backed bus "
                              "(logs/signal-bus/pair_trading/). Opt-in; "
                              "off = behaviour unchanged.")
+    parser.add_argument("--publish-signals-redis", dest="publish_signals_redis",
+                        metavar="REDIS_URL", default=None,
+                        help="Issue #90 §6: also project published signals to a "
+                             "Redis Streams bus (e.g. redis://localhost:6379/0). "
+                             "Requires --publish-signals. The fsync'd file bus "
+                             "stays the system of record; Redis is a rebuildable "
+                             "projection reconciled from the file on startup, and "
+                             "a Redis outage never stops the session.")
     parser.add_argument("--i-understand-this-is-real-money",
                         dest="i_understand", action="store_true",
                         help="Required confirmation flag for --mode live. "
@@ -1086,6 +1094,11 @@ def main():
             "Pass --ack-large-size to acknowledge intentional large sizing, "
             "or reduce --lots-per-leg. (H12 typo-tripwire.)"
         )
+
+    if args.publish_signals_redis and not args.publish_signals:
+        parser.error("--publish-signals-redis requires --publish-signals "
+                     "(the Redis stream projects the file bus, which "
+                     "--publish-signals produces)")
 
     # Typo-tripwire for --quality-max-pvalue. Must be in (0, 0.05]: 0 or
     # negative rejects every pair (empty book); anything above 0.05 is
@@ -1291,10 +1304,20 @@ def main():
     if args.publish_signals:
         from signal_plane import SignalPublisher
         from signal_plane.pair_trading_signals import STRATEGY_ID
+        redis_bus = None
+        if args.publish_signals_redis:
+            from signal_plane.bus import RedisStreamBus
+            # Fail loud here if Redis is unreachable at startup: the operator
+            # explicitly asked for the projection, so a bad URL should stop the
+            # session before the open, not surface as a silent file-only run.
+            # (A Redis outage DURING the session is the non-fatal case — the
+            # file anchor carries on and reconcile repairs Redis next start.)
+            redis_bus = RedisStreamBus(STRATEGY_ID, args.publish_signals_redis)
         signal_publisher = SignalPublisher(
             strategy_id=STRATEGY_ID,
             bus_dir=LOG_DIR / "signal-bus",
             state_dir=DATA_CACHE,
+            redis_bus=redis_bus,
         )
         log.info(
             "Signal publishing armed: strategy_id=%s bus=%s last_sequence=%d "

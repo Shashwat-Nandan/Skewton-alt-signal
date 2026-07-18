@@ -1,3 +1,88 @@
+# Signal plane increment 2 — Redis Streams bus (#90 §6, PLAN 2026-07-18)
+
+Continues issue #90 after the pair runner was fully wired (PR #96/#101). Scope
+= the §6 durable ordered log via Redis Streams, partition key = strategy_id.
+NOT in this increment: signing/mTLS, REST façade, the other five strategies.
+
+**Decisions (confirmed with operator 2026-07-18):**
+- Topology: **file JSONL stays the durable system-of-record**; Redis is a
+  rebuildable delivery/replay projection reconciled from the file tail on
+  startup. Preserves every existing crash guarantee (gap-not-duplicate).
+- Daemon: **code + tests only this session.** redis-server install, systemd
+  unit enable, and flipping the live pair runner are OPERATOR steps. Nothing
+  perturbs the running pair runner; --publish-signals still defaults to file.
+
+## Step 1 — Bus abstraction (surgical extract) ✅
+- [x] `signal_plane/bus.py`: `Bus` protocol (`append`); `FileBus` wraps the old
+      flock+fsync append VERBATIM (parity test `TestFileBusParity`).
+- [x] Publisher takes `redis_bus=None` (FileBus always the anchor) — file-only
+      path byte-for-byte unchanged; all pre-existing publisher tests still pass.
+
+## Step 2 — RedisStreamBus ✅
+- [x] `XADD skewton:signals:<strategy_id> {record=<json>}` `MAXLEN ~100k`.
+- [x] Startup reconcile in publisher `__init__` (under the single-instance
+      lock): replay file records with sequence > Redis-last.
+- [x] Dual-write order: state → file(fsync) → XADD(non-fatal) → group txn.
+
+## Step 3 — Consumer reads Redis ✅
+- [x] `ReferenceConsumer(start_sequence=N)` + `replay_redis(bus, since=N)`;
+      CLI `--redis-url/--strategy-id/--since` (mutually-exclusive with bus_dir).
+
+## Step 4 — Tests (fakeredis, dev-only) ✅
+- [x] `tests/test_signal_bus_redis.py` — 12 tests, `importorskip("fakeredis")`;
+      round-trip, reconcile rebuild, non-fatal XADD, ordering, consumer-over-Redis.
+
+## Step 5 — Ops (no daemon started) ✅
+- [x] `redis` → requirements.in/.lock; `fakeredis` → dev. Operator steps
+      (apt install, AOF, unit flag) in docs/signal-plane.md. No daemon started.
+
+## Review
+
+Increment 2 of #90 (Redis Streams §6 bus) — implemented, NOT deployed.
+
+**Shipped (branch `feat/signal-plane-redis-bus`):**
+- `signal_plane/bus.py` — `Bus` protocol, `FileBus` (verbatim extract of the
+  old inline append), `RedisStreamBus` (lazy `redis` import; append /
+  last_sequence / read_since / reconcile_from).
+- Publisher dual-writes file→Redis with the file as durability anchor; Redis is
+  a rebuildable projection reconciled from the file tail on startup. A mid-
+  session XADD failure is loud-but-non-fatal; a startup connect failure with
+  the flag set is fail-loud (operator asked for it).
+- Consumer replays Redis (`--redis-url … --since N`) with `start_sequence`
+  seeding so a MAXLEN-trimmed head is not a false gap.
+- Runner: opt-in `--publish-signals-redis <url>` (requires `--publish-signals`).
+- 95 signal-plane tests green; ruff clean; 1388 total tests collect clean.
+
+**/code-review (high) — 6 findings, 5 fixed, 1 deferred:**
+- [fixed] consumer CLI tracebacked on a down Redis → typed `BusUnavailable`,
+  clean `REDIS UNAVAILABLE` message + exit 3.
+- [fixed] mid-session XADD gap-until-restart → in-session self-heal (next
+  publish reconciles from the file before appending; no duplicate sequence).
+- [fixed] startup reconcile rescanned the whole file even when Redis current →
+  O(1) short-circuit on `redis.last_sequence() >= publisher.last_sequence`.
+- [fixed] RedisStreamBus leaked its connection → `close()` (owns-client only),
+  called from publisher.close().
+- [fixed] replay_redis `since` vs `start_sequence` two-knob footgun → single
+  `since`, reseeds internally, fails loud on a non-fresh consumer / since<0.
+- [deferred] read_since materializes the whole stream (efficiency-only, bounded
+  by MAXLEN; the file is the archive) — left for the replay-endpoint increment.
+
+**Deliberately NOT in scope (Rule 2/3):** signing/mTLS, network replay façade,
+dashboard tab, the other five strategies, master-book policy.
+
+**Operator steps before this does anything live** (docs/signal-plane.md §Redis
+bus): apt install redis-server + AOF + loopback bind; `redeploy.sh` picks up
+the regenerated lock; add `--publish-signals-redis redis://127.0.0.1:6379/0`
+to the installed pair unit + daemon-reload. Nothing here perturbs the running
+pair runner — the flag defaults off.
+
+**Judgement call to flag:** startup-fatal vs non-fatal on Redis. Chose fail-
+loud at startup (bad URL = stop before open) but non-fatal mid-session (file
+anchor carries on). If the operator would rather a Redis outage never block a
+session start either, flip the runner construction to catch + warn.
+
+---
+
 # BANKNIFTY Taleb — unblock + capture + parquet (PLAN, 2026-07-18)
 
 Finding: the isolated BANKNIFTY paper instance (#62) has taken ZERO trades in

@@ -33,3 +33,4 @@ pyotp
 
 # Signal plane (issue #90)
 jsonschema>=4.18        # draft 2020-12 validator for the §4 signal contract
+redis                   # §6 durable ordered log (Redis Streams); optional at runtime — only imported when --publish-signals-redis is set
