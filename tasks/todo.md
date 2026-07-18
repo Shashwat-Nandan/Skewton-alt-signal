@@ -1,3 +1,47 @@
+# BANKNIFTY Taleb — unblock + capture + parquet (PLAN, 2026-07-18)
+
+Finding: the isolated BANKNIFTY paper instance (#62) has taken ZERO trades in
+every session since 2026-07-08. Two book-default entry gates reject every scan:
+`entry_iv_percentile_min=30` (BANKNIFTY IV-pct runs 19–28) and
+`max_entry_alpha=25000` (observed |alpha| ~150k; alpha ∝ spot² so the NIFTY-scaled
+default is structurally unreachable). Chosen fix = data-driven autoresearch sweep,
+which is BLOCKED on data: installed tick-capture is NIFTY-only. Interim = scaled
+hand-set gates while BANKNIFTY tape accumulates.
+
+## Step 1 — interim scaled gates (host config_banknifty.ini, gitignored) ✅
+- [x] `max_entry_alpha = 825000` (added; was code-fallback 25000). Derivation:
+      143013 × (58263/24207)² ≈ 828k AND 150k observed × NIFTY's 5.5× headroom.
+- [x] `entry_iv_percentile_min = 8`, `entry_iv_percentile_max = 43` (mirror
+      NIFTY's tuned band; BANKNIFTY 19–28 sits inside it). Lower confidence.
+      Parse-verified. Effective next BANKNIFTY session (Mon 2026-07-20).
+- [ ] WATCH `mc_min_mean_pnl` (0.0) — likely next binding gate once IV+alpha
+      open; tune from observed MC rejections, don't pre-guess.
+
+## Step 2 — enable BANKNIFTY tick capture (installed unit) ✅
+- [x] Patched installed tick-capture.service ExecStart → added
+      `--underlyings NIFTY,BANKNIFTY --strikes-each-side 20` (matches /opt tmpl).
+- [x] `systemctl daemon-reload` done; effective ExecStart confirmed.
+- [ ] VERIFY Mon 2026-07-20: next session tape contains BANKNIFTY tokens
+      (didn't --validate to avoid a Kite re-auth; notify-failure unit guards).
+
+## Step 3 — parquet tick tape (space + faster replay) ✅
+- [x] JSONL→parquet at retention boundary (live writer UNCHANGED — JSONL stays
+      crash-safe). New: backtest.convert_tape_to_parquet + _TAPE_PARQUET_COLUMNS
+      (depth-dropped), tape_to_parquet.py CLI, DuckDB COPY … PARQUET/ZSTD.
+- [x] `_tape_path` prefers .parquet > raw .jsonl > .jsonl.zst; _read_tape_header
+      rebuilds the map from retained tradingsymbol (no sidecar);
+      list_captured_sessions globs .parquet too.
+- [x] tick-retention.sh archive step: zstd → tape_to_parquet.py (convert+verify
+      +delete jsonl); prune step handles both .parquet and legacy .zst backlog.
+- [x] Parity gate: tests/test_tape_parquet.py (4 tests PASS) — assert_frame_equal
+      jsonl-vs-parquet incl spot patch / resample / out-of-session / malformed.
+- [x] Real-session smoke: 07-16 (3.36GB→75MB, ~4.4× under the .zst it replaces,
+      17s); depth dropped, retained fields populated, row-count verified.
+- [ ] CONFIRM: full test_backtest.py::TestCapturedTapeReplay green (real-tape
+      run in progress).
+
+---
+
 # Market Profile — Dalton book → profitable trades (PLAN, 2026-07-13)
 
 Source: James Dalton, *Markets in Profile*. Full plan:

@@ -291,23 +291,57 @@ def _find_instruments_csv(date_iso: str, underlying: str = "NIFTY") -> Optional[
 
 
 def _tape_path(date_iso: str) -> Path:
-    """Path of the session tape: the raw ticks-<date>.jsonl when present,
-    else the .jsonl.zst archive tick-retention.sh leaves behind (DuckDB's
-    ndjson reader decompresses zstd natively — no external binary).
+    """Path of the session tape, newest-format first: the parquet archive
+    tick-retention.sh now produces, else the raw ticks-<date>.jsonl (only
+    the newest KEEP_RAW sessions stay raw), else the legacy .jsonl.zst
+    archive (the pre-2026-07-18 backlog; DuckDB decompresses zstd natively).
 
     tick-retention.sh keeps just the newest KEEP_RAW (8) sessions raw and
-    zstd-compresses the rest — without the archive fallback,
-    list_captured_sessions / load_captured_tape could never replay more
-    than ~a week of tape, which capped the autoresearch fitness window at
-    5 sessions (the 2026-06-27 flat-plateau sweep). Prefers the raw file
-    when both exist. Raises FileNotFoundError when neither exists."""
-    raw = Path("data_cache") / "ticks" / f"ticks-{date_iso}.jsonl"
+    converts the rest to columnar parquet (depth-dropped, ZSTD) — without
+    the archive fallback, list_captured_sessions / load_captured_tape could
+    never replay more than ~a week of tape, which capped the autoresearch
+    fitness window at 5 sessions (the 2026-06-27 flat-plateau sweep).
+    Prefers parquet > raw > zst when several coexist. Raises
+    FileNotFoundError when none exists."""
+    ticks = Path("data_cache") / "ticks"
+    parquet = ticks / f"ticks-{date_iso}.parquet"
+    if parquet.exists():
+        return parquet
+    raw = ticks / f"ticks-{date_iso}.jsonl"
     if raw.exists():
         return raw
     zst = raw.with_name(raw.name + ".zst")
     if not zst.exists():
-        raise FileNotFoundError(f"Tick capture not found: {raw}[.zst]")
+        raise FileNotFoundError(f"Tick capture not found: {raw}[.parquet/.zst]")
     return zst
+
+
+# Columns retained when a raw JSONL tape is archived to parquet (see
+# convert_tape_to_parquet). Every FULL-mode scalar field is kept; only the
+# nested `depth` book (~75% of a tick's bytes, unused by any replay — the
+# loader synthesises bid/ask from last_price) is dropped. Ordering here is
+# the parquet column order. An explicit schema (rather than SELECT *) drops
+# depth by omission AND stops the session-header line — whose keys differ —
+# from polluting the tick schema with header-only columns.
+_TAPE_PARQUET_COLUMNS = {
+    "tradable": "BOOLEAN",
+    "mode": "VARCHAR",
+    "instrument_token": "BIGINT",
+    "last_price": "DOUBLE",
+    "last_traded_quantity": "BIGINT",
+    "average_traded_price": "DOUBLE",
+    "volume_traded": "BIGINT",
+    "total_buy_quantity": "BIGINT",
+    "total_sell_quantity": "BIGINT",
+    "ohlc": "STRUCT(open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE)",
+    "change": "DOUBLE",
+    "last_trade_time": "TIMESTAMP",
+    "oi": "BIGINT",
+    "oi_day_high": "BIGINT",
+    "oi_day_low": "BIGINT",
+    "exchange_timestamp": "TIMESTAMP",
+    "tradingsymbol": "VARCHAR",
+}
 
 
 # Session-header lines carry the full instrument map (100s of KB). The
@@ -328,9 +362,29 @@ def _read_tape_header(tick_path: Path) -> dict:
     dependency of tick-retention.sh on this host.
 
     Raises json.JSONDecodeError on a malformed/missing header line (the
-    pre-DuckDB loader's behavior), RuntimeError on a corrupt archive."""
+    pre-DuckDB loader's behavior), RuntimeError on a corrupt archive.
+
+    Parquet tapes carry no header line — the token→symbol map is rebuilt
+    from the retained `tradingsymbol` column (every tick carries it, spot
+    included), returning the same {"instruments": [...]} shape the JSONL
+    header does. So load_captured_tape's consumer is format-agnostic."""
     import json
     import subprocess
+    if tick_path.suffix == ".parquet":
+        import duckdb
+        con = duckdb.connect()
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT instrument_token, tradingsymbol "
+                "FROM read_parquet(?) "
+                "WHERE instrument_token IS NOT NULL AND tradingsymbol IS NOT NULL",
+                [str(tick_path)],
+            ).fetchall()
+        finally:
+            con.close()
+        return {"instruments": [
+            {"token": int(tok), "tradingsymbol": sym} for tok, sym in rows
+        ]}
     if tick_path.suffix == ".zst":
         probe = subprocess.run(
             ["zstd", "-t", str(tick_path)],
@@ -431,18 +485,35 @@ def load_captured_tape(
     con = duckdb.connect()
     try:
         con.execute("SET preserve_insertion_order=true")
-        df = con.execute(
-            """
-            SELECT instrument_token, exchange_timestamp AS timestamp,
-                   last_price
-            FROM read_ndjson(?, columns={instrument_token: 'BIGINT',
-                                         exchange_timestamp: 'TIMESTAMP',
-                                         last_price: 'DOUBLE'},
-                             ignore_errors=true, maximum_object_size=?)
-            WHERE instrument_token IS NOT NULL
-              AND last_price IS NOT NULL
-            """, [str(tick_path), _TAPE_MAX_OBJECT_SIZE],
-        ).df()
+        if tick_path.suffix == ".parquet":
+            # Parquet archive: the same 3 columns are stored typed
+            # (BIGINT/TIMESTAMP/DOUBLE) and depth-dropped at conversion, so
+            # this projects identically to the ndjson path — columnar reads
+            # only touch these three chunks. Row order is the JSONL order
+            # (conversion preserves insertion order), so the resample
+            # last-in-bucket tie-break below is unchanged.
+            df = con.execute(
+                """
+                SELECT instrument_token, exchange_timestamp AS timestamp,
+                       last_price
+                FROM read_parquet(?)
+                WHERE instrument_token IS NOT NULL
+                  AND last_price IS NOT NULL
+                """, [str(tick_path)],
+            ).df()
+        else:
+            df = con.execute(
+                """
+                SELECT instrument_token, exchange_timestamp AS timestamp,
+                       last_price
+                FROM read_ndjson(?, columns={instrument_token: 'BIGINT',
+                                             exchange_timestamp: 'TIMESTAMP',
+                                             last_price: 'DOUBLE'},
+                                 ignore_errors=true, maximum_object_size=?)
+                WHERE instrument_token IS NOT NULL
+                  AND last_price IS NOT NULL
+                """, [str(tick_path), _TAPE_MAX_OBJECT_SIZE],
+            ).df()
     finally:
         con.close()
     # DuckDB hands back datetime64[us] — the same resolution
@@ -568,13 +639,93 @@ def list_captured_sessions(underlying: str = "NIFTY",
     if not ticks_dir.exists():
         return []
     dates = {
-        p.name.replace("ticks-", "").replace(".jsonl.zst", "").replace(".jsonl", "")
-        for pattern in ("ticks-*.jsonl", "ticks-*.jsonl.zst")
+        p.name.replace("ticks-", "").replace(".jsonl.zst", "")
+              .replace(".jsonl", "").replace(".parquet", "")
+        for pattern in ("ticks-*.jsonl", "ticks-*.jsonl.zst", "ticks-*.parquet")
         for p in ticks_dir.glob(pattern)
     }
     if not include_today:
         dates.discard(ist_today().isoformat())
     return sorted(dates)
+
+
+def convert_tape_to_parquet(date_iso: str, ticks_dir: Optional[Path] = None) -> Path:
+    """Archive a raw ticks-<date>.jsonl session to columnar parquet, dropping
+    only the nested depth book (see _TAPE_PARQUET_COLUMNS). ZSTD-compressed,
+    insertion-order preserved so the replay resample's last-in-bucket
+    tie-break is byte-identical to the JSONL path.
+
+    ``ticks_dir`` locates the session (default ``data_cache/ticks``, the path
+    every loader uses); tick-retention.sh passes its own ``$TICKS_DIR`` so the
+    conversion operates on exactly the directory it globbed, independent of cwd.
+
+    Writes to a ``.parquet.tmp`` sidecar and only ``os.replace``s it onto the
+    final ``ticks-<date>.parquet`` name AFTER a fail-loud verify — because
+    _tape_path prefers ``.parquet`` over the still-present raw, a half-written
+    file at the final name would shadow the intact JSONL and corrupt every
+    replay until the next retention run. The ``.tmp`` name is neither globbed by
+    list_captured_sessions nor matched by _tape_path, so a crash mid-COPY leaves
+    inert litter and the raw JSONL still wins.
+
+    Fail-loud (Rule 12): compares the row count COPY reports writing against the
+    count read back from the finished parquet (footer metadata — no rescan of
+    the multi-GB source); a short/unreadable file raises here. On mismatch it
+    removes the temp and raises. Does NOT delete the JSONL — that is the
+    caller's (tick-retention.sh) decision, taken only after this returns.
+
+    Returns the parquet path. Raises FileNotFoundError if the raw JSONL is
+    absent, RuntimeError on a row-count mismatch."""
+    import duckdb
+
+    # Strict ISO validation doubles as path-injection defence: date_iso is
+    # interpolated into the COPY … TO literal (a DuckDB COPY target cannot be
+    # a bind parameter).
+    datetime.strptime(date_iso, "%Y-%m-%d")
+
+    ticks = Path(ticks_dir) if ticks_dir is not None else Path("data_cache") / "ticks"
+    raw = ticks / f"ticks-{date_iso}.jsonl"
+    if not raw.exists():
+        raise FileNotFoundError(f"No raw tape to convert: {raw}")
+    parquet = ticks / f"ticks-{date_iso}.parquet"
+    tmp = parquet.with_name(parquet.name + ".tmp")
+
+    cols_sql = ", ".join(f"{k}: '{v}'" for k, v in _TAPE_PARQUET_COLUMNS.items())
+    select_sql = ", ".join(_TAPE_PARQUET_COLUMNS)
+
+    con = duckdb.connect()
+    try:
+        con.execute("SET preserve_insertion_order=true")
+        # COPY returns the number of rows it wrote — the authoritative source
+        # count (== raw ticks WHERE instrument_token IS NOT NULL, after
+        # ignore_errors skips). No need to reparse the JSONL to count it.
+        written = con.execute(
+            f"""
+            COPY (
+                SELECT {select_sql}
+                FROM read_ndjson(?, columns={{{cols_sql}}},
+                                 ignore_errors=true, maximum_object_size=?)
+                WHERE instrument_token IS NOT NULL
+            ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """, [str(raw), _TAPE_MAX_OBJECT_SIZE],
+        ).fetchone()[0]
+        n_written = con.execute(
+            "SELECT COUNT(*) FROM read_parquet(?)", [str(tmp)],
+        ).fetchone()[0]
+    except BaseException:
+        con.close()
+        tmp.unlink(missing_ok=True)
+        raise
+    con.close()
+
+    if n_written != written:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"tape→parquet row-count mismatch for {date_iso}: parquet holds "
+            f"{n_written} of {written} copied rows — refusing to archive "
+            "(Rule 12: a short archive would bias every sweep it enters)"
+        )
+    tmp.replace(parquet)  # atomic publish onto the name _tape_path prefers
+    return parquet
 
 
 def load_iv_skew_seed(
