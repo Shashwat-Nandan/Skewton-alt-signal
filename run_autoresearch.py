@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # metrics.get(typo, 0) == 0.0 — an hours-long flat sweep whose root cause
 # is never named.
 VALID_METRICS = ("sharpe_ratio", "net_pnl", "calmar_ratio",
-                 "sortino_ratio", "gamma_theta_ratio")
+                 "sortino_ratio", "gamma_theta_ratio", "convexity_edge")
 
 
 def _split_data_into_windows(
@@ -233,6 +233,18 @@ def main():
             "(autoresearch_loop._run_experiment Phase 2.3)."
         )
     else:
+        # convexity_edge needs the Phase-1 component metrics, which only
+        # accrue on real captured-tape replay (theoretical_scalp_pnl needs
+        # per-tick greeks updates; middle_band_worst_pnl needs a real book).
+        # On CSV/synthetic data the components sit at 0.0 and the composite
+        # silently degenerates to mean(net_pnl) — fail loud instead
+        # (Rule 12; same class of bug as the metrics.get(typo, 0) sweep).
+        if loop.primary_metric == "convexity_edge":
+            raise SystemExit(
+                "--metric convexity_edge requires the captured-tape replay "
+                "path (no --data flag, with captured sessions present for "
+                f"{args.underlying}). CSV/synthetic replay would zero the "
+                "component metrics and silently degrade the objective.")
         # Patch _run_experiment to use historical or synthetic data
         def patched_run(params):
             import copy as cp

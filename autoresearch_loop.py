@@ -52,7 +52,9 @@ ZERO_TRADE_PENALTY = -1e6
 # overtrade rather than let it choose to trade less. For ratio objectives
 # (gamma_theta_ratio, sharpe_ratio) a no-trade session is undefined, so the
 # penalty still applies. See _run_experiment.
-PNL_METRICS = frozenset({"net_pnl", "realized_pnl"})
+# convexity_edge is rupee-denominated too: a no-trade session contributes
+# all-zero components, which is its true outcome.
+PNL_METRICS = frozenset({"net_pnl", "realized_pnl", "convexity_edge"})
 
 
 class HedgeResearchLoop:
@@ -586,23 +588,30 @@ class HedgeResearchLoop:
             if not cycle_metrics:
                 return -999999.0
 
-            primary_values = [m.get(self.primary_metric, 0) for m in cycle_metrics]
-            avg_metric = float(np.mean(primary_values))
+            if self.primary_metric == "convexity_edge":
+                # Component fitness (2026-07-18 redesign): computed whole in
+                # its own method — the mean−½σ risk adjustment is embedded
+                # there, so the generic variance penalty below must not be
+                # applied twice. The shared max-DD veto still applies after.
+                avg_metric = self._convexity_edge_fitness(cycle_metrics)
+            else:
+                primary_values = [m.get(self.primary_metric, 0) for m in cycle_metrics]
+                avg_metric = float(np.mean(primary_values))
 
-            # Phase 2.4: variance penalty. A single-cycle win shouldn't be
-            # rewarded as much as a consistent winner — particularly when
-            # primary_metric is gamma_theta_ratio (high single-day numerator
-            # variance is common). penalty_factor is the coefficient on the
-            # std-dev term; 0.5 means "subtract half a stddev from the mean".
-            # The autoresearch [section] can tune this if needed; default
-            # is moderate enough that a wide-but-fat-positive distribution
-            # still wins over an unstable spike.
-            if len(primary_values) >= 2:
-                penalty = float(np.std(primary_values))
-                penalty_factor = self.config.getfloat(
-                    "autoresearch", "variance_penalty", fallback=0.5,
-                )
-                avg_metric -= penalty_factor * penalty
+                # Phase 2.4: variance penalty. A single-cycle win shouldn't be
+                # rewarded as much as a consistent winner — particularly when
+                # primary_metric is gamma_theta_ratio (high single-day numerator
+                # variance is common). penalty_factor is the coefficient on the
+                # std-dev term; 0.5 means "subtract half a stddev from the mean".
+                # The autoresearch [section] can tune this if needed; default
+                # is moderate enough that a wide-but-fat-positive distribution
+                # still wins over an unstable spike.
+                if len(primary_values) >= 2:
+                    penalty = float(np.std(primary_values))
+                    penalty_factor = self.config.getfloat(
+                        "autoresearch", "variance_penalty", fallback=0.5,
+                    )
+                    avg_metric -= penalty_factor * penalty
 
             # Also check drawdown constraint (convert absolute drawdown to % of capital)
             total_capital = self.hedger.immutable_params.get("total_capital", 500000)
@@ -616,6 +625,74 @@ class HedgeResearchLoop:
             return avg_metric
         finally:
             self.hedger.tunable_params = original_params
+
+    def _convexity_edge_fitness(self, cycle_metrics: list) -> float:
+        """Component fitness for the 2026-07-18 redesign (tasks/todo.md).
+
+        Sums three rupee-denominated per-session components, then applies
+        hard vetoes. Built on the Phase-1 metrics (PR #151), so it measures
+        the strategy's thesis directly instead of sampling net P&L noise:
+
+          spread_i = theoretical_scalp_pnl − theta_decay_paid
+              The Taleb Ch.16 identity in rupees: what the session's realized
+              variance was worth against the time rent paid for it. This is
+              the EDGE a config exposes itself to, measurable every session —
+              unlike tail P&L, which needs a tail to happen.
+          middle_i = middle_band_worst_pnl (≤ 0)
+              Worst P&L inside ±1.5% of spot. Penalizes the short-the-middle
+              shape that lost ₹11.7k on 07-10's +1.02% move regardless of how
+              well a crash day happened to pay (Phase-0 F2).
+          pnl_i    = net_pnl — what execution actually kept, risk-adjusted
+              with the same mean−½σ used by the legacy objective.
+
+        Hard vetoes (→ -999999, logged):
+          bleed:  any session losing more than convexity_bleed_cap_pct of
+                  capital (default 1.5%, matching the live max_daily_loss_pct
+                  guard) — unmanaged bleed is disqualifying, not a tiebreak.
+          squandered edge: a session whose spread exceeded
+                  convexity_spread_tail_pct of capital while net_pnl was
+                  negative — the config had its tail and failed to keep it.
+
+        Weights/caps read from [autoresearch] with code defaults; all terms
+        are rupees, so weights are dimensionless and comparable.
+        """
+        capital = float(self.hedger.immutable_params.get("total_capital", 500000))
+        cfg = self.config
+        bleed_cap = capital * cfg.getfloat(
+            "autoresearch", "convexity_bleed_cap_pct", fallback=1.5) / 100.0
+        tail_min = capital * cfg.getfloat(
+            "autoresearch", "convexity_spread_tail_pct", fallback=0.5) / 100.0
+        w_spread = cfg.getfloat(
+            "autoresearch", "convexity_w_spread", fallback=0.5)
+        w_middle = cfg.getfloat(
+            "autoresearch", "convexity_w_middle", fallback=1.0)
+
+        pnl = np.array([m.get("net_pnl", 0.0) for m in cycle_metrics], dtype=float)
+        spread = np.array([
+            m.get("theoretical_scalp_pnl", 0.0) - m.get("theta_decay_paid", 0.0)
+            for m in cycle_metrics], dtype=float)
+        middle = np.array([
+            m.get("middle_band_worst_pnl", 0.0) for m in cycle_metrics], dtype=float)
+
+        worst = float(pnl.min()) if len(pnl) else 0.0
+        if worst < -bleed_cap:
+            logger.info("  convexity_edge VETO: session P&L %.0f breaches "
+                        "bleed cap -%.0f", worst, bleed_cap)
+            return -999999.0
+        squandered = (spread >= tail_min) & (pnl < 0)
+        if bool(squandered.any()):
+            i = int(np.argmax(squandered))
+            logger.info("  convexity_edge VETO: session had spread %.0f "
+                        "(≥ %.0f) but net P&L %.0f — edge squandered",
+                        spread[i], tail_min, pnl[i])
+            return -999999.0
+
+        fitness = float(np.mean(pnl)) if len(pnl) else 0.0
+        if len(pnl) >= 2:
+            fitness -= 0.5 * float(np.std(pnl))
+        fitness += w_spread * float(np.mean(spread)) if len(spread) else 0.0
+        fitness -= w_middle * float(np.mean(np.maximum(0.0, -middle))) if len(middle) else 0.0
+        return fitness
 
     def _evaluate_experiment(self, metric_value: float) -> bool:
         """

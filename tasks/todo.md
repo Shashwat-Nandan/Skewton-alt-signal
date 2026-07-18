@@ -111,11 +111,35 @@ Replace scalar net_pnl with per-session components that converge on quiet data:
       - State serialize/restore backcompat (old files load with 0-defaults).
       - 11 Rule-9 tests in tests/test_taleb_attribution_metrics.py, each
         encoding the Phase-0 failure it guards. Full suite 1406 passed.
-- [ ] **Phase 2 — new fitness in autoresearch_loop:** component objective +
-      vetoes + all-session walk-forward; keep net_pnl logged alongside.
-      Regression check: re-score the 8 kept candidates — new fitness should
-      REJECT them all (they were noise) and must penalize the 07-10
-      middle-short pattern (moderate-move losses) regardless of crash-day wins.
+- [x] **Phase 2 — `convexity_edge` component fitness (DONE 2026-07-18).**
+      - `HedgeResearchLoop._convexity_edge_fitness`: per-session rupee
+        components — risk-adjusted net_pnl (mean−½σ) + w_spread·mean(
+        theoretical_scalp − theta_paid) [the Ch.16 edge, measurable every
+        session] − w_middle·mean(middle-short magnitude). HARD VETOES →
+        −999999: session loss > convexity_bleed_cap_pct (default 1.5% of
+        capital, matches the live daily-loss guard) and squandered-edge
+        (spread ≥ convexity_spread_tail_pct=0.5% of capital with negative
+        P&L). Weights/caps via [autoresearch] with code defaults; shared
+        max-DD veto unchanged; zero-trade sessions = legitimate ₹0 (added to
+        PNL_METRICS).
+      - Fail-loud guard: `--metric convexity_edge` on the CSV/synthetic path
+        exits — components would silently zero and degrade to mean(net_pnl).
+      - 6 Rule-9 tests (TestConvexityEdgeFitness): middle-short penalized
+        despite crash-day win, bleed/squandered vetoes, cheap-vs-expensive
+        convexity ranking, zero-trade semantics.
+      - End-to-end smoke on real tape: 1 experiment × 2 sessions produced a
+        finite composite (−4735.6); direct replay of 2026-07-15 shows the
+        components flowing (theta −23.5, theoretical scalp −49.6).
+      - **Deferred to Phase 4's first sweep:** re-scoring the 8 kept
+        candidates on real tape (hours of replay; the pattern-level
+        requirement is encoded in tests instead).
+      - **Known limitation for Phase 3:** middle_band_worst_pnl /
+        breakeven_move_pct are EOD snapshots — a book closed intra-session
+        scores 0.0 for them that session (overnight holds, the 07-10
+        pattern, DO bind). Phase 3 should sample the profile at entry or
+        intraday if this proves gameable.
+      - NOT flipped: run_weekly_autoresearch.sh stays on `--metric net_pnl`
+        until Phases 3–4.
 - [ ] **Phase 3 — validation/promotion protocol:** hold-out must include tail
       day(s); promotion additionally requires tail-day-positive aggregate +
       bleed-bounded quiet days; keep zero-trade/no-promote guardrails; MC gates

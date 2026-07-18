@@ -546,3 +546,89 @@ class TestReplayWindowPreflight:
         fitness = loop._run_experiment({"gamma_scalp_band_pct": 1.2})
         assert loop._replay_sessions == []
         assert fitness != -999999.0
+
+
+# ──────────────────────────────────────────────────────────
+# convexity_edge component fitness (2026-07-18 redesign).
+# Each test encodes a Phase-0 failure the objective exists to reject —
+# see tasks/todo.md (Taleb fitness redesign) and memory of 07-08/07-10.
+# ──────────────────────────────────────────────────────────
+
+
+def _edge_loop(capital=1_000_000.0, **cfg_overrides):
+    cfg = configparser.ConfigParser()
+    cfg.add_section("autoresearch")
+    for k, v in cfg_overrides.items():
+        cfg.set("autoresearch", k, str(v))
+    return _loop(
+        config=cfg,
+        hedger=SimpleNamespace(immutable_params={"total_capital": capital}),
+    )
+
+
+def _cycle(pnl=0.0, theo=0.0, theta=0.0, middle=0.0):
+    return {"net_pnl": pnl, "theoretical_scalp_pnl": theo,
+            "theta_decay_paid": theta, "middle_band_worst_pnl": middle}
+
+
+class TestConvexityEdgeFitness:
+    def test_middle_short_penalized_despite_crash_day_win(self):
+        # WHY (Phase-0 F2 / success criterion 2): the 07-08 crash win was a
+        # short-ATM leg getting lucky; the same shape lost ₹11.7k on 07-10's
+        # +1.02%. Two configs with IDENTICAL session P&Ls must rank by their
+        # structure: deep negative middle bands must score strictly worse.
+        loop = _edge_loop()
+        pnls = [22_000.0, -11_663.0, -2_000.0, 1_500.0]
+        short_middle = [_cycle(pnl=p, middle=-14_000.0) for p in pnls]
+        clean = [_cycle(pnl=p, middle=0.0) for p in pnls]
+        f_short = loop._convexity_edge_fitness(short_middle)
+        f_clean = loop._convexity_edge_fitness(clean)
+        assert f_short < f_clean
+        # Default w_middle=1.0 → the gap is the mean middle magnitude.
+        assert abs((f_clean - f_short) - 14_000.0) < 1e-6
+
+    def test_unmanaged_bleed_is_a_veto_not_a_tiebreak(self):
+        # WHY: a −17k/−15k quiet-day bleed (observed in the forward record)
+        # on a ₹1M book breaches the 1.5% live daily-loss guard. A config
+        # that does this must be disqualified outright — averaging would let
+        # a lucky week buy it back.
+        loop = _edge_loop()
+        cycles = [_cycle(pnl=5_000.0), _cycle(pnl=-17_000.0)]
+        assert loop._convexity_edge_fitness(cycles) == -999999.0
+
+    def test_squandered_edge_is_a_veto(self):
+        # WHY: a session where realized variance was worth ₹20k against the
+        # theta rent (spread ≥ 0.5% of capital) and the config still lost
+        # money means the structure/exits threw the tail away — the exact
+        # failure "net P&L on quiet windows" could never see.
+        loop = _edge_loop()
+        cycles = [_cycle(pnl=-1_000.0, theo=22_000.0, theta=2_000.0)]
+        assert loop._convexity_edge_fitness(cycles) == -999999.0
+
+    def test_cheap_convexity_outranks_expensive_convexity(self):
+        # WHY (component C): identical realized P&L, but config A bought its
+        # variance at half the rent (theo 2× theta) while B paid double
+        # (theo 0.5× theta). The objective must prefer A — that spread IS the
+        # Taleb edge, measurable on every session without a tail.
+        loop = _edge_loop()
+        pnls = [1_000.0, -500.0]
+        a = [_cycle(pnl=p, theo=4_000.0, theta=2_000.0) for p in pnls]
+        b = [_cycle(pnl=p, theo=1_000.0, theta=2_000.0) for p in pnls]
+        assert loop._convexity_edge_fitness(a) > loop._convexity_edge_fitness(b)
+
+    def test_zero_trade_config_scores_zero_and_beats_bleeder(self):
+        # WHY: choosing not to trade edgeless tape is a legitimate ₹0 outcome
+        # (no-promote gates handle "never trades" at promotion time); it must
+        # not be vetoed, and it must outrank a config that bleeds within cap.
+        loop = _edge_loop()
+        flat = [_cycle() for _ in range(5)]
+        bleeder = [_cycle(pnl=-8_000.0, theta=3_000.0) for _ in range(5)]
+        f_flat = loop._convexity_edge_fitness(flat)
+        assert f_flat == 0.0
+        assert f_flat > loop._convexity_edge_fitness(bleeder)
+
+    def test_convexity_edge_has_pnl_zero_trade_semantics(self):
+        # WHY: if convexity_edge ever leaves PNL_METRICS, zero-trade sessions
+        # get ZERO_TRADE_PENALTY injected and the optimizer is pushed to
+        # overtrade — the exact pathology the rupee-metric split prevents.
+        assert "convexity_edge" in PNL_METRICS
