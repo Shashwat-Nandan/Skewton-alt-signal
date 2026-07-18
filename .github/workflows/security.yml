@@ -1,14 +1,14 @@
 name: security
 
 # Free-plan-friendly security gate (no GitHub Advanced Security required).
-#   - gitleaks      : secret scanning across full history          [BLOCKING]
-#   - pip-audit     : Python dependency CVEs (requirements.lock)   [advisory*]
-#   - npm-audit     : frontend dependency CVEs                     [advisory*]
-#   - bandit        : Python SAST                                  [advisory*]
-#   - signatures    : every PR commit must be verified-signed      [advisory*]
-# *advisory = reports loudly but does not fail the build yet. Promote each to
-#  blocking (remove continue-on-error) once its baseline is triaged / all devs
-#  have registered signing keys. See AGENTS.md + SECURITY.md.
+#   - gitleaks   : secret scanning across full history        [BLOCKING — red fails]
+#   - pip-audit  : Python dependency CVEs                      [advisory — green + ⚠️ warning]
+#   - npm-audit  : frontend dependency CVEs                    [advisory — green + ⚠️ warning]
+#   - bandit     : Python SAST                                 [advisory — green + ⚠️ warning]
+#   - signatures : every PR commit verified-signed            [advisory — green + ⚠️ warning]
+# Advisory jobs surface findings as GitHub warning annotations WITHOUT failing the
+# check — a green PR that still tells you what to triage. Promote any of them to
+# blocking by removing the `|| { warn ... }` wrapper once its baseline is clean.
 
 on:
   pull_request:
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # full history so the scan covers past commits
+          fetch-depth: 0
       - name: Install gitleaks
         run: |
           curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
@@ -38,21 +38,22 @@ jobs:
   pip-audit:
     name: Python deps CVE audit (pip-audit)
     runs-on: ubuntu-latest
-    continue-on-error: true       # advisory until baseline triaged
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run pip-audit against the locked closure
+      - name: Audit (advisory)
         run: |
           python -m pip install --upgrade pip pip-audit
-          pip-audit --requirement requirements.lock --requirement requirements-dev.lock --strict
+          pip-audit --requirement requirements.lock --requirement requirements-dev.lock --strict || {
+            echo "::warning title=pip-audit::Dependency CVE(s) found (advisory) — triage; not blocking."
+            echo "### ⚠️ pip-audit: dependency CVEs found (advisory)" >> "$GITHUB_STEP_SUMMARY"
+          }
 
   npm-audit:
     name: Frontend deps CVE audit (npm audit)
     runs-on: ubuntu-latest
-    continue-on-error: true       # advisory
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -60,37 +61,40 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Audit production deps
+      - name: Audit (advisory)
         working-directory: frontend
         run: |
           npm ci --ignore-scripts
-          npm audit --omit=dev --audit-level=high
+          npm audit --omit=dev --audit-level=high || {
+            echo "::warning title=npm-audit::Frontend CVE(s) found (advisory) — triage; not blocking."
+            echo "### ⚠️ npm audit: frontend CVEs found (advisory)" >> "$GITHUB_STEP_SUMMARY"
+          }
 
   bandit:
     name: Python SAST (bandit)
     runs-on: ubuntu-latest
-    continue-on-error: true       # advisory until baseline triaged
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run bandit (medium+ severity/confidence)
+      - name: Bandit (advisory)
         run: |
           python -m pip install --upgrade pip bandit
-          bandit -r . -ll -ii \
-            --exclude ./tests,./frontend,./.venv,./data_cache,./state
+          bandit -r . -ll -ii --exclude ./tests,./frontend,./.venv,./data_cache,./state || {
+            echo "::warning title=bandit::SAST findings (advisory) — review; not blocking."
+            echo "### ⚠️ bandit: SAST findings (advisory)" >> "$GITHUB_STEP_SUMMARY"
+          }
 
   signatures:
     name: Commit signatures verified
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    continue-on-error: true       # advisory until every founder registers a signing key
     permissions:
       contents: read
       pull-requests: read
     steps:
-      - name: Check every PR commit is verified-signed
+      - name: Check every PR commit is verified-signed (advisory)
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -99,9 +103,10 @@ jobs:
           unsigned=$(gh api "repos/$REPO/pulls/$PR/commits" --paginate \
             --jq '.[] | select(.commit.verification.verified == false) | "\(.sha[0:9])  \(.commit.message | split("\n")[0])"')
           if [ -n "$unsigned" ]; then
-            echo "::warning::Unsigned / unverified commits found:"
+            echo "::warning title=signatures::Unsigned/unverified commits (advisory) — set up signing (CONTRIBUTING.md); not blocking."
             echo "$unsigned"
-            echo "Set up commit signing (see CONTRIBUTING.md). This becomes BLOCKING once all founders have registered signing keys."
-            exit 1
+            echo "### ⚠️ Unsigned commits (advisory)" >> "$GITHUB_STEP_SUMMARY"
+            echo "$unsigned" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All PR commits are verified-signed. ✓"
           fi
-          echo "All PR commits are verified-signed. ✓"
