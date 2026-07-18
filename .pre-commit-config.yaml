@@ -1,0 +1,38 @@
+# Pre-commit hooks — CHECK ONLY. These do not reformat code, matching the team's
+# deliberate no-ruff-format policy (see ruff.toml + AGENTS.md Rule 11). By default
+# pre-commit only runs on the files in your commit, so existing files are not
+# touched. Install with: pre-commit install
+#
+# Keep hook versions fresh with: pre-commit autoupdate
+minimum_pre_commit_version: "3.5.0"
+fail_fast: false
+
+repos:
+  # Lint with the SAME ruff the project/CI uses (from your venv) — no version drift.
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (project venv, config in ruff.toml)
+        entry: python -m ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: false
+
+  # Secret scanning on staged changes (full-history scan runs in CI).
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  # Non-modifying safety checks (do not rewrite files).
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-json
+      - id: check-case-conflict
