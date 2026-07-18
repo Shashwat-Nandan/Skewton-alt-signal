@@ -16,6 +16,7 @@ import json
 import logging
 import sys
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -301,6 +302,10 @@ def main():
 
             if not cycle_metrics:
                 return -999999.0
+            # Phase-3: mirror _run_experiment's per-session P&L stash for the
+            # validation bootstrap.
+            loop._last_cycle_pnls = [
+                float(m.get("net_pnl", 0.0)) for m in cycle_metrics]
             values = [m.get(loop.primary_metric, 0) for m in cycle_metrics]
             avg = np.mean(values)
             total_capital = loop.hedger.immutable_params.get("total_capital", 500000)
@@ -344,10 +349,15 @@ def main():
     # loop.baseline_metric drifts upward as mutations are accepted; keep
     # the seed's score for the sweep-quality verdict below.
     seed_baseline = loop.baseline_metric
+    # Phase-3: per-session P&Ls of the CURRENT BEST config, refreshed on every
+    # acceptance — feeds the validation bootstrap. Starts as the baseline's.
+    best_cycle_pnls = list(getattr(loop, "_last_cycle_pnls", []) or [])
 
     # Experiments
     for i in range(1, args.experiments + 1):
         result = loop.run_single_experiment()
+        if result["accepted"]:
+            best_cycle_pnls = list(getattr(loop, "_last_cycle_pnls", []) or [])
         status = "ACCEPTED" if result["accepted"] else "rejected"
         logger.info("[%d/%d] %s %s=%.6f (mutated %s: %.4f -> %.4f) best=%.6f",
                     i, args.experiments, status,
@@ -422,32 +432,92 @@ def main():
             val_data = historical_data
             val_label = "full dataset (WARNING: no true hold-out, insufficient data)"
         else:
-            # No CSV: prefer a real captured-tape session over synthetic GBM.
-            # The fitness eval trains on the loop's pinned replay window, so
-            # the most recent session OUTSIDE that window is a genuine
-            # hold-out. Falls back to synthetic only when there isn't enough
-            # tape for one.
+            # No CSV: prefer real captured-tape sessions over synthetic GBM.
+            # Phase-3 (2026-07-18): the hold-out is a SET — the most recent
+            # outside-window session plus the largest-|move| outside-window
+            # session (pick_holdout_sessions). A convexity strategy validated
+            # only on the usually-quiet most-recent session can never be
+            # falsified; the tail session is where the thesis lives.
+            from autoresearch_loop import (
+                build_validation_verdict, load_daily_moves, pick_holdout_sessions,
+            )
             from backtest import list_captured_sessions, load_captured_tape, load_iv_skew_seed
             captured = list_captured_sessions(args.underlying)
             window = set(loop._replay_sessions or captured[-loop.eval_cycles:])
-            outside = [d for d in captured if d not in window]
-            if outside:
-                val_date = outside[-1]
-                val_data = load_captured_tape(val_date, args.underlying)
+            moves = load_daily_moves(args.underlying)
+            holdout_dates = pick_holdout_sessions(captured, window, moves)
+            if holdout_dates:
                 # Reuse the seed the fitness eval built (same drop_recent); compute
                 # it if the run never took the tape path. NOTE (Rule 12): the seed
-                # is NOT timestamp-filtered against val_date, so it can include
-                # post-val_date IV — adequate for a relative sanity check, not a
+                # is NOT timestamp-filtered against the hold-out dates, so it can
+                # include later IV — adequate for a relative sanity check, not a
                 # look-ahead-clean absolute claim. Same caveat as load_iv_skew_seed.
                 val_seed_iv = getattr(loop, "_iv_seed", None)
                 val_seed_skew = getattr(loop, "_skew_seed", None)
                 if val_seed_iv is None:
                     drop = loop.config.getint("autoresearch", "iv_seed_drop_recent", fallback=0)
                     val_seed_iv, val_seed_skew = load_iv_skew_seed(args.underlying, drop_recent=drop)
-                age = len(captured) - captured.index(val_date)
-                val_label = (f"captured-tape hold-out ({val_date}, {age} sessions "
-                             f"back — most recent session outside the "
-                             f"{len(window)}-session fitness window)")
+                if not moves:
+                    print("\n  NOTE: daily-move data unavailable — hold-out "
+                          "selection degraded to recency-only (no tail session).")
+                session_results = []
+                print(f"\n  Validation run ({len(holdout_dates)}-session "
+                      f"captured-tape hold-out, outside the {len(window)}-"
+                      f"session fitness window)...")
+                for vd in holdout_dates:
+                    vr = run_backtest(
+                        load_captured_tape(vd, args.underlying),
+                        underlying=args.underlying, tunable_params=loop.best_params,
+                        seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
+                    )["metrics"]
+                    session_results.append({
+                        "date": vd, "net_pnl": vr["net_pnl"],
+                        "total_trades": vr["total_trades"],
+                        "max_drawdown": vr["max_drawdown"],
+                        "move_pct": moves.get(vd),
+                    })
+                    mv = moves.get(vd)
+                    print(f"    {vd} ({f'{mv:+.2f}%' if mv is not None else 'move n/a'}): "
+                          f"Net P/L {vr['net_pnl']:>10,.0f}  "
+                          f"Trades {vr['total_trades']}  "
+                          f"MaxDD {vr['max_drawdown']:,.0f}")
+
+                capital = float(hedger.immutable_params.get("total_capital", 500000))
+                verdict = build_validation_verdict(
+                    session_results, capital, moves,
+                    insample_pnls=best_cycle_pnls,
+                )
+                pn = verdict["checks"]["bootstrap_p_negative"]
+                print("\n  Promotion checklist:")
+                for name, ok in verdict["checks"].items():
+                    if name == "bootstrap_p_negative":
+                        print(f"    {name:<26} = "
+                              f"{'n/a (too few sessions)' if pn is None else f'{pn:.2f} (coarse, n={len(best_cycle_pnls) + len(session_results)})'}")
+                    else:
+                        print(f"    {name:<26} = {ok}")
+                if verdict["promote_ok"]:
+                    print("    → checks PASS — promotion remains an operator "
+                          "decision (review warnings + sweep quality).")
+                else:
+                    print("    → DO NOT PROMOTE:")
+                for w in verdict["warnings"]:
+                    print(f"      - {w}")
+                    logger.warning("VALIDATION: %s", w)
+
+                # Persist the verdict into the candidate file (atomic rewrite,
+                # best-effort — the candidate itself was already saved above).
+                try:
+                    cand_path = Path(args.out)
+                    cand = json.loads(cand_path.read_text())
+                    cand["validation"] = verdict
+                    tmp = cand_path.with_suffix(cand_path.suffix + ".tmp")
+                    tmp.write_text(json.dumps(cand, indent=2, default=str))
+                    os.replace(tmp, cand_path)
+                    print(f"  Verdict embedded in {args.out}")
+                except Exception as e:
+                    logger.warning("Could not embed verdict in %s: %s", args.out, e)
+                val_data = None   # handled here; skip the single-run path below
+                val_label = None
             else:
                 np.random.seed(42)
                 val_data = generate_synthetic_data(days=10, ticks_per_day=12)
@@ -455,18 +525,19 @@ def main():
                              f"tape session(s) are inside the fitness window, "
                              f"no hold-out exists")
 
-        print(f"\n  Validation run ({val_label})...")
-        val_results = run_backtest(
-            val_data, underlying=args.underlying, tunable_params=loop.best_params,
-            seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
-        )
-        vm = val_results["metrics"]
-        print(f"    Net P/L:      {vm['net_pnl']:>12,.2f}")
-        print(f"    Sharpe:       {vm['sharpe_ratio']:>12.4f}")
-        print(f"    Calmar:       {vm['calmar_ratio']:>12.4f}")
-        print(f"    Sortino:      {vm['sortino_ratio']:>12.4f}")
-        print(f"    Max DD:       {vm['max_drawdown']:>12,.2f}")
-        print(f"    Trades:       {vm['total_trades']}")
+        if val_data is not None:
+            print(f"\n  Validation run ({val_label})...")
+            val_results = run_backtest(
+                val_data, underlying=args.underlying, tunable_params=loop.best_params,
+                seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
+            )
+            vm = val_results["metrics"]
+            print(f"    Net P/L:      {vm['net_pnl']:>12,.2f}")
+            print(f"    Sharpe:       {vm['sharpe_ratio']:>12.4f}")
+            print(f"    Calmar:       {vm['calmar_ratio']:>12.4f}")
+            print(f"    Sortino:      {vm['sortino_ratio']:>12.4f}")
+            print(f"    Max DD:       {vm['max_drawdown']:>12,.2f}")
+            print(f"    Trades:       {vm['total_trades']}")
     except Exception as e:
         logger.warning("Validation run failed: %s", e)
         print(f"\n  WARNING: validation run failed ({e}) — skipping. The "

@@ -140,11 +140,31 @@ Replace scalar net_pnl with per-session components that converge on quiet data:
         intraday if this proves gameable.
       - NOT flipped: run_weekly_autoresearch.sh stays on `--metric net_pnl`
         until Phases 3–4.
-- [ ] **Phase 3 — validation/promotion protocol:** hold-out must include tail
-      day(s); promotion additionally requires tail-day-positive aggregate +
-      bleed-bounded quiet days; keep zero-trade/no-promote guardrails; MC gates
-      re-derived from bootstrap paths. mc_min_mean_pnl / best_params edits stay
-      OPERATOR decisions (standing rule).
+- [x] **Phase 3 — validation/promotion protocol (DONE 2026-07-18).**
+      - `pick_holdout_sessions`: hold-out = most-recent outside-window session
+        PLUS largest-|move| outside-window session (tail hold-out). Moves from
+        `load_daily_moves` (newest `{u}_*_eod` snapshot — NIFTY_daily.csv/
+        parquet is STALE since 2026-06-25, deliberately not used); missing
+        moves degrade loudly to recency-only.
+      - `build_validation_verdict`: machine-readable checks —
+        holdout_trades_nonzero (standing no-promote rule),
+        tail_day_nonnegative (|move|≥1% sessions must not lose; absence of a
+        tail session is warned as "thesis NOT tested"), bleed_bounded (no
+        session < −1.5% capital), bootstrap_p_negative (10k deterministic
+        resamples of in-sample+hold-out session P&Ls; reported, labeled
+        coarse, not gated). promote_ok = all pass; verdict + warnings
+        embedded into the candidate JSON (`validation` key) and printed as a
+        promotion checklist. Promotion itself stays an OPERATOR decision.
+      - Loop stashes `_last_cycle_pnls` (accepted/best config) → bootstrap
+        input.
+      - 13 Rule-9 tests; end-to-end smoke picked **07-08 (−2.12%) as tail
+        hold-out** alongside 07-15, printed checklist, embedded verdict.
+      - **Deliberately deferred:** re-deriving the LIVE MC entry gates
+        (mc_worst_path_loss_pct / mc_min_mean_pnl) from block-bootstrap tape
+        paths — that changes live trading behavior and needs its own
+        operator-approved change, not a validation-protocol rider. The
+        EOD-snapshot limitation of middle_band/breakeven also stands
+        (watch in Phase 4; fix only if gamed).
 - [ ] **Phase 4 — re-enable weekly sweep under new objective.** Success may be
       a clean NO ("convexity not cheap enough at NIFTY IV levels to beat theta+
       costs") — that is an acceptable, actionable outcome; prefer more forward

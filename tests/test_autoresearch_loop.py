@@ -632,3 +632,145 @@ class TestConvexityEdgeFitness:
         # get ZERO_TRADE_PENALTY injected and the optimizer is pushed to
         # overtrade — the exact pathology the rupee-metric split prevents.
         assert "convexity_edge" in PNL_METRICS
+
+
+# ──────────────────────────────────────────────────────────
+# Phase-3 validation/promotion helpers (2026-07-18 redesign).
+# The hold-out must be able to FALSIFY a convexity candidate: include a
+# tail session, refuse zero-trade "improvements", bound bleed.
+# ──────────────────────────────────────────────────────────
+
+from autoresearch_loop import (  # noqa: E402
+    build_validation_verdict,
+    load_daily_moves,
+    pick_holdout_sessions,
+)
+
+
+class TestPickHoldoutSessions:
+    def test_includes_recent_and_tail_session(self):
+        # WHY: validating only the most recent (usually quiet) session can
+        # never falsify a convexity candidate — the biggest-|move| session
+        # outside the window must join the hold-out.
+        captured = [f"2026-07-{d:02d}" for d in range(1, 11)]
+        window = set(captured[-5:])                    # 06..10 in-window
+        moves = {"2026-07-02": -2.1, "2026-07-03": 0.3, "2026-07-04": 0.8,
+                 "2026-07-05": -0.2}
+        picks = pick_holdout_sessions(captured, window, moves)
+        assert picks[0] == "2026-07-05"                # most recent outside
+        assert "2026-07-02" in picks                   # the tail session
+        assert len(picks) == 2
+
+    def test_tail_equals_recent_collapses_to_one(self):
+        captured = ["2026-07-01", "2026-07-02", "2026-07-03"]
+        window = {"2026-07-03"}
+        moves = {"2026-07-01": 0.1, "2026-07-02": -1.9}
+        assert pick_holdout_sessions(captured, window, moves) == ["2026-07-02"]
+
+    def test_no_outside_sessions_yields_empty(self):
+        captured = ["2026-07-01"]
+        assert pick_holdout_sessions(captured, {"2026-07-01"}, {}) == []
+
+    def test_no_moves_degrades_to_recency_only(self):
+        # WHY: stale/missing daily data must degrade loudly-but-safely to the
+        # pre-Phase-3 behaviour, not crash the weekly sweep's validation.
+        captured = ["2026-07-01", "2026-07-02", "2026-07-03"]
+        window = {"2026-07-03"}
+        assert pick_holdout_sessions(captured, window, {}) == ["2026-07-02"]
+
+
+class TestBuildValidationVerdict:
+    CAP = 1_000_000.0
+
+    def _r(self, date, pnl, trades=2, dd=1000.0):
+        return {"date": date, "net_pnl": pnl, "total_trades": trades,
+                "max_drawdown": dd}
+
+    def test_zero_trade_holdout_blocks_promotion(self):
+        # WHY: the standing no-promote rule — narrowing gates until nothing
+        # trades is "improvement" by abstention, not edge (2026-07-04 lesson).
+        v = build_validation_verdict(
+            [self._r("2026-07-05", 0.0, trades=0)], self.CAP, {})
+        assert v["checks"]["holdout_trades_nonzero"] is False
+        assert v["promote_ok"] is False
+
+    def test_tail_day_loss_blocks_promotion(self):
+        # WHY: tails are the product. A candidate that lost the −2.1% session
+        # must not be promotable no matter how good the quiet days looked.
+        moves = {"2026-07-02": -2.1}
+        v = build_validation_verdict(
+            [self._r("2026-07-02", -7_000.0), self._r("2026-07-05", 3_000.0)],
+            self.CAP, moves)
+        assert v["checks"]["tail_day_nonnegative"] is False
+        assert v["promote_ok"] is False
+        assert any("tail" in w for w in v["warnings"])
+
+    def test_bleed_breach_blocks_promotion(self):
+        # WHY: mirrors the convexity_edge veto and the live daily-loss guard —
+        # a hold-out session losing >1.5% of capital is disqualifying.
+        v = build_validation_verdict(
+            [self._r("2026-07-05", -16_000.0)], self.CAP, {})
+        assert v["checks"]["bleed_bounded"] is False
+        assert v["promote_ok"] is False
+
+    def test_healthy_candidate_passes_with_tail_tested(self):
+        moves = {"2026-07-02": 1.4}
+        v = build_validation_verdict(
+            [self._r("2026-07-02", 9_000.0), self._r("2026-07-05", -2_000.0)],
+            self.CAP, moves)
+        assert v["promote_ok"] is True
+        assert v["checks"]["tail_day_nonnegative"] is True
+
+    def test_untested_thesis_warns_but_does_not_block(self):
+        # WHY: no tail session available is a data limitation, not a candidate
+        # failure — but the verdict must SAY the thesis went untested rather
+        # than let silence read as validation (Rule 12).
+        v = build_validation_verdict(
+            [self._r("2026-07-05", 1_000.0)], self.CAP, {})
+        assert v["checks"]["tail_day_nonnegative"] is None
+        assert v["promote_ok"] is True
+        assert any("NOT tested" in w for w in v["warnings"])
+
+    def test_bootstrap_is_deterministic_and_bounded(self):
+        # WHY: success criterion 1 (determinism) — re-running the same window
+        # must produce the same verdict, or the verdict is itself noise.
+        sessions = [self._r("2026-07-05", 2_000.0)]
+        ins = [1_000.0, -500.0, 2_000.0, -1_500.0, 3_000.0]
+        p1 = build_validation_verdict(sessions, self.CAP, {}, insample_pnls=ins)
+        p2 = build_validation_verdict(sessions, self.CAP, {}, insample_pnls=ins)
+        pn = p1["checks"]["bootstrap_p_negative"]
+        assert pn == p2["checks"]["bootstrap_p_negative"]
+        assert 0.0 <= pn <= 1.0
+
+    def test_too_few_points_reports_none_not_fake_p(self):
+        v = build_validation_verdict(
+            [self._r("2026-07-05", 2_000.0)], self.CAP, {}, insample_pnls=[1.0])
+        assert v["checks"]["bootstrap_p_negative"] is None
+
+
+class TestLoadDailyMoves:
+    def test_reads_newest_eod_table_and_computes_moves(self, tmp_path, monkeypatch):
+        # WHY: hold-out tail selection needs per-session moves; the loader
+        # must use the newest EOD snapshot (lex-sorted filename convention,
+        # same as the strategy's spot seed) — NIFTY_daily.* went stale 06-25.
+        import pandas as pd
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        old = pd.DataFrame({"timestamp": ["2026-01-01 15:30:00"],
+                            "underlying_price": [10.0]})
+        old.to_csv(dc / "NIFTY_20260101_20260131_eod.csv", index=False)
+        new = pd.DataFrame({
+            "timestamp": ["2026-07-01 15:30:00", "2026-07-01 15:30:00",
+                          "2026-07-02 15:30:00", "2026-07-03 15:30:00"],
+            "underlying_price": [24000.0, 24000.0, 24240.0, 23997.6],
+        })
+        new.to_csv(dc / "NIFTY_20260701_20260731_eod.csv", index=False)
+        moves = load_daily_moves("NIFTY")
+        assert set(moves) == {"2026-07-02", "2026-07-03"}   # first day has no prior
+        assert abs(moves["2026-07-02"] - 1.0) < 1e-9        # +1.0%
+        assert abs(moves["2026-07-03"] - (-1.0)) < 1e-9     # −1.0%
+
+    def test_missing_data_returns_empty_dict(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert load_daily_moves("NIFTY") == {}

@@ -57,6 +57,135 @@ ZERO_TRADE_PENALTY = -1e6
 PNL_METRICS = frozenset({"net_pnl", "realized_pnl", "convexity_edge"})
 
 
+# ── Phase-3 validation/promotion helpers (2026-07-18 redesign) ──
+# Module-level so run_autoresearch's validation stage and tests share one
+# definition. The candidate JSON gets the verdict these produce; promotion
+# itself stays an OPERATOR decision (standing rule) — these inform it.
+
+def load_daily_moves(underlying: str) -> Dict[str, float]:
+    """Per-session close-to-close spot move (%) keyed by ISO date, from the
+    newest {underlying}_*_eod table — the same source (and recency-by-filename
+    convention) the strategy's spot-history seed uses. The NIFTY_daily.csv/
+    parquet series is NOT used: it went stale at 2026-06-25 while the EOD
+    options snapshots stay fresh. Returns {} on any failure — callers degrade
+    to recency-only hold-out selection and say so."""
+    import pandas as pd
+    from data_cache_io import find_tables, read_table
+    try:
+        candidates = find_tables(Path("data_cache"), f"{underlying}_*_eod")
+        if not candidates:
+            return {}
+        df = read_table(candidates[-1], usecols=["timestamp", "underlying_price"])
+        df["date"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d")
+        spot = (df.drop_duplicates(subset="date", keep="last")
+                  .sort_values("date").set_index("date")["underlying_price"])
+        moves = spot.pct_change() * 100.0
+        return {d: float(v) for d, v in moves.items() if v == v}  # drop NaN
+    except Exception as e:
+        logger.warning("load_daily_moves(%s) failed: %s — hold-out selection "
+                       "degrades to recency-only", underlying, e)
+        return {}
+
+
+def pick_holdout_sessions(captured: list, window: set,
+                          moves: Dict[str, float]) -> list:
+    """Hold-out set for candidate validation: the most recent session outside
+    the fitness window (the pre-Phase-3 behaviour) PLUS the largest-|move|
+    outside-window session (the tail hold-out). A convexity strategy's
+    payoff lives in the tail sessions; validating only on the most recent —
+    usually quiet — session could never falsify a candidate (Phase-0 F2)."""
+    outside = [d for d in captured if d not in window]
+    if not outside:
+        return []
+    picks = [outside[-1]]
+    scored = [d for d in outside if d in moves]
+    if scored:
+        tail = max(scored, key=lambda d: abs(moves[d]))
+        if tail not in picks:
+            picks.append(tail)
+    return picks
+
+
+def build_validation_verdict(session_results: list, capital: float,
+                             moves: Dict[str, float],
+                             insample_pnls: Optional[list] = None,
+                             tail_threshold_pct: float = 1.0,
+                             bleed_cap_pct: float = 1.5,
+                             rng_seed: int = 7) -> Dict:
+    """Machine-readable promotion verdict from per-hold-out-session results
+    (each: {'date','net_pnl','total_trades','max_drawdown'}).
+
+    Checks (each failure appends a warning; promote_ok = all pass):
+      holdout_trades_nonzero — the standing no-promote rule: a candidate that
+          cannot trade the hold-out is 'improving' by trading less.
+      tail_day_nonnegative — on hold-out sessions with |move| ≥
+          tail_threshold_pct the candidate must not lose money: tails are the
+          product this strategy sells. None (not a failure) when the hold-out
+          contains no tail session — but that absence is itself warned, since
+          the validation then couldn't test the thesis.
+      bleed_bounded — no hold-out session loses more than bleed_cap_pct of
+          capital (mirrors the convexity_edge veto and the live daily-loss
+          guard).
+      bootstrap_p_negative — share of 10k bootstrap resamples (deterministic
+          rng_seed) of the combined in-sample + hold-out per-session P&Ls
+          whose mean is ≤ 0. Reported, not gated: with ~15 points it is a
+          coarse stability signal, not significance (Rule 12: labeled so).
+    """
+    pnls = [float(r["net_pnl"]) for r in session_results]
+    trades = sum(int(r.get("total_trades", 0)) for r in session_results)
+    bleed_floor = -capital * bleed_cap_pct / 100.0
+    warnings = []
+
+    trades_ok = trades > 0
+    if not trades_ok:
+        warnings.append(
+            f"0 trades across the {len(session_results)}-session hold-out — "
+            "candidate 'improves' by not trading (standing no-promote rule)")
+
+    tail_sessions = [r for r in session_results
+                     if abs(moves.get(r["date"], 0.0)) >= tail_threshold_pct]
+    if tail_sessions:
+        tail_ok = all(float(r["net_pnl"]) >= 0 for r in tail_sessions)
+        if not tail_ok:
+            worst = min(tail_sessions, key=lambda r: float(r["net_pnl"]))
+            warnings.append(
+                f"lost ₹{-float(worst['net_pnl']):,.0f} on tail session "
+                f"{worst['date']} ({moves.get(worst['date'], 0.0):+.2f}%) — "
+                "tails are the product; a config that loses them is not edge")
+    else:
+        tail_ok = None
+        warnings.append(
+            f"hold-out contains no session with |move| ≥ "
+            f"{tail_threshold_pct}% — the convexity thesis was NOT tested")
+
+    bleed_ok = all(p > bleed_floor for p in pnls) if pnls else True
+    if not bleed_ok:
+        warnings.append(
+            f"a hold-out session lost more than {bleed_cap_pct}% of capital "
+            f"(floor ₹{bleed_floor:,.0f}) — unmanaged bleed")
+
+    p_neg = None
+    combined = list(insample_pnls or []) + pnls
+    if len(combined) >= 5:
+        rng = np.random.default_rng(rng_seed)
+        arr = np.asarray(combined, dtype=float)
+        means = rng.choice(arr, size=(10_000, len(arr)), replace=True).mean(axis=1)
+        p_neg = float((means <= 0).mean())
+
+    promote_ok = bool(trades_ok and bleed_ok and tail_ok is not False)
+    return {
+        "sessions": session_results,
+        "checks": {
+            "holdout_trades_nonzero": trades_ok,
+            "tail_day_nonnegative": tail_ok,
+            "bleed_bounded": bleed_ok,
+            "bootstrap_p_negative": p_neg,
+        },
+        "promote_ok": promote_ok,
+        "warnings": warnings,
+    }
+
+
 class HedgeResearchLoop:
     """
     Autonomous parameter optimization loop for the Taleb Dynamic Hedger.
@@ -587,6 +716,13 @@ class HedgeResearchLoop:
 
             if not cycle_metrics:
                 return -999999.0
+
+            # Phase-3: expose this evaluation's per-session P&Ls so the driver
+            # can keep the accepted/best config's series for the validation
+            # bootstrap (build_validation_verdict). Attribute, not return —
+            # every caller of _run_experiment expects a bare scalar.
+            self._last_cycle_pnls = [
+                float(m.get("net_pnl", 0.0)) for m in cycle_metrics]
 
             if self.primary_metric == "convexity_edge":
                 # Component fitness (2026-07-18 redesign): computed whole in
