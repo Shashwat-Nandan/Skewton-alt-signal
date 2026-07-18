@@ -240,6 +240,35 @@ class TestDualWrite:
         pub.close()
 
 
+    def test_startup_reconcile_failure_is_non_fatal_and_self_heals(self, tmp_path):
+        # Redis being down when the live runner starts must NOT abort the
+        # session (the projection is a rebuildable cache, not the book): the
+        # publisher constructs, runs file-only, and self-heals on first publish.
+        client = _client()
+        real = _redis_bus(client)
+
+        class _StartupFlakyBus:
+            stream_key = real.stream_key
+            def __init__(self):
+                self.calls = 0
+            def last_sequence(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ConnectionError("redis down at startup")
+                return real.last_sequence()
+            def reconcile_from(self, records):
+                return real.reconcile_from(records)
+            def append(self, record):
+                real.append(record)
+            def close(self):
+                pass
+
+        pub = _publisher(tmp_path, redis_bus=_StartupFlakyBus())  # must NOT raise
+        pub.publish(_entry(uuid7()))                              # self-heals
+        assert [r["sequence"] for r in real.read_since(0)] == [0]
+        pub.close()
+
+
 class TestBusUnavailable:
     def test_unreachable_redis_raises_typed_bus_unavailable(self):
         # A raw redis traceback out of the runner/CLI would mask "Redis down"

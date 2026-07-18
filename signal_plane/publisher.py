@@ -105,7 +105,21 @@ class SignalPublisher:
         # instead of carrying a hole until the next restart.
         self._redis_degraded = False
         if self._redis_bus is not None:
-            self._reconcile_redis()
+            try:
+                self._reconcile_redis()
+            except Exception:  # noqa: BLE001 — Redis must never abort startup
+                # The file bus is the system of record; a Redis that is
+                # unreachable or erroring at startup must not stop a trading
+                # session. Mark degraded so the next publish self-heals from
+                # the file once Redis recovers (same path as a mid-session
+                # XADD failure).
+                self._redis_degraded = True
+                logger.error(
+                    "[signal-bus %s] Redis startup reconcile failed — "
+                    "publishing continues to the file bus; Redis self-heals "
+                    "from the file on the next publish once reachable.",
+                    self.strategy_id, exc_info=True,
+                )
 
     def _reconcile_redis(self) -> None:
         """Bring Redis level with the file, cheaply. The publisher's own

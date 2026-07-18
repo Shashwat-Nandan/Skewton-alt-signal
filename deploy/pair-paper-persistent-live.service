@@ -3,6 +3,13 @@ Description=Pair-Trading LIVE Runner — persistence-screened pairs (REAL MONEY)
 Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
+# Signal-plane §6 Redis projection (--publish-signals-redis below). Ordering
+# only — redis is enabled at boot and the timer fires long after, so this just
+# guards a same-boot race. The runner is NON-FATAL on an unreachable Redis
+# (logs SIGNAL REDIS DISABLED and trades file-only; Redis reconciles from the
+# file on a later startup), so this dep is a nicety, not a hard requirement.
+Wants=redis-server.service
+After=redis-server.service
 # Two OnFailure handlers, both fire on the terminal `failed` state (a single
 # crash auto-restarts and never reaches here): notify-failure@ pages the generic
 # failure; pair-live-halt-on-failure latches HALT_ALL so the next start FREEZES
@@ -66,6 +73,14 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # runner makes is also published as a §4 signal-contract record to
 # logs/signal-bus/pair_trading/YYYY-MM-DD.jsonl. Publishing is additive and
 # fail-open (a publish failure logs CRITICAL but never blocks trading).
+# --publish-signals-redis (issue #90 §6): ALSO project each record to the Redis
+# Streams bus. The fsync'd file above stays the system of record; Redis is a
+# rebuildable projection (reconciled from the file on startup, self-heals a
+# mid-session XADD failure). ?protocol=2 is REQUIRED on this host's Redis 5.0.7
+# (redis-py 8.x defaults to RESP3, whose HELLO 5.0.7 lacks); drop it if the
+# host moves to Redis >= 6.0. Like --publish-signals, this is fail-open: an
+# unreachable Redis (startup or mid-session) never blocks trading — the file
+# bus is the system of record and Redis reconciles from it when reachable.
 ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py \
     --top 12 --max-leg-notional 1000000 \
     --candidates data_cache/pair_candidates_persistent.csv \
@@ -75,7 +90,8 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run
     --mode live \
     --i-understand-this-is-real-money \
     --max-daily-loss-inr 25000 \
-    --publish-signals
+    --publish-signals \
+    --publish-signals-redis redis://127.0.0.1:6379/0?protocol=2
 # ------------------------------------
 
 Restart=on-failure

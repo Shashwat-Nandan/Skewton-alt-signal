@@ -1307,12 +1307,23 @@ def main():
         redis_bus = None
         if args.publish_signals_redis:
             from signal_plane.bus import RedisStreamBus
-            # Fail loud here if Redis is unreachable at startup: the operator
-            # explicitly asked for the projection, so a bad URL should stop the
-            # session before the open, not surface as a silent file-only run.
-            # (A Redis outage DURING the session is the non-fatal case — the
-            # file anchor carries on and reconcile repairs Redis next start.)
-            redis_bus = RedisStreamBus(STRATEGY_ID, args.publish_signals_redis)
+            # Non-fatal by design: the Redis projection must NEVER stop a live
+            # trading session (it is a rebuildable cache, not the system of
+            # record — the file bus is). If Redis is unreachable or the URL is
+            # bad at startup, log loudly and run file-only; a later startup
+            # reconciles Redis from the file once it is reachable. Surfaced by
+            # the consumer --redis-url watchdog, not by a dead runner.
+            try:
+                redis_bus = RedisStreamBus(STRATEGY_ID, args.publish_signals_redis)
+            except Exception as e:  # noqa: BLE001 — BusUnavailable, URL parse, …
+                log.error(
+                    "SIGNAL REDIS DISABLED for this session: could not set up "
+                    "the Redis projection (%s: %s). Publishing continues to the "
+                    "file bus (system of record); Redis reconciles from the file "
+                    "on a later startup once reachable.",
+                    type(e).__name__, e,
+                )
+                redis_bus = None
         signal_publisher = SignalPublisher(
             strategy_id=STRATEGY_ID,
             bus_dir=LOG_DIR / "signal-bus",

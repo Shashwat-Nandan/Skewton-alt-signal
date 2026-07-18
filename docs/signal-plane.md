@@ -44,9 +44,12 @@ before the first publish. Consequences:
   holds the record and Redis self-heals: the next publish reconciles the gap
   from the file before appending (or, failing that, the next startup does).
   A trading session never dies because a cache is down.
-- Redis unreachable **at startup** with `--publish-signals-redis` set is
-  fail-loud (the operator asked for it — a bad URL stops the session before
-  the open, not silently as a file-only run).
+- Redis unreachable (or a bad URL) **at startup** is **non-fatal**: the runner
+  logs `SIGNAL REDIS DISABLED` and runs file-only, and the publisher's startup
+  reconcile marks itself degraded (self-heals on the next publish once Redis is
+  back). The projection is a rebuildable cache and must never stop a live
+  session — a persistent misconfiguration is caught by the consumer
+  `--redis-url` watchdog, not by a dead runner.
 - `MAXLEN` trims Redis to a bounded tail; the file remains the full archive.
 - replay (§6 "all signals for strategy X since sequence N"):
   `python -m signal_plane.consumer --redis-url <url> --strategy-id pair_trading
@@ -152,23 +155,53 @@ position correlates correctly.
 - Disk: signal volume is tens of KB/day (pair book); no retention policy
   needed yet — revisit when the bus carries all six strategies (issue #90 D).
 
-### Redis bus (increment 2) — operator steps, not done in-session
+### Redis bus (increment 2) — daemon installed 2026-07-18; one step remains
 
-The code + tests landed; the daemon and live cutover are operator steps so the
-running pair runner is never perturbed:
+Daemon setup is **done on the host** (nothing perturbed the running pair
+runner — the flag below is still off):
 
-1. `sudo apt-get install redis-server` (ships its own `redis-server.service`).
-2. Enable persistence — `appendonly yes` in `/etc/redis/redis.conf` — so a
-   restart keeps recent entries (reconcile from the file covers the rest).
-   Bind to loopback (`bind 127.0.0.1`); the OMS plane is a separate server and
-   out of scope for Phase 0.
-3. `redis` is in `requirements.in`; regenerate `requirements.lock`
-   (`uv pip compile`, per the lockfile-refresh runbook) and let `redeploy.sh`
-   install it. `fakeredis` is dev-only (`requirements-dev.in`).
-4. Add `--publish-signals-redis redis://127.0.0.1:6379/0` to the installed
-   `pair-paper-persistent-live` unit + `systemctl daemon-reload`. Verify next
-   session: `python -m signal_plane.consumer --redis-url redis://127.0.0.1:6379/0
-   --strategy-id pair_trading` exits 0.
+1. ✅ `redis-server` installed (Ubuntu 20.04 distro pkg, **Redis 5.0.7** —
+   Streams are supported since 5.0). Enabled + running, ships its own
+   `redis-server.service`.
+2. ✅ Persistence + binding: `appendonly yes` in `/etc/redis/redis.conf`
+   (`aof_enabled:1`); default `bind 127.0.0.1 ::1` + `protected-mode yes`
+   leave it loopback-only (the OMS plane is a separate server, out of scope
+   for Phase 0). **Gotcha:** `/etc/redis/redis.conf` and `/etc/redis/` must
+   stay owned `redis:redis` (mode 640) — editing the file as root flips it to
+   `root:root` and redis then fails to start with "can't open config file";
+   `chown redis:redis` + `systemctl reset-failed redis-server` to recover.
+3. ✅ `redis` (runtime) + `fakeredis` (dev) are in the lockfiles (PR #144,
+   merged); `redeploy.sh` installs them hash-pinned.
+
+**Connection URL — must carry `?protocol=2`:** `redis-py` 8.x defaults to
+RESP3, whose `HELLO` handshake Redis 5.0.7 lacks, so a bare URL fails at the
+publisher's startup ping (surfaced as a clean `BusUnavailable`, not a
+traceback). The canonical URL is therefore:
+
+```
+redis://127.0.0.1:6379/0?protocol=2
+```
+
+RESP2 is fully sufficient for the XADD/XRANGE usage here. (If the host later
+moves to Redis ≥ 6.0, the `?protocol=2` suffix can be dropped.)
+
+4. ✅ **Live cutover (2026-07-18, market closed):** `--publish-signals-redis
+   redis://127.0.0.1:6379/0?protocol=2` added to the installed
+   `pair-paper-persistent-live` unit ExecStart (alongside `--publish-signals`)
+   + `Wants=/After=redis-server.service` ordering + `systemctl daemon-reload`.
+   `systemd-analyze verify` clean; service left inactive (timer picks up the
+   new ExecStart at the next trading-day fire). The repo template
+   `deploy/pair-paper-persistent-live.service` carries the same flag so a
+   reinstall doesn't drop it. **Verify after the first live session:**
+   `python -m signal_plane.consumer --redis-url
+   'redis://127.0.0.1:6379/0?protocol=2' --strategy-id pair_trading` — exit 0
+   clean; exit 3 = stream empty (not yet published); exit 2 = protocol
+   violation.
+
+   **Startup is non-fatal (2026-07-18):** an unreachable Redis at the 09:12
+   fire does NOT stop the live earner — the runner logs `SIGNAL REDIS DISABLED`
+   and trades file-only; Redis reconciles from the file on a later startup.
+   The `Wants=/After=redis-server.service` dep still orders a same-boot start.
 
 ## Deferred (later increments of #90)
 
