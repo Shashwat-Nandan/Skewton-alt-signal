@@ -17,6 +17,12 @@ updates:
     groups:
       frontend-minor-patch:
         update-types: ["minor", "patch"]
+    # Major bumps for frontend libs (React, TypeScript, Vite, ...) are breaking and
+    # are done deliberately by a human, not as noisy auto-PRs. Security fixes still
+    # come through — security updates override this ignore.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     labels: ["dependencies", "frontend"]
 
   # GitHub Actions used in workflows — grouped into ONE PR so multiple action
