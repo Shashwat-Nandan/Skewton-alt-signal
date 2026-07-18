@@ -1,4 +1,4 @@
-# AGENTS.md — Skewton Platform (`taleb-karpathy-kite`)
+# AGENTS.md — Skewton Signal Engine (`skewton-signal`)
 
 **This file is the single source of truth for how anyone — human or AI agent —
 works in this repository.** It follows the tool-agnostic [AGENTS.md](https://agents.md)
