@@ -1,11 +1,7 @@
 name: lockfile
 
-# Catches two regressions:
-#   1. requirements.in / requirements-dev.in edited without regenerating
-#      the corresponding .lock (resolution drift).
-#   2. The pinned closure no longer installs cleanly with --require-hashes
-#      (e.g. a yanked release leaves the lock unbuildable).
-
+# Thin caller -> org hub reusable. Asserts requirements*.lock stay in sync with the
+# requirements*.in sources and remain installable with --require-hashes.
 on:
   pull_request:
     paths:
@@ -23,27 +19,7 @@ on:
       - "requirements-dev.lock"
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Regenerate lockfiles and assert no drift
-        run: |
-          uv pip compile requirements.in \
-            --generate-hashes --output-file requirements.lock \
-            --python-version 3.11 --quiet
-          uv pip compile requirements-dev.in \
-            --generate-hashes --output-file requirements-dev.lock \
-            --python-version 3.11 --constraint requirements.lock --quiet
-          git diff --exit-code -- requirements.lock requirements-dev.lock
-
-      - name: Install with --require-hashes in a clean venv
-        run: |
-          uv venv --python 3.11 .verify
-          .verify/bin/python -m ensurepip --upgrade
-          .verify/bin/python -m pip install --require-hashes \
-            -r requirements.lock -r requirements-dev.lock
+  lockfile:
+    uses: Skewton/.github/.github/workflows/lockfile.yml@main
+    with:
+      source-type: requirements-in

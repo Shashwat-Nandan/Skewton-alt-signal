@@ -1,69 +1,23 @@
 name: ci
 
-# Audit 2026-06-10 task 0.1: before this workflow, nothing ran the test suite
-# or built the frontend on push/PR — the only CI was lockfile drift. Kept
-# separate from lockfile.yml so its path-filter semantics don't change.
-
+# Thin caller -> org hub reusables. Backend = ruff + pytest on the hash-pinned uv
+# lockfile flow (provisions config.ini from the secret-free template, lists skips,
+# and fails if more than the 8 known data_cache skips appear). Frontend = tsc+vite
+# build (lint/test run automatically once those npm scripts exist). Behaviour lives
+# in Skewton/.github.
 on:
   pull_request:
   push:
     branches: [main]
 
 jobs:
-  pytest:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Install locked dependencies
-        run: |
-          uv venv --python 3.11 .venv-ci
-          .venv-ci/bin/python -m ensurepip --upgrade
-          .venv-ci/bin/python -m pip install --require-hashes \
-            -r requirements.lock -r requirements-dev.lock
-
-      # Audit task 2.4: lint gate. Rule set + deliberate ignores live in
-      # ruff.toml (format check intentionally absent — see comment there).
-      - name: ruff
-        run: .venv-ci/bin/python -m ruff check .
-
-      # run_backtest and several suites read config.ini (gitignored — the
-      # operator's copy holds credentials). The checked-in template has the
-      # same sections minus secrets; tests need only the [strategy] shape.
-      - name: Provision config.ini from template
-        run: cp config_template.ini config.ini
-
-      # -rs surfaces every skip in the summary: two suites skip without the
-      # operator's data_cache — 6 tick-session tests (test_backtest.py:179-
-      # 260) and 2 bhavcopy IDF-panel tests (test_calendar_meanreversion.py:
-      # 474,493). The grep guard fails the job if MORE tests start silently
-      # skipping than those known eight (Rule 12).
-      - name: Run test suite
-        run: |
-          .venv-ci/bin/python -m pytest tests/ -q -rs 2>&1 | tee pytest.out
-          test ${PIPESTATUS[0]} -eq 0
-          skips=$(grep -c "^SKIPPED" pytest.out || true)
-          if [ "$skips" -gt 8 ]; then
-            echo "::error::$skips tests skipped (8 known data_cache skips allowed)"
-            exit 1
-          fi
-
+  backend:
+    uses: Skewton/.github/.github/workflows/python-ci.yml@main
+    with:
+      pre-test-cmd: "cp config_template.ini config.ini"
+      pytest-args: "-rs"
+      max-skips: "8"
   frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Build (tsc + vite)
-        working-directory: frontend
-        run: |
-          npm ci --ignore-scripts
-          npm run build
+    uses: Skewton/.github/.github/workflows/ci-frontend.yml@main
+    with:
+      working-directory: frontend

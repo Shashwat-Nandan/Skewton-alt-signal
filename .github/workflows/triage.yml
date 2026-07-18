@@ -1,12 +1,6 @@
 name: triage
 
-# Lightweight PR/issue triage (uses the built-in GITHUB_TOKEN — no PAT needed):
-#   - PR opened            -> assign it to the author
-#   - Issue opened, no one  -> add `needs-assignee` label + a nudge comment
-#   - Issue assigned        -> remove the `needs-assignee` label
-# Board auto-add is handled natively by the org Project's "Auto-add" workflow,
-# not here (no token to expire).
-
+# Thin caller -> org hub reusable. PR/issue triage (assign author, needs-assignee nudge).
 on:
   pull_request:
     types: [opened]
@@ -18,42 +12,5 @@ permissions:
   pull-requests: write
 
 jobs:
-  assign-pr-author:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Assign the PR to its author
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr edit "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" \
-            --add-assignee "${{ github.event.pull_request.user.login }}" || \
-            echo "::notice::Could not auto-assign (author may lack repo access) — assign manually."
-
-  nudge-unassigned-issue:
-    if: github.event_name == 'issues' && github.event.action == 'opened' && toJSON(github.event.issue.assignees) == '[]'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Label + nudge for an owner
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NUM: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
-          AUTHOR: ${{ github.event.issue.user.login }}
-        run: |
-          gh issue edit "$NUM" --repo "$REPO" --add-label "needs-assignee" || true
-          gh issue comment "$NUM" --repo "$REPO" --body \
-          "👋 @$AUTHOR — please **assign this issue to an owner** (Assignees, right sidebar). Every issue should have an owner and is tracked on the [Skewton Roadmap board](https://github.com/orgs/Skewton/projects/1). This \`needs-assignee\` label clears itself once someone is assigned."
-
-  clear-needs-assignee:
-    if: github.event_name == 'issues' && github.event.action == 'assigned'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Remove needs-assignee once assigned
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NUM: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh issue edit "$NUM" --repo "$REPO" --remove-label "needs-assignee" 2>/dev/null || true
+  triage:
+    uses: Skewton/.github/.github/workflows/triage.yml@main

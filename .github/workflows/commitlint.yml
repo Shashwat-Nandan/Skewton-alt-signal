@@ -1,0 +1,11 @@
+name: commitlint
+
+# Thin caller -> org hub reusable. Enforces Conventional Commits on PR commits
+# (uses commitlint.config.mjs in this repo).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  commitlint:
+    uses: Skewton/.github/.github/workflows/commitlint.yml@main
