@@ -2,7 +2,7 @@
 name: Feature / strategy request
 about: Propose a new capability, strategy, or improvement
 title: "feat: "
-labels: enhancement
+type: Feature
 ---
 
 ## Problem / opportunity

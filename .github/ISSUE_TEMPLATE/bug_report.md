@@ -2,7 +2,7 @@
 name: Bug report
 about: Something is behaving incorrectly (not a live-trading incident — use "Trading incident" for that)
 title: "bug: "
-labels: bug
+type: Bug
 ---
 
 ## What happened
