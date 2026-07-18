@@ -193,6 +193,16 @@ class HedgeState:
     rehedge_count: int = 0
     gamma_scalp_pnl: float = 0.0
     theta_decay_paid: float = 0.0
+    # Phase-1 attribution (2026-07-18 fitness redesign): theoretical realized-
+    # variance P&L, accrued as ½·Γ_shadow·(ΔS)² on EVERY greeks update while
+    # positions exist — independent of whether a rehedge was emitted. The
+    # existing gamma_scalp_pnl accrues only on emitted rehedges, so it freezes
+    # for weeks when the Whalley-Wilmott gate blocks (Phase-0 finding F1/F4);
+    # the ratio gamma_scalp_pnl / theoretical_scalp_pnl is the scalp-capture
+    # efficiency the new fitness objective needs. Attribution only — never
+    # feeds a trading decision.
+    theoretical_scalp_pnl: float = 0.0
+    _last_scalp_anchor_spot: Optional[float] = None
     max_drawdown: float = 0.0
     peak_pnl: float = 0.0
     total_transaction_costs: float = 0.0
@@ -1143,7 +1153,65 @@ class TalebKarpathyStrategy(BaseStrategy):
         else:
             gamma_theta_ratio = 0.0
 
+        # ── Phase-1 component metrics (2026-07-18 fitness redesign) ──
+        # All are attribution/measurement only; degenerate cases emit 0.0 so
+        # downstream mean()/variance math never sees None. Spot proxy is the
+        # last greeks-update anchor (no broker I/O from a metrics call).
+        g = self.state.portfolio_greeks
+        spot_proxy = self.state._last_scalp_anchor_spot or 0.0
+
+        # Breakeven daily move: the |move| that re-earns one day of theta rent,
+        # ½·Γ·(S·r)² = θ_day → r = √(2θ/(Γ·S²)). Defined only for a book that
+        # pays theta AND is long gamma; a short-middle book (Γ<0) emits 0.0 —
+        # its "breakeven" is not a move size, it's the absence of one.
+        breakeven_move_pct = 0.0
+        if g is not None and spot_proxy > 0:
+            theta_day = g.net_shadow_theta if g.net_shadow_theta != 0 else g.net_theta
+            gamma_now = g.net_shadow_gamma if g.net_shadow_gamma != 0 else g.net_gamma
+            if theta_day > 0 and gamma_now > 0:
+                breakeven_move_pct = float(
+                    np.sqrt(2.0 * theta_day / (gamma_now * spot_proxy ** 2)) * 100.0
+                )
+
+        # Worst P&L across the ±1.5% spot band — the "middle" where 17 of 41
+        # observed sessions actually land (Phase-0 F2: the book kept losing on
+        # 0.5–1.5% moves while its profile only paid off outside them). Uses
+        # the pnl_profile compute_portfolio_greeks already built; flat → 0.0.
+        middle_band_worst_pnl = 0.0
+        if g is not None and spot_proxy > 0 and g.pnl_profile:
+            band = [pnl for price, pnl in g.pnl_profile.items()
+                    if abs(price - spot_proxy) <= 0.015 * spot_proxy]
+            if band:
+                middle_band_worst_pnl = float(min(band))
+
+        # Scalp-capture efficiency: rehedge-gated scalp vs the always-on
+        # theoretical ½Γ(ΔS)² accrual. Only meaningful for a long-gamma book
+        # with real accrued variance (denominator > ₹1); else 0.0.
+        theoretical_scalp = self.state.theoretical_scalp_pnl
+        scalp_capture_efficiency = (
+            gamma_scalp / theoretical_scalp if theoretical_scalp > 1.0 else 0.0
+        )
+
+        # Entry-pricing / holding ingredients from the per-structure
+        # attribution baseline (0.0 when flat — no open structure).
+        entry_atm_iv = 0.0
+        structure_hold_hours = 0.0
+        ab = self.state._attribution_baseline
+        if ab is not None:
+            entry_atm_iv = float(ab.get("entry_atm_iv") or 0.0)
+            entry_t = ab.get("entry_time")
+            if entry_t is not None:
+                structure_hold_hours = float(
+                    (self._clock() - entry_t).total_seconds() / 3600.0
+                )
+
         return {
+            "breakeven_move_pct": breakeven_move_pct,
+            "middle_band_worst_pnl": middle_band_worst_pnl,
+            "theoretical_scalp_pnl": theoretical_scalp,
+            "scalp_capture_efficiency": scalp_capture_efficiency,
+            "entry_atm_iv": entry_atm_iv,
+            "structure_hold_hours": structure_hold_hours,
             "net_pnl": total_pnl,
             "realized_pnl": self.state.realized_pnl,
             "unrealized_pnl": self.state.unrealized_pnl,
@@ -1158,6 +1226,47 @@ class TalebKarpathyStrategy(BaseStrategy):
             "rehedge_count": self.state.rehedge_count,
             "position_count": len(self.state.positions),
             "total_transaction_costs": self.state.total_transaction_costs,
+        }
+
+    # ── Phase-1 dated session attribution (2026-07-18 fitness redesign) ──
+    # Phase-0 finding F1: none of the persisted records could answer "what did
+    # this session pay in theta / capture in scalp / spend in costs" — counters
+    # are lifetime totals, daily_pnl_history is undated floats, closed_trades
+    # has no P&L. These two methods give the runner a dated, per-session,
+    # delta-based record: snapshot at session start, diff at session end.
+
+    ATTRIBUTION_COUNTERS = (
+        "total_pnl", "realized_pnl", "theta_decay_paid", "gamma_scalp_pnl",
+        "theoretical_scalp_pnl", "total_transaction_costs", "rehedge_count",
+    )
+
+    def snapshot_attribution_counters(self) -> Dict:
+        """Session-start snapshot of the lifetime counters, taken by the
+        runner right after state restore."""
+        return {k: getattr(self.state, k) for k in self.ATTRIBUTION_COUNTERS}
+
+    def get_session_attribution(self, anchor: Dict) -> Dict:
+        """Dated end-of-session attribution record: this session's deltas over
+        `anchor` (from snapshot_attribution_counters) plus the EOD component
+        metrics. The runner appends it to the per-underlying attribution JSONL
+        — the input the redesigned fitness objective consumes."""
+        deltas = {
+            f"session_{k}": getattr(self.state, k) - anchor.get(k, 0.0)
+            for k in self.ATTRIBUTION_COUNTERS
+        }
+        m = self.get_strategy_metrics()
+        return {
+            "date": self._clock().date().isoformat(),
+            **deltas,
+            "eod_position_count": len(self.state.positions),
+            "eod_structures": list(self.state.active_structure_types or []),
+            "eod_spot": self.state._last_scalp_anchor_spot,
+            "breakeven_move_pct": m["breakeven_move_pct"],
+            "middle_band_worst_pnl": m["middle_band_worst_pnl"],
+            "scalp_capture_efficiency": m["scalp_capture_efficiency"],
+            "entry_atm_iv": m["entry_atm_iv"],
+            "structure_hold_hours": m["structure_hold_hours"],
+            "lifetime_total_pnl": self.state.total_pnl,
         }
 
     # ══════════════════════════════════════════════════════════
@@ -1213,6 +1322,8 @@ class TalebKarpathyStrategy(BaseStrategy):
                 "rehedge_count": self.state.rehedge_count,
                 "gamma_scalp_pnl": self.state.gamma_scalp_pnl,
                 "theta_decay_paid": self.state.theta_decay_paid,
+                "theoretical_scalp_pnl": self.state.theoretical_scalp_pnl,
+                "_last_scalp_anchor_spot": self.state._last_scalp_anchor_spot,
                 "max_drawdown": self.state.max_drawdown,
                 "peak_pnl": self.state.peak_pnl,
                 "total_transaction_costs": self.state.total_transaction_costs,
@@ -1281,6 +1392,13 @@ class TalebKarpathyStrategy(BaseStrategy):
         self.state.rehedge_count = int(s["rehedge_count"])
         self.state.gamma_scalp_pnl = float(s["gamma_scalp_pnl"])
         self.state.theta_decay_paid = float(s["theta_decay_paid"])
+        # Phase-1 attribution fields — .get() defaults keep pre-2026-07-18
+        # state files loadable (backcompat: counters simply start at zero).
+        self.state.theoretical_scalp_pnl = float(
+            s.get("theoretical_scalp_pnl", 0.0))
+        lsa = s.get("_last_scalp_anchor_spot")
+        self.state._last_scalp_anchor_spot = (
+            float(lsa) if lsa is not None else None)
         self.state.max_drawdown = float(s["max_drawdown"])
         self.state.peak_pnl = float(s["peak_pnl"])
         self.state.total_transaction_costs = float(s["total_transaction_costs"])
@@ -1556,8 +1674,10 @@ class TalebKarpathyStrategy(BaseStrategy):
         if not self.state.positions:
             self.state.portfolio_greeks = PortfolioGreeks()
             # Flat book: drop the theta anchor so the next entry starts a
-            # fresh integration window.
+            # fresh integration window. Same for the theoretical-scalp spot
+            # anchor — a flat gap must not accrue ½Γ(ΔS)² across the re-entry.
             self.state._last_theta_anchor_time = None
+            self.state._last_scalp_anchor_spot = None
             return
         spot = self._get_spot_price()
         if not spot or spot <= 0:
@@ -1610,6 +1730,20 @@ class TalebKarpathyStrategy(BaseStrategy):
                     -self.state.portfolio_greeks.net_shadow_theta * elapsed_days
                 )
         self.state._last_theta_anchor_time = now
+
+        # Theoretical realized-variance accrual (Phase-1 attribution): ½·Γ·(ΔS)²
+        # per greeks update, SIGNED gamma (a short-gamma book accrues negative —
+        # same sign convention as the rehedge-gated gamma_scalp_pnl). Uses the
+        # shadow gamma when available, mirroring the scalp accrual at rehedge.
+        anchor_spot = self.state._last_scalp_anchor_spot
+        if anchor_spot is not None and anchor_spot > 0:
+            dS = spot - anchor_spot
+            g = self.state.portfolio_greeks
+            gamma_for_accrual = (
+                g.net_shadow_gamma if g.net_shadow_gamma != 0 else g.net_gamma
+            )
+            self.state.theoretical_scalp_pnl += 0.5 * gamma_for_accrual * dS * dS
+        self.state._last_scalp_anchor_spot = spot
 
     def execute_proposals(self, proposals):
         # signals mode: emit each proposal to the dashboard JSONL feed and

@@ -1,3 +1,148 @@
+# Taleb fitness-objective redesign — measure the edge, not the noise (PLAN 2026-07-18, NOT STARTED — awaiting operator sign-off)
+
+Weekly autoresearch is mechanically healthy but 8 weeks of candidates show NO
+convergence (see memory 2026-07-18): in-sample best fitness negative every week,
+trade-selecting params oscillate. Root cause is the OBJECTIVE, not the machinery.
+
+## Evidence gathered 2026-07-18
+
+- **Forward record (paper NIFTY, taleb_paper_state.json):** total −₹147.5k,
+  peak P&L ever +₹1.4k, gamma_scalp +₹22.8k vs theta_decay_paid ₹2.50M (units
+  need verification — cash P&L is only −147k) vs costs ₹75.8k, 28 closed trades.
+- **Smoking gun (CORRECTED by Phase 0):** initial read ("lost ₹7,192 on the
+  07-08 crash") was WRONG — daily_pnl_history stores bare undated floats and my
+  alignment was off. EOD logs are authoritative: **+₹21,994 on 07-08** (crash),
+  **−₹11,663 on 07-10** (+1.02% moderate up-day). See Phase 0 findings below —
+  the real failure is structural (short-the-middle + daily churn), not "missed
+  the tail".
+- **Data reality:** 46 captured tick sessions (2026-05-13→now, 8 raw jsonl + 37
+  zst + 1 stillborn). Of 41 measurable days: 7 with |move|≥1%, 3 ≥1.5%, only
+  1 ≥2%. A convexity edge CANNOT be estimated from raw net P&L on this sample —
+  the estimator is dominated by 1-3 days.
+- **Current objective** (autoresearch_loop.py `_run_experiment` /
+  run_weekly_autoresearch.sh): mean(net_pnl) over last-15-session tape replay
+  − 0.5·std, max-DD veto, zero-trade→₹0, keep-if-strictly-better. On a
+  mostly-quiet window this rewards "trade less, bleed least" — exactly the
+  no-convergence oscillation observed.
+- **Book grounding (Dynamic_Hedging-Taleb.pdf):** Ch.16 "Initiation to
+  Volatility Trading: Vega versus Gamma" (p.260), "Volatility Betting / Higher
+  Moment Bets" (p.263-4), Case Study "Path Dependence of a Regular Option"
+  (p.265) — same terminal move, wildly different hedging P&L, so single-window
+  net_pnl is noise. Ch.15 "Beware the Distribution" (p.238) — tails/vol regimes.
+  Core identity: daily long-gamma P&L ≈ Σ ½ΓS²(r² − σ²ᵢₘₚdt): the EDGE is the
+  realized-vs-implied spread and the theta-breakeven, both measurable EVERY
+  session — unlike tail P&L which needs a tail to happen.
+
+## Redesign direction: component fitness, each term fast-converging
+
+Replace scalar net_pnl with per-session components that converge on quiet data:
+
+- **A. Bleed efficiency (all ~39 quiet sessions):** theta paid per unit gamma
+  held; penalize structures whose breakeven move ≫ typical daily move. Bounded
+  bleed is a REQUIREMENT, not a tiebreak.
+- **B. Tail capture (the ≥1% sessions):** conditional P&L on event days + scalp
+  efficiency = gamma scalp captured / theoretical ½Γ(ΔS)². The 07-08 loss must
+  make a config score BADLY.
+- **C. Entry pricing (the actual Taleb edge):** realized-vs-implied spread
+  captured on entered days — buy convexity only when RV/IV + skew say it's
+  cheap; reward the spread, not the luck.
+- **D. Costs/churn hurdle:** keep existing.
+- **Combine:** weighted sum with HARD vetoes (net-negative on tail days = veto;
+  per-session bleed cap = veto), evaluated walk-forward over ALL 46 sessions
+  (not last-15), + bootstrap/deflated significance so a 1-day fluke can't win.
+- **MC realism (audit C4 "GBM-tuned edge"):** replace/augment GBM Monte Carlo
+  with block-bootstrap resamples of captured tape paths.
+
+## Phases (checkable)
+
+- [x] **Phase 0 — attribution audit (DONE 2026-07-18).** Findings:
+      - **F1 — attribution counters unusable as levels.** `theta_decay_paid`
+        ₹2.50M is a legacy artifact: the pre-a7e3005 (2026-05-23) accumulator
+        was a per-tick abs() gross sum; the fix never reset persisted state.
+        Post-fix deltas are sane (±₹1-2k/session). `gamma_scalp_pnl` accrues
+        ONLY when a rehedge is emitted — frozen at ₹18,536 for 7 sessions
+        (rehedge_count 90→93) while the WW gate blocked. `closed_trades` rows
+        have NULL symbol/qty/pnl (only structure + timestamps).
+        `daily_pnl_history` = bare floats, NO dates → cannot be aligned to
+        sessions (this is what produced the wrong initial 07-08 claim).
+      - **F2 — corrected tail story (EOD session_stats authoritative).**
+        07-08 crash −2.12%: **+₹21,994**, but via the SHORT 5×ATM-CE leg
+        collapsing (directional luck); same EOD pnl_profile showed −₹46k at
+        +2.5% — the book was short the up-middle. 07-10 (+1.02%): **−₹11,663**
+        — that short-ATM middle run over by a moderate up move. The structure
+        wins only on crashes (short-call side) or >4% melt-ups (far wings);
+        it LOSES on the 0.5–1.5% moves that dominate the actual distribution.
+      - **F3 — the churn loop.** `max_holding_period_hours=22` (a TUNED
+        best_params value!) force-closes every structure at ~09:15 next
+        morning ("Close all (safety trigger)"); the classifier re-enters
+        minutes later. skew_pct pegged 96–100 for weeks → backspread picked
+        11/13 recent sessions. 28 round-trips, ₹75.8k costs. A convexity book
+        that can't hold convexity >22h can only harvest a tail that lands
+        within 1 day of a fresh ATM strike — the sweep tuned the book INTO
+        churn.
+      - **F4 — WW rehedge gate starves both hedging and attribution.** On
+        07-08 every rehedge was skipped (negative expected scalp in the
+        short-gamma mid-zone) → delta ran to −34 unhedged all day; the same
+        gate freezes gamma_scalp accrual for whole weeks.
+      - **Implications folded into Phases 1–3 below:** dated per-session
+        attribution sidecar is a PREREQUISITE (state counters can't feed any
+        fitness); tail-capture component must score the pnl_profile SHAPE
+        against realistic move sizes (a 07-10-style middle-short must score
+        badly); holding-period/churn must be charged to the objective (cost
+        per unit of convexity-held); component C prices the wing bought (the
+        call wing at skew_pct≈100 is the cheap side — fine per Ch.19 — the
+        short middle is the defect, not the wing).
+- [x] **Phase 1 — instrument component metrics (DONE 2026-07-18).**
+      - `theoretical_scalp_pnl` state counter: ½Γ_sh(ΔS)² accrued on EVERY
+        greeks update (signed; flat-book resets anchor) — F1/F4 can't recur;
+        `scalp_capture_efficiency` = rehedge-gated scalp / theoretical.
+      - New metrics in `get_strategy_metrics`: `breakeven_move_pct`
+        (√(2θ/ΓS²), 0.0 for short-gamma/flat), `middle_band_worst_pnl`
+        (worst P&L inside ±1.5% of spot from the existing pnl_profile — the
+        F2 middle-short detector), `entry_atm_iv`, `structure_hold_hours`
+        (churn ingredient). Flow into autoresearch cycle metrics automatically
+        (shared method).
+      - Dated per-session attribution sidecar:
+        `snapshot_attribution_counters()` at session start (runner, after
+        restore) + `get_session_attribution()` diffed at `end_of_session` →
+        appends one dated JSONL line to `data_cache/taleb_attribution{sfx}.jsonl`
+        (per-underlying via RunnerPaths; BANKNIFTY isolated automatically).
+        Write failure never blocks state persistence.
+      - State serialize/restore backcompat (old files load with 0-defaults).
+      - 11 Rule-9 tests in tests/test_taleb_attribution_metrics.py, each
+        encoding the Phase-0 failure it guards. Full suite 1406 passed.
+- [ ] **Phase 2 — new fitness in autoresearch_loop:** component objective +
+      vetoes + all-session walk-forward; keep net_pnl logged alongside.
+      Regression check: re-score the 8 kept candidates — new fitness should
+      REJECT them all (they were noise) and must penalize the 07-10
+      middle-short pattern (moderate-move losses) regardless of crash-day wins.
+- [ ] **Phase 3 — validation/promotion protocol:** hold-out must include tail
+      day(s); promotion additionally requires tail-day-positive aggregate +
+      bleed-bounded quiet days; keep zero-trade/no-promote guardrails; MC gates
+      re-derived from bootstrap paths. mc_min_mean_pnl / best_params edits stay
+      OPERATOR decisions (standing rule).
+- [ ] **Phase 4 — re-enable weekly sweep under new objective.** Success may be
+      a clean NO ("convexity not cheap enough at NIFTY IV levels to beat theta+
+      costs") — that is an acceptable, actionable outcome; prefer more forward
+      capture over forcing a promote.
+
+## Success criteria (Rule 4)
+
+1. Determinism: same window re-swept twice → same winner (no noise-fitting).
+2. The new objective, run on history, rejects all 8 past candidates, scores the
+   07-10 middle-short loss (−₹11,663 on a +1.02% day) as a failure, and does
+   NOT credit 07-08's +₹21,994 as convexity edge (it was directional luck on a
+   short-ATM leg).
+3. Candidate params stop oscillating across ≥3 consecutive weekly sweeps.
+4. Any promoted candidate is tail-day-positive AND bleed-bounded out-of-sample.
+5. Honesty cap: with 1 two-sigma day in sample, final promote gate stays
+   conservative regardless of in-sample fitness.
+
+Constraints: paper-only throughout (safety rule 3); money-affecting files →
+CODEOWNERS review; BANKNIFTY instance inherits the objective later (#87 scope).
+
+---
+
 # Baseline pair runner — top-8 paper validation, then live-alongside (PLAN 2026-07-18)
 
 Operator wants the **baseline** pair strategy (`pair-paper.service`,

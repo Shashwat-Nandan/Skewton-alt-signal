@@ -81,6 +81,9 @@ class RunnerPaths(NamedTuple):
     lock_file: Path
     silent_fail_flag: Path
     log_prefix: str
+    # Phase-1 (2026-07-18 fitness redesign): dated per-session attribution
+    # JSONL — one appended line per session (see end_of_session).
+    attribution_file: Path
 
 
 def resolve_underlying(config_path: str) -> str:
@@ -114,6 +117,7 @@ def derive_paths(underlying: str) -> RunnerPaths:
         lock_file=DATA_CACHE / f".taleb_paper{sfx}.lock",
         silent_fail_flag=DATA_CACHE / f"taleb_paper_silent_fail{sfx}.flag",
         log_prefix=f"paper{sfx}",
+        attribution_file=DATA_CACHE / f"taleb_attribution{sfx}.jsonl",
     )
 
 
@@ -241,9 +245,11 @@ def write_state_file(hedger, log: logging.Logger, state_file: Path):
 
 
 def end_of_session(hedger, today: date, args, log: logging.Logger,
-                   state_file: Path):
+                   state_file: Path, session_anchor: Optional[dict] = None,
+                   attribution_file: Optional[Path] = None):
     """At session end: (1) force-flatten on operator hatch or expiry-day,
-    (2) write EOD report, (3) save IV history, (4) persist state.
+    (2) write EOD report, (3) append the dated session-attribution JSONL
+    line (Phase-1 fitness redesign), (4) save IV history, (5) persist state.
 
     Order matters — flatten before EOD report so the report reflects the
     post-flatten reality; persist after report so any state mutations the
@@ -274,6 +280,19 @@ def end_of_session(hedger, today: date, args, log: logging.Logger,
         log.info("EOD report: %s", report)
     except Exception as e:
         log.exception("EOD report failed: %s", e)
+
+    # Phase-1 attribution sidecar: one dated JSONL line per session. Failure
+    # here must never block IV-history/state persistence — log and continue
+    # (Rule 12: the log line IS the loud failure).
+    if session_anchor is not None and attribution_file is not None:
+        try:
+            record = hedger.get_session_attribution(session_anchor)
+            with open(attribution_file, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+            log.info("Session attribution appended: %s (%s)",
+                     attribution_file.name, record["date"])
+        except Exception as e:
+            log.exception("Session attribution write failed: %s", e)
 
     try:
         hedger._save_iv_history()
@@ -383,6 +402,10 @@ def main():
     # Restore any open position from yesterday's session before the tick loop.
     restore_state_if_any(hedger, log, paths.state_file)
 
+    # Phase-1 attribution: session-start counter snapshot, diffed at
+    # end_of_session into the dated per-session attribution JSONL.
+    session_anchor = hedger.snapshot_attribution_counters()
+
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
     session_end_ts = now.replace(hour=SESSION_END_AT[0], minute=SESSION_END_AT[1],
@@ -419,15 +442,18 @@ def main():
         if silent_fail:
             log.critical("Silent-fail heartbeat breached — persisting state "
                          "and exiting non-zero so OnFailure alerts.")
-            end_of_session(hedger, today, args, log, paths.state_file)
+            end_of_session(hedger, today, args, log, paths.state_file,
+                           session_anchor, paths.attribution_file)
             return 1
 
         log.info("Session-end window reached.")
-        end_of_session(hedger, today, args, log, paths.state_file)
+        end_of_session(hedger, today, args, log, paths.state_file,
+                           session_anchor, paths.attribution_file)
 
     except KeyboardInterrupt:
         log.info("Interrupted — persisting state and exiting.")
-        end_of_session(hedger, today, args, log, paths.state_file)
+        end_of_session(hedger, today, args, log, paths.state_file,
+                           session_anchor, paths.attribution_file)
         return 130
 
     log.info("Session complete. Exiting cleanly.")
