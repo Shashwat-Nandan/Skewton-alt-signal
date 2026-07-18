@@ -4,8 +4,10 @@ name: board fields
 # the built-in Auto-add to a single repo, so add-to-board is done here per repo.
 #   - issue opened  -> add to board + Status = 📥 Triage
 #   - `incident`    -> Priority = 🔴 P0 (Now)
-# Close→Done and PR-merged→Done stay as the project's built-in workflows (token-free).
-# Requires repo secret PROJECTS_TOKEN (PAT with org Projects read/write).
+# Close→Done and PR-merged→Done stay as the project's built-in workflows.
+# Auth: a short-lived token minted from the "Skewton Board Bot" GitHub App
+#   (org Projects: write). Requires repo variable BOARD_APP_ID + secret
+#   BOARD_APP_PRIVATE_KEY.
 # Design: Skewton/.github/docs/specs/2026-07-18-roadmap-board-automation-design.md
 
 on:
@@ -27,7 +29,6 @@ jobs:
       contains(toJSON(github.event.issue.labels.*.name), '"incident"')
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
       PROJECT_ID: PVT_kwDOEjqnAc4BdoDS
       STATUS_FIELD_ID: PVTSSF_lADOEjqnAc4BdoDSzhYISE8
       STATUS_TRIAGE_OPTION_ID: "33b7ff54"
@@ -36,19 +37,18 @@ jobs:
       ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
     steps:
-      - name: Guard — is the PAT configured?
-        id: guard
-        run: |
-          if [ -n "$GH_TOKEN" ]; then
-            echo "has_token=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_token=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::PROJECTS_TOKEN is not set — skipping board update. Add the repo secret to enable board automation."
-          fi
+      - name: Mint a token from the Skewton Board Bot app
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.BOARD_APP_ID }}
+          private-key: ${{ secrets.BOARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
 
       - name: Add the issue to the board (idempotent) and capture item id
         id: add
-        if: steps.guard.outputs.has_token == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           item_id=$(gh api graphql -f query='
             mutation($project:ID!, $content:ID!) {
@@ -64,7 +64,9 @@ jobs:
           echo "item_id=$item_id" >> "$GITHUB_OUTPUT"
 
       - name: Set Status = 📥 Triage (new issues only)
-        if: steps.guard.outputs.has_token == 'true' && github.event.action == 'opened'
+        if: github.event.action == 'opened'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           gh api graphql -f query='
             mutation($project:ID!, $item:ID!, $field:ID!, $opt:String!) {
@@ -77,7 +79,9 @@ jobs:
           echo "::notice::Issue #$ISSUE_NUMBER added to the board with Status = Triage."
 
       - name: Set Priority = 🔴 P0 (incident)
-        if: steps.guard.outputs.has_token == 'true' && contains(toJSON(github.event.issue.labels.*.name), '"incident"')
+        if: contains(toJSON(github.event.issue.labels.*.name), '"incident"')
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           gh api graphql -f query='
             mutation($project:ID!, $item:ID!, $field:ID!, $opt:String!) {
