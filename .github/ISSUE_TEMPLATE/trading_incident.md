@@ -2,7 +2,7 @@
 name: 🚨 Trading incident
 about: Live money impacted — bad fill, missed exit, runaway daemon, broker/API outage, risk-limit breach
 title: "incident: "
-labels: incident, priority:high
+labels: incident
 ---
 
 > If money is actively at risk RIGHT NOW, act first (halt the daemon / kill-switch),

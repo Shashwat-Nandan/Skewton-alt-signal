@@ -1,0 +1,90 @@
+name: board fields
+
+# Puts new issues on the Roadmap board and sets their fields. GitHub Free caps
+# the built-in Auto-add to a single repo, so add-to-board is done here per repo.
+#   - issue opened  -> add to board + Status = 📥 Triage
+#   - `incident`    -> Priority = 🔴 P0 (Now)
+# Close→Done and PR-merged→Done stay as the project's built-in workflows (token-free).
+# Requires repo secret PROJECTS_TOKEN (PAT with org Projects read/write).
+# Design: Skewton/.github/docs/specs/2026-07-18-roadmap-board-automation-design.md
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: board-fields-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  board-fields:
+    # Every newly opened issue, plus any issue that carries the `incident` label.
+    if: >-
+      github.event.action == 'opened' ||
+      contains(toJSON(github.event.issue.labels.*.name), '"incident"')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+      PROJECT_ID: PVT_kwDOEjqnAc4BdoDS
+      STATUS_FIELD_ID: PVTSSF_lADOEjqnAc4BdoDSzhYISE8
+      STATUS_TRIAGE_OPTION_ID: "33b7ff54"
+      PRIORITY_FIELD_ID: PVTSSF_lADOEjqnAc4BdoDSzhYISKk
+      PRIORITY_P0_OPTION_ID: "840d972a"
+      ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Guard — is the PAT configured?
+        id: guard
+        run: |
+          if [ -n "$GH_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PROJECTS_TOKEN is not set — skipping board update. Add the repo secret to enable board automation."
+          fi
+
+      - name: Add the issue to the board (idempotent) and capture item id
+        id: add
+        if: steps.guard.outputs.has_token == 'true'
+        run: |
+          item_id=$(gh api graphql -f query='
+            mutation($project:ID!, $content:ID!) {
+              addProjectV2ItemById(input: { projectId: $project, contentId: $content }) {
+                item { id }
+              }
+            }' -f project="$PROJECT_ID" -f content="$ISSUE_NODE_ID" \
+            --jq '.data.addProjectV2ItemById.item.id')
+          if [ -z "$item_id" ]; then
+            echo "::error::Could not resolve the board item id for issue #$ISSUE_NUMBER."
+            exit 1
+          fi
+          echo "item_id=$item_id" >> "$GITHUB_OUTPUT"
+
+      - name: Set Status = 📥 Triage (new issues only)
+        if: steps.guard.outputs.has_token == 'true' && github.event.action == 'opened'
+        run: |
+          gh api graphql -f query='
+            mutation($project:ID!, $item:ID!, $field:ID!, $opt:String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project, itemId: $item, fieldId: $field,
+                value: { singleSelectOptionId: $opt }
+              }) { projectV2Item { id } }
+            }' -f project="$PROJECT_ID" -f item="${{ steps.add.outputs.item_id }}" \
+               -f field="$STATUS_FIELD_ID" -f opt="$STATUS_TRIAGE_OPTION_ID"
+          echo "::notice::Issue #$ISSUE_NUMBER added to the board with Status = Triage."
+
+      - name: Set Priority = 🔴 P0 (incident)
+        if: steps.guard.outputs.has_token == 'true' && contains(toJSON(github.event.issue.labels.*.name), '"incident"')
+        run: |
+          gh api graphql -f query='
+            mutation($project:ID!, $item:ID!, $field:ID!, $opt:String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project, itemId: $item, fieldId: $field,
+                value: { singleSelectOptionId: $opt }
+              }) { projectV2Item { id } }
+            }' -f project="$PROJECT_ID" -f item="${{ steps.add.outputs.item_id }}" \
+               -f field="$PRIORITY_FIELD_ID" -f opt="$PRIORITY_P0_OPTION_ID"
+          echo "::notice::Issue #$ISSUE_NUMBER flagged Priority P0 (incident)."
