@@ -26,8 +26,8 @@ Production is at <https://dashboard.propelytics.in>.
 
 ```bash
 # 1. Clone + venv + deps (deps are pinned with sha256 hashes — see "Reproducing the venv" below)
-git clone git@github.com:Shashwat-Nandan/taleb-karpathy-kite.git
-cd taleb-karpathy-kite
+git clone git@github.com:Skewton/skewton-signal.git
+cd skewton-signal
 python3.11 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements.lock -r requirements-dev.lock
 
