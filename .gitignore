@@ -36,3 +36,6 @@ claude_example.py
 # lessons (happened 2026-06-30). SKILL.md (rules/goal/lessons) stays tracked.
 state/*/STATE.md
 state/*/.STATE.lock
+# Decay ledger: runtime memory of per-strategy health states (2026-07-19).
+# Same rationale as STATE.md — tracking it would let branch ops clobber it.
+state/strategy_decay.json

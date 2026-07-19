@@ -1,3 +1,79 @@
+# Strategy decay state machine (Vibe-Trading review item 2, 2026-07-19)
+
+Persistent fleet-wide decay states on top of scripts/strategy_scoreboard.py
+(the existing data layer + kill-rule enforcement point). Adapted from
+HKUDS/Vibe-Trading `strategy_store/decay.py`, reshaped to our monthly
+net-realized cadence. Replaces the stateless `kill_verdict` (Rule 7: the
+machine SUBSUMES the standing two-negative-months rule, not sits beside it).
+Advisory only — no timer is ever auto-disabled; parking stays an operator
+action. Operator decisions taken 2026-07-19: recovery needs 2 consecutive
+healthy months (hysteresis); critical monthly-loss fast path ships DISABLED
+(opt-in per-strategy caps in config.ini [decay]).
+
+States: ACTIVE → MONITORING (1 losing complete month) → PARK_RECOMMENDED
+(2 consecutive losing ≡ standing rule; or any CRITICAL month) → back to
+ACTIVE only after 2 consecutive healthy months. PARKED = operator/sentinel,
+sticky. Flat month (₹0) counts healthy (matches `all(v < 0)` semantics).
+NO_DATA months are neutral (never count either way, standing rule).
+
+- [x] scripts/strategy_decay.py — pure machine (classify/evaluate) + ledger
+      IO (state/strategy_decay.json, atomic write, idempotent by month)
+- [x] scoreboard: stable slugs, machine-driven verdict column, transition
+      lines printed loudly, [decay] caps from config.ini, --no-ledger,
+      --park/--unpark SLUG operator commands, buy-on-gap sentinel → PARKED
+- [x] Remove kill_verdict; port its 4 tests to machine equivalents
+- [x] tests/test_strategy_decay.py (transitions, hysteresis, critical path,
+      NO_DATA neutrality, idempotent re-run, parked stickiness, round-trip)
+- [x] config_template.ini [decay] section; .gitignore the ledger
+- [x] docs/strategy-efficiency-review-2026-07-05.md §3 E1 pointer
+- [x] ruff + pytest green, PR
+
+## Review
+
+Shipped on branch `feat/strategy-decay-state-machine`. Design notes:
+- NO_DATA months are neutral but NOT exculpatory: two losing months
+  separated by a data gap still park (pinned in a test). The old rule's
+  "insufficient history" case (one losing month, newborn) maps to
+  MONITORING — same can't-park-a-newborn protection, more information.
+- Corrupt ledger fails LOUD (propagates), never silently resets to ACTIVE —
+  the ledger's whole job is decay memory.
+- PARKED is sticky (sentinel or --park); healthy months cannot revive it;
+  --unpark resets streaks (fresh start, history retained, cap 36 months).
+- Real-data smoke (--no-ledger): pair persistent LIVE = ACTIVE; kalman
+  pairs / taleb NIFTY / arbitrage / buy-on-gap = MONITORING off June
+  losses; historical transitions replay correctly. First persisted ledger
+  write happens on the first post-merge scoreboard run.
+- No BANKNIFTY-taleb row yet: it has no EOD series the scoreboard reads —
+  the unclaimed-sidecar warning will surface it once one exists.
+
+**Code-review fixes (2026-07-19, 8-angle review, 10 findings applied):**
+- REPLAY replaces accumulate-and-advance. The top finding: a one-run data
+  outage froze that month NO_DATA forever, so a real −₹80k month could
+  never count and two losing months either side of the gap never parked.
+  State is now a pure function of the whole monthly series, recomputed each
+  run; corrected data re-scores and is announced `[REVISED]`. Idempotency
+  is structural, not a cursor.
+- PARKED became an OVERLAY with two sources. SENTINEL parks are derived
+  from the runner's kill file every run (removing the file revives the row,
+  restoring pre-machine behaviour); `--unpark` on one now fails loudly
+  telling the operator to remove the file (it used to "succeed", then get
+  silently re-parked in the same run). OPERATOR parks stay sticky. Health
+  replay keeps running underneath either, so un-parking shows true health.
+- Taleb's first month is declared PARTIAL (neutral) — it is an observed-
+  window artifact and was supplying one of the two months that trigger
+  PARK. VISIBLE EFFECT: taleb NIFTY reads ACTIVE until July closes as its
+  first fully-scored month.
+- Sentinel lookup is now one KILL_SENTINELS table (not a buy-on-gap special
+  case); HALT_DAILY_LOSS*/HALT_ALL deliberately excluded (transient / fleet
+  -wide) with HALT_ALL surfaced as a banner instead.
+- ensure_entries lets --park/--unpark address a valid slug on a fresh
+  ledger; load_ledger validates shape (no bare KeyError); render() refuses
+  unevaluated rows with a clear message instead of a TypeError; usage
+  docstring lists all flags; month arithmetic is one ordinal helper pair.
+- Suite 1477 green, ruff clean, real-data smoke re-run.
+
+---
+
 # Absolute promotion bar: shuffle-null + walk-forward + vetoed-seed fix (issue #159, 2026-07-19)
 
 The 2026-07-19 re-score showed `_evaluate_experiment`'s "keep iff > baseline"

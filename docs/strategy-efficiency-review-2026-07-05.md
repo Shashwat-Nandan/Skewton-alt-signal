@@ -217,6 +217,14 @@ can render it) and a standing kill rule: **any strategy net-negative after
 costs over two consecutive expiry cycles is parked** (timer disabled, state
 archived). Parking is reversible; attention is not.
 
+*Update 2026-07-19:* the stateless kill verdict evolved into a persistent
+decay state machine (`scripts/strategy_decay.py`, ledger
+`state/strategy_decay.json`; adapted from HKUDS/Vibe-Trading): same
+two-losing-months trigger → PARK RECOMMENDED, plus MONITORING after one
+losing month, recovery hysteresis (2 consecutive healthy months), an opt-in
+`[decay]` catastrophic-month cap, and an audit trail of every transition.
+Operator commands: `strategy_scoreboard.py --park/--unpark <slug>`.
+
 **E2 — Universal rupee-denominated cost hurdle at entry.**
 Three strategies (Taleb structures, arbitrage calendars, kalman-trend) lose
 primarily to transaction costs. The cost model (`estimate_transaction_cost`,

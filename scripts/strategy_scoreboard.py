@@ -7,9 +7,15 @@ net realized, open unrealized, and a kill-rule verdict. Read-only — aggregates
 what the runners already persist (EOD sidecars in data_cache/, dated state
 backups, dashboard.db). No Kite, no network, stdlib only.
 
-Standing kill rule (docs/strategy-efficiency-review-2026-07-05.md §3 E1):
-  a strategy that is net-negative after costs in BOTH of the last two COMPLETE
-  calendar months is a PARK CANDIDATE (disable its timer, archive its state).
+Standing kill rule (docs/strategy-efficiency-review-2026-07-05.md §3 E1),
+since 2026-07-19 enforced by the decay state machine (scripts/strategy_decay.py
++ state/strategy_decay.json ledger): net-negative in BOTH of the last two
+COMPLETE calendar months → PARK RECOMMENDED, with memory (recovery needs 2
+consecutive healthy months), an opt-in catastrophic-month fast path ([decay]
+caps in config.ini), and an audit trail of every transition. States are
+REPLAYED from the whole monthly series each run, so a month missed during a
+data-source outage re-scores once the data returns. Verdicts are advisory —
+parking (disable the timer, archive state) stays an OPERATOR action.
 Calendar months are a deliberate proxy for expiry cycles — close enough for a
 monthly review, and derivable from every EOD series we have.
 
@@ -21,8 +27,17 @@ Honesty notes printed with the table:
   - kalman_trend rows are in rupee-equivalents of an A/B experiment
     (points × lot), not a funded book.
 
-Usage: python scripts/strategy_scoreboard.py [--data-cache DIR] [--db PATH]
-                                             [--months N]
+Usage:
+  python scripts/strategy_scoreboard.py [--data-cache DIR] [--db PATH]
+                                        [--months N] [--ledger PATH]
+                                        [--config PATH] [--no-ledger]
+  # operator park / un-park (decay ledger only — never touches a timer):
+  python scripts/strategy_scoreboard.py --park <slug> --reason "why"
+  python scripts/strategy_scoreboard.py --unpark <slug>
+
+--no-ledger renders without persisting state (safe dry run). A strategy
+parked by its runner's kill file shows PARKED [sentinel] and is revived by
+removing that file, not by --unpark.
 """
 from __future__ import annotations
 
@@ -38,8 +53,23 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import strategy_decay as sd  # noqa: E402  (needs the path insert above)
 
 Monthly = Dict[str, float]          # "YYYY-MM" -> net realized ₹ for the month
+
+# Runner kill sentinels: slug -> (filename, label). A file present in
+# data_cache/ means "this runner declared itself dead", which the board shows
+# as PARKED [sentinel] and un-parks automatically when the file is removed.
+# DELIBERATELY not listed: HALT_DAILY_LOSS* (a daily breaker that resets next
+# session — parking on it would churn the ledger daily) and HALT_ALL (a
+# fleet-wide halt, surfaced as a banner below rather than as one strategy's
+# death). Adding a runner's kill file here is a one-line change.
+KILL_SENTINELS: Dict[str, str] = {
+    "buy_on_gap": "HALT_BUY_ON_GAP_KILLED",
+}
+HALT_ALL_SENTINEL = "HALT_ALL"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -243,44 +273,114 @@ def equity_swing_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Kill rule
+# Kill rule → decay state machine (2026-07-19)
 # ──────────────────────────────────────────────────────────────────────────
+# The stateless kill_verdict ("PARK CANDIDATE iff both of the last two
+# complete months negative") became the ACTIVE → MONITORING →
+# PARK_RECOMMENDED path of the persistent state machine in
+# strategy_decay.py — same trigger, plus memory (one lucky month no longer
+# silently clears two months of decay: recovery needs 2 consecutive healthy
+# months), an opt-in critical-month fast path, and a ledger recording when
+# each transition happened. Verdicts are advisory; parking stays an
+# operator action.
+
 def last_complete_months(today: date, n: int = 2) -> List[str]:
     """The n calendar months before today's month, most recent last."""
-    y, m = today.year, today.month
-    out: List[str] = []
-    for _ in range(n):
-        m -= 1
-        if m == 0:
-            y, m = y - 1, 12
-        out.append(f"{y:04d}-{m:02d}")
-    return list(reversed(out))
+    this_month = f"{today.year:04d}-{today.month:02d}"
+    return [sd.shift_month(this_month, -i) for i in range(n, 0, -1)]
 
 
-def kill_verdict(monthly: Monthly, today: date) -> str:
-    """PARK CANDIDATE iff BOTH of the last two complete months have data and
-    both are net-negative. A month with no data never counts against a
-    strategy (it may not have existed yet) — that is 'insufficient history',
-    not a pass."""
-    window = last_complete_months(today, 2)
-    values = [monthly.get(m) for m in window]
-    if any(v is None for v in values):
-        return "insufficient history"
-    if all(v < 0 for v in values):
-        return f"PARK CANDIDATE ({window[0]}: {values[0]:+,.0f}, {window[1]}: {values[1]:+,.0f})"
-    return "OK"
+def ensure_entries(rows: List[dict], ledger: dict) -> None:
+    """Create a ledger entry for every machine-evaluated row, so operator
+    commands can address a strategy by slug on a FRESH ledger (before any
+    run has written one) instead of reporting a valid slug as unknown."""
+    for r in rows:
+        if r.get("verdict") is not None:      # control arm etc. — exempt
+            continue
+        entry = ledger["strategies"].setdefault(r["slug"], sd.new_entry(r["name"]))
+        entry["display"] = r["name"]          # keep display fresh
+
+
+def apply_decay(rows: List[dict], ledger: dict, today: date,
+                caps: Dict[str, float]) -> List[str]:
+    """Replay every machine-evaluated row's monthly series, reconcile the
+    PARKED overlay with the runner sentinels, stamp each row's verdict, and
+    return this run's transition lines. Mutates `ledger` and `rows`.
+
+    The replay reads the FULL series every run (strategy_decay.replay), so
+    a month whose data was missing on an earlier run re-scores the moment
+    the data appears — reported as a REVISED transition. Nothing about a
+    month's verdict is frozen by having been seen once.
+    """
+    transitions: List[str] = []
+    latest_complete = last_complete_months(today, 1)[0]
+    this_month = f"{today.year:04d}-{today.month:02d}"
+    ensure_entries(rows, ledger)
+    for r in rows:
+        if r.get("verdict") is not None:
+            continue
+        entry = ledger["strategies"][r["slug"]]
+        transitions += sd.apply_park_overlay(
+            entry, r.get("parked_reason"), this_month)
+        data_months = [m for m in r["monthly"] if m <= latest_complete]
+        if data_months:
+            # Replay from the strategy's birth (first complete month with
+            # data) to the last complete month. Gap months inside the range
+            # score NO_DATA and stay neutral (the standing rule); months the
+            # extractor flags as partial score PARTIAL, likewise neutral.
+            months = sd.month_range(min(data_months), latest_complete)
+            result = sd.replay(r["monthly"], months,
+                               critical_cap=caps.get(r["slug"]),
+                               partial_months=r.get("partial_months", ()))
+            transitions += sd.apply_replay(entry, result, r["name"],
+                                           latest_complete)
+        r["verdict"] = sd.verdict_line(entry)
+    return transitions
+
+
+def load_decay_caps(config_path: Path) -> Dict[str, float]:
+    """Opt-in critical monthly-loss caps: [decay] critical_monthly_loss_<slug>
+    in config.ini (positive rupees). Absent file/section/keys = no caps —
+    the fast path is disabled by default (operator decision 2026-07-19)."""
+    import configparser
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+    caps: Dict[str, float] = {}
+    if cfg.has_section("decay"):
+        for key, val in cfg.items("decay"):
+            if key.startswith("critical_monthly_loss_"):
+                try:
+                    caps[key[len("critical_monthly_loss_"):]] = abs(float(val))
+                except ValueError:
+                    print(f"  [warn] [decay] {key} = {val!r} is not a number "
+                          "— cap ignored", file=sys.stderr)
+    return caps
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Rendering
 # ──────────────────────────────────────────────────────────────────────────
-def render(rows: List[dict], months: List[str], today: date) -> str:
+def render(rows: List[dict], months: List[str], today: date,
+           halted: bool = False) -> str:
+    unevaluated = [r["name"] for r in rows if not r.get("verdict")]
+    if unevaluated:
+        # build_rows leaves verdict=None for machine rows; apply_decay fills
+        # it. Saying so beats the bare TypeError this used to raise when the
+        # two were called out of order (or apply_decay died mid-loop).
+        raise ValueError(
+            f"render(): {len(unevaluated)} row(s) have no verdict "
+            f"({', '.join(unevaluated)}) — call apply_decay(rows, ...) first.")
     name_w = max(len(r["name"]) for r in rows) + 2
     cols = [f"{m}" for m in months] + ["cum realized", "unrealized", "verdict"]
     out = [f"STRATEGY SCOREBOARD — {today.isoformat()} (net realized ₹, modeled costs included)"]
+    if halted:
+        out += ["", f"  ⚠ {HALT_ALL_SENTINEL} is present — the whole fleet is halted; "
+                "rows below", "  reflect P&L up to the halt, not a running book."]
     if SKIPPED:
         out += ["", f"  ⚠ {len(SKIPPED)} data source(s) skipped (see stderr) — monthly",
-                "  figures may be INCOMPLETE and verdicts unreliable."]
+                "  figures may be INCOMPLETE. Months that read as missing score",
+                "  NO_DATA (neutral) and are RE-SCORED automatically once the",
+                "  source recovers — no month is frozen by one bad run."]
     out += ["",
             "  " + "strategy".ljust(name_w) + "".join(c.rjust(14) for c in cols[:-1]) + "  verdict"]
     out.append("  " + "-" * (name_w + 14 * (len(cols) - 1) + 30))
@@ -294,53 +394,79 @@ def render(rows: List[dict], months: List[str], today: date) -> str:
         out.append("  " + r["name"].ljust(name_w) + "".join(cells) + "  " + r["verdict"])
     out += [
         "",
-        "  Kill rule: net-negative in BOTH of the last two complete months → PARK",
-        "  CANDIDATE (calendar months proxy expiry cycles). Notes: paper fills are",
-        "  optimistic vs live; Taleb's FIRST month is observed-window only (backup",
-        "  series starts mid-life, pre-backup P&L unattributable); kalman_trend",
-        "  rows are A/B rupee-equivalents, not a funded book.",
+        "  Decay states (strategy_decay.py, advisory): 1 losing complete month →",
+        "  MONITORING; 2 consecutive → PARK RECOMMENDED (the standing kill rule);",
+        "  recovery needs 2 consecutive healthy months; an opt-in [decay] cap can",
+        "  fast-path a catastrophic month. States are REPLAYED from the full",
+        "  monthly series every run, so corrected data re-scores (shown REVISED).",
+        "  PARKED [sentinel] follows the runner's kill file (remove it to revive);",
+        "  PARKED [operator] is set/cleared with --park/--unpark. Parking a timer",
+        "  is always an OPERATOR action — this board only advises.",
+        "  Notes: paper fills are optimistic vs live; Taleb's FIRST month is",
+        "  observed-window only (backup series starts mid-life) and is therefore",
+        "  scored PARTIAL/neutral; kalman_trend rows are A/B rupee-equivalents,",
+        "  not a funded book.",
     ]
     return "\n".join(out)
 
 
 def build_rows(data_cache: Path, db_path: Path, today: date) -> List[dict]:
+    """Rows carry a stable `slug` (the decay ledger / [decay] config key) and
+    verdict=None for machine-evaluated rows; a non-None verdict marks the row
+    machine-exempt (control arm). `parked_reason` requests a sticky PARKED
+    state (runner kill sentinel)."""
     rows: List[dict] = []
 
-    def add(name: str, monthly: Monthly, cum: Optional[float], unreal: Optional[float],
-            verdict: Optional[str] = None):
-        rows.append({"name": name, "monthly": monthly,
+    def add(slug: str, name: str, monthly: Monthly, cum: Optional[float],
+            unreal: Optional[float], verdict: Optional[str] = None,
+            partial_months: Tuple[str, ...] = ()):
+        # Kill sentinels are looked up from ONE table for every row (no
+        # per-strategy special case): the file's presence is re-read each
+        # run, so removing it revives the row automatically.
+        sentinel = KILL_SENTINELS.get(slug)
+        reason = None
+        if sentinel and (data_cache / sentinel).exists():
+            first = (data_cache / sentinel).read_text().strip().splitlines()
+            reason = f"{sentinel}: {first[0] if first else 'no reason recorded'}"
+        rows.append({"slug": slug, "name": name, "monthly": monthly,
                      "cum": sum(monthly.values()) if cum is None else cum,
-                     "unreal": unreal,
-                     "verdict": verdict or kill_verdict(monthly, today)})
+                     "unreal": unreal, "verdict": verdict,
+                     "parked_reason": reason,
+                     "partial_months": partial_months})
 
     m, u = pair_system_monthly(data_cache, "pair_paper_persistent_eod_*.json")
-    add("pair persistent (LIVE)", m, None, u)
+    add("pair_persistent_live", "pair persistent (LIVE)", m, None, u)
     m, u = pair_system_monthly(data_cache, "pair_paper_eod_2*.json")
-    add("pair baseline (paper)", m, None, u)
+    add("pair_baseline", "pair baseline (paper)", m, None, u)
     m, u = pair_system_monthly(data_cache, "pair_paper_kalman_eod_*.json")
-    add("kalman pairs (paper)", m, None, u)
+    add("kalman_pairs", "kalman pairs (paper)", m, None, u)
 
     m, cum, u = taleb_monthly(data_cache)
-    add("taleb NIFTY (paper)", m, cum, u)
+    # Taleb's FIRST month is an observed-window partial (the state-backup
+    # series starts mid-life, so pre-backup P&L is unattributable). Scoring
+    # it as a real month would let an artifact supply one of the two losing
+    # months that trigger PARK RECOMMENDED — declare it partial so the
+    # machine treats it as neutral, matching the footnote render() prints.
+    add("taleb_nifty", "taleb NIFTY (paper)", m, cum, u,
+        partial_months=tuple(sorted(m)[:1]))
 
     m, u, rep = report_system_monthly(data_cache, "arbitrage_paper_eod_*.json")
-    add("arbitrage (paper)", m, rep.get("realized_pnl"), u)
+    add("arbitrage", "arbitrage (paper)", m, rep.get("realized_pnl"), u)
     m, u, rep = report_system_monthly(data_cache, "buy_on_gap_paper_eod_*.json")
     # Once the runner's own cumulative kill rule fires it stops writing EOD
-    # sidecars, so this row's months go blank ("insufficient history") — the
-    # sentinel it drops is the authoritative "dead, not missing" signal.
-    bog_kill = data_cache / "HALT_BUY_ON_GAP_KILLED"
-    add("buy-on-gap (paper)", m, rep.get("realized_pnl"), u,
-        verdict=(f"KILLED by runner rule ({bog_kill.read_text().strip().splitlines()[0]})"
-                 if bog_kill.exists() else None))
+    # sidecars, so this row's months go blank — the HALT_BUY_ON_GAP_KILLED
+    # file it drops is the authoritative "dead, not missing" signal, picked
+    # up generically by KILL_SENTINELS in add().
+    add("buy_on_gap", "buy-on-gap (paper)", m, rep.get("realized_pnl"), u)
 
     m, cum, u = equity_swing_monthly(db_path)
-    add("equity swing (paper)", m, cum, u)
+    add("equity_swing", "equity swing (paper)", m, cum, u)
 
     kal, ma, last = kalman_trend_monthly(data_cache)
-    add("kalman_trend A/B: kalman", kal, last.get("total_kalman_rupees", 0.0), None)
-    add("kalman_trend A/B: MA ctl", ma, last.get("total_ma_rupees", 0.0), None,
-        verdict="control arm")
+    add("kalman_trend", "kalman_trend A/B: kalman", kal,
+        last.get("total_kalman_rupees", 0.0), None)
+    add("kalman_trend_ma", "kalman_trend A/B: MA ctl", ma,
+        last.get("total_ma_rupees", 0.0), None, verdict="control arm")
 
     warn_unclaimed_sidecars(data_cache)
     return rows
@@ -373,19 +499,70 @@ def warn_unclaimed_sidecars(data_cache: Path) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Whole-book strategy scoreboard + kill rules")
+    ap = argparse.ArgumentParser(description="Whole-book strategy scoreboard + decay states")
     ap.add_argument("--data-cache", type=Path, default=HERE / "data_cache")
     ap.add_argument("--db", type=Path, default=None,
                     help="dashboard.db path (default: <data-cache>/dashboard.db)")
     ap.add_argument("--months", type=int, default=3,
                     help="How many trailing months to show as columns (default 3)")
+    ap.add_argument("--ledger", type=Path, default=HERE / "state" / "strategy_decay.json",
+                    help="Decay ledger path (default: state/strategy_decay.json)")
+    ap.add_argument("--no-ledger", action="store_true",
+                    help="Read-only run: evaluate + render but do not write "
+                         "the ledger (state transitions are NOT persisted)")
+    ap.add_argument("--config", type=Path, default=HERE / "config.ini",
+                    help="config.ini for opt-in [decay] critical caps")
+    ap.add_argument("--park", metavar="SLUG",
+                    help="Operator: mark SLUG as PARKED (with --reason) "
+                         "before evaluating")
+    ap.add_argument("--reason", default="operator",
+                    help="Reason recorded with --park")
+    ap.add_argument("--unpark", metavar="SLUG",
+                    help="Operator: clear a PARKED state back to ACTIVE")
     args = ap.parse_args()
     db_path = args.db or (args.data_cache / "dashboard.db")
 
     today = date.today()
+    this_month = f"{today.year:04d}-{today.month:02d}"
+    ledger = sd.load_ledger(args.ledger)
+    transitions: List[str] = []
+
+    # Rows first: they define the known slugs, so an operator command works
+    # on a FRESH ledger instead of reporting a valid slug as unknown.
     rows = build_rows(args.data_cache, db_path, today)
-    shown = last_complete_months(today, args.months - 1) + [f"{today.year:04d}-{today.month:02d}"]
-    print(render(rows, shown, today))
+    ensure_entries(rows, ledger)
+
+    for slug, action in ((args.park, "park"), (args.unpark, "unpark")):
+        if not slug:
+            continue
+        entry = ledger["strategies"].get(slug)
+        if entry is None:
+            known = ", ".join(sorted(ledger["strategies"])) or "none"
+            print(f"error: unknown slug {slug!r} (known: {known})", file=sys.stderr)
+            return 2
+        try:
+            transitions += (sd.set_operator_park(entry, args.reason, this_month)
+                            if action == "park" else
+                            sd.clear_operator_park(entry, this_month))
+        except ValueError as e:
+            # e.g. --unpark on a sentinel-parked strategy: the file is the
+            # authority, so say what to do instead of silently re-parking.
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+
+    transitions += apply_decay(rows, ledger, today, load_decay_caps(args.config))
+    if not args.no_ledger:
+        sd.save_ledger(args.ledger, ledger)
+
+    shown = last_complete_months(today, args.months - 1) + [this_month]
+    print(render(rows, shown, today,
+                 halted=(args.data_cache / HALT_ALL_SENTINEL).exists()))
+    if transitions:
+        print("\n  ⚠ STATE TRANSITIONS this run:")
+        for t in transitions:
+            print(f"    - {t}")
+        if args.no_ledger:
+            print("    (--no-ledger: NOT persisted — next run will repeat them)")
     return 0
 
 
