@@ -616,6 +616,29 @@ class TestConvexityEdgeFitness:
         b = [_cycle(pnl=p, theo=1_000.0, theta=2_000.0) for p in pnls]
         assert loop._convexity_edge_fitness(a) > loop._convexity_edge_fitness(b)
 
+    def test_short_premium_carry_earns_no_spread_credit(self):
+        # WHY (2026-07-18 review): theta_decay_paid is NEGATIVE for a short-
+        # premium book (rent EARNED). With raw `theo − theta` the collected
+        # rent leaks into "spread" and rewards short-vol carry — the exact
+        # short-the-middle structure this objective must reject. Rent is
+        # clamped at 0, so a short-premium session's carry adds nothing.
+        loop = _edge_loop()
+        # Two calm sessions, IDENTICAL except one collected ₹3k of theta.
+        collected = [_cycle(pnl=2_000.0, theo=-200.0, theta=-3_000.0)]
+        neutral = [_cycle(pnl=2_000.0, theo=-200.0, theta=0.0)]
+        # The collected rent must NOT buy a higher score.
+        assert (loop._convexity_edge_fitness(collected)
+                <= loop._convexity_edge_fitness(neutral) + 1e-9)
+
+    def test_long_convexity_outscores_short_vol_carry_at_equal_pnl(self):
+        # WHY: same net_pnl, but A genuinely captured realized variance against
+        # rent paid (long convexity) while B just harvested theta (short vol,
+        # blows up on the next out-of-window tail). A must win outright.
+        loop = _edge_loop()
+        a = [_cycle(pnl=2_000.0, theo=5_000.0, theta=3_000.0, middle=0.0)]
+        b = [_cycle(pnl=2_000.0, theo=-200.0, theta=-3_000.0, middle=-500.0)]
+        assert loop._convexity_edge_fitness(a) > loop._convexity_edge_fitness(b)
+
     def test_zero_trade_config_scores_zero_and_beats_bleeder(self):
         # WHY: choosing not to trade edgeless tape is a legitimate ₹0 outcome
         # (no-promote gates handle "never trades" at promotion time); it must

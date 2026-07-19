@@ -165,10 +165,21 @@ Replace scalar net_pnl with per-session components that converge on quiet data:
         operator-approved change, not a validation-protocol rider. The
         EOD-snapshot limitation of middle_band/breakeven also stands
         (watch in Phase 4; fix only if gamed).
-- [ ] **Phase 4 — re-enable weekly sweep under new objective.** Success may be
-      a clean NO ("convexity not cheap enough at NIFTY IV levels to beat theta+
-      costs") — that is an acceptable, actionable outcome; prefer more forward
-      capture over forcing a promote.
+- [x] **Phase 4 — weekly sweep flipped to convexity_edge (2026-07-18).**
+      - `deploy/run_weekly_autoresearch.sh`: `--metric net_pnl` →
+        `--metric convexity_edge` (+ dated rationale comment). First sweep
+        under the new objective: **Sat 2026-07-25 06:33**. EVAL_CYCLES stays
+        15 (env-overridable): component fitness makes each session
+        informative; 46-session walk-forward would ~3× the runtime — operator
+        can bump via AUTORESEARCH_EVAL_CYCLES if wanted.
+      - `scripts/rescore_candidates_convexity.py`: dev tool re-scoring the 8
+        old-objective candidates + seed under convexity_edge over the weekly
+        window (writes nothing; tape cache shared). Regression expectation
+        (success criterion 2): new objective keeps 0/8. RUN 2026-07-18,
+        results recorded below when complete.
+      - Success may be a clean NO ("convexity not cheap enough at NIFTY IV
+        levels to beat theta+costs") — acceptable, actionable; prefer more
+        forward capture over forcing a promote.
 
 ## Success criteria (Rule 4)
 

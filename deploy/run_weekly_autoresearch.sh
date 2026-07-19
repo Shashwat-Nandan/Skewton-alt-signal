@@ -83,15 +83,21 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # captured-tape replay path. The CSV-based path replayed daily bars
   # (12 ticks/day) and can't exercise an intraday objective. Tape sessions
   # live in data_cache/ticks/ticks-*.jsonl.
-  # 2026-06-14: optimize net_pnl (₹ realized+unrealized, net of costs), NOT
-  # gamma_theta_ratio. The ratio is DECOUPLED from money: the 2026-06-13 run
-  # drove gamma_theta_ratio to 0.95 while the "winner" lost MORE than baseline
-  # in-sample (a 1.31 ratio day still booked -₹5.6k). net_pnl is well-defined
-  # on a single session (unlike Sharpe, which needs many daily buckets and is
-  # a flat 0.0 here) and is what we actually care about. The loop's variance
-  # penalty + drawdown veto make it risk-aware; zero-trade sessions score ₹0
-  # (not the ratio penalty) so the optimizer can choose to trade less rather
-  # than be pushed to overtrade.
+  # 2026-06-14: net_pnl replaced gamma_theta_ratio (ratio was DECOUPLED from
+  # money — the 2026-06-13 "winner" lost MORE than baseline in-sample).
+  # 2026-07-18: convexity_edge replaces net_pnl (Phase 4 of the fitness
+  # redesign, tasks/todo.md). Eight weekly net_pnl sweeps oscillated without
+  # converging: a long-convexity strategy's mean P&L cannot be estimated from
+  # 15 mostly-quiet sessions, so each week's winner was tape noise, and the
+  # sweep tuned the book INTO churn (22h holds) and short-the-middle shapes.
+  # convexity_edge scores per-session components measurable on EVERY session
+  # (realized-variance value vs theta rent, middle-band shape, risk-adjusted
+  # P&L) with hard vetoes for unmanaged bleed and squandered tails, and the
+  # Phase-3 validation now includes the biggest-|move| hold-out session plus
+  # a promotion checklist embedded in the candidate JSON. Zero-trade sessions
+  # still score ₹0 (PNL_METRICS) so the optimizer may choose to trade less.
+  # A clean NO — no candidate beating the seed — is an acceptable, actionable
+  # outcome; do not force a promote (standing no-promote rules apply).
   # 2026-06-14: eval_cycles does double duty — it's both the cycles-per-
   # experiment AND the size of the most-recent-sessions window
   # (replay_sessions = captured[-eval_cycles:]).
@@ -107,7 +113,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   "$PY" run_autoresearch.py \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
-      --metric net_pnl \
+      --metric convexity_edge \
       --eval-cycles "$EVAL_CYCLES" \
       --window-days 5 \
       --out "$CANDIDATE"

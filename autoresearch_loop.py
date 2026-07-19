@@ -769,11 +769,13 @@ class HedgeResearchLoop:
         hard vetoes. Built on the Phase-1 metrics (PR #151), so it measures
         the strategy's thesis directly instead of sampling net P&L noise:
 
-          spread_i = theoretical_scalp_pnl − theta_decay_paid
+          spread_i = theoretical_scalp_pnl − max(theta_decay_paid, 0)
               The Taleb Ch.16 identity in rupees: what the session's realized
-              variance was worth against the time rent paid for it. This is
+              variance was worth against the time rent PAID for it. This is
               the EDGE a config exposes itself to, measurable every session —
-              unlike tail P&L, which needs a tail to happen.
+              unlike tail P&L, which needs a tail to happen. Rent is clamped
+              at 0 so a short-premium session (theta_decay_paid < 0, rent
+              earned) gets no carry credit — only long-convexity edge counts.
           middle_i = middle_band_worst_pnl (≤ 0)
               Worst P&L inside ±1.5% of spot. Penalizes the short-the-middle
               shape that lost ₹11.7k on 07-10's +1.02% move regardless of how
@@ -804,8 +806,18 @@ class HedgeResearchLoop:
             "autoresearch", "convexity_w_middle", fallback=1.0)
 
         pnl = np.array([m.get("net_pnl", 0.0) for m in cycle_metrics], dtype=float)
+        # spread = realized-variance value − rent PAID. Guard (2026-07-18
+        # review): rent is max(theta_decay_paid, 0), NOT the raw value.
+        # theta_decay_paid is negative for a short-premium book (rent EARNED,
+        # per the accrual comment in taleb_karpathy), so subtracting the raw
+        # value would ADD collected theta into "spread" and reward short-vol
+        # carry — exactly the short-the-middle structure this objective exists
+        # to reject. Clamping rent at 0 credits only genuine long-convexity
+        # edge: a short-gamma book still shows negative theoretical_scalp
+        # (it loses to realized vol) and now earns no carry bonus.
         spread = np.array([
-            m.get("theoretical_scalp_pnl", 0.0) - m.get("theta_decay_paid", 0.0)
+            m.get("theoretical_scalp_pnl", 0.0)
+            - max(m.get("theta_decay_paid", 0.0), 0.0)
             for m in cycle_metrics], dtype=float)
         middle = np.array([
             m.get("middle_band_worst_pnl", 0.0) for m in cycle_metrics], dtype=float)
