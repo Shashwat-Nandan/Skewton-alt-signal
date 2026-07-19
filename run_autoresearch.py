@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from backtest import generate_synthetic_data, MockKite, run_backtest
 from data_cache_io import read_table
 from strategies import TalebKarpathyStrategy
-from autoresearch_loop import HedgeResearchLoop, ZERO_TRADE_PENALTY
+from autoresearch_loop import HedgeResearchLoop, VETO_FITNESS, ZERO_TRADE_PENALTY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,7 +279,7 @@ def main():
                         cycle_metrics.append(m)
                     except Exception as e:
                         logger.warning("Cycle %d failed: %s", cycle + 1, e)
-                        return -999999.0
+                        return VETO_FITNESS
             else:
                 # Synthetic mode: generate fresh data per cycle
                 for cycle in range(loop.eval_cycles):
@@ -298,10 +298,10 @@ def main():
                         cycle_metrics.append(m)
                     except Exception as e:
                         logger.warning("Cycle %d failed: %s", cycle + 1, e)
-                        return -999999.0
+                        return VETO_FITNESS
 
             if not cycle_metrics:
-                return -999999.0
+                return VETO_FITNESS
             # Phase-3: mirror _run_experiment's per-session P&L stash for the
             # validation bootstrap.
             loop._last_cycle_pnls = [
@@ -313,7 +313,7 @@ def main():
             max_dd_pct = (max_dd / total_capital) * 100 if total_capital > 0 else 0
             if max_dd_pct > loop.max_dd_threshold:
                 logger.info("  DD %.2f%% exceeds threshold — penalizing", max_dd_pct)
-                avg = -999999.0
+                avg = VETO_FITNESS
             return avg
         loop._run_experiment = patched_run
 
@@ -346,6 +346,14 @@ def main():
     loop.best_metric_value = loop.baseline_metric
     loop._log_experiment(0, "BASELINE", 0, 0, loop.baseline_metric, True, loop.baseline_params)
     logger.info("[0/%d] Baseline %s = %.6f", args.experiments, args.metric, loop.baseline_metric)
+    if loop.baseline_metric <= VETO_FITNESS:
+        # Issue #159: a vetoed status quo is a headline finding, and it flips
+        # the acceptance rule to the absolute floor (_evaluate_experiment).
+        logger.warning(
+            "SEED VETOED: the current config is disqualified on this replay "
+            "window. 'Beats seed' is meaningless this run — mutations are "
+            "accepted only with fitness > %g.",
+            loop.vetoed_baseline_abs_floor)
     # loop.baseline_metric drifts upward as mutations are accepted; keep
     # the seed's score for the sweep-quality verdict below.
     seed_baseline = loop.baseline_metric
@@ -372,9 +380,17 @@ def main():
     print(f"  Experiments:    {args.experiments}")
     print(f"  Metric:         {args.metric}")
     print(f"  Data:           {data_desc}")
-    print(f"  Baseline:       {loop.baseline_metric:.6f}" if loop.baseline_metric != -999999.0
+    print(f"  Baseline:       {loop.baseline_metric:.6f}" if loop.baseline_metric > VETO_FITNESS
           else f"  Baseline:       {loop.baseline_metric}")
     print(f"  Best:           {loop.best_metric_value:.6f}")
+    if VETO_FITNESS < loop.best_metric_value <= 0.0:
+        # 2026-07-19 review: a negative best under a NON-vetoed seed is
+        # relative improvement only — nothing else in the report says so.
+        print("  ⚠️  Best fitness is ≤ 0 — the sweep found less-bad configs, "
+              "not positive edge; do not promote on 'beats baseline' alone.")
+        logger.warning("Best fitness %.6f is ≤ 0 — relative improvement "
+                       "only, no positive-edge config found.",
+                       loop.best_metric_value)
     print("\n  Best parameters:")
     for k, v in sorted(loop.best_params.items()):
         if k in loop.TUNABLE_RANGES:
@@ -491,13 +507,47 @@ def main():
                 print("\n  Promotion checklist:")
                 for name, ok in verdict["checks"].items():
                     if name == "bootstrap_p_negative":
-                        print(f"    {name:<26} = "
+                        print(f"    {name:<31} = "
                               f"{'n/a (too few sessions)' if pn is None else f'{pn:.2f} (coarse, n={len(best_cycle_pnls) + len(session_results)})'}")
+                    elif name == "shuffle_null_p":
+                        alpha = verdict["shuffle_alpha"]
+                        n_ins = verdict["shuffle_sessions"]["insample"]
+                        n_out = verdict["shuffle_sessions"]["holdout"]
+                        # Disclose the in-sample dominance next to the p it
+                        # biases (2026-07-19 review): the series is mostly
+                        # the replay window the config was optimized on.
+                        detail = (f"{ok:.3f} (alpha {alpha:g}; n={n_ins} "
+                                  f"in-sample + {n_out} hold-out, "
+                                  "in-sample-dominated)") if ok is not None \
+                            else "n/a (too few sessions)"
+                        print(f"    {name:<31} = {detail}")
                     else:
-                        print(f"    {name:<26} = {ok}")
+                        # None = untestable, mirror the p-value rows' label
+                        # instead of printing a bare 'None' that reads as a
+                        # failed check.
+                        print(f"    {name:<31} = "
+                              f"{'n/a (not tested)' if ok is None else ok}")
+                if verdict.get("walkforward"):
+                    wf = verdict["walkforward"]
+                    print(f"    walk-forward window P&Ls        : "
+                          f"{wf['window_pnls']} "
+                          f"(consistency {wf['consistency_rate']:.0%})")
                 if verdict["promote_ok"]:
-                    print("    → checks PASS — promotion remains an operator "
-                          "decision (review warnings + sweep quality).")
+                    gates_untested = (
+                        verdict["checks"]["edge_beats_shuffle_null"] is None
+                        or verdict["checks"]["walkforward_any_window_positive"]
+                        is None)
+                    if gates_untested:
+                        # Thin data (cold-start host): promote_ok fell back
+                        # to the pre-#159 trades/bleed/tail formula — say so
+                        # at the verdict line, not only in the warnings.
+                        print("    → checks PASS, but the absolute edge "
+                              "gates were UNTESTED (thin data) — this is "
+                              "the pre-#159 checklist only.")
+                    else:
+                        print("    → checks PASS — promotion remains an "
+                              "operator decision (review warnings + sweep "
+                              "quality).")
                 else:
                     print("    → DO NOT PROMOTE:")
                 for w in verdict["warnings"]:

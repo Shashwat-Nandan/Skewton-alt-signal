@@ -76,34 +76,53 @@ def main() -> int:
         fit = loop._run_experiment(params)
         rows.append((label, old, fit))
 
+    # Issue #159: "beats seed" alone is degenerate when the seed is vetoed
+    # (−999999 → any non-vetoed fitness "wins"). Report BOTH columns — the
+    # relative comparison and the absolute bar the loop now actually applies
+    # under a vetoed seed (_evaluate_experiment / vetoed_baseline_abs_floor)
+    # — so the headline can't be an artifact of the seed's status.
+    from autoresearch_loop import VETO_FITNESS
+    floor = loop.vetoed_baseline_abs_floor
+    seed_vetoed = seed_fit <= VETO_FITNESS
+
     print("\n" + "=" * 78)
     print("CONVEXITY_EDGE RE-SCORE — old-objective candidates "
           f"({loop.eval_cycles}-session window: "
           f"{loop._replay_sessions[0] if loop._replay_sessions else '?'}"
           f"..{loop._replay_sessions[-1] if loop._replay_sessions else '?'})")
+    if seed_vetoed:
+        print(f"⚠️  SEED VETOED — 'beats seed' is meaningless below; the "
+              f"absolute bar (fitness > {floor:g}) is the operative column.")
     print("=" * 78)
-    print(f"{'candidate':<36}{'old net_pnl':>14}{'convexity_edge':>16}  verdict")
-    kept = 0
+    print(f"{'candidate':<36}{'old net_pnl':>12}{'convexity_edge':>16}"
+          f"{'  vs seed':<12}{'abs bar':<10}")
+    beats_seed = clears_bar = 0
     for label, old, fit in rows:
-        # "would keep" mirrors the loop's actual acceptance rule
-        # (_evaluate_experiment: keep iff metric_value > baseline_metric),
-        # where baseline_metric IS the seed's score. Compare against seed_fit
-        # directly — NOT max(seed_fit, 0): a candidate that beats a negative
-        # seed but is itself negative would still be accepted as the new best,
-        # and clamping to 0 hid exactly those from the count (2026-07-18 review).
-        verdict = ("VETOED" if fit == -999999.0
-                   else "would keep" if fit > seed_fit and label != "SEED (config+best_params)"
-                   else "reject")
-        if label == "SEED (config+best_params)":
-            verdict = "baseline"
-        elif verdict == "would keep":
-            kept += 1
+        is_seed = label == "SEED (config+best_params)"
+        vetoed = fit <= VETO_FITNESS
+        # Relative column mirrors the non-vetoed-seed acceptance rule: keep
+        # iff metric_value > baseline_metric. NOT max(seed_fit, 0): clamping
+        # hid negative-but-better-than-seed keeps (2026-07-18 review).
+        if is_seed:
+            rel = "baseline" + (" (VETOED)" if vetoed else "")
+        elif vetoed:
+            rel = "VETOED"
+        elif fit > seed_fit:
+            rel = "beats seed"
+            beats_seed += 1
+        else:
+            rel = "reject"
+        bar = "clears" if (not is_seed and not vetoed and fit > floor) else "-"
+        if bar == "clears":
+            clears_bar += 1
         old_s = f"{old:,.0f}" if isinstance(old, (int, float)) else "n/a"
-        print(f"{label:<36}{old_s:>14}{fit:>16,.1f}  {verdict}")
+        print(f"{label:<36}{old_s:>12}{fit:>16,.1f}  {rel:<12}{bar:<10}")
     print("-" * 78)
-    print(f"Candidates the new objective would keep over the seed: {kept}"
-          f"/{len(rows) - 1} (expectation from the 8-week no-convergence "
-          "analysis: 0)")
+    n = len(rows) - 1
+    print(f"Beats seed: {beats_seed}/{n}"
+          + (" (MEANINGLESS — seed vetoed)" if seed_vetoed else "")
+          + f" | clears absolute bar (fitness > {floor:g}): {clears_bar}/{n} "
+          "(expectation from the 8-week no-convergence analysis: 0)")
     print("=" * 78)
     return 0
 

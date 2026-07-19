@@ -56,6 +56,14 @@ ZERO_TRADE_PENALTY = -1e6
 # all-zero components, which is its true outcome.
 PNL_METRICS = frozenset({"net_pnl", "realized_pnl", "convexity_edge"})
 
+# The hard-veto sentinel (bleed cap, squandered edge, DD blow-up, cycle
+# failure). Any fitness at or below this is "disqualified", not a score —
+# issue #159: comparing against it ("keep iff > baseline") accepts anything
+# non-vetoed, so acceptance must fall back to an absolute floor instead.
+# ZERO_TRADE_PENALTY (-1e6) sits below this on purpose: a baseline whose
+# cycles averaged to the zero-trade penalty is equally not a baseline.
+VETO_FITNESS = -999999.0
+
 
 # ── Phase-3 validation/promotion helpers (2026-07-18 redesign) ──
 # Module-level so run_autoresearch's validation stage and tests share one
@@ -111,7 +119,8 @@ def build_validation_verdict(session_results: list, capital: float,
                              insample_pnls: Optional[list] = None,
                              tail_threshold_pct: float = 1.0,
                              bleed_cap_pct: float = 1.5,
-                             rng_seed: int = 7) -> Dict:
+                             rng_seed: int = 7,
+                             shuffle_alpha: float = 0.10) -> Dict:
     """Machine-readable promotion verdict from per-hold-out-session results
     (each: {'date','net_pnl','total_trades','max_drawdown'}).
 
@@ -130,6 +139,36 @@ def build_validation_verdict(session_results: list, capital: float,
           rng_seed) of the combined in-sample + hold-out per-session P&Ls
           whose mean is ≤ 0. Reported, not gated: with ~15 points it is a
           coarse stability signal, not significance (Rule 12: labeled so).
+      edge_beats_shuffle_null — sign-flip permutation test on the combined
+          per-session P&Ls. Null: no edge (each session's P&L equally likely
+          + or −); p = share of 10k sign-flipped resamples whose mean ≥ the
+          observed mean (+1 correction). Gates at shuffle_alpha. This is the
+          issue-#159 ABSOLUTE bar in the narrow sense that it never
+          references the seed, so it stays meaningful when the seed is
+          vetoed and 'beats seed' is degenerate. It is NOT an out-of-sample
+          claim (2026-07-19 review): the series is dominated by the
+          IN-SAMPLE replay sessions the config was optimized on (hold-out
+          contributes only 1-2 picks — too few to test alone), so a pass is
+          a necessary floor of evidence, not proof of forward edge; the
+          split is disclosed in `shuffle_sessions`. Two more labeled
+          properties: alpha defaults to 0.10, not 0.05 — with ~15-17
+          sessions the test is coarse (p reported so the margin is
+          visible) — and a positive mean concentrated in k large sessions
+          bottoms out near p≈2^-k, so ~4+ independent tail wins are needed
+          to clear alpha 0.10; a fail with positive mean is warned as
+          insufficient evidence, distinct from a bleeding book. Location
+          test, unlike the order-shuffle path test it was adapted from
+          (HKUDS/Vibe-Trading backtest/validation.py): mean−½σ fitness is
+          order-invariant, only location can gate promotion here.
+      walkforward_any_window_positive — chronological windows (3 if ≥9
+          in-sample sessions, else 2) over the IN-SAMPLE per-session P&Ls
+          (the replay window; hold-out picks are non-contiguous). Gated only
+          on the degenerate case: NO window net-positive = the config
+          demonstrated edge nowhere (the −1.7k..−3.6k candidate shape from
+          the 2026-07-19 re-score). 'Most windows profitable' would be the
+          WRONG gate for a convexity book — a tail-harvester legitimately
+          bleeds small in quiet windows and earns everything in the window
+          holding the tail — so consistency_rate is reported ungated.
     """
     pnls = [float(r["net_pnl"]) for r in session_results]
     trades = sum(int(r.get("total_trades", 0)) for r in session_results)
@@ -165,14 +204,76 @@ def build_validation_verdict(session_results: list, capital: float,
             f"(floor ₹{bleed_floor:,.0f}) — unmanaged bleed")
 
     p_neg = None
+    shuffle_p = None
+    shuffle_ok = None
     combined = list(insample_pnls or []) + pnls
+    # One guard + one array for both resampling tests: a threshold or
+    # construction edited in one and not the other would let the two tests
+    # silently disagree about when they run on identical data. Each test
+    # keeps its own default_rng(rng_seed) stream.
     if len(combined) >= 5:
-        rng = np.random.default_rng(rng_seed)
         arr = np.asarray(combined, dtype=float)
+
+        rng = np.random.default_rng(rng_seed)
         means = rng.choice(arr, size=(10_000, len(arr)), replace=True).mean(axis=1)
         p_neg = float((means <= 0).mean())
 
-    promote_ok = bool(trades_ok and bleed_ok and tail_ok is not False)
+        observed = float(arr.mean())
+        rng = np.random.default_rng(rng_seed)
+        flips = rng.choice(np.array([-1.0, 1.0]), size=(10_000, len(arr)))
+        null_means = (flips * arr).mean(axis=1)
+        shuffle_p = float((int((null_means >= observed).sum()) + 1) / (10_000 + 1))
+        shuffle_ok = shuffle_p <= shuffle_alpha
+        if not shuffle_ok and observed > 0:
+            # Distinguish "underpowered" from "bleeding" (2026-07-19 review):
+            # a positive mean concentrated in k large sessions bottoms out
+            # near p≈2^-k regardless of how positive the mean is — the gate
+            # cannot pass ~fewer than 4 independent tail wins at alpha 0.10.
+            # That is insufficient EVIDENCE, not a negative book; say which.
+            warnings.append(
+                f"mean session P&L is positive (₹{observed:,.0f}) but fails "
+                f"the shuffle null (p={shuffle_p:.3f} > alpha "
+                f"{shuffle_alpha:g}) — edge is concentrated in too few "
+                "sessions to rule out luck; needs more tail evidence, "
+                "not a bleeding config")
+        elif not shuffle_ok:
+            warnings.append(
+                f"mean session P&L does not beat the shuffle null "
+                f"(p={shuffle_p:.3f} > alpha {shuffle_alpha:g}) — no absolute "
+                "evidence of edge, only relative-to-seed")
+    else:
+        warnings.append(
+            f"only {len(combined)} session P&Ls — shuffle-null edge test "
+            "could NOT run (absolute edge untested)")
+
+    walkforward = None
+    wf_ok = None
+    ins = [float(p) for p in (insample_pnls or [])]
+    if len(ins) >= 4:
+        k = 3 if len(ins) >= 9 else 2
+        size = len(ins) // k
+        sums = []
+        for i in range(k):
+            hi = (i + 1) * size if i < k - 1 else len(ins)
+            sums.append(float(sum(ins[i * size:hi])))
+        wf_ok = any(s > 0 for s in sums)
+        walkforward = {
+            "n_windows": k,
+            "window_pnls": [round(s, 2) for s in sums],
+            "consistency_rate": round(sum(1 for s in sums if s > 0) / k, 3),
+        }
+        if not wf_ok:
+            warnings.append(
+                f"no walk-forward window is net-positive ({k} windows over "
+                f"{len(ins)} in-sample sessions) — the config demonstrated "
+                "edge nowhere on the window")
+    else:
+        warnings.append(
+            f"in-sample series too short ({len(ins)} sessions) for "
+            "walk-forward windows — consistency untested")
+
+    promote_ok = bool(trades_ok and bleed_ok and tail_ok is not False
+                      and shuffle_ok is not False and wf_ok is not False)
     return {
         "sessions": session_results,
         "checks": {
@@ -180,7 +281,17 @@ def build_validation_verdict(session_results: list, capital: float,
             "tail_day_nonnegative": tail_ok,
             "bleed_bounded": bleed_ok,
             "bootstrap_p_negative": p_neg,
+            "shuffle_null_p": shuffle_p,
+            "edge_beats_shuffle_null": shuffle_ok,
+            "walkforward_any_window_positive": wf_ok,
         },
+        "shuffle_alpha": shuffle_alpha,
+        # Composition of the shuffle/bootstrap series (Rule 12): the tests
+        # are in-sample-dominated, and the reader must be able to see by
+        # how much without re-deriving it.
+        "shuffle_sessions": {"insample": len(insample_pnls or []),
+                             "holdout": len(pnls)},
+        "walkforward": walkforward,
         "promote_ok": promote_ok,
         "warnings": warnings,
     }
@@ -262,6 +373,22 @@ class HedgeResearchLoop:
         self.results_file = self.config.get("autoresearch", "results_file")
         self.log_file = self.config.get("autoresearch", "log_file")
         self.mutation_step = self.config.getfloat("autoresearch", "mutation_step_size")
+        # Issue #159: acceptance bar when the baseline is vetoed (see
+        # _evaluate_experiment). 0.0 = require strictly positive fitness.
+        self.vetoed_baseline_abs_floor = self.config.getfloat(
+            "autoresearch", "vetoed_baseline_abs_floor", fallback=0.0)
+        # Negative floors are unsupported (2026-07-19 review): monotonic
+        # acceptance keeps every accepted config above the FIRST accepted
+        # value, so any floor is technically preserved — but a negative
+        # floor means "accept losing configs", which contradicts the bar's
+        # documented purpose. Fail loud at construction, before hours of
+        # sweep compute, rather than run under murky semantics.
+        if self.vetoed_baseline_abs_floor < 0.0:
+            raise ValueError(
+                f"[autoresearch] vetoed_baseline_abs_floor = "
+                f"{self.vetoed_baseline_abs_floor} is negative — the "
+                "absolute bar exists to require positive fitness under a "
+                "vetoed seed; use 0.0 (default) or a positive floor.")
 
         self.experiment_number = 0
         self.baseline_params = copy.deepcopy(hedger.tunable_params)
@@ -712,10 +839,10 @@ class HedgeResearchLoop:
 
                 except Exception as e:
                     logger.warning("  Cycle %d failed: %s", cycle + 1, e)
-                    return -999999.0
+                    return VETO_FITNESS
 
             if not cycle_metrics:
-                return -999999.0
+                return VETO_FITNESS
 
             # Phase-3: expose this evaluation's per-session P&Ls so the driver
             # can keep the accepted/best config's series for the validation
@@ -756,7 +883,7 @@ class HedgeResearchLoop:
             if max_dd_pct > self.max_dd_threshold:
                 logger.info("  Max drawdown %.2f%% (₹%.0f) exceeds threshold %.2f%%. Penalizing.",
                             max_dd_pct, max_dd, self.max_dd_threshold)
-                avg_metric = -999999.0  # Reject any param set that blows drawdown
+                avg_metric = VETO_FITNESS  # Reject any param set that blows drawdown
 
             return avg_metric
         finally:
@@ -826,14 +953,14 @@ class HedgeResearchLoop:
         if worst < -bleed_cap:
             logger.info("  convexity_edge VETO: session P&L %.0f breaches "
                         "bleed cap -%.0f", worst, bleed_cap)
-            return -999999.0
+            return VETO_FITNESS
         squandered = (spread >= tail_min) & (pnl < 0)
         if bool(squandered.any()):
             i = int(np.argmax(squandered))
             logger.info("  convexity_edge VETO: session had spread %.0f "
                         "(≥ %.0f) but net P&L %.0f — edge squandered",
                         spread[i], tail_min, pnl[i])
-            return -999999.0
+            return VETO_FITNESS
 
         fitness = float(np.mean(pnl)) if len(pnl) else 0.0
         if len(pnl) >= 2:
@@ -849,9 +976,19 @@ class HedgeResearchLoop:
         Simple rule (following Karpathy): keep if strictly better than baseline.
         No probabilistic acceptance (unlike simulated annealing) — we want
         monotonic improvement with guaranteed safety.
+
+        Issue #159: a VETOED baseline (≤ VETO_FITNESS) is not a score to beat
+        — "keep iff > −999999" accepts the first non-vetoed mutation however
+        bad, and every later acceptance anchors to it. A vetoed baseline is
+        treated as NO baseline: a mutation must clear the absolute floor
+        (`vetoed_baseline_abs_floor`, default 0.0 = positive fitness) to be
+        kept. The likely weekly outcome — 0 accepted, candidate = the vetoed
+        seed — is the honest one; sweep_quality flags it loudly.
         """
         if self.baseline_metric is None:
             return True
+        if self.baseline_metric <= VETO_FITNESS:
+            return metric_value > self.vetoed_baseline_abs_floor
         return metric_value > self.baseline_metric
 
     # ══════════════════════════════════════════════════════════════
@@ -910,10 +1047,23 @@ class HedgeResearchLoop:
             max(fitness_counts.values()) / len(records) if records else 0.0
         )
         n_accepted = sum(1 for r in records if r["accepted"])
+        # bool() guards the JSON path: `A and B` returns B's type, and a
+        # numpy scalar leaking into seed_baseline would make this np.bool_,
+        # which _save_best_params's json.dump (no default=) cannot serialize.
+        seed_vetoed = bool(seed_baseline is not None
+                           and seed_baseline <= VETO_FITNESS)
         warnings = []
+        if seed_vetoed:
+            # Issue #159: a vetoed status quo is a HEADLINE finding — and it
+            # makes every "beats seed" comparison in this run meaningless, so
+            # the verdict must carry that context into the candidate file.
+            warnings.append(
+                "SEED VETOED — the current config is disqualified on this "
+                "window ('beats seed' is meaningless; acceptance required "
+                f"fitness > {self.vetoed_baseline_abs_floor:g} instead)")
         if n_accepted == 0:
             warnings.append("0 mutations accepted — candidate is the seed params")
-        elif self.best_metric_value <= seed_baseline:
+        elif not seed_vetoed and self.best_metric_value <= seed_baseline:
             # Unreachable while acceptance is strictly-better-than-baseline;
             # kept as a tripwire should the acceptance rule ever admit ties.
             warnings.append("best never beat the seed baseline")
@@ -930,6 +1080,7 @@ class HedgeResearchLoop:
             "distinct_fitness": len(fitness_counts),
             "plateau_share": round(plateau_share, 3),
             "seed_baseline": seed_baseline,
+            "seed_vetoed": seed_vetoed,
             "best": self.best_metric_value,
             "informative": not warnings,
             "warnings": warnings,

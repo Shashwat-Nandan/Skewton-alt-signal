@@ -1,3 +1,70 @@
+# Absolute promotion bar: shuffle-null + walk-forward + vetoed-seed fix (issue #159, 2026-07-19)
+
+The 2026-07-19 re-score showed `_evaluate_experiment`'s "keep iff > baseline"
+is degenerate when the seed itself is vetoed (−999999): any non-vetoed config
+"beats baseline", including deeply negative ones. Fix = absolute checks that
+never reference the seed. Method for the two new checklist checks adapted from
+HKUDS/Vibe-Trading's `backtest/validation.py` (permutation null + walk-forward
+consistency), reshaped for a convexity book (walk-forward gates only the
+all-windows-negative case — a tail-harvester legitimately loses most windows).
+
+- [x] `_evaluate_experiment`: vetoed baseline = NO baseline → mutation must
+      clear `vetoed_baseline_abs_floor` (config, default 0.0) to be accepted
+- [x] `sweep_quality`: `seed_vetoed` flag + loud warning (headline, not footnote)
+- [x] `build_validation_verdict`: sign-flip shuffle-null p-value on combined
+      session P&Ls (gates at alpha=0.10, labeled coarse) + walk-forward
+      windows over in-sample P&Ls (gates only when NO window is positive)
+- [x] `run_autoresearch.py`: print SEED VETOED prominently; format new checks
+- [x] `scripts/rescore_candidates_convexity.py`: add "clears absolute bar"
+      column so "would keep" can't be an artifact of a vetoed seed
+- [x] `config_template.ini`: document `vetoed_baseline_abs_floor`
+- [x] Tests: vetoed-baseline acceptance, seed_vetoed surfacing, shuffle/WF
+      gates incl. the convexity-shape guard (tail win must not be WF-blocked)
+- [x] ruff + pytest green, PR referencing #159
+
+## Review
+
+Shipped on branch `fix/159-absolute-promotion-bar`. Design notes that matter
+later:
+- `VETO_FITNESS = -999999.0` constant; ZERO_TRADE_PENALTY (−1e6) deliberately
+  sits below it, so a zero-trade-penalty baseline also counts as vetoed.
+- The shuffle null is a sign-flip LOCATION test (not Vibe-Trading's order
+  shuffle — our mean−½σ fitness is order-invariant). Known property, pinned
+  in a test: a SINGLE tail win scores p≈0.5 and does not pass — deliberate,
+  matching Phase-0's "won crash day by luck". Promotion needs repeated
+  evidence; the p-value is printed so the operator sees the margin.
+- Walk-forward gates ONLY the all-windows-negative case; "most windows
+  profitable" would structurally reject a healthy tail-harvester.
+- Alpha 0.10 (not 0.05) because n≈15-17 sessions; kwarg on
+  build_validation_verdict, labeled in output.
+- Expected weekly reality until the bleed is fixed: SEED VETOED headline,
+  0 accepted, promote_ok False — that is the honest outcome, not a bug.
+- Full suite 1451 passed / 0 skipped; smoke-tested all three checklist print
+  modes (all-negative / healthy / untestable) against real verdicts.
+
+**Code-review fixes (2026-07-19, 8-angle review, 9 findings applied):**
+- Shuffle-null gate is IN-SAMPLE-DOMINATED (combined series ≈15 replay + 1-2
+  hold-out sessions) — now disclosed in docstring, `shuffle_sessions` in the
+  verdict, and the checklist line; a pass is a floor of evidence, not an
+  out-of-sample claim.
+- Multi-tail property documented + warned: positive mean concentrated in k
+  sessions bottoms out at p≈2^-k (needs ~4+ tails at alpha 0.10); a fail
+  with positive mean now says "insufficient evidence", distinct from a
+  bleeding book.
+- vetoed_baseline_abs_floor must be ≥ 0 — ValueError at construction
+  (monotonic acceptance technically preserves any floor; negative floors
+  are refused for their semantics, not a re-anchor bug).
+- VETO_FITNESS fully adopted at all ~9 producer sites (was consumers-only);
+  tests still pin the literal -999999.0 so retuning the constant forces a
+  conscious test update.
+- seed_vetoed wrapped in bool() (numpy-leak JSON hardening); thin-data
+  promote_ok now prints "absolute edge gates UNTESTED (thin data)"; driver
+  warns when best fitness ≤ 0 under a non-vetoed seed; bootstrap+shuffle
+  share one hoisted guard/array; checklist prints "n/a (not tested)"
+  instead of bare None. Suite 1453 green after fixes.
+
+---
+
 # MC entry-gate: block-bootstrap tape paths, replace Gaussian (issue #160, PLAN 2026-07-19 — awaiting operator sign-off)
 
 The Taleb live entry gates (mc_min_mean_pnl expectancy floor +

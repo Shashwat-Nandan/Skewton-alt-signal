@@ -134,6 +134,51 @@ class TestEvaluateExperiment:
         # the canonical sign-flip guard: if `>` became `<`, this passes worse
         assert _loop(baseline_metric=1.0)._evaluate_experiment(0.5) is False
 
+    # ── vetoed baseline → absolute floor (issue #159) ──
+
+    def test_vetoed_baseline_rejects_nonvetoed_negative(self):
+        # WHY: the 2026-07-19 re-score degeneracy — with a vetoed seed, a
+        # −3,600 candidate "beat" −999999 and would have anchored the sweep.
+        loop = _loop(baseline_metric=-999999.0, vetoed_baseline_abs_floor=0.0)
+        assert loop._evaluate_experiment(-3600.0) is False
+
+    def test_vetoed_baseline_accepts_only_above_floor(self):
+        loop = _loop(baseline_metric=-999999.0, vetoed_baseline_abs_floor=0.0)
+        assert loop._evaluate_experiment(1.0) is True
+        # strict: 0.0 fitness (e.g. an all-no-trade config) is not edge
+        assert loop._evaluate_experiment(0.0) is False
+
+    def test_vetoed_baseline_configured_floor_respected(self):
+        loop = _loop(baseline_metric=-999999.0,
+                     vetoed_baseline_abs_floor=500.0)
+        assert loop._evaluate_experiment(499.0) is False
+        assert loop._evaluate_experiment(501.0) is True
+
+    def test_zero_trade_penalty_baseline_counts_as_vetoed(self):
+        # ZERO_TRADE_PENALTY (−1e6) sits below VETO_FITNESS by design: a
+        # baseline averaging the zero-trade penalty is equally no baseline.
+        loop = _loop(baseline_metric=ZERO_TRADE_PENALTY,
+                     vetoed_baseline_abs_floor=0.0)
+        assert loop._evaluate_experiment(-1.0) is False
+
+    def test_negative_floor_rejected_at_construction(self, tmp_path):
+        # WHY (2026-07-19 review): a negative floor means "accept losing
+        # configs" — semantically contrary to the bar's purpose. Fail loud
+        # at __init__, before hours of sweep compute, not mid-sweep.
+        cfg = tmp_path / "config.ini"
+        cfg.write_text(
+            "[autoresearch]\n"
+            "eval_cycles_per_experiment = 5\n"
+            "metric = net_pnl\n"
+            "max_drawdown_threshold = 5.0\n"
+            "results_file = results.tsv\n"
+            "log_file = autoresearch.log\n"
+            "mutation_step_size = 0.1\n"
+            "vetoed_baseline_abs_floor = -500\n")
+        hedger = SimpleNamespace(tunable_params={})
+        with pytest.raises(ValueError, match="vetoed_baseline_abs_floor"):
+            HedgeResearchLoop(hedger, config_path=str(cfg))
+
 
 # ── _run_experiment (the fitness scalar) ───────────────────
 
@@ -491,6 +536,22 @@ class TestSweepQualityMethod:
         assert q["experiments"] == 0
         assert q["informative"] is False
 
+    def test_vetoed_seed_is_a_headline_warning(self):
+        # WHY (issue #159): with a vetoed seed, every "beats seed" comparison
+        # in the run is meaningless — the candidate file must carry that as a
+        # finding, not leave the reader to check the seed row.
+        records = [{"accepted": False, "metric_value": -3600.0}] * 3
+        q = _loop(_experiment_records=records, best_metric_value=-999999.0,
+                  vetoed_baseline_abs_floor=0.0).sweep_quality(-999999.0)
+        assert q["seed_vetoed"] is True
+        assert q["informative"] is False
+        assert any("SEED VETOED" in w for w in q["warnings"])
+
+    def test_healthy_seed_not_flagged_vetoed(self):
+        q = self._loop_with([{"accepted": True, "metric_value": -90.0}],
+                            best=-90.0).sweep_quality(-100.0)
+        assert q["seed_vetoed"] is False
+
 
 class TestReplayWindowPreflight:
     """2026-07-12: a stillborn tape (parses to 0 rows) inside the replay
@@ -769,6 +830,88 @@ class TestBuildValidationVerdict:
         v = build_validation_verdict(
             [self._r("2026-07-05", 2_000.0)], self.CAP, {}, insample_pnls=[1.0])
         assert v["checks"]["bootstrap_p_negative"] is None
+
+    # ── absolute gates: shuffle null + walk-forward (issue #159) ──
+
+    def test_all_negative_sessions_fail_both_absolute_gates(self):
+        # WHY (issue #159): the −1.7k..−3.6k re-score candidates — negative
+        # everywhere, yet "better than the vetoed seed". The absolute checks
+        # must reject them WITHOUT referencing any seed.
+        ins = [-1000.0, -2000.0, -1500.0, -3000.0, -500.0, -2500.0,
+               -1800.0, -900.0, -2200.0]
+        v = build_validation_verdict(
+            [self._r("2026-07-05", -1_200.0)], self.CAP, {}, insample_pnls=ins)
+        assert v["checks"]["edge_beats_shuffle_null"] is False
+        assert v["checks"]["walkforward_any_window_positive"] is False
+        assert v["promote_ok"] is False
+
+    def test_consistent_positive_edge_passes_both_absolute_gates(self):
+        ins = [1500.0, 2000.0, 1800.0, 2200.0, 1600.0, 1900.0, 2100.0,
+               1700.0, 2400.0]
+        v = build_validation_verdict(
+            [self._r("2026-07-05", 2_000.0)], self.CAP, {}, insample_pnls=ins)
+        assert v["checks"]["edge_beats_shuffle_null"] is True
+        assert v["checks"]["shuffle_null_p"] < 0.10
+        assert v["checks"]["walkforward_any_window_positive"] is True
+        assert v["promote_ok"] is True
+
+    def test_convexity_shape_not_blocked_by_walkforward(self):
+        # WHY: a tail-harvester bleeds small in quiet windows and earns its
+        # P&L in the window holding the tail. "Most windows profitable" would
+        # structurally reject a HEALTHY convexity config — the walk-forward
+        # gate must fire only when NO window is positive.
+        ins = [-800.0, -600.0, -700.0,        # quiet window: managed bleed
+               -900.0, 25_000.0, -750.0,      # tail window: the payoff
+               -650.0, -800.0, -700.0]        # quiet window: managed bleed
+        v = build_validation_verdict(
+            [self._r("2026-07-05", -500.0)], self.CAP, {}, insample_pnls=ins)
+        assert v["walkforward"]["n_windows"] == 3
+        assert v["checks"]["walkforward_any_window_positive"] is True
+        assert v["walkforward"]["consistency_rate"] == 0.333  # rounded 1/3
+        # A SINGLE tail win is statistically indistinguishable from luck
+        # (Phase-0: "won crash day +21,994 by luck") — the shuffle null sits
+        # near p=0.5 and must NOT pass on one tail. Deliberate: promotion
+        # needs repeated evidence, and the operator sees the p to judge.
+        assert v["checks"]["edge_beats_shuffle_null"] is False
+        assert 0.3 < v["checks"]["shuffle_null_p"] < 0.7
+
+    def test_multi_tail_positive_mean_fails_with_underpowered_warning(self):
+        # WHY (2026-07-19 review): a book whose positive mean is concentrated
+        # in k large sessions bottoms out near p≈2^-k — the gate CANNOT pass
+        # it at alpha 0.10 until ~4+ tails accumulate. That is insufficient
+        # evidence, not a bleeding config, and the warning must say which so
+        # the operator reads "wait for more tape", not "reject the shape".
+        ins = [-500.0] * 13 + [15_000.0, 12_000.0]
+        v = build_validation_verdict(
+            [self._r("2026-07-05", 2_000.0)], self.CAP, {}, insample_pnls=ins)
+        assert v["checks"]["edge_beats_shuffle_null"] is False
+        assert 0.10 < v["checks"]["shuffle_null_p"] < 0.5
+        assert any("concentrated in too few sessions" in w
+                   for w in v["warnings"])
+        # And the in-sample dominance of the series is disclosed, not silent.
+        assert v["shuffle_sessions"] == {"insample": 15, "holdout": 1}
+
+    def test_shuffle_p_is_deterministic(self):
+        ins = [1000.0, -500.0, 2000.0, -1500.0, 3000.0, 800.0]
+        v1 = build_validation_verdict(
+            [self._r("2026-07-05", 2_000.0)], self.CAP, {}, insample_pnls=ins)
+        v2 = build_validation_verdict(
+            [self._r("2026-07-05", 2_000.0)], self.CAP, {}, insample_pnls=ins)
+        assert v1["checks"]["shuffle_null_p"] == v2["checks"]["shuffle_null_p"]
+        assert 0.0 < v1["checks"]["shuffle_null_p"] <= 1.0
+
+    def test_absolute_gates_none_when_untestable_do_not_block(self):
+        # WHY: mirrors the tail-day None semantics — an untestable check is a
+        # warned data limitation, not a candidate failure (Rule 12).
+        v = build_validation_verdict(
+            [self._r("2026-07-05", 1_000.0)], self.CAP, {})
+        assert v["checks"]["edge_beats_shuffle_null"] is None
+        assert v["checks"]["shuffle_null_p"] is None
+        assert v["checks"]["walkforward_any_window_positive"] is None
+        assert v["walkforward"] is None
+        assert v["promote_ok"] is True
+        assert any("could NOT run" in w for w in v["warnings"])
+        assert any("walk-forward" in w for w in v["warnings"])
 
 
 class TestLoadDailyMoves:
