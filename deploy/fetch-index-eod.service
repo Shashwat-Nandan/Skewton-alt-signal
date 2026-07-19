@@ -1,0 +1,39 @@
+[Unit]
+Description=Daily index EOD option-chain snapshot fetch (NIFTY, BANKNIFTY) — issue #162
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+# Refreshes data_cache/{underlying}_*_eod.parquet from NSE's public bhavcopy
+# archive for each index in INDEX_EOD_UNDERLYINGS (default "NIFTY BANKNIFTY").
+# Idempotent (cached days skipped). No Kite auth for past dates — see the
+# wrapper header. Override the underlying list / window via
+# INDEX_EOD_UNDERLYINGS / INDEX_EOD_DAYS in the environment.
+ExecStart=/opt/taleb-karpathy-kite/deploy/run_index_eod_fetch.sh
+# -------------------------------
+
+TimeoutStartSec=60min
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (mirrors fetch-bhavcopy-eq.service)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

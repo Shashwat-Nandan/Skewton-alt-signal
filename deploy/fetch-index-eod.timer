@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire fetch-index-eod.service Mon-Fri at 18:15 IST (after NSE F&O bhavcopy publishes)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 18:15 IST — NSE publishes the F&O UDiFF bhavcopy ~17:30-18:00. 18:15 gives
+# headroom and staggers ~15 min after fetch-bhavcopy-eq (18:00) so the two
+# archive fetches don't race. Running after publish keeps today's data in the
+# public archive, so fetch_bhavcopy never reaches its Kite today-fallback (no
+# login while a live runner is active).
+OnCalendar=Mon..Fri *-*-* 18:15:00 Asia/Kolkata
+
+# Persistent catch-up: if the VPS was down at 18:15, run when it returns —
+# fetch_bhavcopy is idempotent (re-fetching a cached date is a no-op).
+Persistent=true
+
+RandomizedDelaySec=120
+
+Unit=fetch-index-eod.service
+
+[Install]
+WantedBy=timers.target
