@@ -134,7 +134,7 @@ export function ArbitragePage() {
           <span>
             No EOD sidecars found in this window yet. Once
             {" "}
-            <code>run_paper_arbitrage.py</code> completes a trading session it
+            <code>runners/run_paper_arbitrage.py</code> completes a trading session it
             writes <code>arbitrage_paper_eod_&lt;date&gt;.json</code>, which
             this page reads.
           </span>

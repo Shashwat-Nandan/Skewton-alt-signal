@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Literal, Optional
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 from .base import BaseStrategy, ExecutionMode
 
@@ -154,7 +154,7 @@ class ArbitrageStrategy(BaseStrategy):
         elif cfg.get("universe"):
             self.universe = [s.strip() for s in cfg["universe"].split(",") if s.strip()]
         else:
-            from screen_pairs import NIFTY_50
+            from core.screen_pairs import NIFTY_50
             self.universe = list(NIFTY_50)
 
         # Carry assumptions. `dividend_yield_default` is the global fallback;

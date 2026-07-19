@@ -1,11 +1,11 @@
-"""Tests for greeks_engine.py — BS pricing, Greeks, and portfolio calculations."""
+"""Tests for core/greeks_engine.py — BS pricing, Greeks, and portfolio calculations."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import math
 import pytest
-from greeks_engine import (
+from core.greeks_engine import (
     GreeksEngine, OptionContract, implied_volatility_bisect,
 )
 

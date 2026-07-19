@@ -3,7 +3,7 @@ SQLite storage layer for the Market Profile feature.
 
 The schema lives in `backend.db.SCHEMA`. This module is the read/write
 surface used by both the FastAPI router (`/api/market-profile/...`) and the
-ingestion script (`fetch_bars.py`).
+ingestion script (`market_data/fetch_bars.py`).
 
 Why stdlib sqlite3 here too: same as runs/proposals — single-writer
 dashboard, simple queries, no ORM.

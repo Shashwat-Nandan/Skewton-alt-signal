@@ -14,7 +14,7 @@ Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # --days 5 covers Fri-after-long-weekend catch-up; the script is idempotent
 # so re-fetching is cheap. Universe defaults to Nifty-200 inside the script.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/fetch_bhavcopy_eq.py --days 5
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m market_data.fetch_bhavcopy_eq --days 5
 # -------------------------------
 
 TimeoutStartSec=15min

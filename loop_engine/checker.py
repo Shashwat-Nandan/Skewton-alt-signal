@@ -28,7 +28,7 @@ import numpy as np
 
 from loop_engine import memory
 # Single source for the annualization constant (was a duplicated literal).
-from optimize_kalman_trend import TRADING_DAYS
+from research.optimize_kalman_trend import TRADING_DAYS
 
 logger = logging.getLogger("loop.kalman_trend.checker")
 
@@ -189,8 +189,8 @@ def kalman_trend_oos_returns(
     curve. Reuses backtest_kalman_trend._fold_oos + optimize_kalman_trend, so the
     checker does not reimplement the simulator (Rules 7/8).
     """
-    import backtest_kalman_trend as bt
-    import optimize_kalman_trend as o
+    from research import backtest_kalman_trend as bt
+    from research import optimize_kalman_trend as o
 
     closes = np.asarray(closes, float)
     n = closes.size
@@ -260,7 +260,7 @@ def default_kalman_trend_checker(symbols=("NIFTY", "BANKNIFTY")):
     grade of the exact intraday candidate. A true intraday checker is future work.
     """
     def _check(outcome) -> CheckResult:
-        from validate_kalman_trend import load_daily_closes
+        from research.validate_kalman_trend import load_daily_closes
 
         per_symbol: Dict[str, CheckResult] = {}
         for sym in symbols:

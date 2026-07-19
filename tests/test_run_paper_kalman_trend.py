@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import run_paper_kalman_trend as r
+from runners import run_paper_kalman_trend as r
 
 KAL = {"filter_params": [0.0, 0.0, 1.0, 100.0, 10000.0, 100.0], "model": 2,
        "mu": 0.0, "stop_ticks": 20, "target_ticks": 40}

@@ -1,7 +1,7 @@
 """Five-stage loop orchestrator (paper §III), kalman_trend pilot.
 
 This is the paper's Appendix Fig. 4 skeleton made real, but it WRAPS the existing
-`run_paper_kalman_trend.py` runner rather than reimplementing ingest/maker/execute
+`runners/run_paper_kalman_trend.py` runner rather than reimplementing ingest/maker/execute
 (CLAUDE.md Rules 2/7/8 — the runner is battle-tested; don't fork it). The
 orchestrator's own job is the part the runner doesn't do: thread the compounding
 STATE.md memory around a session (read-first / write-last) and provide the
@@ -62,7 +62,7 @@ def kite_engine(today: Optional[date] = None) -> SessionOutcome:  # pragma: no c
     orchestrator can write the result into STATE.md. Never fresh-logs-in (the
     runner reuses the cached session — see SKILL.md / no-auth-while-live).
     """
-    import run_paper_kalman_trend as runner
+    from runners import run_paper_kalman_trend as runner
 
     today = today or date.today()
     # Sunset gate (docs/strategy-efficiency-review-2026-07-05.md §2.7):
@@ -172,7 +172,7 @@ class LoopOrchestrator:
         """
         halt = self._risk_halt_path
         if halt is None:
-            from runner_common import HALT_NEW_ENTRIES_PATH
+            from core.runner_common import HALT_NEW_ENTRIES_PATH
             halt = HALT_NEW_ENTRIES_PATH
         return "HALT_NEW_ENTRIES" if halt.exists() else "ok"
 

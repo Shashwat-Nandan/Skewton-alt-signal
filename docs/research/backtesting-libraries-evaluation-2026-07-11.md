@@ -53,7 +53,7 @@ family. The deliberate house pattern:
   (pairs), expiry force-flattens, intraday restarts restoring serialized
   books, entry windows, per-strategy kill switches.
 - **Fail-loud research hygiene:** `ZERO_TRADE_PENALTY` sentinels, the
-  coarse-timeframe warning (`backtest_timeframe.py`, issue #63), the
+  coarse-timeframe warning (`core/backtest_timeframe.py`, issue #63), the
   Newey-West t-stat in the loop checker, the no-promotion-without-holdout-
   trades rule.
 

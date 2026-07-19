@@ -74,7 +74,7 @@ defence-in-depth but risks silent data loss on busy days (busy F&O days
 can push 100k+ rows).
 
 **Approach if pursued:**
-- Cap raw download size at the network layer (`fetch_bhavcopy.py`):
+- Cap raw download size at the network layer (`market_data/fetch_bhavcopy.py`):
   reject any `csv_bytes` exceeding e.g. 50MB. Fail loud, not silent.
 - Don't cap `nrows` — silent truncation is worse than the threat model
   warrants.

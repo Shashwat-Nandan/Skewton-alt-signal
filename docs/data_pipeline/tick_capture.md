@@ -21,7 +21,7 @@ trigger-fair-value research that intra-day 30-min bars can't support.
 
 ## Overview
 
-`tick_capture.py` (307 lines) runs as an independent oneshot process
+`market_data/tick_capture.py` (307 lines) runs as an independent oneshot process
 alongside the trading strategies. A WebSocket exception in the tick
 recorder cannot disrupt the trading loop (docstring line 17–20) —
 they're separate processes.
@@ -33,7 +33,7 @@ snapshots.
 
 Default capture: NIFTY only. With `--underlyings NIFTY,BANKNIFTY`
 (which the systemd unit passes), BANKNIFTY is added (~24 extra tokens;
-4.3× finer hedge granularity for the gamma scalper). `backtest.py`
+4.3× finer hedge granularity for the gamma scalper). `research/backtest.py`
 function `load_captured_tape(date, underlying=...)` filters by
 underlying so mixed-underlying JSONL files replay cleanly per leg.
 
@@ -49,12 +49,12 @@ RandomizedDelaySec=30
 
 09:08 IST is 2 minutes before `taleb-hedger.timer` (09:10) and 3
 minutes before `pair-paper.timer` (09:11). Earliest of the three so the
-WebSocket is up before the strategies start polling. `tick_capture.py`
+WebSocket is up before the strategies start polling. `market_data/tick_capture.py`
 self-gates on 15:30 IST, so a slightly early start is harmless.
 
 `deploy/tick-capture.service` ExecStart:
 ```
-…/python …/tick_capture.py --underlyings NIFTY,BANKNIFTY
+…/python -m market_data.tick_capture --underlyings NIFTY,BANKNIFTY
 ```
 
 **Hardening gotcha (line 30–34 of the service unit):** `ProtectHome=true`
@@ -67,7 +67,7 @@ Documented in `tasks/lessons.md` (2026-05-12 incident).
 ## Instrument resolution
 
 `resolve_instruments_for(kite, log, underlying, nfo_cache)` at
-`tick_capture.py:57` picks for each underlying:
+`market_data/tick_capture.py:57` picks for each underlying:
 
 1. **Index spot** — look up `SPOT_DISPLAY_SYMBOLS[underlying]` in
    `kite.instruments("NSE")`. NIFTY → `NIFTY 50`, BANKNIFTY → `NIFTY BANK`.
@@ -139,7 +139,7 @@ log tick count.
 | One underlying's instruments missing | Raise + abort capture for the day | Manual investigation (NSE F&O cycle changes?) |
 | WebSocket disconnect mid-day | `on_close` logged; KiteTicker auto-reconnects (default) | If reconnect fails repeatedly, tape will be missing ticks for that window — replay should expect gaps |
 | Disk full | `json.dump` raises, write_lock holds; next ticks queue | Manual cleanup; ticks during the full-disk window are LOST |
-| TIMER missed (VPS asleep) | `Persistent=true` catches up on boot; if past 15:30, `tick_capture.py` self-refuses | Skip the day |
+| TIMER missed (VPS asleep) | `Persistent=true` catches up on boot; if past 15:30, `market_data/tick_capture.py` self-refuses | Skip the day |
 
 Tick capture is best-effort. There's no guarantee every tick lands;
 replay code must tolerate gaps.
@@ -148,10 +148,10 @@ replay code must tolerate gaps.
 
 | Consumer | How it uses ticks |
 |---|---|
-| `backtest.py:load_captured_tape(date, underlying)` | Replays JSONL into the backtest harness for trigger-fair-value research |
-| `replay_2026_05_06.py` | Specific incident replay (one-off ops tool) |
+| `research/backtest.py:load_captured_tape(date, underlying)` | Replays JSONL into the backtest harness for trigger-fair-value research |
+| `research/replay_2026_05_06.py` | Specific incident replay (one-off ops tool) |
 | `scripts/replay_missed_bars.py` | Reconstructs 30-min bars from ticks when fetch-bars missed a window |
-| `autoresearch_loop.py` | Uses backtest-replayed ticks for parameter sweeps under realistic intra-bar conditions |
+| `runners/autoresearch_loop.py` | Uses backtest-replayed ticks for parameter sweeps under realistic intra-bar conditions |
 
 The 30-min Kite bars from `fetch-bars.timer` are independent — they're
 EOD post-bell snapshots from Kite's historical API, not derived from
@@ -184,14 +184,14 @@ Failure alerts: nonzero exit triggers `notify-failure@tick-capture.service`
 
 | File | Role |
 |---|---|
-| `tick_capture.py` | The capture script |
-| `kite_auth.py` | TOTP auto-login (shared with strategies) |
+| `market_data/tick_capture.py` | The capture script |
+| `core/kite_auth.py` | TOTP auto-login (shared with strategies) |
 | `data_cache/ticks/ticks-YYYY-MM-DD.jsonl` | Per-day tick tape |
 | `logs/ticks-YYYY-MM-DD.log` | Per-day log |
 | `deploy/tick-capture.service` | systemd service (note `ProtectHome` gotcha) |
 | `deploy/tick-capture.timer` | 09:08 IST Mon–Fri |
 | `deploy/notify-failure@.service` | Failure alert |
-| `backtest.py` | `load_captured_tape` consumer |
-| `replay_2026_05_06.py` | One-off incident replay |
+| `research/backtest.py` | `load_captured_tape` consumer |
+| `research/replay_2026_05_06.py` | One-off incident replay |
 | `scripts/replay_missed_bars.py` | Bars-from-ticks fallback |
 | `tasks/lessons.md` | 2026-05-12 `ProtectHome` incident write-up |

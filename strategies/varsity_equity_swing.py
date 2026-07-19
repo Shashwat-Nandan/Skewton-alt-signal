@@ -40,7 +40,7 @@ from typing import Dict, List, Literal, Optional
 
 import pandas as pd
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 from . import _indicators as ind
 from ._eq_data import load_equity_panel

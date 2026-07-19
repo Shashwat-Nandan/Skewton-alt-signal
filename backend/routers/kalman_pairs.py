@@ -1,6 +1,6 @@
 """Kalman pair-trading monitoring view for the dashboard.
 
-Reads the per-day EOD sidecars that `run_paper_kalman_pairs.py` writes
+Reads the per-day EOD sidecars that `runners/run_paper_kalman_pairs.py` writes
 (``data_cache/pair_paper_kalman_eod_<date>.json``) and exposes the LATEST
 session's per-pair detail: which pairs the Kalman runner is monitoring, each
 pair's tracked hedge ratio γ_t and intercept μ_t, its current z-score and entry

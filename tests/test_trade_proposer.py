@@ -1,4 +1,4 @@
-"""Tests for trade_proposer.py — sign convention and proposal generation."""
+"""Tests for core/trade_proposer.py — sign convention and proposal generation."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock
-from trade_proposer import TradeProposer
+from core.trade_proposer import TradeProposer
 
 
 @pytest.fixture
@@ -54,7 +54,7 @@ class TestSignConvention:
             return {"last_price": 200, "depth": {"buy": [{"price": 199}], "sell": [{"price": 201}]}}
         proposer._get_quote = mock_quote
 
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         engine = GreeksEngine()
 
         proposals = proposer.propose_delta_neutral(
@@ -78,7 +78,7 @@ class TestSignConvention:
             return {"last_price": 200, "depth": {"buy": [{"price": 199}], "sell": [{"price": 201}]}}
         proposer._get_quote = mock_quote
 
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         engine = GreeksEngine()
 
         proposals = proposer.propose_delta_neutral(
@@ -102,7 +102,7 @@ class TestStraddleOnly:
             return {"last_price": 200, "depth": {"buy": [{"price": 199}], "sell": [{"price": 201}]}}
         proposer._get_quote = mock_quote
 
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         engine = GreeksEngine()
         proposals = proposer.propose_delta_neutral(
             chain=sample_chain, spot=22000, capital=500000,
@@ -158,7 +158,7 @@ class TestCalendarShortFront:
                     "depth": {"buy": [{"price": 349}], "sell": [{"price": 351}]}}
         proposer._get_quote = mock_quote
 
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         engine = GreeksEngine()
         proposals = proposer.propose_calendar_short_front(
             chain=two_expiry_chain, spot=22000, capital=500000,
@@ -192,7 +192,7 @@ class TestCalendarShortFront:
         proposer.config = MagicMock()
         proposer._get_quote = lambda sym: {"last_price": 200,
             "depth": {"buy": [{"price": 199}], "sell": [{"price": 201}]}}
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         proposals = proposer.propose_calendar_short_front(
             chain=sample_chain, spot=22000, capital=500000,
             position_size_pct=15, greeks_engine=GreeksEngine(),
@@ -231,7 +231,7 @@ class TestBackspreadSizing:
         Max loss per unit = (1100 − 200) × 25 = ₹22,500. With
         risk_capital = 500k × 12% = ₹60k, max_lots ≈ 2. Old code
         clamped per_unit_cost to 25 INR and produced ~2,400 lots."""
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         proposer = self._build_proposer(mock_kite, atm_price=300, otm_price=50)
         proposals = proposer.propose_backspread(
             chain=sample_chain, spot=22000, capital=500000,
@@ -255,7 +255,7 @@ class TestBackspreadSizing:
         notional, not premium × notional. With ATM ₹300 strike 22000
         lot 25 qty 2: premium-only would be 300×25×2 = ₹15,000;
         SPAN approx is 0.15×22000×25×2 = ₹165,000."""
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         proposer = self._build_proposer(mock_kite, atm_price=300, otm_price=50)
         proposals = proposer.propose_backspread(
             chain=sample_chain, spot=22000, capital=500000,
@@ -279,7 +279,7 @@ class TestBackspreadSizing:
     def test_long_leg_margin_unchanged_uses_premium(self, mock_kite, sample_chain):
         """BUY legs still post premium × notional as 'margin' — that's
         the cash outlay, which is the correct meaning for longs."""
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         proposer = self._build_proposer(mock_kite, atm_price=300, otm_price=50)
         proposals = proposer.propose_backspread(
             chain=sample_chain, spot=22000, capital=500000,
@@ -293,7 +293,7 @@ class TestBackspreadSizing:
         """ATM short ₹50, OTM long ₹40 → net debit 30 (2·40 − 50).
         Max loss per unit = (1100 − (−30)) × 25 = ₹28,250. Still
         bounded by strike width even in the unusual debit case."""
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         proposer = self._build_proposer(mock_kite, atm_price=50, otm_price=40)
         proposals = proposer.propose_backspread(
             chain=sample_chain, spot=22000, capital=500000,

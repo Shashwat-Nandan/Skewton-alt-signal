@@ -85,7 +85,7 @@ export function MpTrendPage() {
     return (
       <div className="rounded-md border border-border bg-card p-6 text-sm text-muted-foreground">
         Could not load the Market-Profile trend book. The paper runner may not
-        have produced any rows yet (<code>run_paper_mp.py</code>).
+        have produced any rows yet (<code>runners/run_paper_mp.py</code>).
       </div>
     );
   }
@@ -119,7 +119,7 @@ export function MpTrendPage() {
         <div className="flex items-start gap-2 rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
           <Info className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
-            No paper runs yet. Once <code>run_paper_mp.py</code> processes a
+            No paper runs yet. Once <code>runners/run_paper_mp.py</code> processes a
             trading day it writes to <code>mp_trend_runs</code> /{" "}
             <code>mp_trend_positions</code>, which this page reads.
           </span>

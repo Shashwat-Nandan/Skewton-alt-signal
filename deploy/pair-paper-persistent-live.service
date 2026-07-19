@@ -81,7 +81,7 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # host moves to Redis >= 6.0. Like --publish-signals, this is fail-open: an
 # unreachable Redis (startup or mid-session) never blocks trading — the file
 # bus is the system of record and Redis reconciles from it when reachable.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py \
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_pairs \
     --top 12 --max-leg-notional 1000000 \
     --candidates data_cache/pair_candidates_persistent.csv \
     --system persistent \

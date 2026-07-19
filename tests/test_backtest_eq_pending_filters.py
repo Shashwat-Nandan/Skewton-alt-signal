@@ -18,7 +18,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from backtest_varsity_equity import EquityBacktester
+from research.backtest_varsity_equity import EquityBacktester
 from strategies.varsity_equity_swing import (
     PENDING_GAP_ATR_THRESHOLD,
     PENDING_MAX_AGE_DAYS,
@@ -54,7 +54,7 @@ def test_constants_match_live_runner():
     """Rule 7: the two filter constants must be defined in exactly one
     place and read by both run_equity_swing and backtest. The strategy
     module is the single source of truth."""
-    from run_equity_swing import (
+    from runners.run_equity_swing import (
         _PENDING_GAP_ATR_THRESHOLD,
         _PENDING_MAX_AGE_DAYS,
     )

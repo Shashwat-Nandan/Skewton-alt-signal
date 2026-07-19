@@ -213,7 +213,7 @@ export function PairCandidatesPage({ variant = "baseline" }: { variant?: PairVar
           ) : rows.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               {data?.candidates?.length === 0
-                ? "No candidates yet — has screen_pairs.py run?"
+                ? "No candidates yet — has core/screen_pairs.py run?"
                 : "No candidates match the current filter."}
             </p>
           ) : (

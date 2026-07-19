@@ -1,5 +1,5 @@
 """
-Audit 2026-06-10 task 2.6 / deferred 2.1: run_paper.py gained a silent-
+Audit 2026-06-10 task 2.6 / deferred 2.1: runners/run_paper.py gained a silent-
 dead-trader heartbeat. Its input is tick()'s new bool return, so pin that
 contract — a tick is "ok" only when neither scan nor rehedge swallowed an
 exception. If tick() always returned True (the old behavior), a token-
@@ -9,7 +9,7 @@ import json
 import logging
 from unittest.mock import MagicMock
 
-import run_paper
+from runners import run_paper
 
 log = logging.getLogger("test")
 
@@ -81,7 +81,7 @@ def test_runner_and_dashboard_share_one_suffix_rule():
     bug #87 fixed. Both go through runner_common.taleb_state_suffix; pin that
     the reader reconstructs exactly what the writer produces."""
     from backend.routers import positions
-    from runner_common import taleb_state_suffix
+    from core.runner_common import taleb_state_suffix
 
     assert taleb_state_suffix("NIFTY") == ""            # legacy unsuffixed
     assert taleb_state_suffix("BANKNIFTY") == "_BANKNIFTY"

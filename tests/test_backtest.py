@@ -4,8 +4,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-import backtest
-from backtest import (
+from research import backtest
+from research.backtest import (
     generate_synthetic_data, MockKite, run_backtest,
     load_captured_tape, list_captured_sessions,
 )
@@ -194,7 +194,7 @@ class TestCapturedTapeReplay:
         a host-local check would discard the just-COMPLETED session."""
         from datetime import timedelta
 
-        from backtest import ist_today
+        from research.backtest import ist_today
         ticks = tmp_path / "data_cache" / "ticks"
         ticks.mkdir(parents=True)
         today = ist_today().isoformat()

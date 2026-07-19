@@ -6,7 +6,7 @@ Data is read from one of two sources, in priority order:
 1. **Per-symbol cache tables** under ``data_cache/equity_ohlcv/<SYMBOL>.parquet``
    (legacy ``.csv`` still honored; canonical schema:
    ``date,open,high,low,close,volume``). This is what
-   ``fetch_bhavcopy_eq.py`` writes once the operator runs it on a host where
+   ``market_data/fetch_bhavcopy_eq.py`` writes once the operator runs it on a host where
    NSE archives are reachable.
 
 2. **Front-month STF proxy** from ``data_cache/bhavcopy_raw/`` — the F&O
@@ -32,7 +32,7 @@ from typing import Iterable, List, Optional
 
 import pandas as pd
 
-from data_cache_io import find_tables, read_table
+from core.data_cache_io import find_tables, read_table
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,8 @@ def _load_stf_proxy(
     if not files:
         raise RuntimeError(
             f"No F&O bhavcopy files in {raw_dir} and no per-symbol equity cache "
-            f"under {EQ_CACHE_DIR}. Run fetch_bhavcopy.py (F&O) or "
-            f"fetch_bhavcopy_eq.py (EQ) first."
+            f"under {EQ_CACHE_DIR}. Run market_data/fetch_bhavcopy.py (F&O) or "
+            f"market_data/fetch_bhavcopy_eq.py (EQ) first."
         )
 
     universe_set = set(universe)
@@ -130,7 +130,7 @@ def _load_stf_proxy(
     # case: rather than try to detect-and-adjust we drop the symbol from
     # the universe for the whole panel, which keeps indicators clean and
     # backtest exits realistic. Operators on the VPS can run
-    # ``fetch_bhavcopy_eq.py`` to populate split-adjusted EQ caches and
+    # ``market_data/fetch_bhavcopy_eq.py`` to populate split-adjusted EQ caches and
     # bypass this filter (source="cache" path doesn't go through here).
     out["_pct_chg"] = out.groupby("symbol")["close"].pct_change().abs()
     bad_syms = sorted(out.loc[out["_pct_chg"] > 0.30, "symbol"].unique().tolist())

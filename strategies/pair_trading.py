@@ -1,7 +1,7 @@
 """
 Pair Trading Strategy — Long-Short on Cointegrated Stock Futures
 ================================================================
-Trades a cointegrated NIFTY 50 stock-futures pair (chosen by screen_pairs.py).
+Trades a cointegrated NIFTY 50 stock-futures pair (chosen by core/screen_pairs.py).
 
 Logic:
   - Spread = price_a - hedge_ratio * price_b (hedge_ratio from screener)
@@ -36,7 +36,7 @@ from typing import Callable, Dict, List, Literal, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
 
@@ -75,7 +75,7 @@ HEDGE_RATIO_MAX = 10.0
 # serves __new__-built test/backtest instances that skip __init__.
 DEFAULT_MARGIN_HEADROOM = 1.05
 
-HOLIDAYS_PATH = Path(__file__).resolve().parent.parent / "holidays.csv"
+HOLIDAYS_PATH = Path(__file__).resolve().parent.parent / "market_data" / "holidays.csv"
 
 
 def _load_holidays(path: Path = HOLIDAYS_PATH) -> set:
@@ -593,7 +593,7 @@ class PairTradingStrategy(BaseStrategy):
         # stands even when the master's own orders are failing. Publish
         # failures are logged CRITICAL but never block the trading loop:
         # managing the live book beats telling subscribers about it.
-        # getattr: backtest_pairs.py and the test fixtures build instances
+        # getattr: research/backtest_pairs.py and the test fixtures build instances
         # via __new__ (no __init__), so the attribute may not exist there.
         published_entry = None
         if getattr(self, "_signal_publisher", None) is not None and proposals:
@@ -1893,7 +1893,7 @@ class PairTradingStrategy(BaseStrategy):
             panel = self._spread_panel
         else:
             try:
-                from screen_pairs import load_front_month_panel
+                from core.screen_pairs import load_front_month_panel
                 panel = load_front_month_panel(
                     [self.symbol_a, self.symbol_b],
                     min_coverage=0.5,
@@ -1923,7 +1923,7 @@ class PairTradingStrategy(BaseStrategy):
         if not PAIR_CANDIDATES_PATH.exists():
             raise FileNotFoundError(
                 f"{PAIR_CANDIDATES_PATH} not found — "
-                "run `python screen_pairs.py` to generate pair candidates first."
+                "run `python -m core.screen_pairs` to generate pair candidates first."
             )
         df = pd.read_csv(PAIR_CANDIDATES_PATH).sort_values("rank_score")
         if df.empty:
@@ -1937,7 +1937,7 @@ class PairTradingStrategy(BaseStrategy):
             raise RuntimeError(
                 f"{PAIR_CANDIDATES_PATH} has {len(df)} candidates but none with "
                 f"|β| in [{HEDGE_RATIO_MIN}, {HEDGE_RATIO_MAX}] — re-run "
-                "`python screen_pairs.py` or set pair_trading.symbol_a/b in config."
+                "`python -m core.screen_pairs` or set pair_trading.symbol_a/b in config."
             )
         row = tradeable.iloc[0]
         return str(row["symbol_a"]), str(row["symbol_b"]), float(row["hedge_ratio"])

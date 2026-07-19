@@ -34,7 +34,7 @@ Three files, three roles:
 - **program.md** (human-editable): Instructions for the agent
 
 In our trading system:
-- **prepare.py** → `kite_auth.py` + `greeks_engine.py` (fixed infrastructure)
+- **prepare.py** → `core/kite_auth.py` + `core/greeks_engine.py` (fixed infrastructure)
 - **train.py** → `tunable_params` dict in `dynamic_hedger.py` (optimized by loop)
 - **program.md** → `config.ini` strategy section (human sets constraints)
 
@@ -217,10 +217,10 @@ experiment_id  timestamp  param_mutated  old_value  new_value  sharpe_ratio  acc
 
 ```bash
 # Print summary
-python scripts/autoresearch_loop.py analyze
+python -m runners.autoresearch_loop analyze
 
 # Generate progress plot (like Karpathy's progress.png)
-python scripts/autoresearch_loop.py plot
+python -m runners.autoresearch_loop plot
 ```
 
 ### What to Look For

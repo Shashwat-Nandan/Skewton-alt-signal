@@ -33,7 +33,7 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # rather than the -₹50k floor after a handful of ₹10k stop-outs — same
 # evidence, ~1/3 the paper bleed. The cumulative floor was already ₹39.3k
 # consumed at ₹1M sizing when this was cut.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_buy_on_gap.py --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend-filter --total-capital 300000
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_buy_on_gap --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend-filter --total-capital 300000
 # -------------------------------
 
 # A clean 15:25 IST teardown returns 0 and does NOT trigger restart, so the

@@ -5,7 +5,7 @@ or the wrong types, so these tests pin the contract itself."""
 import pandas as pd
 import pytest
 
-from data_cache_io import (
+from core.data_cache_io import (
     find_tables,
     parquet_sibling,
     read_table,

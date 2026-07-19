@@ -6,12 +6,12 @@ A single repository running **two parallel systems** against the same Zerodha
 Kite Connect account:
 
 1. **Headless paper/live-trading + autoresearch daemons.** Run on a VPS under
-   `systemd`. Authenticate via TOTP (`kite_auth.py`) and run one strategy per
+   `systemd`. Authenticate via TOTP (`core/kite_auth.py`) and run one strategy per
    timer-driven runner through the trading session: Taleb-Karpathy
-   (`run_paper.py`), pair trading (`run_paper_pairs.py` — a baseline and a
+   (`runners/run_paper.py`), pair trading (`runners/run_paper_pairs.py` — a baseline and a
    persistent system, the latter with a real-money `pair-paper-persistent-live`
-   variant), calendar-spread arbitrage (`run_paper_arbitrage.py`), and Varsity
-   equity swing (`run_equity_swing.py`). The autoresearch loop sweeps
+   variant), calendar-spread arbitrage (`runners/run_paper_arbitrage.py`), and Varsity
+   equity swing (`runners/run_equity_swing.py`). The autoresearch loop sweeps
    Taleb-Karpathy parameters once a week against recent captured NIFTY tape.
    Going live is documented in `deploy/VPS_DEPLOYMENT.md` §7 (least-privilege
    user migration in §6.5).
@@ -100,7 +100,7 @@ HEADLESS DAEMON (separate from the dashboard)
 ┌─────────────────────────────┐    ┌────────────────────────────────────────┐
 │  systemd timers             │    │  systemd services (oneshot)            │
 │   ─ taleb-hedger.timer      │───▶│   ─ taleb-hedger.service               │
-│      Mon–Fri 09:10 IST      │    │      → run_paper.py (TOTP login,       │
+│      Mon–Fri 09:10 IST      │    │      → runners/run_paper.py (TOTP login,       │
 │                             │    │        ticks 09:15–15:25, flatten)     │
 │   ─ taleb-autoresearch.timer│───▶│   ─ taleb-autoresearch.service         │
 │      Sat 10:00 IST          │    │      → deploy/run_weekly_autoresearch  │
@@ -120,10 +120,10 @@ cache and (eventually) `data_cache/`.
 
 | File | Role |
 |---|---|
-| `kite_auth.py` | Screen-scrapes the Kite login (`POST /api/login` → `POST /api/twofa` with TOTP from `pyotp`) and exchanges `request_token` → `access_token` via the SDK. Caches to `.kite_session.json`. |
-| `run_paper.py` | One trading session. Boots `TalebKarpathyStrategy(mode="paper")`, ticks every 60 s from 09:15 to 15:25 IST, flattens, writes the EOD report, exits. Per-day log file under `logs/`. |
-| `run.py` | Long-running version that wires the autoresearch loop in addition to the hedger. Used by the live trading runner (`run_live.py` is a copy with the paper-mode guard removed; see `deploy/VPS_DEPLOYMENT.md` §7). |
-| `run_autoresearch.py` + `autoresearch_loop.py` | Karpathy-style Gaussian random-walk over `tunable_params`. Holds out the last 5-day window for validation. Writes `best_params.json` (top-3) and `results.tsv` (every experiment). |
+| `core/kite_auth.py` | Screen-scrapes the Kite login (`POST /api/login` → `POST /api/twofa` with TOTP from `pyotp`) and exchanges `request_token` → `access_token` via the SDK. Caches to `.kite_session.json`. |
+| `runners/run_paper.py` | One trading session. Boots `TalebKarpathyStrategy(mode="paper")`, ticks every 60 s from 09:15 to 15:25 IST, flattens, writes the EOD report, exits. Per-day log file under `logs/`. |
+| `runners/run.py` | Long-running version that wires the autoresearch loop in addition to the hedger. Used by the live trading runner (`run_live.py` is a copy with the paper-mode guard removed; see `deploy/VPS_DEPLOYMENT.md` §7). |
+| `runners/run_autoresearch.py` + `runners/autoresearch_loop.py` | Karpathy-style Gaussian random-walk over `tunable_params`. Holds out the last 5-day window for validation. Writes `best_params.json` (top-3) and `results.tsv` (every experiment). |
 
 **Auth lifetime.** Kite tokens expire ~06:00 IST next day. Both flows
 re-authenticate on the next invocation if `_is_token_valid()` fails.
@@ -181,7 +181,7 @@ class BaseStrategy(ABC):
     def _emit_signal(self, proposal: TradeProposal) -> Dict: ...
 ```
 
-`TradeProposal` (from `trade_proposer.py`) is the universal currency:
+`TradeProposal` (from `core/trade_proposer.py`) is the universal currency:
 `tradingsymbol`, `transaction_type` (BUY/SELL), `quantity` (lots),
 `lot_size`, `price`, `option_type` (CE/PE/FUT), `strike`, `expiry`,
 `rationale`, etc. Both strategies emit them; both modes consume them.
@@ -216,7 +216,7 @@ That's it. The dashboard discovers it automatically; no other wiring.
 
 The dashboard's `POST /api/runs` rejects `live`; the daemon path uses `paper`.
 `live` is only reachable today by the (deliberately separate) `run_live.py`
-the operator copies from `run_paper.py` after deleting the paper guard. See
+the operator copies from `runners/run_paper.py` after deleting the paper guard. See
 `deploy/VPS_DEPLOYMENT.md` §7.
 
 ### 4.4 Strategy details
@@ -229,7 +229,7 @@ the operator copies from `run_paper.py` after deleting the paper guard. See
 - Persists ATM IV samples to `data_cache/iv_history_<UNDERLYING>.json` so the IV percentile gate has a real distribution across sessions.
 
 **Pair Trading** (`strategies/pair_trading.py`, ~400 lines)
-- Pair from `config.ini → [pair_trading]`, or auto-picks top row of `data_cache/pair_candidates.csv` (output of `screen_pairs.py`).
+- Pair from `config.ini → [pair_trading]`, or auto-picks top row of `data_cache/pair_candidates.csv` (output of `core/screen_pairs.py`).
 - Spread = `price_a − hedge_ratio × price_b`. Z-score against rolling window seeded from cached bhav copy.
 - Entry on `|z| ≥ entry_z`; exit on `|z| ≤ exit_z` (mean revert), `|z| ≥ stop_z` (stop), or `max_holding_days`.
 - Hedge sizing matches notional via `|β| × (price_a/price_b) × (lot_a/lot_b)`. Negative-β pairs handled.
@@ -237,7 +237,7 @@ the operator copies from `run_paper.py` after deleting the paper guard. See
 **Varsity Equity Swing** (`strategies/varsity_equity_swing.py`, ~800 lines)
 - Universe: F&O-listed equities (Nifty 200 v1 — `data_cache/nifty200.csv`).
 - **Not** driven by the dashboard's tick loop. Run via the cron path
-  `run_equity_swing.py --scan {open|close} --mode {signals|paper}`, persisted
+  `python -m runners.run_equity_swing --scan {open|close} --mode {signals|paper}`, persisted
   to `equity_positions` + `equity_scans` tables; dashboard is read-only.
 - Entry gates: SMA50 > SMA200 trend + Wilder ADX ≥ threshold, then one of
   three triggers — Donchian breakout, EMA20 pullback in uptrend, or momentum
@@ -249,7 +249,7 @@ the operator copies from `run_paper.py` after deleting the paper guard. See
   classifier reading `data_cache/bhavcopy_raw/` (sum across all expiries to
   dodge calendar-roll artifacts), FII/DII rolling 5-day net flow read from
   `data_cache/fii_dii/`.
-- Backtest engine: `backtest_varsity_equity.py` (no look-ahead — entries fill at
+- Backtest engine: `research/backtest_varsity_equity.py` (no look-ahead — entries fill at
   next-bar open, exits gated on `low ≤ price ≤ high`). 0.20% round-trip
   costs. Per-trade ledger written to `data_cache/equity_swing_trades.tsv`.
 
@@ -413,7 +413,7 @@ Two flows, one cache file.
        writes/reads  │           │           │  writes/reads
                      │           │           │
         ┌────────────┴───┐       │       ┌───┴────────────────┐
-        │ kite_auth.py   │       │       │ backend/kite_oauth │
+        │ core/kite_auth.py   │       │       │ backend/kite_oauth │
         │  TOTP scrape   │       │       │  OAuth redirect    │
         │  (headless)    │       │       │  (browser)         │
         └────────────────┘       │       └────────────────────┘
@@ -427,7 +427,7 @@ Two flows, one cache file.
 
 | | TOTP path | OAuth path |
 |---|---|---|
-| Used by | `run_paper.py`, `run.py`, `run_autoresearch.py` | Dashboard `POST /api/runs` |
+| Used by | `runners/run_paper.py`, `runners/run.py`, `runners/run_autoresearch.py` | Dashboard `POST /api/runs` |
 | Trigger | Process startup | User clicks "Login with Kite" |
 | Inputs | `KITE_USER_ID`, `KITE_PASSWORD`, `KITE_TOTP_KEY` from `.env` | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` from `.env` |
 | Mechanism | POST to `/api/login` + `/api/twofa` with auto-generated TOTP | Browser-side redirect to `kite.zerodha.com/connect/login`, callback exchanges request_token |
@@ -447,7 +447,7 @@ the next paper-trade run picks up that token — no second auth needed
 | Source | Endpoint / file | Used by |
 |---|---|---|
 | Kite Connect REST | `kite.quote()`, `kite.instruments()`, `kite.historical_data()`, `kite.place_order()` | All live-data paths |
-| NSE F&O bhav copy (UDiFF) | `archives.nseindia.com/...BhavCopy_NSE_FO_*.csv.zip` | `fetch_bhavcopy.py`, `screen_pairs.py` |
+| NSE F&O bhav copy (UDiFF) | `archives.nseindia.com/...BhavCopy_NSE_FO_*.csv.zip` | `market_data/fetch_bhavcopy.py`, `core/screen_pairs.py` |
 | Local cached CSVs | `data_cache/NIFTY_*.csv` (intraday option chain), `data_cache/bhavcopy_raw/*.csv` (EOD) | Backtests, screener, autoresearch |
 
 ### 8.2 `data_cache/` layout
@@ -459,9 +459,9 @@ data_cache/
 │   └── ...
 ├── instruments_NIFTY_<YYYYMMDD>.csv       # Snapshot of Kite instrument master
 ├── iv_history_NIFTY.json                  # Persistent ATM IV samples (Taleb gate)
-├── pair_candidates.csv                    # Output of screen_pairs.py
-├── NIFTY_<from>_<to>.csv                  # Intraday option chain (fetch_historical_data.py)
-├── NIFTY_<from>_<to>_eod_nearest.csv      # EOD nearest-expiry option chain (fetch_bhavcopy.py)
+├── pair_candidates.csv                    # Output of core/screen_pairs.py
+├── NIFTY_<from>_<to>.csv                  # Intraday option chain (market_data/fetch_historical_data.py)
+├── NIFTY_<from>_<to>_eod_nearest.csv      # EOD nearest-expiry option chain (market_data/fetch_bhavcopy.py)
 └── dashboard.db                           # SQLite store for the dashboard
 ```
 
@@ -495,7 +495,7 @@ data_cache/pair_candidates.csv (top N)
 ```
 
 `PairTradingStrategy.__init__` reads the top row when no explicit pair is
-configured. Re-run the screener (`python screen_pairs.py`) periodically as
+configured. Re-run the screener (`python -m core.screen_pairs`) periodically as
 markets drift.
 
 ---
@@ -741,7 +741,7 @@ Two independent stacks under `systemd`:
                        └──▶ 127.0.0.1:8000 (FastAPI) ── shared ──▶ Kite Connect
                                                                      ▲
                                                                      │
-                          taleb-hedger ─ run_paper.py ────────────────┘
+                          taleb-hedger ─ runners/run_paper.py ────────────────┘
                                           (independent process,
                                            authenticates via TOTP)
 ```
@@ -767,7 +767,7 @@ internet. HTTPS is managed by certbot's nginx plugin.
 ```
 .
 ├── ARCHITECTURE.md                # this document
-├── README                         # (no top-level README; entry point is run.py)
+├── README                         # (no top-level README; entry point is runners/run.py)
 ├── config.ini                     # gitignored — strategy/risk/credentials
 ├── config_template.ini            # public starter
 ├── .env                           # gitignored — OAuth + TOTP creds + dashboard knobs
@@ -840,16 +840,16 @@ internet. HTTPS is managed by certbot's nginx plugin.
 │   ├── signals-YYYY-MM-DD.jsonl
 │   └── hedger.log
 │
-├── greeks_engine.py               # Black-Scholes + IV bisection
-├── trade_proposer.py              # TradeProposal dataclass + ATM straddle proposer
-├── risk_analyzer.py               # MC, bleed, stability
-├── kite_auth.py                   # TOTP login (headless daemon path)
-├── run.py / run_paper.py / run_autoresearch.py  # entry points
-├── backtest.py                    # MockKite + replay
-├── fetch_historical_data.py       # Kite intraday fetcher
-├── fetch_bhavcopy.py              # NSE F&O EOD fetcher
-├── screen_pairs.py                # cointegration screener
-├── analyze_rv_iv_regime.py        # RV/IV regime tool
+├── core/greeks_engine.py               # Black-Scholes + IV bisection
+├── core/trade_proposer.py              # TradeProposal dataclass + ATM straddle proposer
+├── core/risk_analyzer.py               # MC, bleed, stability
+├── core/kite_auth.py                   # TOTP login (headless daemon path)
+├── runners/run.py / runners/run_paper.py / runners/run_autoresearch.py  # entry points
+├── research/backtest.py                    # MockKite + replay
+├── market_data/fetch_historical_data.py       # Kite intraday fetcher
+├── market_data/fetch_bhavcopy.py              # NSE F&O EOD fetcher
+├── core/screen_pairs.py                # cointegration screener
+├── research/analyze_rv_iv_regime.py        # RV/IV regime tool
 ├── sweep_*.py                     # one-off parameter sweeps
-└── variance_pnl_gate.py           # variance-based gate validator
+└── core/variance_pnl_gate.py           # variance-based gate validator
 ```

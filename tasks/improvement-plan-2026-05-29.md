@@ -68,10 +68,10 @@ is not what runs.
 experiments on synthetic GBM; the netpnl variant's best `gamma_theta_ratio` is
 0.55 (<1.0 ⇒ theta out-earned scalps — the edge is *negative* on the tuned set).
 GBM lacks the fat-tails/skew/vol-regime the strategy needs (the code admits this,
-`autoresearch_loop.py:355`). The captured tape was single-expiry, so the entire
+`runners/autoresearch_loop.py:355`). The captured tape was single-expiry, so the entire
 Phase-3 calendar/regime surface that best_params *enables* has never been measured.
 - **Impact: High (this is the root profitability question). Effort: M.**
-- First step: accumulate ≥2 weeks of the now-multi-expiry tape (tick_capture.py
+- First step: accumulate ≥2 weeks of the now-multi-expiry tape (market_data/tick_capture.py
   already patched), re-run autoresearch on the captured-tape path, and refuse to
   promote unless a candidate clears `gamma_theta_ratio > 1.0` OOS (the bar already
   written in todo.md:60). Until then, treat live Taleb as paying for data, not edge.
@@ -87,7 +87,7 @@ Residual risk after the T-0 fix is still C2 + C3.
 ## HIGH — robustness / correctness
 
 ### H1 ⭐ — pair single-window screen has no multiple-testing correction
-`screen_pairs.py:257` applies raw p<0.05 across ~1225 NIFTY-50 pairs → tens of
+`core/screen_pairs.py:257` applies raw p<0.05 across ~1225 NIFTY-50 pairs → tens of
 false positives by chance; the composite `rank_score` then sorts in-sample luck to
 the top. The **persistence screen** (`:328`, ≥M-of-N rolling windows) is the real,
 OOS-validated edge (22/23 profitable pair-windows vs −₹450k single-window per
@@ -202,7 +202,7 @@ stopped for one strategy.
 - Subagents did not read `.env`/session/config secrets. Whether `ALLOW_LIVE_MODE`
   is set, and which exact taleb unit is live on the VPS, is assumed from the
   documented cutover path — verify on the box.
-- `greeks_engine.py` / `risk_analyzer.py` / `regime_classifier.py` bodies were read
+- `core/greeks_engine.py` / `core/risk_analyzer.py` / `core/regime_classifier.py` bodies were read
   only at call sites; correctness of the MC sizing / regime thresholds is unverified.
 - The infra dimension's first agent run failed (session limit); these infra
   findings (M3/M4/M6) were gathered directly and are lighter than the other three

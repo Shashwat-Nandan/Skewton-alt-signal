@@ -15,7 +15,7 @@ only ingests historical candles.**
 1. **Do NOT force a fresh Kite login while a live runner is active.** Zerodha
    invalidates the prior access token on a new login, which has broken the live
    pair runner before (`feedback_no_auth_while_live_runner_active`). Mitigation:
-   `fetch_bars.py` uses `KiteAuthManager`, which **reuses** the cached
+   `market_data/fetch_bars.py` uses `KiteAuthManager`, which **reuses** the cached
    `.kite_session.json` when it is still valid — reuse does **not** invalidate
    anything. A fresh login only happens if that cache is stale/missing.
    - **Safest window:** run **after 15:30 IST** (or on a weekend/holiday) when no
@@ -87,7 +87,7 @@ print(','.join(r['symbol'] for r in b.list_universe()))")
 echo "backfilling: $SYMS"
 
 # Pull ~200 days (Kite caps 30-min history; it returns what it can, idempotently)
-.venv/bin/python fetch_bars.py --backfill --days 200 --symbols "$SYMS" --config config.ini
+.venv/bin/python -m market_data.fetch_bars --backfill --days 200 --symbols "$SYMS" --config config.ini
 ```
 
 Notes:
@@ -98,7 +98,7 @@ Notes:
 - To also add the book-faithful index path, append the indices (deeper history
   helps here too):
   ```bash
-  .venv/bin/python fetch_bars.py --backfill --days 200 --symbols "NIFTY 50,NIFTY BANK" --config config.ini
+  .venv/bin/python -m market_data.fetch_bars --backfill --days 200 --symbols "NIFTY 50,NIFTY BANK" --config config.ini
   ```
   (Confirm the exact index tradingsymbols your instrument master uses; adjust if
   the resolver reports them missing.)
@@ -117,9 +117,9 @@ print("new days :", c.execute("select count(distinct substr(ts,1,10)) from bars"
 PY
 
 # 2) re-log features (idempotent), then re-report + re-stress-test
-.venv/bin/python log_mp_features.py --source intraday
-.venv/bin/python mp_edge_report.py --min-count 50 --cost-bps 25   # ~overnight delivery cost
-.venv/bin/python mp_trend_robustness.py
+.venv/bin/python -m scripts.log_mp_features --source intraday
+.venv/bin/python -m research.mp_edge_report --min-count 50 --cost-bps 25   # ~overnight delivery cost
+.venv/bin/python -m research.mp_trend_robustness
 
 # 3) the decisive cut — split the edge by month and eyeball a DOWN month.
 #    trend_up must stay positive (net of ~25 bps) through a drawdown to graduate.
@@ -173,4 +173,4 @@ delete just that token's rows and re-fetch:
 import sqlite3; c=sqlite3.connect('data_cache/dashboard.db')
 c.execute('delete from bars where instrument_token=? and interval_minutes=30',(TOKEN,)); c.commit()"
 ```
-`mp_features` rows are regenerated idempotently by re-running `log_mp_features.py`.
+`mp_features` rows are regenerated idempotently by re-running `scripts/log_mp_features.py`.

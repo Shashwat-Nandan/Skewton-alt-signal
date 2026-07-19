@@ -84,12 +84,12 @@ they change what gets built:
   *discovery* universe (cointegration screening is unchanged — what changes is
   *tracking*, not *discovery*), but the Kalman system **ignores the static β**
   and re-fits γ itself from the training window. Discovery stays in
-  `screen_pairs.py` (reused, not forked).
+  `core/screen_pairs.py` (reused, not forked).
 
 ## What is reused vs. forked
 
-**Reused (no fork):** `runner_common.py` (locks, holidays, market hours, signal
-handlers, heartbeat), `screen_pairs.py` (cointegration discovery + candidate
+**Reused (no fork):** `core/runner_common.py` (locks, holidays, market hours, signal
+handlers, heartbeat), `core/screen_pairs.py` (cointegration discovery + candidate
 universe), `strategies/base.py` (`_publish_signal`, `proposal_to_leg`, `uuid7`,
 TradeProposal), `kite_auth` / `kite_throttle`, data layer (bhavcopy /
 `fetch_bars` / `tick_capture`), dashboard auth.
@@ -119,7 +119,7 @@ sweep, its verifier, its tests, its systemd units, its dashboard tab.
       lower lag (α-matched); spread uses predicted state (no look-ahead, pinned
       to v/(1+γ_pred)); serialize→deserialize identity; NaN/constant/collinear/
       too-short → fail loud.
-- [x] **Correctness gate:** `validate_kalman_filter.py` (deterministic synthetic
+- [x] **Correctness gate:** `research/validate_kalman_filter.py` (deterministic synthetic
       Eq-15.1 pair; `--csv` for ad-hoc real pairs) reproduces the book's
       ordering and FAILS LOUD otherwise. Result: γ adapts 0.60→0.75, band tight
       [0.59,0.79]; spread variance static 2.31 ≫ basic 0.19 > momentum 0.16
@@ -161,13 +161,13 @@ sweep, its verifier, its tests, its systemd units, its dashboard tab.
 ### Phase 2 — Backtest + validation on our pairs  ✅ DONE (2026-06-24)
 **Verdict: CONDITIONAL GO → forward paper test (Phase 3). Full writeup in
 `tasks/kalman-pairs-findings.md`.**
-- [x] `backtest_kalman_pairs.py` — screen-on-train / test-on-holdout (no
+- [x] `research/backtest_kalman_pairs.py` — screen-on-train / test-on-holdout (no
       look-ahead). static (Kalman α≈0) vs basic vs momentum through the
       *identical* code path. Reports trips, net/gross P&L, win%, spread-var,
       half-life; `--min-edge-multiplier` tunable.
-- [x] `sweep_kalman_pairs.py` — screens once, sweeps α×entry×exit (18 cells)
+- [x] `research/sweep_kalman_pairs.py` — screens once, sweeps α×entry×exit (18 cells)
       on the holdout; small book-anchored grid, OOS by construction.
-- [x] `compare_kalman_vs_paper.py` — **real-data Test A**: replays the live
+- [x] `research/compare_kalman_vs_paper.py` — **real-data Test A**: replays the live
       paper book's actual pairs over the last month, static vs Kalman.
 - [x] Findings → `tasks/kalman-pairs-findings.md`. Headlines:
       • Test A (in-regime, live pairs, last month): **Kalman +₹225k vs static
@@ -181,7 +181,7 @@ sweep, its verifier, its tests, its systemd units, its dashboard tab.
         regime/selection-driven → settle it with a forward paper test.
 
 ### Phase 3 — Paper runner  ✅ DONE (build) 2026-06-24 — needs host smoke-test
-- [x] `run_paper_kalman_pairs.py` — mirrors `run_paper_pairs.py` scaffolding via
+- [x] `runners/run_paper_kalman_pairs.py` — mirrors `runners/run_paper_pairs.py` scaffolding via
       `runner_common` (TOTP auth, holiday/weekend gate, 09:15→15:25 loop, shared
       `HALT_*` kill switches, atomic crash-safe state persist, silent-fail
       heartbeat). Own system: state `kalman_pairs_runner_state.json`, EOD
@@ -201,7 +201,7 @@ sweep, its verifier, its tests, its systemd units, its dashboard tab.
 - [ ] `verify_kalman_pair_paper.py` — deferred to deploy-time; the EOD sidecar
       shares the static system's shape, so the existing verifier is adaptable.
       Lower value until forward data accumulates.
-- **Forward A/B test is now runnable:** `compare_kalman_vs_paper.py` (Phase 2)
+- **Forward A/B test is now runnable:** `research/compare_kalman_vs_paper.py` (Phase 2)
   already compares Kalman vs the live book on accumulating EOD data — re-run it
   weekly; the paper runner adds an independent forward book once smoke-tested.
 
@@ -209,7 +209,7 @@ sweep, its verifier, its tests, its systemd units, its dashboard tab.
 Chosen approach (Rule 2): instead of a dedicated router, the Kalman runner now
 writes the `pair_paper_{system="kalman"}` filenames, so "kalman" is a first-class
 system in the EXISTING `/pair-paper-compare` router + `PaperSystemCompare` tab +
-`compare_paper_systems.py` CLI — zero new backend code. That head-to-head
+`research/compare_paper_systems.py` CLI — zero new backend code. That head-to-head
 (baseline vs persistent vs kalman) IS the forward A/B view.
 - [x] Runner emits EOD `pair_paper_kalman_eod_<date>.json` (the compare tooling's
       `pair_paper_{system}` convention); state is `kalman_pairs_runner_state.json`

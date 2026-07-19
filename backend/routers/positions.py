@@ -168,7 +168,7 @@ def _taleb_state_path(underlying: str) -> Path:
     run_paper.derive_paths). One rule, so the reader can't drift from the
     writer — a mismatch would render a live instance permanently unavailable
     (the bug issue #87 fixed)."""
-    from runner_common import taleb_state_suffix
+    from core.runner_common import taleb_state_suffix
     return DATA_CACHE / f"taleb_paper_state{taleb_state_suffix(underlying)}.json"
 
 

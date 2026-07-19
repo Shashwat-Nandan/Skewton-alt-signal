@@ -1,8 +1,8 @@
 """Head-to-head comparison of paper-trading systems.
 
-Reads the per-day EOD sidecar JSONs that `run_paper_pairs.py` writes
+Reads the per-day EOD sidecar JSONs that `runners/run_paper_pairs.py` writes
 (``data_cache/pair_paper{,_<system>}_eod_<date>.json``) and exposes
-per-day and aggregate P&L by system. The CLI `compare_paper_systems.py`
+per-day and aggregate P&L by system. The CLI `research/compare_paper_systems.py`
 covers the same data — this router is the dashboard surface for the
 parallel-system paper-trading experiment introduced 2026-05-17
 (see tasks/todo.md).

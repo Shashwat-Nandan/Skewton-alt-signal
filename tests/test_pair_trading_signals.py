@@ -21,7 +21,7 @@ from signal_plane.contract import uuid7
 from signal_plane.publisher import SignalPublisher
 from signal_plane import pair_trading_signals as sigmap
 from tests.test_pair_trading import _make_strategy
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 def _prop(tradingsymbol, lot_size, qty, price, side,

@@ -87,7 +87,7 @@
   feature.
 - The fix shipped is to drop any symbol with a > 30 % single-bar `pct_change`
   from the entire panel. Operators on a host with NSE archive access run
-  `fetch_bhavcopy_eq.py` to populate `data_cache/equity_ohlcv/`, which uses
+  `market_data/fetch_bhavcopy_eq.py` to populate `data_cache/equity_ohlcv/`, which uses
   the EQ-segment bhavcopy that IS corp-action adjusted, and the loader's
   cache-priority path bypasses the STF proxy entirely.
 - Same shape as the dividend-asymmetry lesson (`mean-reversion fails
@@ -288,10 +288,10 @@
   discovered:
   (a) `_get_options_chain` returned one expiry — calendar builder
       always returned `[]`.
-  (b) `tick_capture.py` only subscribed to the front weekly — every
+  (b) `market_data/tick_capture.py` only subscribed to the front weekly — every
       captured tape session was single-expiry.
   (c) `deploy/run_weekly_autoresearch.sh` passed `--data $CSV` which
-      bypassed `run_autoresearch.py:198`'s captured-tape replay
+      bypassed `runners/run_autoresearch.py:198`'s captured-tape replay
       path entirely.
 - Rule: memory notes are point-in-time observations. When a memory
   asserts a code path is wired, verify the actual call chain end to

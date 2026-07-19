@@ -1,5 +1,5 @@
 """
-Audit 3.2: tests for _state_backup.py — the only local record of overnight
+Audit 3.2: tests for core/_state_backup.py — the only local record of overnight
 positions. Untested until now. Pins: a backup is written after a state
 write, pruning keeps the newest keep_n, and the orphan-backup guard refuses
 a "start fresh" when backups exist (the broker may still hold those
@@ -9,8 +9,8 @@ import logging
 
 import pytest
 
-import _state_backup
-from _state_backup import (
+from core import _state_backup
+from core._state_backup import (
     _backups_dir,
     archive_state_backup,
     assert_no_orphan_backups,

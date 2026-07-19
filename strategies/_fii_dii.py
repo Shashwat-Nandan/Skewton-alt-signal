@@ -1,7 +1,7 @@
 """
 FII/DII flow overlay for the equity-swing strategy.
 
-Reads the per-day JSON cache produced by ``fetch_fii_dii.py`` (one file
+Reads the per-day JSON cache produced by ``market_data/fetch_fii_dii.py`` (one file
 per ISO date under ``data_cache/fii_dii/``) and exposes a panel of
 per-trading-day net flows in ₹ crore — both FII (foreign) and DII
 (domestic institutions). The strategy uses a rolling 5-day cumulative

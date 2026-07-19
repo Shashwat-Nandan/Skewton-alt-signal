@@ -115,7 +115,7 @@ export function BuyOnGapPage() {
           <span>
             No EOD sidecars found in this window yet. Once
             {" "}
-            <code>run_paper_buy_on_gap.py</code> completes a trading session it
+            <code>runners/run_paper_buy_on_gap.py</code> completes a trading session it
             writes <code>buy_on_gap_paper_eod_&lt;date&gt;.json</code>, which this
             page reads.
           </span>

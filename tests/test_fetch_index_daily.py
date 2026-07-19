@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import fetch_index_daily as f
+from market_data import fetch_index_daily as f
 
 
 class _FakeKite:

@@ -296,7 +296,7 @@ export type BuyOnGapResponse = {
   open_positions: BuyOnGapOpenPosition[];
 };
 
-// Market-Profile trend_up paper book (run_paper_mp.py → dashboard.db).
+// Market-Profile trend_up paper book (runners/run_paper_mp.py → dashboard.db).
 export type MpTrendDailyRun = {
   date: string;
   n_trend_up: number;

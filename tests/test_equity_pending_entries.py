@@ -35,7 +35,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend import db
-from run_equity_swing import (
+from runners.run_equity_swing import (
     _PENDING_GAP_ATR_THRESHOLD,
     _PENDING_MAX_AGE_DAYS,
     _fill_pending_entries,

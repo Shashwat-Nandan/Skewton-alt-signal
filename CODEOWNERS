@@ -16,15 +16,12 @@
 /signal_plane/          @adigunners @Shashwat-Nandan @sarinsaurabh
 /loop_engine/           @adigunners @Shashwat-Nandan @sarinsaurabh
 /backend/               @adigunners @Shashwat-Nandan @sarinsaurabh
-/run_paper*.py          @adigunners @Shashwat-Nandan @sarinsaurabh
-/run_equity_swing.py    @adigunners @Shashwat-Nandan @sarinsaurabh
-/run_autoresearch.py    @adigunners @Shashwat-Nandan @sarinsaurabh
-/runner_common.py       @adigunners @Shashwat-Nandan @sarinsaurabh
-/greeks_engine.py       @adigunners @Shashwat-Nandan @sarinsaurabh
-/risk_analyzer.py       @adigunners @Shashwat-Nandan @sarinsaurabh
-/regime_classifier.py   @adigunners @Shashwat-Nandan @sarinsaurabh
-/kite_auth.py           @adigunners @Shashwat-Nandan @sarinsaurabh
-/kite_throttle.py       @adigunners @Shashwat-Nandan @sarinsaurabh
+# Reorg 2026-07-19: these moved out of the repo root into runners/ and core/.
+# Whole-directory ownership so a new runner or engine is covered on day one
+# (the old per-file list silently left new files on the default rule).
+/runners/               @adigunners @Shashwat-Nandan @sarinsaurabh
+/core/                  @adigunners @Shashwat-Nandan @sarinsaurabh
+/market_data/           @adigunners @Shashwat-Nandan @sarinsaurabh
 
 # --- Governance, CI, deploy, dependencies (change deliberately) ---
 /.github/               @adigunners @Shashwat-Nandan @sarinsaurabh

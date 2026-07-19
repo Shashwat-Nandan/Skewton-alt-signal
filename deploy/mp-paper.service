@@ -4,7 +4,7 @@ Documentation=https://github.com/anthropics/claude-code
 Wants=network-online.target
 After=network-online.target
 # Ordering: needs the day's 30-min bars present. Run AFTER the nightly
-# fetch_bars.py --update (Kite) and after mp-features. If you template those as
+# python -m market_data.fetch_bars --update (Kite) and after mp-features. If you template those as
 # units, add them here (After=/Requires=). Otherwise ensure the timer fires
 # late enough that the bar update has finished.
 OnFailure=notify-failure@%n.service
@@ -24,7 +24,7 @@ Environment=TZ=Asia/Kolkata
 # --min-signals 3 = the broad-momentum filter that made the edge net-positive
 # out-of-sample (docs/market-profile-book-analysis.md §5.1). Kill switch halts
 # new entries on drawdown/cum-loss automatically.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_mp.py --min-signals 3 --capital 1000000 --cost-bps 25
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_mp --min-signals 3 --capital 1000000 --cost-bps 25
 # -------------------------------
 
 StandardOutput=journal

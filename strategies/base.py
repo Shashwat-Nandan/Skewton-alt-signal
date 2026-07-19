@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 logger = logging.getLogger(__name__)
 

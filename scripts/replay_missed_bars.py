@@ -27,7 +27,7 @@ logging.basicConfig(
 log = logging.getLogger("replay")
 
 from backend import db
-from run_equity_swing import _load_open_positions_into_strategy, _persist_proposals
+from runners.run_equity_swing import _load_open_positions_into_strategy, _persist_proposals
 from strategies.varsity_equity_swing import VarsityEquitySwingStrategy
 
 

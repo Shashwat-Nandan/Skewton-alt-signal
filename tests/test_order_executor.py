@@ -22,7 +22,7 @@ from strategies.order_executor import (
     _OrderException,
     _TokenException,
 )
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 class FakeKite:

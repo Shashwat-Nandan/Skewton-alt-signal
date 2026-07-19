@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from market_profile import (
+from core.market_profile import (
     Bar,
     auto_tick_size,
     compute_composite,
@@ -468,7 +468,7 @@ class TestDayShape:
 
 class TestBalanceState:
     def test_all_six_relationships(self):
-        from market_profile import _classify_balance
+        from core.market_profile import _classify_balance
         # prior value area = [100, 110]
         assert _classify_balance(112, 120, 100, 110) == "higher"
         assert _classify_balance(85, 95, 100, 110) == "lower"
@@ -478,7 +478,7 @@ class TestBalanceState:
         assert _classify_balance(95, 105, 100, 110) == "overlapping_lower"
 
     def test_unknown_without_prior(self):
-        from market_profile import _classify_balance
+        from core.market_profile import _classify_balance
         assert _classify_balance(100, 110, None, None) == "unknown"
 
     def test_in_balance_flag(self):

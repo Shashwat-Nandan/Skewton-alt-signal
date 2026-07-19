@@ -6,12 +6,12 @@ Documentation=man:systemd.timer(5)
 # 09:08 IST — offset from taleb-hedger (09:10) and pair-paper (09:11) so all
 # three TOTP-using units don't collide on the same .kite_session.json. Also
 # earlier than both so the WebSocket is up before the strategies start
-# polling and trading. tick_capture.py self-gates on 15:30, so a slightly
+# polling and trading. market_data/tick_capture.py self-gates on 15:30, so a slightly
 # early start is harmless.
 OnCalendar=Mon..Fri *-*-* 09:08:00 Asia/Kolkata
 
 # If the VPS was asleep or systemd missed the window, run once to catch up.
-# tick_capture.py refuses to start after 15:30 — safe to be Persistent.
+# market_data/tick_capture.py refuses to start after 15:30 — safe to be Persistent.
 Persistent=true
 
 # Jitter to avoid thundering-herd Kite logins on multi-account VPSes.

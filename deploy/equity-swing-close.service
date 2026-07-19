@@ -18,7 +18,7 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_equity_swing.py --scan close --mode paper
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_equity_swing --scan close --mode paper
 # -------------------------------
 
 TimeoutStartSec=0

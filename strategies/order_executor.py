@@ -32,7 +32,7 @@ import math
 import time
 from typing import Callable, Dict, List, Optional
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 from .base import OrderValidationError, validate_order
 

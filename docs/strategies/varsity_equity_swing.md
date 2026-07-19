@@ -27,7 +27,7 @@ fill at the NEXT trading day's official open (since 2026-05-25).
 ## Overview
 
 Strategy: `strategies/varsity_equity_swing.py` (~700 lines). Runner:
-`run_equity_swing.py`. Two systemd timers fire per trading day: an
+`runners/run_equity_swing.py`. Two systemd timers fire per trading day: an
 **open scan** at 09:30 IST (exits-only, v1 design) and a **close scan**
 at 18:30 IST (entries + exits + persistence).
 
@@ -39,7 +39,7 @@ notional capital. Exits are SL_HIT, TARGET_HIT, TIME_STOP, or
 TRAIL_STOP (Chandelier).
 
 Mode: paper only. Live mode raises `NotImplementedError` (see
-`run_equity_swing.py:188`). Migration to live is Phase 5, blocked on
+`runners/run_equity_swing.py:188`). Migration to live is Phase 5, blocked on
 the same hardening pair_trading went through (see
 `tasks/live-readiness-deferred.md` EQ-FU-1 .. EQ-FU-6).
 
@@ -50,7 +50,7 @@ the same hardening pair_trading went through (see
 | open | `equity-swing-open.timer` | Mon–Fri 09:30 IST | Exits only; reads live Kite quote for today's intraday view | true |
 | close | `equity-swing-close.timer` | Mon–Fri 18:30 IST | Entries + exits + fills + state persist | true |
 
-Open-scan rationale (line 280 of `run_equity_swing.py`): 09:30 is 15
+Open-scan rationale (line 280 of `runners/run_equity_swing.py`): 09:30 is 15
 minutes after the bell, giving Kite spot quotes time to settle. Open
 scan only does exits because bhavcopy hasn't published yet — entries
 must wait for the close scan's full feature compute.
@@ -74,10 +74,10 @@ series only). Loaded by `strategies/_eq_data.load_equity_panel()` which
 returns a per-symbol panel of (date, open, high, low, close, volume).
 
 Source: `data_cache/equity_ohlcv/` (per-symbol per-date OHLCV CSVs
-populated by `fetch_bhavcopy_eq.py`). Schema: `date, symbol, open,
+populated by `market_data/fetch_bhavcopy_eq.py`). Schema: `date, symbol, open,
 high, low, close, volume`. Sort: `(symbol, date)` ascending.
 
-Staleness guard (`run_equity_swing.py:270`): at close-scan, panel max
+Staleness guard (`runners/run_equity_swing.py:270`): at close-scan, panel max
 date MUST equal today. If less, refuse with error — fetch-bhavcopy-eq
 likely failed. Open-scan tolerates up to 4 calendar days behind (long
 weekend) with a warning at >1 day behind. This is the fail-loud guard
@@ -208,7 +208,7 @@ _PENDING_GAP_ATR_THRESHOLD = 1.5      # |open - signal_close| / atr
 _REQUIRED_SNAPSHOT_KEYS = ("atr", "entry", "sl", "target")
 ```
 
-### Queue path (`_queue_pending_entries`, `run_equity_swing.py:266`)
+### Queue path (`_queue_pending_entries`, `runners/run_equity_swing.py:266`)
 
 Runs at close-scan after `scan_and_propose`. Per proposal:
 1. Dedupe against existing PENDING for same symbol; skip if present
@@ -222,7 +222,7 @@ Runs at close-scan after `scan_and_propose`. Per proposal:
    would let NaN through)
 5. INSERT into `equity_pending_entries` with status PENDING
 
-### Fill path (`_fill_pending_entries`, `run_equity_swing.py:153`)
+### Fill path (`_fill_pending_entries`, `runners/run_equity_swing.py:153`)
 
 Runs FIRST in close-scan, before rehedge. Per-row try/except so one bad
 row can't abort the batch. Per pending row:
@@ -270,7 +270,7 @@ From `tasks/live-readiness-deferred.md` EQ-FU-1 .. EQ-FU-6:
 | ID | Severity | What |
 |---|---|---|
 | EQ-FU-1 | High | No `/equity/pending-entries` API endpoint — dashboard can't show today's signals until tomorrow |
-| EQ-FU-2 | High | `backtest_varsity_equity.py` doesn't apply gap-skip or staleness filter → contract drift with live; autoresearch optimises against wrong trade rate |
+| EQ-FU-2 | High | `research/backtest_varsity_equity.py` doesn't apply gap-skip or staleness filter → contract drift with live; autoresearch optimises against wrong trade rate |
 | EQ-FU-3 | Medium | Autocommit gap between INSERT position + UPDATE pending → process kill leaves OPEN position + PENDING row. Self-heals via SKIPPED_OPEN on next run. |
 | EQ-FU-4 | Low | `opened_by_scan='close'` hardcoded in `_fill_pending_entries`; fragile if open-scan ever pre-fills |
 | EQ-FU-5 | Low | Signals-mode never drains PENDING rows — they age to SKIPPED_STALE at day 6 |
@@ -390,7 +390,7 @@ Optional gates (default OFF unless noted):
 | `fii_enabled` | 1 | FII/DII confluence (default ON — boost only) |
 | `fii_boost_when_positive` | 1 | +1 score when 5d FII net cash positive |
 
-CLI on `run_equity_swing.py`:
+CLI on `runners/run_equity_swing.py`:
 
 | Flag | Purpose |
 |---|---|
@@ -425,7 +425,7 @@ fires the Telegram template.
 
 ## Backtest harness and contract drift
 
-`backtest_varsity_equity.py` (`EquityBacktester`) is the harness used
+`research/backtest_varsity_equity.py` (`EquityBacktester`) is the harness used
 by autoresearch sweeps. It loads the panel, walks it day-by-day, and
 simulates entries / exits.
 
@@ -500,8 +500,8 @@ All 53 pass.
 | `strategies/_market_profile_eq.py` | MP value area computation |
 | `strategies/_oi_signal.py` | OI confluence classifier |
 | `strategies/_fii_dii.py` | FII/DII 5d signal builder |
-| `run_equity_swing.py` | Runner: scan kind dispatch, pending queue/fill, persistence |
-| `backtest_varsity_equity.py` | Backtester (contract drift flagged in EQ-FU-2) |
+| `runners/run_equity_swing.py` | Runner: scan kind dispatch, pending queue/fill, persistence |
+| `research/backtest_varsity_equity.py` | Backtester (contract drift flagged in EQ-FU-2) |
 | `backend/db.py` | `equity_positions`, `equity_pending_entries`, `equity_scans` tables + helpers |
 | `config.ini` | `[equity_swing]` defaults |
 | `holidays.csv` | Holiday gate |

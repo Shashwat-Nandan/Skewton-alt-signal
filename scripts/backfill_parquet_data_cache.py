@@ -39,9 +39,9 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from data_cache_io import parquet_sibling  # noqa: E402
-from fetch_bhavcopy import RAW_STR_COLS as FO_STR_COLS  # noqa: E402
-from fetch_bhavcopy_eq import RAW_STR_COLS as EQ_STR_COLS  # noqa: E402
+from core.data_cache_io import parquet_sibling  # noqa: E402
+from market_data.fetch_bhavcopy import RAW_STR_COLS as FO_STR_COLS  # noqa: E402
+from market_data.fetch_bhavcopy_eq import RAW_STR_COLS as EQ_STR_COLS  # noqa: E402
 
 CACHE = ROOT / "data_cache"
 

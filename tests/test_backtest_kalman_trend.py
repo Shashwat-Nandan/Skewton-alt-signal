@@ -16,7 +16,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import backtest_kalman_trend as b
+from research import backtest_kalman_trend as b
 
 
 def test_pooled_sharpe_matches_manual():

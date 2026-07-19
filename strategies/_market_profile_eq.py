@@ -1,7 +1,7 @@
 """
 Daily-bar Market Profile adapter for the equity-swing strategy.
 
-The repo's existing ``market_profile.py`` operates on intraday TPO bars and
+The repo's existing ``core/market_profile.py`` operates on intraday TPO bars and
 expects 30-min data from ``backend/bars.db``. For the swing horizon we
 want a profile built from *daily* bars over a rolling N-day window — same
 VAH/POC/VAL semantics, but the raw data is one OHLCV row per day per

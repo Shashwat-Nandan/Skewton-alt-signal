@@ -9,10 +9,10 @@ more than `k × σ` (σ = stddev of recent daily returns), filter to names still
 Done when:
 1. `strategies/buy_on_gap.py` implements the BaseStrategy contract and shares its
    signal/exit logic with the backtester (Rule 7 — no divergent copies).
-2. `backtest_buy_on_gap.py` runs on the local daily OHLCV cache (2024-03 →
+2. `research/backtest_buy_on_gap.py` runs on the local daily OHLCV cache (2024-03 →
    2026-06, 209 syms), reports Sharpe/win-rate/P&L/drawdown + per-trade ledger.
    No look-ahead (decide at open, exit at close).
-3. `run_paper_buy_on_gap.py`: enters at the open via `kite.quote`, exits at the
+3. `runners/run_paper_buy_on_gap.py`: enters at the open via `kite.quote`, exits at the
    close, persists state, writes an EOD sidecar — mirrors run_paper_arbitrage.
 4. Dashboard router `/api/buy-on-gap-paper` + frontend tab.
 5. systemd `.service`/`.timer` (NOT installed — operator-gated).
@@ -43,8 +43,8 @@ Done when:
 ## Tasks
 - [x] 1. strategies/buy_on_gap.py — BuyOnGapStrategy + GapPosition
 - [x] 2. register in strategies/__init__.py
-- [x] 3. backtest_buy_on_gap.py
-- [x] 4. run_paper_buy_on_gap.py
+- [x] 3. research/backtest_buy_on_gap.py
+- [x] 4. runners/run_paper_buy_on_gap.py
 - [x] 5. backend/routers/buy_on_gap_paper.py + register in backend/main.py
 - [x] 6. frontend BuyOnGapPage + route + nav (Header)
 - [x] 7. deploy/buy-on-gap-paper.{service,timer} (not installed)
@@ -62,9 +62,9 @@ Done when:
   from the daily panel (through yesterday), today's open/LTP/low from
   `set_today_quotes()` (live) or the panel row (backtest). Live mode raises
   (paper-first, like equity-swing).
-- `backtest_buy_on_gap.py` — single-day replay; costs booked inside the
+- `research/backtest_buy_on_gap.py` — single-day replay; costs booked inside the
   strategy so backtest P&L == live accounting.
-- `run_paper_buy_on_gap.py` — once-at-open entry window (09:20–09:45), tick
+- `runners/run_paper_buy_on_gap.py` — once-at-open entry window (09:20–09:45), tick
   loop for catastrophic stops, flatten-at-close; crash-safe state, EOD sidecar,
   daily-loss breaker, silent-fail heartbeat, own lock. `--dry-run` smoke path.
 - Dashboard: `backend/routers/buy_on_gap_paper.py` (`/api/buy-on-gap-paper`) +

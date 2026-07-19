@@ -9,7 +9,7 @@
 # the exact state/book that just crash-looped, with no human in the loop.
 #
 # Touching data_cache/HALT_ALL fixes that: the runner reads it every tick
-# (run_paper_pairs.py _HaltState) and FREEZES the book (no entries, no exits)
+# (runners/run_paper_pairs.py _HaltState) and FREEZES the book (no entries, no exits)
 # until the operator removes the flag. So on the next start the runner comes up,
 # reconciles with the broker (reporting any open positions), then waits frozen
 # for a conscious operator `rm HALT_ALL`. HALT_ALL is the runner's OWN read —

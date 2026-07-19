@@ -12,7 +12,7 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/fetch_fii_dii.py
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m market_data.fetch_fii_dii
 # -------------------------------
 
 TimeoutStartSec=5min

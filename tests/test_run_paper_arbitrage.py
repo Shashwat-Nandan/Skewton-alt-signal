@@ -12,8 +12,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import run_paper_arbitrage as arb
-import run_paper_pairs as pairs
+from runners import run_paper_arbitrage as arb
+from runners import run_paper_pairs as pairs
 
 
 class TestFilenameNamespacing:

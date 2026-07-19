@@ -20,7 +20,7 @@ Environment=TZ=Asia/Kolkata
 # No EnvironmentFile: the logger reads local dashboard.db only — it needs NO
 # Kite auth. (Kept commented so it's obvious this is deliberate.)
 # EnvironmentFile=/opt/taleb-karpathy-kite/.env
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/log_mp_features.py --source intraday
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m scripts.log_mp_features --source intraday
 # -------------------------------
 
 StandardOutput=journal

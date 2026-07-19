@@ -53,9 +53,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 HERE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(HERE))
 
-import strategy_decay as sd  # noqa: E402  (needs the path insert above)
+# Import through the package, NOT as a top-level module. scripts/ became a
+# package in the 2026-07-19 reorg; `import strategy_decay` alongside
+# `from scripts import strategy_decay` yields TWO distinct module objects,
+# and this one owns the decay ledger's module state (CLAUDE.md Rule 7).
+from scripts import strategy_decay as sd  # noqa: E402  (needs the path insert above)
 
 Monthly = Dict[str, float]          # "YYYY-MM" -> net realized ₹ for the month
 
@@ -178,7 +182,7 @@ def taleb_monthly(data_cache: Path) -> Tuple[Monthly, float, float]:
     series: List[Tuple[str, float]] = []
     backups = sorted(glob.glob(str(data_cache / "state_backups" / "taleb_paper_state.*.json")))
     if not backups:
-        # The backup filename format is owned by _state_backup.py; if it ever
+        # The backup filename format is owned by core/_state_backup.py; if it ever
         # changes, this glob would silently match nothing and Taleb's monthly
         # column would go blank — say so instead.
         print("  [warn] no taleb_paper_state.* backups found — Taleb monthly "

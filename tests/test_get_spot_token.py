@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import fetch_historical_data as fh
+from market_data import fetch_historical_data as fh
 
 
 class _FakeKite:
@@ -71,7 +71,7 @@ def test_reuses_the_canonical_superset_map():
     # The whole point of the reuse fix: one map, not a local subset. FINNIFTY
     # is absent from the old inline dict but present in NSE_INDEX_NAME, so it
     # now resolves through get_spot_token too.
-    from fetch_index_daily import NSE_INDEX_NAME
+    from market_data.fetch_index_daily import NSE_INDEX_NAME
     assert NSE_INDEX_NAME["FINNIFTY"] == "NIFTY FIN SERVICE"
     kite = _FakeKite([{"tradingsymbol": "NIFTY FIN SERVICE",
                        "instrument_token": 257801}])

@@ -90,7 +90,7 @@ We already have two non-HMM "regime" mechanisms, and Rule 7 (surface
 conflicts, don't average) means a third must be clearly distinct from both,
 not a silent blend:
 
-- **`regime_classifier.py`** — deterministic, rule-based classifier over
+- **`core/regime_classifier.py`** — deterministic, rule-based classifier over
   four *option-surface* observables (IV percentile, RV/IV ratio, skew
   percentile, vol-of-vol) → one of six trade structures
   (`STRADDLE`/`CALENDAR_SHORT_FRONT`/`RISK_REVERSAL_LONG_PUT`/`BACKSPREAD`/
@@ -98,7 +98,7 @@ not a silent blend:
   via `RegimeFeatures`/`classify()`. This is "regime" in the Taleb Ch.15/16
   sense (what distribution shape the option surface implies), entirely
   different from "is the market bull/bear/neutral."
-- **`analyze_rv_iv_regime.py`** — an offline analysis script (not wired into
+- **`research/analyze_rv_iv_regime.py`** — an offline analysis script (not wired into
   any live strategy) that computes a daily RV/IV ratio and reports threshold
   admission rates and ratio-crossing dates. Descriptive, not predictive; no
   model is fit, no state is inferred — it's a transition-counting report
@@ -179,7 +179,7 @@ this, the scoped version worth prototyping is:
    `regime_probabilities()` and the stability check (>3 flips/10 days).
 2. A backtest comparing `varsity_equity_swing` with vs. without a
    `1 - P(BEAR)` position-size multiplier, over the same data the strategy's
-   existing backtest (`backtest_varsity_equity.py`) already uses.
+   existing backtest (`research/backtest_varsity_equity.py`) already uses.
 3. Only if step 2 shows a real, walk-forward (not in-sample) improvement,
    wire it into the live strategy behind a feature flag, with the
    instability kill switch from day one.

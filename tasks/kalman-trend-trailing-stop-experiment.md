@@ -100,8 +100,8 @@ first; only escalate to C if D is inconclusive.
 
 ### 3.1 Data & harness
 - 5-min bars, **both** NIFTY + BANKNIFTY (`*_5minute.parquet`). Per the standing
-  rule (`backtest_timeframe.py`), 5-min is the standard — no daily approximation.
-- Reuse the existing harness (`backtest_kalman_trend.py` walk-forward folds) —
+  rule (`core/backtest_timeframe.py`), 5-min is the standard — no daily approximation.
+- Reuse the existing harness (`research/backtest_kalman_trend.py` walk-forward folds) —
   do **not** write a new bespoke simulator (Rule 7; the exploratory scratch
   script is explicitly not the reference). Extend `simulate` with the exit modes
   above so fit and test share one code path.
@@ -168,7 +168,7 @@ separately (KILL_DATE 2026-08-30, see project memory).
 
 ---
 
-## 7. RESULT — variant D, run 2026-07-14 (`experiment_kalman_trail.py`)
+## 7. RESULT — variant D, run 2026-07-14 (`research/experiment_kalman_trail.py`)
 
 Protocol as specified: walk-forward (20 folds × 5 seeds), T fit on TRAIN only
 (grid argmax of train Sharpe), short/long/offset held at the incumbent
@@ -227,5 +227,5 @@ prefers hyper-tight stops whose churn the live book then pays for"). The low-cos
   the margin model. Since B (hold-to-stop) already lost ₹322k with realistic
   fills, and D loses with honest fills, the burden of proof on "hold longer" is
   now high. Do not re-open without OHLC data and a fresh hypothesis.
-- **Re-running D is cheap once OHLC exists** — `experiment_kalman_trail.py` is
+- **Re-running D is cheap once OHLC exists** — `research/experiment_kalman_trail.py` is
   written and parameterised; only the fill model and data need to change.

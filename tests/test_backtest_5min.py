@@ -17,7 +17,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from backtest_kalman_pairs import _write_temp_config, load_5min_panel, run_replay_5min
+from research.backtest_kalman_pairs import _write_temp_config, load_5min_panel, run_replay_5min
 
 
 def _cointegrated_daily(n=300, seed=0):
@@ -85,7 +85,7 @@ def test_5min_replay_gate_wired_and_baseline_trades():
 
 def test_load_5min_panel_reads_and_aligns(tmp_path):
     """load_5min_panel must build a sorted wide close-panel from the per-symbol
-    CSVs fetch_5min_stf.py writes, so pair alignment via dropna works."""
+    CSVs market_data/fetch_5min_stf.py writes, so pair alignment via dropna works."""
     for sym, base in (("PA", 100.0), ("PB", 200.0)):
         df = pd.DataFrame({
             "date": pd.date_range("2026-06-22 09:15", periods=10, freq="5min"),

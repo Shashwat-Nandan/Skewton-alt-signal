@@ -10,7 +10,7 @@ Documentation=man:systemd.timer(5)
 OnCalendar=Mon..Fri *-*-* 09:14:00 Asia/Kolkata
 
 # If the VPS was asleep or systemd missed the window, run once to catch up.
-# run_paper_buy_on_gap.py refuses to start after 15:30, and runs exit-only if
+# runners/run_paper_buy_on_gap.py refuses to start after 15:30, and runs exit-only if
 # started past the 09:45 entry cutoff — safe to be Persistent.
 Persistent=true
 

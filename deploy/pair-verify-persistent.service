@@ -16,7 +16,7 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # input and pair-verify-persistent-*.log / .json output. Tunables (entry/exit/
 # stop/lookback/max-hold) are identical to baseline pair-verify.service so the
 # trailing-backtest comparison is apples-to-apples.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/verify_pair_paper.py --system persistent
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m scripts.verify_pair_paper --system persistent
 # -------------------------------
 
 TimeoutStartSec=10min

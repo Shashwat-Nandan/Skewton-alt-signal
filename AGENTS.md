@@ -15,8 +15,8 @@ style preferences; they are the reason we can run unattended.
 ## 🛑 Non-negotiable safety rules (read first)
 
 1. **Never enable or commit live trading in the dashboard or in CI.** Live trading
-   lives **only** on the headless, audited path (`run_paper*.py` /
-   `run_equity_swing.py` under systemd timers). `backend/main.py` + `frontend/`
+   lives **only** on the headless, audited path (`runners/run_paper*.py` /
+   `runners/run_equity_swing.py` under systemd timers). `backend/main.py` + `frontend/`
    **never** place live orders — that is by design so the audit trail is the daily
    log file, not a browser session. Do not "wire up" live trading anywhere else.
 2. **Never commit, print, or log secrets.** `config.ini`, `config_banknifty.ini`,
@@ -29,12 +29,12 @@ style preferences; they are the reason we can run unattended.
    not shortcut, skip, or fake this progression.
 4. **Never weaken a safety guard to "make it run."** The market-hours gate
    (09:15–15:30 IST), the `--force` requirement, position/exposure limits, throttle
-   (`kite_throttle.py`), and any kill-switch exist on purpose. If a guard blocks
+   (`core/kite_throttle.py`), and any kill-switch exist on purpose. If a guard blocks
    you, the guard is working — do not delete or bypass it; ask.
 5. **Money-affecting changes require human review** via `CODEOWNERS` — no
    self-merge. This covers `strategies/`, `signal_plane/`, `loop_engine/`,
-   order/execution paths in `backend/`, `risk_analyzer.py`, `greeks_engine.py`,
-   `run_paper*.py`, `runner_common.py`, and `deploy/`.
+   order/execution paths in `backend/`, `core/risk_analyzer.py`, `core/greeks_engine.py`,
+   `runners/run_paper*.py`, `core/runner_common.py`, and `deploy/`.
 6. **Dependencies change only through the lockfile flow.** Edit `requirements.in` /
    `requirements-dev.in`, then regenerate the `.lock` files with hashes (see
    commands below). **Never hand-edit a `.lock`.** CI enforces drift and installs
@@ -71,7 +71,7 @@ cd frontend && npm ci && npm run build      # frontend: tsc -b && vite build
 cd frontend && npm run dev                  # SPA on :5173
 
 # Headless paper/live runner (refuses outside 09:15–15:30 IST unless --force)
-.venv/bin/python run_paper.py --force
+.venv/bin/python -m runners.run_paper --force
 ```
 
 **Change dependencies:**
@@ -86,10 +86,30 @@ uv pip compile requirements-dev.in --generate-hashes --output-file requirements-
 - `backend/` — FastAPI dashboard API (read-only w.r.t. live trading).
 - `frontend/` — React/Vite/TS dashboard SPA (`taleb-karpathy-dashboard`).
 - `strategies/`, `signal_plane/`, `loop_engine/` — the trading brain (money-affecting).
-- `run_*.py` (root) — headless daemons/runners (paper, pairs, arbitrage, equity swing, autoresearch).
-- `backtest_*.py`, `sweep_*.py` (root) — research/backtest & parameter sweeps.
-- `greeks_engine.py`, `risk_analyzer.py`, `market_profile.py`, `regime_classifier.py`, `kite_*.py` — core engines & broker I/O.
+- `runners/` — headless daemons/entry points (paper, pairs, arbitrage, equity swing, autoresearch). Money-affecting.
+- `core/` — shared engines & broker I/O: `greeks_engine`, `risk_analyzer`, `market_profile`, `regime_classifier`, `runner_common`, `screen_pairs`, `data_cache_io`, `kite_auth`, `kite_throttle`.
+- `market_data/` — market-data acquisition (`fetch_*`, `tick_capture`, `tape_to_parquet`) plus `holidays.csv`.
+- `research/` — backtests, parameter sweeps, optimizers and validators. Never on a live path.
+- `scripts/` — operational one-shots (scoreboard, decay ledger, verify, feature logging, reports).
 - `tests/` — pytest suite (~74 files). `docs/` — architecture, data-pipeline, strategy & research notes. `deploy/` — VPS (systemd + nginx). `state/` — on-disk runtime state (gitignored bits). `.claude/skills/` — repo-specific agent skills.
+
+**Invocation:** every entry point under `core/`, `market_data/`, `research/`
+and `runners/` runs as a module from the repo root —
+`.venv/bin/python -m runners.run_paper`, `-m research.backtest_pairs`,
+`-m core.screen_pairs`. Calling them by file path
+(`python runners/run_paper.py`) **fails**: that puts `runners/` on `sys.path`
+instead of the repo root, so the cross-package imports don't resolve. There is
+deliberately no `sys.path` bootstrap left in those packages to paper over it —
+one existed, sat *after* the imports it was supposed to enable, and made the
+breakage look intermittent (Rule 7: one convention, not two). systemd units
+use `-m` and set `WorkingDirectory` to the repo root.
+
+`scripts/` is the exception: those one-shots keep an explicit repo-root
+bootstrap so `python scripts/strategy_scoreboard.py` still works, and they may
+also be run with `-m scripts.<name>`. Inside `scripts/`, always import siblings
+through the package (`from scripts import strategy_decay`) — a bare
+`import strategy_decay` creates a *second*, separate module object, which
+splits the decay ledger's state (reorg 2026-07-19).
 
 **The two-systems model:** headless daemons and the dashboard **share the same
 strategy code and on-disk caches**. That coupling is why the backend, strategies,

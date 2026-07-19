@@ -17,7 +17,7 @@ increments.
 | Publisher: sequence, idempotency, ordering, file bus | `signal_plane/publisher.py` | §4.11, §5, §6 |
 | TradeProposal → contract mapper | `signal_plane/pair_trading_signals.py` | §4.14 |
 | Strategy hooks | `strategies/pair_trading.py` (`execute_proposals`) | §5 |
-| Runner flag | `run_paper_pairs.py --publish-signals` | — |
+| Runner flag | `python -m runners.run_paper_pairs --publish-signals` | — |
 | Worked examples pinned | `tests/fixtures/signals/*.json` | §4.10 |
 | Reference consumer (§3 protocol, replay + verify; `python -m signal_plane.consumer <bus-dir>`; exit 0 clean / 2 violation / 3 no bus files → EOD watchdog) | `signal_plane/consumer.py` | oms-guide §3, #99 |
 | Shared group-close predicate (publisher + consumer must not drift) | `signal_plane/contract.py` `closes_group()` | §4.15 |

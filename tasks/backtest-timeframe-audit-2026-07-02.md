@@ -14,7 +14,7 @@ timeframe. One row per backtest harness.
   `data_cache/NIFTY_5minute.csv`, `data_cache/BANKNIFTY_5minute.csv`.
 - **5-min MISSING:**
   - single-stock **futures** (Kalman pairs / arbitrage / calendar universe) —
-    only daily bhavcopy exists. Fetcher `fetch_5min_stf.py` exists but
+    only daily bhavcopy exists. Fetcher `market_data/fetch_5min_stf.py` exists but
     `data_cache/stf_5min/` is **empty** (host-only fetch, needs cached Kite
     session; not run yet).
   - **equities** (buy_on_gap, varsity_equity) — only daily EOD panels.
@@ -25,22 +25,22 @@ timeframe. One row per backtest harness.
 
 | Backtest | Instrument class | Timeframe today | 5-min capable? | Blocker |
 |---|---|---|---|---|
-| `backtest.py` (Taleb) | NIFTY/BANKNIFTY options | tape replay `--resolution` (tick/1min/5min) **or** synthetic daily-vol GBM | **Yes** — pass `--resolution 5min` on a tape session | none for tape; synthetic path is inherently daily-vol GBM (not a bar timeframe) |
-| `backtest_kalman_pairs.py` | STF futures | **5min default** (`--timeframe 5min`); daily legacy retained | **Yes (built, commits 8074d9a/ec0e648)** | needs `data_cache/stf_5min/` — host fetch pending |
-| `backtest_kalman_trend.py` | daily closes (universe / index) | **DAILY** (`load_daily_closes`, `*_daily.csv`) | Partially — accepts `--csv`; could point at `NIFTY_5minute.csv` | generic-universe run has no 5-min source; only index has 5-min |
-| `backtest_buy_on_gap.py` | equities | **DAILY** (`load_equity_panel`) | No | no 5-min equity data; forward-capture territory |
-| `backtest_varsity_equity.py` | equities | **DAILY** (`load_equity_panel`) | No | no 5-min equity data |
-| `backtest_arbitrage.py` | STF futures (calendar spreads) | **DAILY** (`load_stf_panel`, bhavcopy) | No (yet) | no 5-min STF data (same blocker as kalman_pairs) |
-| `backtest_calendar_meanreversion.py` | STF futures | **DAILY** (`load_stf_panel`) | No (yet) | no 5-min STF data |
-| `backtest_pairs.py` / `backtest_pairs_rule.py` | STF front-month | **DAILY** (`load_front_month_panel`) | No | **legacy** — superseded by `backtest_kalman_pairs.py`; candidates for retirement, not migration |
+| `research/backtest.py` (Taleb) | NIFTY/BANKNIFTY options | tape replay `--resolution` (tick/1min/5min) **or** synthetic daily-vol GBM | **Yes** — pass `--resolution 5min` on a tape session | none for tape; synthetic path is inherently daily-vol GBM (not a bar timeframe) |
+| `research/backtest_kalman_pairs.py` | STF futures | **5min default** (`--timeframe 5min`); daily legacy retained | **Yes (built, commits 8074d9a/ec0e648)** | needs `data_cache/stf_5min/` — host fetch pending |
+| `research/backtest_kalman_trend.py` | daily closes (universe / index) | **DAILY** (`load_daily_closes`, `*_daily.csv`) | Partially — accepts `--csv`; could point at `NIFTY_5minute.csv` | generic-universe run has no 5-min source; only index has 5-min |
+| `research/backtest_buy_on_gap.py` | equities | **DAILY** (`load_equity_panel`) | No | no 5-min equity data; forward-capture territory |
+| `research/backtest_varsity_equity.py` | equities | **DAILY** (`load_equity_panel`) | No | no 5-min equity data |
+| `research/backtest_arbitrage.py` | STF futures (calendar spreads) | **DAILY** (`load_stf_panel`, bhavcopy) | No (yet) | no 5-min STF data (same blocker as kalman_pairs) |
+| `research/backtest_calendar_meanreversion.py` | STF futures | **DAILY** (`load_stf_panel`) | No (yet) | no 5-min STF data |
+| `research/backtest_pairs.py` / `research/backtest_pairs_rule.py` | STF front-month | **DAILY** (`load_front_month_panel`) | No | **legacy** — superseded by `research/backtest_kalman_pairs.py`; candidates for retirement, not migration |
 
 ## Conclusions
 
-1. **Already compliant / capable:** Taleb (`backtest.py`, tape `--resolution 5min`)
-   and Kalman pairs (`backtest_kalman_pairs.py`, 5-min default). Kalman pairs is
-   *code-complete* but data-blocked until `fetch_5min_stf.py` runs on the host.
+1. **Already compliant / capable:** Taleb (`research/backtest.py`, tape `--resolution 5min`)
+   and Kalman pairs (`research/backtest_kalman_pairs.py`, 5-min default). Kalman pairs is
+   *code-complete* but data-blocked until `market_data/fetch_5min_stf.py` runs on the host.
 2. **Data-blocked (STF futures):** arbitrage + calendar mean-reversion share the
-   *exact* blocker as Kalman pairs — no 5-min STF data. The `fetch_5min_stf.py`
+   *exact* blocker as Kalman pairs — no 5-min STF data. The `market_data/fetch_5min_stf.py`
    corpus (front-month continuous 5-min) is the same feed they'd need. Migrating
    these is a follow-on to the STF fetch, not independent work.
 3. **Data-blocked (equities):** buy_on_gap + varsity_equity have no 5-min equity
@@ -64,7 +64,7 @@ timeframe. One row per backtest harness.
 ## What is HOST-GATED (needs cached Kite session; do NOT fresh-login while a live
 runner is active — Zerodha invalidates the token)
 
-- Run `fetch_5min_stf.py --days 90` on the host → unblocks Kalman pairs 5-min
+- Run `python -m market_data.fetch_5min_stf --days 90` on the host → unblocks Kalman pairs 5-min
   re-validation (checkbox 3), then arbitrage + calendar 5-min migration.
 - Stand up forward 5-min capture for equities (buy_on_gap, varsity_equity).
 
@@ -72,7 +72,7 @@ runner is active — Zerodha invalidates the token)
 
 1. (this session, no host) Audit ✅ + loud coarse-timeframe warning across daily
    backtests.
-2. (host) `fetch_5min_stf.py` → re-validate Kalman pairs 5-min re-base findings.
+2. (host) `market_data/fetch_5min_stf.py` → re-validate Kalman pairs 5-min re-base findings.
 3. (host, follow-on) Reuse STF 5-min corpus to add 5-min mode to arbitrage +
    calendar backtests.
 4. (host, forward) Equity 5-min forward capture; retire `backtest_pairs*.py`.

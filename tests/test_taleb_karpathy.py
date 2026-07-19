@@ -10,9 +10,9 @@ from strategies.taleb_karpathy import (
     TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
     _apply_best_params, _FUT_EXCHANGE_RATE_LEGACY,
 )
-from trade_proposer import TradeProposal
-from greeks_engine import OptionContract
-from regime_classifier import Structure
+from core.trade_proposer import TradeProposal
+from core.greeks_engine import OptionContract
+from core.regime_classifier import Structure
 
 
 class TestTransactionCosts:
@@ -437,7 +437,7 @@ class TestCredentialValidation:
     """P2: Placeholder credentials must raise immediately."""
 
     def test_placeholder_detected(self):
-        from kite_auth import KiteAuthManager, AuthenticationError
+        from core.kite_auth import KiteAuthManager, AuthenticationError
         import tempfile
         config_content = """[kite]
 api_key = ${KITE_API_KEY}
@@ -517,7 +517,7 @@ class TestTimeToExpiryReplay:
     """P1: time_to_expiry must use reference_time, not datetime.now()."""
 
     def test_reference_time_used(self):
-        from greeks_engine import time_to_expiry
+        from core.greeks_engine import time_to_expiry
         from datetime import datetime
 
         # Expiry is 2026-03-13, reference time is 2026-03-01 → ~12 days out
@@ -555,7 +555,7 @@ class TestOptimizerRangeCoverage:
     """P2: All active runtime tunable params must be in TUNABLE_RANGES."""
 
     def test_all_runtime_tunables_covered(self):
-        from autoresearch_loop import HedgeResearchLoop
+        from runners.autoresearch_loop import HedgeResearchLoop
         # Params used in runtime decision paths that the optimizer must cover.
         # Under regime dispatch (the live config) structure routing is decided by
         # the regime_* classifier cutoffs, so those must be sweepable. The legacy
@@ -1753,7 +1753,7 @@ class TestSpotFetch:
 # ──────────────────────────────────────────────────────────────────
 # Cross-session persistence (serialize_state / restore_state)
 # ──────────────────────────────────────────────────────────────────
-# The 2026-05-19 rebuild removed run_paper.py's unconditional EOD flatten.
+# The 2026-05-19 rebuild removed runners/run_paper.py's unconditional EOD flatten.
 # Open straddle + futures hedge positions now survive across sessions via
 # serialize/restore. Roundtrip correctness is load-bearing — a partial
 # restore would abandon a real position.
@@ -2403,7 +2403,7 @@ class TestSkewPercentileGate:
         and `call_iv` for the OTM call."""
         import pandas as pd
         from datetime import date as _date, timedelta as _td
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         engine = GreeksEngine(risk_free_rate=0.065)
         T = 7 / 365
         put_strike = spot - 200
@@ -2478,7 +2478,7 @@ class TestSkewPercentileGate:
         per-strike pattern silently inert in production."""
         from datetime import date as _date, timedelta as _td
         import pandas as pd
-        from greeks_engine import GreeksEngine
+        from core.greeks_engine import GreeksEngine
         h = self._make_hedger(skew_history=[])
         engine = GreeksEngine(risk_free_rate=0.065)
         T = 7 / 365

@@ -16,7 +16,7 @@ from strategies.pair_trading import (
     PairState,
     PairTradingStrategy,
 )
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 # ──────────────────────────────────────────────────────────
@@ -1976,7 +1976,7 @@ class TestMarginPrecheck:
         return s
 
     def _props(self, margin_a=20000, margin_b=30000):
-        from trade_proposer import TradeProposal
+        from core.trade_proposer import TradeProposal
         a = TradeProposal(
             tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
             expiry="2026-04-28", option_type="FUT", lot_size=100,
@@ -2252,7 +2252,7 @@ class TestProtectiveLimitOrders:
         return s
 
     def _prop(self, transaction_type="BUY", price=1000.0):
-        from trade_proposer import TradeProposal
+        from core.trade_proposer import TradeProposal
         return TradeProposal(
             tradingsymbol="AAA26APRFUT", instrument_token=111, strike=0,
             expiry="2026-04-28", option_type="FUT", lot_size=100,
@@ -2496,7 +2496,7 @@ class TestSpreadPanelInjection:
         )
 
     def test_injected_panel_seeds_without_file_read(self, monkeypatch):
-        import screen_pairs
+        from core import screen_pairs
         monkeypatch.setattr(
             screen_pairs, "load_front_month_panel",
             lambda *a, **k: (_ for _ in ()).throw(
@@ -2510,7 +2510,7 @@ class TestSpreadPanelInjection:
         assert s._spread_history == expected[-s.lookback_days * 3:]
 
     def test_no_panel_falls_back_to_self_load(self, monkeypatch):
-        import screen_pairs
+        from core import screen_pairs
         calls = []
         panel = self._panel()
         def fake_load(universe, **kw):

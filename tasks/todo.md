@@ -1,3 +1,161 @@
+# Root-directory reorganisation (2026-07-19)
+
+Move the 65 tracked root `.py` modules into topical top-level packages and
+update every reference. Gitignored artifacts (PDFs, results.tsv,
+candidate_params_*.json, shot.png, *.log) are OUT of scope by operator
+decision — they stay where they are.
+
+**Why this is not a cosmetic change:** the repo is a flat module namespace
+(`import greeks_engine` resolves only because everything sits in root) and
+30+ *installed* systemd units on this host invoke root scripts by absolute
+path. 301 import sites across 121 files. A move that misses a reference
+takes a paper — or the LIVE pair runner — down at the next timer fire.
+
+**Deadline:** next timer fire is Mon 2026-07-20 05:38 CEST (tick-capture),
+live pair runner 05:42 CEST. Cutover must be complete and verified before
+then, or the affected units get masked until it is.
+
+## Target layout
+
+| Package | Modules | Notes |
+|---|---|---|
+| `core/` | greeks_engine, risk_analyzer, regime_classifier, market_profile, variance_pnl_gate, trade_proposer, runner_common, data_cache_io, backtest_timeframe, _state_backup, kite_auth, kite_throttle | the widely-imported engines (data_cache_io 23 importers, kite_auth 18) |
+| `market_data/` | fetch_5min_stf, fetch_bars, fetch_bhavcopy, fetch_bhavcopy_eq, fetch_fii_dii, fetch_historical_data, fetch_index_daily, tick_capture, tape_to_parquet, holidays.csv | named `market_data` not `data` to avoid confusion with `data_cache/` |
+| `research/` | backtest, backtest_* (9), sweep_* (7), optimize_kalman_trend, validate_* (3), experiment_kalman_trail, analyze_rv_iv_regime, compare_* (2), replay_2026_05_06, mp_edge_report, mp_trend_robustness | research/backtest only |
+| `runners/` | run_paper, run_paper_pairs, run_paper_kalman_pairs, run_paper_kalman_trend, run_paper_arbitrage, run_paper_buy_on_gap, run_paper_mp, run_equity_swing, run_autoresearch, autoresearch_loop, run | money-affecting entrypoints |
+| `scripts/` (exists) | + screen_pairs, verify_pair_paper, log_mp_features, mp_finetune | operational one-shots, joins the existing ops-tool dir |
+
+Staying in root (tooling/convention expects them there): AGENTS.md,
+CLAUDE.md, README.md, LICENSE, CONTRIBUTING.md, SECURITY.md, CODEOWNERS,
+.editorconfig, .gitignore, .pre-commit-config.yaml, ruff.toml,
+commitlint.config.mjs, requirements{,-dev}.{in,lock}, config_template.ini,
+config_banknifty_template.ini (must sit beside the gitignored config.ini
+that code reads from root).
+
+Open decisions for the operator — see "Decisions" below: best_params.json,
+SKILL.md/taleb-dynamic-hedger.skill, entrypoint invocation style.
+
+## Steps
+
+- [x] 1. Land a `pyproject.toml`-free import story: each new dir gets
+      `__init__.py`; entrypoints move to `python -m runners.<name>`
+      (matches the existing `python -m loop_engine.orchestrator` precedent
+      and removes the `sys.path.insert(Path(__file__).parent)` hacks in 10
+      files, which would silently point at the WRONG dir after the move).
+- [x] 2. `git mv` in one commit per package, so history follows the files.
+- [x] 3. Rewrite 301 import sites via a scripted module→package map
+      (`import X` → `from pkg import X`; `from X import Y` →
+      `from pkg.X import Y`), then hand-audit the diff.
+- [x] 4. Fix path constants that break on move — `HERE / "holidays.csv"` in
+      run_paper_pairs (LIVE), run_equity_swing, run_paper_buy_on_gap;
+      `Path("holidays.csv")` in run_paper_kalman_trend; the default arg in
+      fetch_bhavcopy_eq. Introduce one REPO_ROOT constant rather than five
+      `parent.parent` chains.
+- [x] 5. Update deploy/*.sh (9 scripts, 18 refs) and deploy/*.service
+      templates.
+- [ ] 6. Update the 30+ INSTALLED units in /etc/systemd/system + daemon-reload.
+      Operator-confirmed step — this is the live-trading cutover.
+- [x] 7. Update .github workflows, .pre-commit-config.yaml, ruff.toml
+      excludes, backend/frontend references.
+- [x] 8. Update docs: 42 tracked .md files name root scripts, incl. the
+      AGENTS.md repo map, README.md, docs/architecture.md, and
+      .claude/skills/.
+
+## Verification gates (all must pass before the units are switched)
+
+- [x] `ruff check .` clean
+- [x] `pytest tests/ -q` green, no new skips beyond the known 8 data_cache
+- [x] import smoke: every moved module imports from a clean interpreter
+- [x] `python -m runners.<each>` `--help` exits 0 for all 11 entrypoints
+- [ ] every deploy/*.sh runs its dry-run/`--help` path
+- [x] `systemd-analyze verify` on every edited unit
+- [x] grep sweep: zero surviving references to the old root paths
+- [x] rollback rehearsed: the whole change is one merge commit + one
+      units diff, both revertible in under a minute
+
+## Decisions needed from operator
+
+1. **best_params.json** — the live autoresearch seed, read by
+   strategies/taleb_karpathy.py, runners/run_autoresearch.py,
+   deploy/run_weekly_autoresearch.sh, both config templates. Recommend
+   LEAVING IN ROOT: a stale-path bug here silently reverts live params to
+   defaults, and the reorg gain is one file. (Alternative: state/.)
+2. **SKILL.md + taleb-dynamic-hedger.skill** (37KB) — superseded by
+   .claude/skills/taleb-dynamic-hedger.md? If yes, delete; else move under
+   .claude/skills/ or docs/.
+3. **best_params.pre-resweep-2026-05-07.json** — stale 2026-05 backup,
+   cited only by tasks/todo.md. Recommend state/archive/.
+4. **Entrypoint style** — `python -m runners.run_paper` (recommended,
+   matches loop_engine) vs keeping absolute script paths in the units.
+
+
+## Review (2026-07-19)
+
+Executed. 64 tracked root modules moved into `core/` (13), `market_data/` (9),
+`research/` (28), `runners/` (11), `scripts/` (+3); `holidays.csv` →
+`market_data/`; stale `best_params.pre-resweep-2026-05-07.json` →
+`state/archive/`; legacy `SKILL.md` + `taleb-dynamic-hedger.skill` →
+`.claude/skills/`. Root now holds only governance docs, tooling configs,
+requirements, the two config templates, and `best_params.json` (deliberately
+kept in root — it is the live autoresearch seed).
+
+Verified: ruff clean; `pytest tests/ -q` 1477 passed / 0 failed / 0 skipped
+(run twice — after the import rewrite and again after the message rewrites);
+all 64 modules import from a clean interpreter; 21 entry points respond to
+`--help` via `-m`; `npm run build` green; zero residual references to old
+root paths anywhere in the tree.
+
+Findings worth keeping:
+- `screen_pairs` was reclassified core, not ops: 19 importers including the
+  LIVE pair runner and `strategies/pair_trading.py`.
+- `research/replay_2026_05_06.py` fails on import — PRE-EXISTING, not caused
+  by this reorg: it does its work at module level and its input
+  `logs/paper-2026-05-06.log` was truncated to 0 bytes by logrotate on
+  2026-05-10. Left as-is; it is a dead one-off.
+- CODEOWNERS per-file money-path rules were replaced by whole-directory
+  rules (`/runners/`, `/core/`, `/market_data/`). The old list would have
+  silently left a NEW runner on the default rule.
+- Operator-facing error messages that told the user to run a now-moved
+  script (e.g. "Run `python fetch_fii_dii.py`") were rewritten to the `-m`
+  form, including 7 frontend files.
+
+Step 6 DONE (2026-07-19 17:5x CEST): 18 installed units cut over to `-m`,
+backed up to /root/systemd-backup-2026-07-19, `systemd-analyze verify` clean
+on all, drop-in 10-top8.conf still wins (--top 8). End-to-end proof:
+`systemctl start taleb-hedger.service` → TZ + disk checks → holidays loaded →
+"No-op: weekend" → exit 0. The weekend gate precedes Kite auth, so the test
+did not touch the cached session token.
+
+## Code review follow-up (2026-07-19, 8 findings, all fixed)
+
+1+2. Command-shaped doc refs (`runners/run_paper.py --config ...`) had been
+   rewritten to a path form that CANNOT run. 30 occurrences fixed to
+   `python -m pkg.mod`, incl. `.claude/skills/verify/SKILL.md` (the repo's own
+   agent-executable verify skill) and config_banknifty_template.ini.
+3. `scripts/` dual-instance: `import strategy_decay` + `from scripts import
+   strategy_decay` produced TWO module objects, splitting the decay ledger's
+   state. Unified on package imports; proven single-object.
+4+7. sys.path bootstraps removed from all 18 moved modules that had one — in
+   backtest_pairs.py the bootstrap sat AFTER the import it enabled (dead code,
+   the one research script that couldn't run by path). One convention now:
+   `-m` for core/market_data/research/runners; `scripts/` keeps its explicit
+   repo-root bootstrap as a documented exception.
+5+6. Holiday-calendar anchor: `HOLIDAYS_PATH` now defined ONCE in
+   core/runner_common.py; 6 runners + verify_pair_paper import it, and
+   run_paper_kalman_trend no longer resolves it relative to CWD. The
+   fetch_bhavcopy* `load_holidays()` silently returned an EMPTY set on a
+   missing file (every NSE holiday = trading day); it now fails loud.
+8. Commit message corrected — bootstraps were re-anchored, not retired, in
+   the original commit; they are actually removed now.
+
+Re-verified after the fixes: ruff clean, pytest 1477 passed / 0 failed /
+0 skipped, all 22 entry points answer --help via -m, taleb-hedger.service
+green end-to-end.
+
+---
+
+# ARCHIVE — previous plans
+
 # Strategy decay state machine (Vibe-Trading review item 2, 2026-07-19)
 
 Persistent fleet-wide decay states on top of scripts/strategy_scoreboard.py
@@ -90,7 +248,7 @@ all-windows-negative case — a tail-harvester legitimately loses most windows).
 - [x] `build_validation_verdict`: sign-flip shuffle-null p-value on combined
       session P&Ls (gates at alpha=0.10, labeled coarse) + walk-forward
       windows over in-sample P&Ls (gates only when NO window is positive)
-- [x] `run_autoresearch.py`: print SEED VETOED prominently; format new checks
+- [x] `runners/run_autoresearch.py`: print SEED VETOED prominently; format new checks
 - [x] `scripts/rescore_candidates_convexity.py`: add "clears absolute bar"
       column so "would keep" can't be an artifact of a vetoed seed
 - [x] `config_template.ini`: document `vetoed_baseline_abs_floor`
@@ -235,7 +393,7 @@ trade-selecting params oscillate. Root cause is the OBJECTIVE, not the machinery
   zst + 1 stillborn). Of 41 measurable days: 7 with |move|≥1%, 3 ≥1.5%, only
   1 ≥2%. A convexity edge CANNOT be estimated from raw net P&L on this sample —
   the estimator is dominated by 1-3 days.
-- **Current objective** (autoresearch_loop.py `_run_experiment` /
+- **Current objective** (runners/autoresearch_loop.py `_run_experiment` /
   run_weekly_autoresearch.sh): mean(net_pnl) over last-15-session tape replay
   − 0.5·std, max-DD veto, zero-trade→₹0, keep-if-strictly-better. On a
   mostly-quiet window this rewards "trade less, bleed least" — exactly the
@@ -417,7 +575,7 @@ CODEOWNERS review; BANKNIFTY instance inherits the objective later (#87 scope).
 # Baseline pair runner — top-8 paper validation, then live-alongside (PLAN 2026-07-18)
 
 Operator wants the **baseline** pair strategy (`pair-paper.service`,
-`run_paper_pairs.py`) to (a) trade a tighter **top-8** universe (was top-12) and
+`runners/run_paper_pairs.py`) to (a) trade a tighter **top-8** universe (was top-12) and
 (b) go **LIVE alongside** the existing persistent live runner
 (`pair-paper-persistent-live.service`, +₹107k). Two operator decisions locked
 2026-07-18: **run alongside** (not replace) persistent-live, and
@@ -434,7 +592,7 @@ it must clear its own paper window before any live cutover.
 - [x] Checked-in template `deploy/pair-paper.service` ExecStart 12→8 (source of
       truth aligned).
 - [x] **Per-runner daily-loss breaker namespacing** (`halt_daily_loss_path` in
-      run_paper_pairs.py): `--system baseline` touches `HALT_DAILY_LOSS_baseline`;
+      runners/run_paper_pairs.py): `--system baseline` touches `HALT_DAILY_LOSS_baseline`;
       the persistent/live runner keeps canonical `HALT_DAILY_LOSS` (alert +
       runbook unchanged). Operator `HALT_ALL`/`HALT_NEW_ENTRIES` stay shared.
       Tests in tests/test_runner_risk_mediums.py (isolation asserted). Docs
@@ -568,11 +726,11 @@ hand-set gates while BANKNIFTY tape accumulates.
 ## Step 3 — parquet tick tape (space + faster replay) ✅
 - [x] JSONL→parquet at retention boundary (live writer UNCHANGED — JSONL stays
       crash-safe). New: backtest.convert_tape_to_parquet + _TAPE_PARQUET_COLUMNS
-      (depth-dropped), tape_to_parquet.py CLI, DuckDB COPY … PARQUET/ZSTD.
+      (depth-dropped), market_data/tape_to_parquet.py CLI, DuckDB COPY … PARQUET/ZSTD.
 - [x] `_tape_path` prefers .parquet > raw .jsonl > .jsonl.zst; _read_tape_header
       rebuilds the map from retained tradingsymbol (no sidecar);
       list_captured_sessions globs .parquet too.
-- [x] tick-retention.sh archive step: zstd → tape_to_parquet.py (convert+verify
+- [x] tick-retention.sh archive step: zstd → market_data/tape_to_parquet.py (convert+verify
       +delete jsonl); prune step handles both .parquet and legacy .zst backlog.
 - [x] Parity gate: tests/test_tape_parquet.py (4 tests PASS) — assert_frame_equal
       jsonl-vs-parquet incl spot patch / resample / out-of-session / malformed.
@@ -595,7 +753,7 @@ order path (user decision: "NO orders until edge shown").
       points / open-type conviction / balance-imbalance / excess) mapped to our
       code, with a deterministic "profitable-use playbook" table.
 
-## Phase 1 — indicator layer (pure, in market_profile.py)
+## Phase 1 — indicator layer (pure, in core/market_profile.py)
 - [ ] `DayIndicators` dataclass + `market_generated_indicators(bars, *, prior)`:
       open_type, day_shape (incl p/b), balance_state (vs prior VA, Fig 4.5),
       range_extension, excess/poor-high-low, single_prints, one_timeframing.
@@ -605,15 +763,15 @@ order path (user decision: "NO orders until edge shown").
       the book's label (Rule 9 — fail on drift).
 
 ## Phase 2 — feature log + edge report (go/no-go gate)
-- [ ] `log_mp_features.py`: nightly read-only, NIFTY/BANKNIFTY (30-min bars.db)
+- [ ] `scripts/log_mp_features.py`: nightly read-only, NIFTY/BANKNIFTY (30-min bars.db)
       + equity daily panel (warn_coarse_timeframe) → dashboard.db `mp_features`.
 - [ ] `deploy/mp-features.{service,timer}` template (NOT installed on host).
-- [ ] `mp_edge_report.py`: join features → forward outcomes, bucket hit-rate +
+- [ ] `research/mp_edge_report.py`: join features → forward outcomes, bucket hit-rate +
       mean forward return by open_type/day_shape/balance_state.
 
 ## Phase 3 — standalone MP paper strategy (GATED on Phase 2 edge)
 - [ ] Only if a bucket shows a cost-survivable edge: strategies/
-      market_profile_intraday.py + run_paper_mp.py (mirror run_paper_arbitrage),
+      market_profile_intraday.py + runners/run_paper_mp.py (mirror run_paper_arbitrage),
       backtest → paper → kill rule. Reject if 0 trades on hold-out / net-neg.
 
 ## Review (Phases 0-2 done, 2026-07-13)
@@ -622,14 +780,14 @@ Deliverables shipped (no order path touched — user's "NO orders until edge
 shown" honored):
 - Phase 0: `docs/market-profile-book-analysis.md` — four profit layers →
   our code, deterministic playbook, + the measured verdict (§5).
-- Phase 1: `market_profile.py` gained `DayIndicators` +
+- Phase 1: `core/market_profile.py` gained `DayIndicators` +
   `market_generated_indicators()` (open_type, day_shape, profile_skew,
   balance_state, range extension, excess/poor, single prints, one-timeframing) —
   pure geometry, no router/frontend change. 18 figure-reproducing tests added;
   `tests/test_market_profile.py` = 40 passed.
-- Phase 2: `log_mp_features.py` (nightly, read-only) → `mp_features` table in
+- Phase 2: `scripts/log_mp_features.py` (nightly, read-only) → `mp_features` table in
   dashboard.db (5,184 intraday-30m rows on the host; daily balance-state pass
-  also works). `mp_edge_report.py` buckets forward returns.
+  also works). `research/mp_edge_report.py` buckets forward returns.
   `deploy/mp-features.{service,timer}` templates (NOT installed).
 
 Two honest findings (Rule 12):
@@ -646,7 +804,7 @@ code yet).
 
 ## Phase 2.5 — trend_up robustness (done 2026-07-13)
 
-`mp_trend_robustness.py` stress-tested the one lead. `trend_up` next-day
+`research/mp_trend_robustness.py` stress-tested the one lead. `trend_up` next-day
 (n=437) is more robust than first feared:
 - Beats drift (baseline ~0.7 bps), broad (37/46 names +), persistent (5/6 mo).
 - **Not** tail-driven: survives trim 5%/5% (+31.7) and winsorize (+34.0).
@@ -668,7 +826,7 @@ Remaining operator steps:
   (host currently has 30-min *equity* bars only).
 ## Phase 3a — backtest gate (done 2026-07-13): FAILED
 
-`backtest_mp_trend.py` (long trend_up at close, exit next close, equal-weight
+`research/backtest_mp_trend.py` (long trend_up at close, exit next close, equal-weight
 per day, 25 bps overnight cost):
 - ALL: Sharpe -0.53, -4.8%. TRAIN: -0.14. **HOLDOUT: Sharpe -1.68, -3.5%,
   -12 bps/day** — net loser out-of-sample. Holdout breakeven ~12 bps < realistic
@@ -681,7 +839,7 @@ Naive all-days portfolio does NOT graduate. But a pre-registered rescue does.
 
 ## Phase 3 rescue + build (done 2026-07-13)
 
-`backtest_mp_trend.py --fit-min-signals`: fit a broad-momentum-day filter (≥K
+`python -m research.backtest_mp_trend --fit-min-signals`: fit a broad-momentum-day filter (≥K
 trend_up names) on TRAIN, confirm on HOLDOUT (leakage-free — count known at
 close). K=3 chosen on train (Sharpe 1.75); HOLDOUT K≥3 Sharpe 3.33, +17.3
 bps/day net, **monotone in K** (K=5 +27, K=6 +36). Consistent + economically
@@ -692,7 +850,7 @@ with a kill switch** (the right vehicle for a consistent-but-underpowered edge):
 - `strategies/market_profile_intraday.py` — pure logic: broad-momentum filter,
   equal-weight sizing, cost-aware P&L, `check_kill` (6% DD / ₹40k cum-loss after
   ≥20 trades). Tested in `tests/test_mp_trend_strategy.py` (9 tests).
-- `run_paper_mp.py` — EOD paper runner (no Kite/order path) → mp_trend_positions
+- `runners/run_paper_mp.py` — EOD paper runner (no Kite/order path) → mp_trend_positions
   / mp_trend_runs in dashboard.db; `--replay` seeds from history.
 - `deploy/mp-paper.{service,timer}` — nightly template (NOT installed).
 
@@ -713,13 +871,13 @@ Remaining operator steps:
   dashboard-backend restarted (/api/mp-trend live, 401-gated); frontend rebuilt
   via deploy/build-frontend.sh (PROJECT_DIR=/root/...) — MP Trend tab verified
   on the public URL.
-- `mp_finetune.py` (pre-registered H1/H2/H3/H5, train/holdout, net 25 bps):
+- `scripts/mp_finetune.py` (pre-registered H1/H2/H3/H5, train/holdout, net 25 bps):
   H1 K≥6 PASSES (holdout 42 net bps/trade, port Sharpe 8.0, no collapse);
   H2 top-N REJECTED; H3 poor-high REJECTED (train contradicts);
   H5 hold-2d promising (+125 net bps non-overlap, NOT beta — holdout drift
   negative) but train-ambiguous. Full table in book-analysis §5.4.
 - **Runner deliberately left at K=3/h=1**: the K=3 book is a superset of every
-  K≥k cut, so forward data re-cuts offline via mp_finetune.py. Promote K=6/h=2
+  K≥k cut, so forward data re-cuts offline via scripts/mp_finetune.py. Promote K=6/h=2
   only on forward confirmation (~4+ weeks of paper days).
 - PR #120 MERGED (6ef25dd). Weekly re-cut wired: mp-finetune-report.timer
   (Sat 10:00 IST) → deploy/run_mp_finetune_report.sh → journald + dated
@@ -861,7 +1019,7 @@ re-implemented:
 
 ## Parity gate (the merge condition, per the arbitrage-dead-code lesson)
 
-- Host run: old loader (main's backtest.py imported as a legacy module)
+- Host run: old loader (main's research/backtest.py imported as a legacy module)
   vs new loader on 3 REAL sessions — one .zst archive, two raw July
   sessions (incl. ticks-2026-07-06, the epoch-zero OOM tape) — must be
   assert_frame_equal-identical at 1min AND tick resolutions.
@@ -871,7 +1029,7 @@ re-implemented:
 
 ## Checklist
 - [x] duckdb==1.5.4 pinned (requirements.in + hash lock, no --upgrade) + .venv
-- [x] backtest.py: DuckDB parse + header; deleted _open_tape/_TAPE_CHUNK_ROWS/
+- [x] research/backtest.py: DuckDB parse + header; deleted _open_tape/_TAPE_CHUNK_ROWS/
       chunk merge; enrich pipeline untouched. NOTE vs plan: NO ns cast —
       legacy pd.to_datetime on pandas 3 yields datetime64[us], same as
       DuckDB, and the first gate run caught my cast as the only mismatch
@@ -897,7 +1055,7 @@ re-implemented:
   datetime64[ns] cast, added to match an assumed legacy dtype that
   pandas 3 doesn't actually produce (legacy gives us-resolution, same
   as DuckDB; removing the cast was the fix).
-- Net deletion in backtest.py: _open_tape (zstd subprocess + EPIPE
+- Net deletion in research/backtest.py: _open_tape (zstd subprocess + EPIPE
   bookkeeping), _TAPE_CHUNK_ROWS, per-chunk resample, cross-chunk merge
   — all replaced by two DuckDB queries + the pre-#110 single-shot
   resample, now safe because the epoch filter runs before it.
@@ -925,8 +1083,8 @@ re-implemented:
 
 # ARCHIVE — prior tasks' plans & reviews (accumulated record)
 
-Kept because source files cite dated entries here (screen_pairs.py,
-strategies/pair_trading.py, compare_paper_systems.py, autoresearch_loop.py,
+Kept because source files cite dated entries here (core/screen_pairs.py,
+strategies/pair_trading.py, research/compare_paper_systems.py, runners/autoresearch_loop.py,
 loop_engine/__init__.py, tests/test_runner_live_gate.py, …). Do not prune
 without fixing those references.
 
@@ -940,17 +1098,17 @@ deleted in this increment.
 
 ## Families in scope
 1. EOD option chains (`data_cache/<U>_*_eod*.csv`, 535 MB) — writers
-   fetch_bhavcopy.py / fetch_historical_data.py
+   market_data/fetch_bhavcopy.py / market_data/fetch_historical_data.py
 2. F&O bhavcopy raw day cache (`bhavcopy_raw/bhavcopy_fo_*.csv`, 3.5 GB) —
    writer fetch_bhavcopy._download_bhavcopy (kite-fallback sentinel logic
    must survive unchanged)
-3. EQ bhavcopy raw day cache + per-symbol `equity_ohlcv/` — fetch_bhavcopy_eq.py
-4. STF 5-min per-symbol (`stf_5min/`) — fetch_5min_stf.py
+3. EQ bhavcopy raw day cache + per-symbol `equity_ohlcv/` — market_data/fetch_bhavcopy_eq.py
+4. STF 5-min per-symbol (`stf_5min/`) — market_data/fetch_5min_stf.py
 5. Index daily/intraday bars (`<SYM>_daily.csv`, `<SYM>_5minute.csv`) —
-   fetch_index_daily.py
+   market_data/fetch_index_daily.py
 
 Explicitly OUT of scope: instruments master CSVs, pair_candidates.csv,
-nifty200/holidays, fii_dii, *.tsv logs, dashboard.db, replay_2026_05_06.py,
+nifty200/holidays, fii_dii, *.tsv logs, dashboard.db, research/replay_2026_05_06.py,
 prototype_kalman_signal_exit.py (frozen one-offs).
 
 ## Parity rules (the correctness core)
@@ -964,14 +1122,14 @@ prototype_kalman_signal_exit.py (frozen one-offs).
   writer parquet carries real datetimes.
 
 ## Checklist
-- [x] data_cache_io.py — read_table / write_table / table_columns /
+- [x] core/data_cache_io.py — read_table / write_table / table_columns /
       find_tables (parquet-first, csv fallback) + tests/test_data_cache_io.py
 - [x] pyarrow: requirements.in + hash-pinned lock recompile (NO --upgrade)
       + install into .venv (pyarrow==25.0.0, lock diff purely additive)
-- [x] Writers → parquet: fetch_bhavcopy.py (raw cache = parquet day frames,
+- [x] Writers → parquet: market_data/fetch_bhavcopy.py (raw cache = parquet day frames,
       _parse_udiff_day takes df; explicit --output *.csv still honored),
-      fetch_bhavcopy_eq.py, fetch_historical_data.py (eod output only),
-      fetch_index_daily.py, fetch_5min_stf.py
+      market_data/fetch_bhavcopy_eq.py, market_data/fetch_historical_data.py (eod output only),
+      market_data/fetch_index_daily.py, market_data/fetch_5min_stf.py
 - [x] Readers → read_table/find_tables: all sites ported. Notes vs plan:
       validate_kalman_filter --csv is ad-hoc user data, NOT a converted
       family → left as read_csv; backtest_pairs_rule/sweep_top only pass
@@ -980,7 +1138,7 @@ prototype_kalman_signal_exit.py (frozen one-offs).
 - [x] scripts/backfill_parquet_data_cache.py — one-shot, per-family kwargs,
       round-trip parity check per file, skip+report failures, keep CSVs
 - [x] Full test suite green: 1281 passed (incl. arbitrage AST-parity test)
-- [x] Run backfill for real; smoke: backtest.py on a parquet eod file,
+- [x] Run backfill for real; smoke: research/backtest.py on a parquet eod file,
       screen_pairs panel load, taleb spot-history seed
 - [x] docs/data_pipeline/bhavcopy_ingestion.md touch-up (formats changed)
 
@@ -990,7 +1148,7 @@ prototype_kalman_signal_exit.py (frozen one-offs).
   4,585 MB csv → 1,190 MB parquet (3.9x). CSVs retained (deprecation
   window); deleting them later reclaims ~4.5 GB.
 - End-to-end verification on real data (all through CLIs, not unit calls):
-  backtest.py loaded the chains via parquet given a .csv path, given a
+  research/backtest.py loaded the chains via parquet given a .csv path, given a
   parquet-only dir, and given the .parquet path (260 ticks each);
   missing-both fails loud naming both candidates; the LIVE strategy seeded
   43 spot samples from `NIFTY_20260511_20260710_eod.parquet`;
@@ -1065,7 +1223,7 @@ HALT_DAILY_LOSS (entries suspended; exits continue and ARE published).
       execute_proposals publishes ENTRY at decision, CANCEL if the entry
       batch fails to establish, EXIT with reason for every exit path.
       Publish failures log CRITICAL but never block the live loop.
-- [x] `run_paper_pairs.py`: --publish-signals flag → one shared publisher
+- [x] `runners/run_paper_pairs.py`: --publish-signals flag → one shared publisher
 - [x] deploy/pair-paper-persistent-live.service template: add flag + comment
       (installed-unit edit = operator step)
 - [x] deps: jsonschema (>=4.18 for 2020-12) → requirements.in + lock (plain
@@ -1137,7 +1295,7 @@ installed; no state/log/iv-history on host). So working #87 now means
 UNBLOCKING THE GATE, not building the loop:
 - [ ] Host ops (the PR #86 operator steps, explicitly requested via "work on
       issue 87"): config_banknifty.ini from template (creds via .env),
-      BANKNIFTY EOD seed via fetch_index_daily.py (cached session,
+      BANKNIFTY EOD seed via market_data/fetch_index_daily.py (cached session,
       post-market), install+enable taleb-banknifty-paper.{service,timer}
       (09:12 stagger), correcting the deploy files' /opt template path to
       this host's checkout at install.
@@ -1161,8 +1319,8 @@ VERIFY-FIRST findings (the #70/E4 lesson, applied again):
     gate (cost_hurdle_factor, live 2.53 → ~1.36x), asymmetric √γ bands,
     T-0 tightening, C2 churn caps (host: cooldown 180s, session cap 20).
     All rehedge knobs are in TUNABLE_RANGES → tuned weekly under net_pnl.
-    Remaining gap = the sweep script (sweep_rehedge_params.py) runs on CSV
-    bars, not tape → add a --tape mode reusing backtest.py's loaders.
+    Remaining gap = the sweep script (research/sweep_rehedge_params.py) runs on CSV
+    bars, not tape → add a --tape mode reusing research/backtest.py's loaders.
   * §2.2 item 3 (per-structure cost hurdle): the mechanism EXISTS (Gap #2
     MC expected-value gate, mc_min_mean_pnl) but is DOUBLY BROKEN:
     (a) risk_analyzer._simulate_single_path charges ZERO transaction costs
@@ -1190,8 +1348,8 @@ VERIFY-FIRST findings (the #70/E4 lesson, applied again):
       NOT zero out trading. If applied later, change BOTH config.ini (the
       persistence seam) and best_params.json (live effective until the
       weekly regen).
-- [x] Increment 3 — sweep_rehedge_params.py --tape N / --grid frontier
-      (reuses backtest.py loaders; per-session replay, aggregated net_pnl;
+- [x] Increment 3 — python -m research.sweep_rehedge_params --tape N / --grid frontier
+      (reuses research/backtest.py loaders; per-session replay, aggregated net_pnl;
       excludes today's in-progress capture). 10-session sweep RESULT
       (2026-06-22→07-03, honest MC estimator, floor −10000):
       * WIDER BANDS DOMINATE (the review's §2.2 prediction): reh_dt 1.2 →
@@ -1266,7 +1424,7 @@ E4 autoresearch objective swap.
 - [x] Verify E4 status FIRST (Rule 8 / the #70 lesson): ALREADY DONE —
       config.ini + config_template.ini both have [autoresearch] metric =
       net_pnl (cost-inclusive: taleb metrics net_pnl = realized(net)+unreal);
-      autoresearch_loop.py PNL_METRICS handles no-trade sessions; no-promote
+      runners/autoresearch_loop.py PNL_METRICS handles no-trade sessions; no-promote
       guards live. Only the review doc needs correcting (§3 E4 / §5 week 2).
 - [x] Arbitrage rupee-denominated cost hurdle at entry (§2.3): in
       _build_calendar_entry, require expected convergence P&L over the
@@ -1288,7 +1446,7 @@ E4 autoresearch objective swap.
 - [x] config_template.ini [arbitrage]: both knobs + cost-math rationale.
       Host config.ini NOT edited: absent keys fall back to the code defaults
       (2.0 / 2.0), which are the intended values — no operator step.
-- [x] run_paper_arbitrage.py startup log: cost_hurdle + min_hold shown.
+- [x] runners/run_paper_arbitrage.py startup log: cost_hurdle + min_hold shown.
 - [x] Correct review doc: §3 E4 marked already-implemented; §5 week-2 note.
 - [x] Tests (Rule 9, +7): thin-notional passes % gate but fails rupee gate;
       fat carry clears; 0 disables; gate arithmetic pinned to
@@ -1348,12 +1506,12 @@ long-run profitability; deliver a review doc in docs/.
       months net-negative). Smoke-tested against real data: flags Taleb NIFTY
       (May −56k, Jun −64.7k); current partial month never counts.
 - [x] Buy-on-gap experiment kill rule (§2.4) → experiment_kill_reason() in
-      run_paper_buy_on_gap.py + --kill-net-loss-inr 50000 / --kill-min-trades
+      runners/run_paper_buy_on_gap.py + --kill-net-loss-inr 50000 / --kill-min-trades
       15 / --kill-max-win-rate 0.35; open positions ⇒ EXIT-ONLY session via
       GapHaltState(kill_rule=True). Dry-run verified: fires at a ₹30k test
       floor on the real −₹39,268 state, does NOT fire at defaults.
 - [x] Kalman-trend kill date (§2.7) → KILL_DATE = 2026-08-01 +
-      experiment_expired() gate in run_paper_kalman_trend.py main(); exits 0
+      experiment_expired() gate in runners/run_paper_kalman_trend.py main(); exits 0
       without EOD → loop orchestrator records "no_session" (verified against
       kite_engine's status contract).
 - [x] Kalman-pairs roll buffer #70: found ALREADY IMPLEMENTED (closed
@@ -1388,7 +1546,7 @@ long-run profitability; deliver a review doc in docs/.
 - [x] tasks/todo.md wholesale replacement had orphaned dated entries cited by
       source files (pair_trading.py 2026-05-13 incident, loop_engine
       "Loop-Engineering Orchestrator", …) — prior content restored under an
-      ARCHIVE divider. (screen_pairs.py's "2026-05-17 entry" was ALREADY
+      ARCHIVE divider. (core/screen_pairs.py's "2026-05-17 entry" was ALREADY
       dangling on main before this branch — pre-existing, not fixed here.)
 - [x] Accepted as-is (deliberate): scoreboard's readers duplicate backend
       router parsing (standalone-script tradeoff; consolidation = follow-up),
@@ -1416,7 +1574,7 @@ DECISIONS (AskUserQuestion 2026-07-04):
   1. FIRST deliverable = isolated BANKNIFTY paper runner (gather edge evidence);
      DEFER the loop_engine orchestrator/checker/risk/dashboard to a follow-up
      gated on paper showing something.
-  2. Reuse run_paper.py as a 2nd isolated instance (parameterize paths), not a
+  2. Reuse runners/run_paper.py as a 2nd isolated instance (parameterize paths), not a
      dedicated runner (Rule 2/8).
   3. Cold seed (use_best_params=false, book defaults) — NOT NIFTY's best_params.
   4. BANKNIFTY-only on loop_engine later; NIFTY stays on autoresearch.
@@ -1428,7 +1586,7 @@ step 100 for non-NIFTY; _INDEX_SPOT_SYMBOLS[BANKNIFTY]="NSE:NIFTY BANK";
 best_params_path/use_best_params config-driven. So the ONLY gap = runner paths.
 
 ## Increment 1 (this PR) — isolated BANKNIFTY paper instance, PAPER-ONLY
-- [x] run_paper.py: --config + --override (thin merge, override wins) → derive
+- [x] runners/run_paper.py: --config + --override (thin merge, override wins) → derive
       underlying → derive_paths(): NIFTY keeps LEGACY unsuffixed names (byte-
       identical), else suffix _{underlying}. Threaded `state_file` through
       load/restore/write/end_of_session. Fail-loud on config-underlying mismatch.
@@ -1438,14 +1596,14 @@ best_params_path/use_best_params config-driven. So the ONLY gap = runner paths.
       book-default tunables; creds+rails inherited from base. gitignore
       config_banknifty.ini (host copy).
 - [x] deploy/taleb-banknifty-paper.{service,timer} mirror taleb-hedger; ExecStart
-      run_paper.py --config config.ini --override config_banknifty.ini. Documented,
+      python -m runners.run_paper --config config.ini --override config_banknifty.ini. Documented,
       NOT auto-installed.
 - [x] Tests (Rule 9, +4): NIFTY→legacy names; BANKNIFTY→isolated/disjoint;
       state persist/load uses the passed path; and an END-TO-END construction
       test — merged base+override builds a COLD BANKNIFTY strategy (underlying,
       iv_history_BANKNIFTY.json, book 30-70 band, 1M inherited). 8 run_paper tests.
 - [x] Data dependency documented in the template header (BANKNIFTY_*_eod.csv via
-      fetch_index_daily.py; iv_history_BANKNIFTY.json builds forward). NO live path.
+      market_data/fetch_index_daily.py; iv_history_BANKNIFTY.json builds forward). NO live path.
 
 ### Code-review fixes (2026-07-04, high-effort → applied)
 The review CHANGED the design: the thin-override-onto-config.ini approach was
@@ -1491,12 +1649,12 @@ Pure cleanup (Rule 2/3), NO behaviour change. Two copy-paste blocks the re-base
 added risked silent drift (two sources of truth for the candidate schema + the
 replay report). Factored shared helpers, verified byte-identical.
 
-- [x] screen_pairs.py: `_choose_direction` (Error-Ratio pick, once — fixes the
+- [x] core/screen_pairs.py: `_choose_direction` (Error-Ratio pick, once — fixes the
       book's 3× `_error_ratio` recompute), `_pair_metrics_row` (the ~17-col row;
       correlation passed in since screen=|corr|-matrix vs book=signed corrcoef),
       `_composite_rank` (the (p+hl+vol)/3 score, now single-sourced across
       screen_pairs / screen_pairs_book / screen_pairs_persistent).
-- [x] backtest_kalman_pairs.py: `_force_close` + `_replay_metrics` (the 12-key
+- [x] research/backtest_kalman_pairs.py: `_force_close` + `_replay_metrics` (the 12-key
       dict) shared by run_replay + run_replay_5min.
 - [x] VERIFIED byte-identical vs pre-refactor baselines: screen_pairs /
       screen_pairs_book(npd & composite) / screen_pairs_persistent frames
@@ -1550,7 +1708,7 @@ monotonically, stall-to-stop=0" — a code review found that WRONG on two
 measurement bugs: (a) the split force-closed boundary-spanning positions as
 EOD_CLOSE, masking the exit knob; (b) min|z| was sampled AFTER the close, so a
 MAX_HOLD/stall that closes near the mean was never counted (→ false stall=0).
-Corrected + committed as `validate_kalman_exit.py` (continuous full-window with
+Corrected + committed as `research/validate_kalman_exit.py` (continuous full-window with
 production-faithful per-day step + bar-START min|z| sampling; per-trade rows in
 data_cache/kalman_exit66_trades.csv → every number below is reproducible).
 
@@ -1731,8 +1889,8 @@ independent copies; the config surfaces + a stale comment lagged. Fixed:
    that steered a reader back to the retired value.
 2. strategies/kalman_pair_trading.py regime-gate comment no longer asserts
    "book s₀=1 is best" (it contradicted the new __init__ rationale).
-3. Extracted `build_parser()` in run_paper_kalman_pairs.py AND
-   backtest_kalman_pairs.py; new test_kalman_pairs_entry_z_defaults_in_sync
+3. Extracted `build_parser()` in runners/run_paper_kalman_pairs.py AND
+   research/backtest_kalman_pairs.py; new test_kalman_pairs_entry_z_defaults_in_sync
    pins the runner argparse default (the value that ACTUALLY governs live
    paper — deploy unit passes no --entry-z) == backtest == strategy fallback
    == config_template, so a future one-sided drift fails CI. Verified the
@@ -1762,18 +1920,18 @@ lucky step, candidate ≈ seed params. 06-20: 0/40 accepted. Root causes:
    most params never flip a single entry/routing/rehedge decision → flat
    plateau, hill-climber starves.
 2. **Nothing fails loud (Rule 12).** An uninformative sweep still writes a
-   legitimate-looking candidate JSON. And `run_autoresearch.py --metric`
+   legitimate-looking candidate JSON. And `python -m runners.run_autoresearch --metric`
    defaults to `sharpe_ratio`, silently overriding config's `net_pnl` for
    anyone running it by hand.
 
 ## Plan
 
-- [x] backtest.py: `list_captured_sessions` also lists `.jsonl.zst` (dedupe
+- [x] research/backtest.py: `list_captured_sessions` also lists `.jsonl.zst` (dedupe
       stems); `load_captured_tape` streams `.zst` via system `zstd -dc`
       (retention script already hard-depends on the binary; no new pip dep)
-- [x] run_autoresearch.py: `--metric` default None → fall back to
+- [x] runners/run_autoresearch.py: `--metric` default None → fall back to
       `[autoresearch] metric` from config.ini
-- [x] run_autoresearch.py + autoresearch_loop.py: sweep-quality telemetry —
+- [x] runners/run_autoresearch.py + runners/autoresearch_loop.py: sweep-quality telemetry —
       n_accepted, distinct-fitness count, plateau share, baseline→best delta
       → embedded as `sweep_quality` in the candidate JSON + loud WARNING when
       uninformative (0 accepts / best==baseline / plateau >50%)
@@ -1781,7 +1939,7 @@ lucky step, candidate ≈ seed params. 06-20: 0/40 accepted. Root causes:
       incl. expiry days), experiments 40→25 (with the tape cache: ~30-45 min
       first-parse + 20-40 s/cycle ⇒ ≈3-5 h, well inside the 10 h unit
       timeout; the earlier ~77 s/cycle ⇒ 8 h figure was pre-cache)
-- [x] stale-comment sweep: tick-retention.sh + tick_capture.py no longer say
+- [x] stale-comment sweep: tick-retention.sh + market_data/tick_capture.py no longer say
       "replay reads .jsonl only"
 - [x] tests: zst listing/dedupe + zst tape load (skip w/o zstd binary),
       sweep_quality embed + `_migrations` preservation, metric-from-config
@@ -1869,13 +2027,13 @@ DECIDED (AskUserQuestion 2026-06-28):
    is the deterministic Kalman strategy and the gates (Sharpe / MDD / Newey–West
    t-stat) are deterministic inequalities. Rule 5 forbids using the model for
    deterministic transforms. → per-signal checker = plain-code verifier (mirrors
-   `verify_pair_paper.py`). LLM is reserved ONLY for the judgment layer the paper
+   `scripts/verify_pair_paper.py`). LLM is reserved ONLY for the judgment layer the paper
    also names: the periodic verification-debt audit + lesson synthesis (Phase 6).
 
 2. **Reuse, don't fork (Rule 7/8).** The orchestrator WRAPS existing pieces; it
-   does not reimplement them: ingest=`fetch_bars.py`/`fetch-bars.timer`,
-   maker=`strategies/kalman_trend_following.py` via `run_paper_kalman_trend.py`,
-   connector=`kite_auth.py`, session-control=`runner_common.py`. Where the paper's
+   does not reimplement them: ingest=`market_data/fetch_bars.py`/`fetch-bars.timer`,
+   maker=`strategies/kalman_trend_following.py` via `runners/run_paper_kalman_trend.py`,
+   connector=`core/kite_auth.py`, session-control=`core/runner_common.py`. Where the paper's
    skeleton overlaps existing systemd timers, the timer is the source of truth;
    the orchestrator calls into the runner rather than re-scheduling it.
 
@@ -2111,9 +2269,9 @@ acknowledged in §7 and reported in findings, not engineered away (per directive
 Goal: a reference doc on implementing linear-regression signals for
 profitability + the learnings for our built system.
 
-- [x] Survey existing regression machinery: `screen_pairs.py` (OLS hedge
+- [x] Survey existing regression machinery: `core/screen_pairs.py` (OLS hedge
       ratio, intercept SE), `varsity_equity_swing` additive score,
-      `run_autoresearch.py` hold-out splitter, `sweep_*.py`.
+      `runners/run_autoresearch.py` hold-out splitter, `sweep_*.py`.
 - [x] Wrote `docs/research/linear_regression_signals.md` — theory (alpha =
       intercept), reading an OLS summary, the OOS/IC/Newey-West/Bonferroni
       gauntlet, "Relevance to this codebase", and a 5-step profitability-first
@@ -2196,7 +2354,7 @@ LIVE path → operator-coordinated. Rest are safe code/test/docs.
 - [x] 3.3 /api/equity/signals: tail-read (last 4 MB) + `limit` param instead
       of parsing the whole shared feed (can be 358 MB) per poll. +2 tests.
 - [x] 3.8 split classify_pair_candidates + QUALITY_*/LEG_CONCENTRATION_CAP →
-      screen_pairs.py; run_paper_pairs re-exports (select_pairs/dashboard/
+      core/screen_pairs.py; run_paper_pairs re-exports (select_pairs/dashboard/
       tests unchanged); backtest_pairs_rule + sweep_top repointed → neither
       imports the live runner anymore. 31 affected tests green.
 - [x] 3.1 docs: README entry-point + script tables add run_paper_pairs /
@@ -2236,7 +2394,7 @@ Finding: optimizing gamma_theta_ratio is decoupled from P&L — the 2026-06-13
 candidate (gtr 0.95) lost MORE than baseline in-sample (-₹7,814 vs -₹1,171
 realized over the 3 training sessions; one day scored gtr 1.31 while booking
 -₹5.6k). Fix: optimize net_pnl (₹ realized+unrealized, net of costs).
-- autoresearch_loop.py: PNL_METRICS set; zero-trade session scores ₹0 for a
+- runners/autoresearch_loop.py: PNL_METRICS set; zero-trade session scores ₹0 for a
   P&L objective (was -1e6 ratio penalty → that pushed overtrading). Variance
   penalty + DD veto already make net_pnl risk-aware.
 - config.ini + config_template.ini [autoresearch] metric → net_pnl;
@@ -2278,21 +2436,21 @@ Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
       below/above bound + missing-β refusals, happy-path seed-from-panel,
       paper-mode notional-cap requirement. +27 tests.
 - [x] 2.1 shared runner scaffolding — DONE across pt1+pt2.
-      PT1 (900deb9): runner_common.py with the 15 shared symbols extracted
+      PT1 (900deb9): core/runner_common.py with the 15 shared symbols extracted
       verbatim; pairs imports+re-exports; arbitrage repointed (cross-import
       gone).
       PT2: (A) generic acquire_lock() in runner_common; pairs + arbitrage
       acquire_runner_lock now thin wrappers over it (lock tests green,
-      "already holding the lock" message preserved). (B) run_paper.py: de-dup
+      "already holding the lock" message preserved). (B) runners/run_paper.py: de-dup
       its OLD holiday helpers + session constants + sleep_until → runner_common
       (now gets the hardened load_holidays w/ precise errors + header
       tolerance); added assert_timezone_ist + assert_disk_space_ok + a
-      single-instance lock (.taleb_paper.lock). (C) run_equity_swing.py: added
+      single-instance lock (.taleb_paper.lock). (C) runners/run_equity_swing.py: added
       tz + disk pre-flights + a PER-SCAN lock (.equity_swing_{open,close}.lock
       — two same-kind scans would double-drain pending entries; open/close
       coexist). All 3 units already set TZ=Asia/Kolkata so the tz gate is safe.
       DELIBERATELY DEFERRED: install_signal_handlers + HeartbeatTracker for
-      run_paper.py — they make SIGTERM exit 130, which taleb-hedger.service
+      runners/run_paper.py — they make SIGTERM exit 130, which taleb-hedger.service
       (OnFailure set, NO SuccessExitStatus=130) would treat as failure and
       false-page. That needs a paired unit change → fold into 2.6 host work.
 - [~] 2.6 User=taleb units — CODE/CANON + runbook done; HOST APPLY is
@@ -2300,7 +2458,7 @@ Order: S-effort/low-risk first; host-touching + XL last (same as session 1).
       runs EVERY unit as root (data_cache + all state files root:root) — the
       repo's User=taleb was canon the host never matched. So 2.6 is a
       host-wide privilege migration, not a 4-unit flip.
-      DONE: (a) deferred-2.1 hardening — run_paper.py now installs the
+      DONE: (a) deferred-2.1 hardening — runners/run_paper.py now installs the
       SIGTERM→KeyboardInterrupt handler + a HeartbeatTracker (silent-dead-
       trader: token-expired session no longer exits 0 after trading nothing;
       breach → exit 1 → OnFailure); taleb-hedger.service gets
@@ -2525,7 +2683,7 @@ paper mode untouched. This is the FIRST real-money deployment in the repo.
   fcntl lock `.pair_paper_persistent.lock` (H9 — two `--system persistent`
   runners cannot coexist), EOD `pair_paper_persistent_eod_*.json`, own log.
 - **CSV freshness gate (H10):** live defaults `--max-csv-age-days` to **1.0**
-  (`run_paper_pairs.py:161`). `pair_candidates_persistent.csv` is refreshed
+  (`runners/run_paper_pairs.py:161`). `pair_candidates_persistent.csv` is refreshed
   by `screen-pairs.timer` (Mon..Fri 19:00 IST) — so Monday morning it is
   ~2.6 days old → **a live runner with the default would REFUSE to start on
   Mondays / post-holidays.** Live unit must set `--max-csv-age-days 4`.
@@ -2545,7 +2703,7 @@ paper mode untouched. This is the FIRST real-money deployment in the repo.
 ### A. Repo artifacts (Claude creates on approval; reviewed before install)
 - [ ] A1. New unit `deploy/pair-paper-persistent-live.service` — copy of
       `pair-paper-persistent.service` with ExecStart:
-      `run_paper_pairs.py --top 12 --max-leg-notional 1000000
+      `python -m runners.run_paper_pairs --top 12 --max-leg-notional 1000000
        --candidates data_cache/pair_candidates_persistent.csv --system persistent
        --quality-max-pvalue 0.05 --mode live --i-understand-this-is-real-money
        --max-daily-loss-inr 25000 --max-csv-age-days 4`
@@ -2686,7 +2844,7 @@ data job needed.
 
 # Repair pair walk-forward backtest harness (2026-06-02)
 
-`backtest_pairs_rule.py` / `backtest_pairs.py` had bit-rotted and were silently
+`research/backtest_pairs_rule.py` / `research/backtest_pairs.py` had bit-rotted and were silently
 producing all-₹0 results. Found while trying to backtest the persistent system.
 
 Three rot layers fixed:
@@ -2737,7 +2895,7 @@ Plan:
 
 ## Review (2026-06-02)
 
-Done. `run_paper_pairs.py`: `max_pvalue` keyword on classify_pair_candidates
+Done. `runners/run_paper_pairs.py`: `max_pvalue` keyword on classify_pair_candidates
 (mirrors the existing exclude_symbols/max_hedge_ratio override pattern),
 threaded through select_pairs, exposed as `--quality-max-pvalue` (default None
 → QUALITY_MAX_PVALUE 0.025, so every existing caller — baseline runner,
@@ -2846,8 +3004,8 @@ but flagging it so the P&L number is read with that prior in mind.
 - [ ] Add `_session_start_realized` / `_session_start_unrealized` baseline
       attrs in `__init__` so the runner's daily-loss check works.
 
-### 2. Daily runner (new: run_paper_arbitrage.py)
-- [ ] Single-strategy mirror of run_paper_pairs.py. REUSE generic safety
+### 2. Daily runner (new: runners/run_paper_arbitrage.py)
+- [ ] Single-strategy mirror of runners/run_paper_pairs.py. REUSE generic safety
       helpers via import (load_holidays, is_trading_day, assert_*, sleep_until,
       install_signal_handlers, HeartbeatTracker, _HaltState, HALT_* paths,
       session-time constants).
@@ -2886,7 +3044,7 @@ All 7 pieces landed and verified.
 Files:
 - `strategies/arbitrage.py` — added `serialize_state()`/`restore_state()` +
   `_serialise/_deserialise_closed_trade` helpers + session-start P&L baselines.
-- `run_paper_arbitrage.py` (new) — single-strategy daily runner; imports the
+- `runners/run_paper_arbitrage.py` (new) — single-strategy daily runner; imports the
   generic safety helpers from run_paper_pairs; own lock/state/EOD/daily-loss
   namespacing so it never collides with the pair runner.
 - `config_template.ini` — added `[arbitrage]` section (live config.ini already
@@ -2962,7 +3120,7 @@ kalman-vs-MA delta is inflated by ~₹13.5k of uncharged round-trip costs.
 ## 2026-07-06 — Offline experiment: cost-aware warmup fit for kalman_trend
 
 Question: does passing cost_per_unit=2.5 into the warmup CMA-ES fit (runner
-today fits at 0.0 — run_paper_kalman_trend.py:177) cut churn enough to beat
+today fits at 0.0 — runners/run_paper_kalman_trend.py:177) cut churn enough to beat
 the costed MA baseline OOS? Mirrors deployment: train 1500 5-min bars,
 n_gen=25, OOS eval always charged 2.5/side.
 
@@ -3004,7 +3162,7 @@ embeds THIS session's trades; existing sidecars keep aggregate-only.
 - [x] strategies/kalman_trend_following.py: track session boundary
       (_session_start_n; set in on_session_start; fresh books default 0),
       add session_trades()/session summary fields to book_summary()
-- [x] run_paper_kalman_trend.py: no new call site (on_session_start already
+- [x] runners/run_paper_kalman_trend.py: no new call site (on_session_start already
       called for restored books; fresh books start at 0) — verify EOD sidecar
       carries the new fields
 - [x] backend/routers/kalman_trend.py: SessionTrade model + session_trades /

@@ -1,4 +1,4 @@
-"""Tests for fetch_bhavcopy.py — focused on the 2026-05-19 Kite-historical
+"""Tests for market_data/fetch_bhavcopy.py — focused on the 2026-05-19 Kite-historical
 fallback for today's missing F&O bhavcopy.
 
 NSE publishes the F&O bhavcopy ~18:00–20:00 IST (sometimes later). The
@@ -28,8 +28,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import fetch_bhavcopy
-from fetch_bhavcopy import _build_today_stfs_via_kite, _download_bhavcopy
+from market_data import fetch_bhavcopy
+from market_data.fetch_bhavcopy import _build_today_stfs_via_kite, _download_bhavcopy
 
 
 # ──────────────────────────────────────────────────────────
@@ -114,8 +114,8 @@ class TestBuildTodayStfsViaKite:
         auth_mock = MagicMock()
         auth_mock.get_kite.return_value = kite
 
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
-             patch("screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+             patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
             df = _build_today_stfs_via_kite(today)
 
         assert df is not None
@@ -140,8 +140,8 @@ class TestBuildTodayStfsViaKite:
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00, 1003: 1340.00})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
 
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
-             patch("screen_pairs.NIFTY_50", ["RELIANCE"]):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+             patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
             df = _build_today_stfs_via_kite(today)
 
         assert len(df) == 1
@@ -160,8 +160,8 @@ class TestBuildTodayStfsViaKite:
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
 
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
-             patch("screen_pairs.NIFTY_50", ["RELIANCE"]):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+             patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
             df = _build_today_stfs_via_kite(today)
 
         assert len(df) == 1
@@ -170,7 +170,7 @@ class TestBuildTodayStfsViaKite:
     def test_auth_failure_returns_none(self, today):
         """Auth failure must not crash — just degrade to current
         no-bhavcopy behaviour."""
-        with patch("kite_auth.KiteAuthManager",
+        with patch("core.kite_auth.KiteAuthManager",
                    side_effect=RuntimeError("totp expired")):
             assert _build_today_stfs_via_kite(today) is None
 
@@ -178,7 +178,7 @@ class TestBuildTodayStfsViaKite:
         kite = MagicMock()
         kite.instruments.side_effect = RuntimeError("kite api down")
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock):
             assert _build_today_stfs_via_kite(today) is None
 
     def test_no_nifty50_futures_returns_none(self, today):
@@ -188,7 +188,7 @@ class TestBuildTodayStfsViaKite:
         would misinterpret as "no data today"."""
         kite = _mk_kite(instruments_list=[], candle_close_by_token={})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock):
             assert _build_today_stfs_via_kite(today) is None
 
     def test_individual_historical_data_failure_is_skipped_not_fatal(self, today, expiries):
@@ -209,8 +209,8 @@ class TestBuildTodayStfsViaKite:
         kite.historical_data.side_effect = _hist
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
 
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
-             patch("screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+             patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
             df = _build_today_stfs_via_kite(today)
 
         assert len(df) == 1
@@ -292,8 +292,8 @@ class TestDownloadBhavcopyFallback:
 
         s = self._stub_404_session()
         yyyymmdd = today.strftime("%Y%m%d")
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
-             patch("screen_pairs.NIFTY_50", ["RELIANCE"]):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+             patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
             out = _download_bhavcopy(today, s)
 
         assert out is not None
@@ -312,7 +312,7 @@ class TestDownloadBhavcopyFallback:
         from datetime import timedelta
         past_date = datetime.now() - timedelta(days=7)
         s = self._stub_404_session()
-        with patch("fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
+        with patch("market_data.fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
             out = _download_bhavcopy(past_date, s)
         assert out is None
         mock_fallback.assert_not_called()
@@ -351,7 +351,7 @@ class TestDownloadBhavcopyFallback:
         sentinel.write_text("synthesised_via_kite_historical_data\n")
 
         s = self._stub_404_session()
-        with patch("fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
+        with patch("market_data.fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
             out = _download_bhavcopy(today, s)
         assert out.iloc[0]["TckrSymb"] == "KITE_FB"
         mock_fallback.assert_not_called()
@@ -364,10 +364,10 @@ class TestDownloadBhavcopyFallback:
 class TestSynthCsvIsScreenerCompatible:
 
     def test_load_front_month_panel_consumes_synth_day(self, tmp_path, today, expiries):
-        """The whole point of the fallback is that screen_pairs.py reads
+        """The whole point of the fallback is that core/screen_pairs.py reads
         the synth day cleanly. Verify end-to-end via the parquet cache the
         fallback now writes."""
-        from screen_pairs import load_front_month_panel
+        from core.screen_pairs import load_front_month_panel
 
         # Synthesise today's frame via the fallback
         instruments = _instruments_for([
@@ -376,8 +376,8 @@ class TestSynthCsvIsScreenerCompatible:
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
         auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-        with patch("kite_auth.KiteAuthManager", return_value=auth_mock), \
-             patch("screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
+        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+             patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
             df = _build_today_stfs_via_kite(today)
         assert df is not None
 

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backend import db
 from backend.run_manager import Run
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 @pytest.fixture

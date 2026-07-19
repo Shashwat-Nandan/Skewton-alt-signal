@@ -1,6 +1,6 @@
 """Pair-trading candidate listing.
 
-Reads the screener CSV produced by `screen_pairs.py` (regenerated daily
+Reads the screener CSV produced by `core/screen_pairs.py` (regenerated daily
 by the systemd timer in deploy/screen-pairs.timer) and exposes it as
 JSON. Backend does not re-run screening — that is heavyweight and
 already covered by the cron path.
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pair-candidates", tags=["pair-candidates"])
 
 CSV_PATH = REPO_ROOT / "data_cache" / "pair_candidates.csv"
-# Persistence-screened candidates (screen_pairs.py --persistence-min 2), written
+# Persistence-screened candidates (python -m core.screen_pairs --persistence-min 2), written
 # by the [3/3] step of deploy/run_weekly_pair_screen.sh.
 PERSISTENT_CSV_PATH = REPO_ROOT / "data_cache" / "pair_candidates_persistent.csv"
 
@@ -117,7 +117,7 @@ def _serve_candidates(
     if not csv_path.exists():
         raise HTTPException(
             status_code=503,
-            detail="Pair candidates not yet generated. Run screen_pairs.py.",
+            detail="Pair candidates not yet generated. Run core/screen_pairs.py.",
         )
 
     # Millisecond precision: Safari's Date parser rejects 6-digit fractional
@@ -129,7 +129,7 @@ def _serve_candidates(
 
     # Lazy import: pulls dotenv at module-top, which is fine in-process but
     # we don't want to fail backend import if someone strips the runner out.
-    from run_paper_pairs import classify_pair_candidates
+    from runners.run_paper_pairs import classify_pair_candidates
 
     df = pd.read_csv(csv_path)
     annotated = classify_pair_candidates(df, top=top, max_pvalue=max_pvalue)

@@ -52,7 +52,7 @@ class _Capture(logging.Handler):
 
 
 def _replay(session, underlying, config_path, seed_iv, seed_skew, tape):
-    from backtest import run_backtest
+    from research.backtest import run_backtest
     cap = _Capture()
     for name in ("risk_analyzer", "strategies.taleb_karpathy"):
         logging.getLogger(name).addHandler(cap)
@@ -73,7 +73,7 @@ def main() -> int:
     parser.add_argument("--underlying", default="NIFTY")
     args = parser.parse_args()
 
-    from backtest import (
+    from research.backtest import (
         list_captured_sessions, load_captured_tape, load_iv_skew_seed,
     )
 

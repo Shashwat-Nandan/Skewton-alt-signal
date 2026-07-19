@@ -13,7 +13,7 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/tick_capture.py --underlyings NIFTY,BANKNIFTY --strikes-each-side 20
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m market_data.tick_capture --underlyings NIFTY,BANKNIFTY --strikes-each-side 20
 # ------------------------------------
 
 # Oneshot session — exits cleanly at 15:30 IST. Timer fires again tomorrow.

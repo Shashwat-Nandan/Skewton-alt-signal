@@ -14,17 +14,17 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | Unit                          | When                          | What it does                                                                         |
 | ----------------------------- | ----------------------------- | ------------------------------------------------------------------------------------ |
 | `taleb-hedger.timer`          | Mon–Fri 09:10 IST + jitter    | Fires `taleb-hedger.service`                                                         |
-| `taleb-hedger.service`        | Oneshot, ~6 hours             | Runs `run_paper.py` — auths, sleeps to 09:15, ticks until 15:25, flattens, exits     |
+| `taleb-hedger.service`        | Oneshot, ~6 hours             | Runs `runners/run_paper.py` — auths, sleeps to 09:15, ticks until 15:25, flattens, exits     |
 | `pair-paper.timer`            | Mon–Fri 09:11 IST + jitter    | Fires `pair-paper.service` (1-min offset from taleb-hedger to stagger TOTP logins)   |
-| `pair-paper.service`          | Oneshot, ~6 hours             | Runs `run_paper_pairs.py` — top-N cointegrated STF pairs, paper mode, EOD JSON sidecar |
+| `pair-paper.service`          | Oneshot, ~6 hours             | Runs `runners/run_paper_pairs.py` — top-N cointegrated STF pairs, paper mode, EOD JSON sidecar |
 | `arbitrage-paper.timer`       | Mon–Fri 09:13 IST + jitter    | Fires `arbitrage-paper.service` (1-min offset after pair-paper to stagger TOTP logins) |
-| `arbitrage-paper.service`     | Type=simple, ~6 hours         | Runs `run_paper_arbitrage.py` — calendar/term-structure spreads, paper mode, EOD sidecar |
+| `arbitrage-paper.service`     | Type=simple, ~6 hours         | Runs `runners/run_paper_arbitrage.py` — calendar/term-structure spreads, paper mode, EOD sidecar |
 | `buy-on-gap-paper.timer`      | Mon–Fri 09:14 IST + jitter    | Fires `buy-on-gap-paper.service` (1-min offset after arbitrage to stagger TOTP logins) |
-| `buy-on-gap-paper.service`    | Type=simple, ~6 hours         | Runs `run_paper_buy_on_gap.py` — intraday gap-down mean reversion, paper mode, EOD sidecar |
+| `buy-on-gap-paper.service`    | Type=simple, ~6 hours         | Runs `runners/run_paper_buy_on_gap.py` — intraday gap-down mean reversion, paper mode, EOD sidecar |
 | `kalman-pairs-paper.timer`    | Mon–Fri 09:16 IST + jitter    | Fires `kalman-pairs-paper.service` (after buy-on-gap; just after the open, reuses cached session) |
-| `kalman-pairs-paper.service`  | Type=simple, ~6 hours         | Runs `run_paper_kalman_pairs.py` — Kalman time-varying-γ pairs, paper-only, A/B vs static (§3.4) |
+| `kalman-pairs-paper.service`  | Type=simple, ~6 hours         | Runs `runners/run_paper_kalman_pairs.py` — Kalman time-varying-γ pairs, paper-only, A/B vs static (§3.4) |
 | `pair-verify.timer`           | Mon–Fri 16:00 IST + jitter    | Fires `pair-verify.service`                                                          |
-| `pair-verify.service`         | Oneshot, ~5 min               | Runs `verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
+| `pair-verify.service`         | Oneshot, ~5 min               | Runs `scripts/verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
 | `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
 | `screen-pairs.service`        | Oneshot, ~5–15 min            | Runs `deploy/run_weekly_pair_screen.sh` — bhavcopy fetch + Engle-Granger screen      |
 | `taleb-autoresearch.timer`    | Sat 10:00 IST + jitter        | Fires `taleb-autoresearch.service`                                                   |
@@ -33,7 +33,7 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `fetch-bars.service`          | Oneshot, ~1–4 min             | Runs `deploy/run_daily_bars_update.sh` — incremental 30-min bars for Market Profile  |
 | `dashboard-backend.service`   | Long-running, restart=always  | `uvicorn backend.main:app` on 127.0.0.1:8000 — see [section 10](#10-strategy-dashboard) |
 
-The daily timer never collides with the weekly one (different days). The headless paper/autoresearch jobs authenticate inside the Python process via TOTP (`kite_auth.py`); the dashboard backend uses the OAuth redirect flow instead and stores its token in the same `.kite_session.json` cache.
+The daily timer never collides with the weekly one (different days). The headless paper/autoresearch jobs authenticate inside the Python process via TOTP (`core/kite_auth.py`); the dashboard backend uses the OAuth redirect flow instead and stores its token in the same `.kite_session.json` cache.
 
 ---
 
@@ -74,18 +74,18 @@ chmod 600 .env config.ini
 
 The Kite session cache (`.kite_session.json`) is created on first auth and refreshed automatically — leave it alone.
 
-> **TOTP, not interactive 2FA.** `kite_auth.py:169` generates the TOTP code from `KITE_TOTP_KEY` (the seed Kite gives you when you enable 2FA). This is what makes unattended daily login possible. Verify the seed once with `oathtool` or the Kite app before relying on the timer.
+> **TOTP, not interactive 2FA.** `core/kite_auth.py:169` generates the TOTP code from `KITE_TOTP_KEY` (the seed Kite gives you when you enable 2FA). This is what makes unattended daily login possible. Verify the seed once with `oathtool` or the Kite app before relying on the timer.
 
 ### 2.4 Holidays
 
-Edit `holidays.csv` so NSE holidays are skipped. `run_paper.py:50` no-ops when today is a weekend or in the file.
+Edit `holidays.csv` so NSE holidays are skipped. `runners/run_paper.py:50` no-ops when today is a weekend or in the file.
 
 ### 2.5 Sanity-check before installing units
 
 Run the daily script once with `--force` after market close to confirm auth works end-to-end (it will refuse trading because the window has passed but the auth + flatten path will exercise):
 
 ```bash
-sudo -u taleb -i bash -c 'cd /opt/taleb-karpathy-kite && .venv/bin/python run_paper.py --force'
+sudo -u taleb -i bash -c 'cd /opt/taleb-karpathy-kite && .venv/bin/python -m runners.run_paper --force'
 ```
 
 If that prints `Authenticated as <name>` and exits cleanly, you are good.
@@ -196,7 +196,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now arbitrage-paper.timer
 ```
 
-It mirrors `pair-paper`: the timer fires **Mon–Fri 09:13 IST** (staggered after the hedger/pair logins so the TOTP logins don't collide on the shared `.kite_session.json`), and the service runs `run_paper_arbitrage.py --max-leg-notional 500000` as a session-long loop that self-gates to the 09:15 open, then exits 0 at **15:25 IST** writing `data_cache/arbitrage_paper_eod_<date>.json` — the EOD sidecar the `/arbitrage` dashboard tab reads. Unlike the units above, `deploy/arbitrage-paper.service` already hardcodes `User=root`, so the only per-VPS edit is the path.
+It mirrors `pair-paper`: the timer fires **Mon–Fri 09:13 IST** (staggered after the hedger/pair logins so the TOTP logins don't collide on the shared `.kite_session.json`), and the service runs `python -m runners.run_paper_arbitrage --max-leg-notional 500000` as a session-long loop that self-gates to the 09:15 open, then exits 0 at **15:25 IST** writing `data_cache/arbitrage_paper_eod_<date>.json` — the EOD sidecar the `/arbitrage` dashboard tab reads. Unlike the units above, `deploy/arbitrage-paper.service` already hardcodes `User=root`, so the only per-VPS edit is the path.
 
 **Host reconciliation note (2026-06-03).** On the current VPS this unit had been hand-installed as `Type=oneshot` with no `Restart=`, so a mid-session crash would stay dead until the next day's timer fire (only `notify-failure@` alerting). It was reconciled to match `deploy/arbitrage-paper.service` byte-for-byte except the path substitution (`/opt/taleb-karpathy-kite` → `/root/algo-trading/taleb-karpathy-kite`), restoring `Type=simple` + `Restart=on-failure` (`RestartSec=30`) + `StartLimitBurst=5`/`StartLimitIntervalSec=600`. A clean 15:25 IST teardown returns 0 and does **not** trip the restart, so the daily-timer pattern is unaffected. An interim `arbitrage-paper.service.d/restart.conf` drop-in — used to apply those directives before the full reconcile — was removed as redundant once the base unit matched. The pre-reconcile unit is backed up at `/root/arbitrage-paper.service.pre-reconcile.bak`.
 
@@ -226,7 +226,7 @@ systemctl list-timers buy-on-gap-paper.timer   # confirm next fire is tomorrow 0
 The timer fires **Mon–Fri 09:14 IST** (staggered after taleb-hedger/pair/arbitrage so the TOTP logins don't collide on the shared session). The service runs:
 
 ```
-run_paper_buy_on_gap.py --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend-filter
+python -m runners.run_paper_buy_on_gap --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend-filter
 ```
 
 `--gap-std-mult 2.0 --no-trend-filter` is the **OOS-survivor** config: the book-faithful default (k=1.0, trend on) loses out-of-sample, so the deployed run forward-tests the deep-gap, trend-off variant (the in-code default stays book-faithful — drop the two flags to revert). The runner self-gates to the 09:15 open, opens its book once in the **09:20–09:45** entry window, holds with a catastrophic stop, then flattens at **15:25 IST**, exits 0, and writes `data_cache/buy_on_gap_paper_eod_<date>.json` — the EOD sidecar the `/buy-on-gap` dashboard tab reads.
@@ -243,7 +243,7 @@ run_paper_buy_on_gap.py --max-daily-loss-inr 30000 --gap-std-mult 2.0 --no-trend
 
 ```bash
 # preflight + panel + feature build, NO auth, NO orders — must exit 0
-TZ=Asia/Kolkata .venv/bin/python run_paper_buy_on_gap.py --dry-run --force
+TZ=Asia/Kolkata .venv/bin/python -m runners.run_paper_buy_on_gap --dry-run --force
 ```
 
 **Observe a real session:**
@@ -263,7 +263,7 @@ Same long-short pairs trade as `pair-paper`, but the hedge ratio γ_t is tracked
 
 It writes its own files, deliberately named to slot into the existing tooling **and** to stay isolated:
 
-- EOD sidecar `data_cache/pair_paper_kalman_eod_<date>.json` — the `pair_paper_{system}` convention, so `/pair-paper-compare` and `compare_paper_systems.py` pick up the `kalman` system with no new code.
+- EOD sidecar `data_cache/pair_paper_kalman_eod_<date>.json` — the `pair_paper_{system}` convention, so `/pair-paper-compare` and `research/compare_paper_systems.py` pick up the `kalman` system with no new code.
 - State `data_cache/kalman_pairs_runner_state.json` — deliberately **not** a `*paper_state*.json` name, so this paper book is **not** summed into the live runner's notional cap (`_aggregate_book_notional`) or its H17 per-symbol concentration limiter. Isolated paper book.
 - Log `logs/paper-kalman-pairs-<date>.log`.
 
@@ -285,7 +285,7 @@ systemctl list-timers kalman-pairs-paper.timer   # confirm next fire is tomorrow
 The timer fires **Mon–Fri 09:16 IST** (staggered after taleb-hedger/pair/arbitrage/buy-on-gap; firing just after the 09:15 open is fine — the others have already populated the cached session, so this run reuses it rather than logging in fresh). The service runs:
 
 ```
-run_paper_kalman_pairs.py --top 10 --max-leg-notional 1000000
+python -m runners.run_paper_kalman_pairs --top 10 --max-leg-notional 1000000
 ```
 
 To make the A/B a clean same-pairs comparison against the **persistent** live book, point it at that book's universe with `--candidates data_cache/pair_candidates_persistent.csv` (default is `pair_candidates.csv`, the baseline set). The runner self-gates to the 09:15 open, seeds each pair's filter from the bhavcopy daily-close history (log prices), runs the tick loop, steps each filter once at **15:25 IST** on the close, exits 0, and writes the EOD sidecar. On restart after missed sessions it replays the elapsed bhavcopy days to catch the filters up.
@@ -305,7 +305,7 @@ To make the A/B a clean same-pairs comparison against the **persistent** live bo
 # 1. Offline, NO auth — the filter/strategy logic (must all pass / exit 0):
 .venv/bin/python -m pytest tests/test_kalman_filter.py tests/test_kalman_pair_trading.py \
     tests/test_run_paper_kalman_pairs.py -q
-.venv/bin/python validate_kalman_filter.py        # Phase-0 correctness gate, exits 0
+.venv/bin/python -m research.validate_kalman_filter        # Phase-0 correctness gate, exits 0
 ```
 
 The runner itself has **no `--dry-run`** (unlike buy-on-gap) — `build_strategies` needs the live NFO instrument dump + bhavcopy panel, so the runner can only start with a Kite session. It is **paper-only and places no orders**, so the first scheduled paper session *is* the live smoke-test (money-safe; the only real risk is the TOTP collision the evening-install avoids). Watch the first session:
@@ -315,7 +315,7 @@ journalctl -u kalman-pairs-paper.service -f        # live journal
 tail -f logs/paper-kalman-pairs-$(date +%F).log    # richer per-day file
 # After 15:25 IST, confirm the sidecar landed and the A/B is visible:
 ls -l data_cache/pair_paper_kalman_eod_$(date +%F).json
-.venv/bin/python compare_kalman_vs_paper.py --system persistent   # Kalman vs the live book
+.venv/bin/python -m research.compare_kalman_vs_paper --system persistent   # Kalman vs the live book
 ```
 
 Operator controls: the shared `HALT_ALL` / `HALT_NEW_ENTRIES` kill switches apply (it reads the same flags). There is **no** Kalman-specific daily-loss breaker — it's a paper book; rely on the shared switches. A pair whose log-elasticity γ is non-cointegrable (|γ| outside [0.1, 10]) is skipped at build with a logged reason — expect fewer pairs than the static runner on the same candidates.
@@ -336,7 +336,7 @@ git checkout main && git pull --ff-only               # pull the Kalman system +
 ```bash
 .venv/bin/python -m pytest tests/test_kalman_filter.py tests/test_kalman_pair_trading.py \
     tests/test_run_paper_kalman_pairs.py -q
-.venv/bin/python validate_kalman_filter.py            # Phase-0 gate, exits 0
+.venv/bin/python -m research.validate_kalman_filter            # Phase-0 gate, exits 0
 ```
 
 **2. Install the units with this host's substitution applied:**
@@ -379,7 +379,7 @@ journalctl -u kalman-pairs-paper.service -f
 tail -f logs/paper-kalman-pairs-$(date +%F).log
 # after 15:25 IST:
 ls -l data_cache/pair_paper_kalman_eod_$(date +%F).json
-.venv/bin/python compare_kalman_vs_paper.py --system persistent   # Kalman vs the live book
+.venv/bin/python -m research.compare_kalman_vs_paper --system persistent   # Kalman vs the live book
 ```
 
 **Rollback / stop:**
@@ -395,7 +395,7 @@ sudo systemctl stop kalman-pairs-paper.service          # kill a mid-session run
 ### 4.1 Why a timer, not cron
 
 - **Calendar TZ pinned to IST.** `taleb-hedger.timer:10` says `OnCalendar=Mon..Fri *-*-* 09:10:00 Asia/Kolkata`, so a UTC-clock VPS still fires at the right wall-clock — no daylight or off-by-one bugs.
-- **`Persistent=true`** (line 15) makes systemd run the missed job once if the VPS was asleep when 09:10 came around. `run_paper.py:165` then self-gates: starts trading from whatever time it wakes, flattens at 15:25, refuses to start after 15:30.
+- **`Persistent=true`** (line 15) makes systemd run the missed job once if the VPS was asleep when 09:10 came around. `runners/run_paper.py:165` then self-gates: starts trading from whatever time it wakes, flattens at 15:25, refuses to start after 15:30.
 - **`RandomizedDelaySec=60`** prevents identical-second hits to Kite if you ever run multiple accounts on one host.
 - **Hardened service** (`taleb-hedger.service:25-32`): `NoNewPrivileges`, `ProtectSystem=strict`, scoped `ReadWritePaths`. Cron gives you none of this.
 
@@ -404,12 +404,12 @@ sudo systemctl stop kalman-pairs-paper.service          # kill a mid-session run
 | Time (IST) | What happens                                                                     |
 | ---------- | -------------------------------------------------------------------------------- |
 | 09:10      | Timer fires → service starts                                                     |
-| 09:10–09:15| `run_paper.py` auths (TOTP), boots `TalebHedger`, blocks until 09:15              |
-| 09:15      | Tick loop begins (`TICK_SECONDS=60` in `run_paper.py:34`)                         |
+| 09:10–09:15| `runners/run_paper.py` auths (TOTP), boots `TalebHedger`, blocks until 09:15              |
+| 09:15      | Tick loop begins (`TICK_SECONDS=60` in `runners/run_paper.py:34`)                         |
 | 15:25      | Flatten window. Open positions closed via `_generate_close_all_proposals`        |
 | 15:25–15:30| EOD report written, IV history persisted, log flushed, exit 0                    |
 
-The whole run is one `systemd` job — there is **no per-tick service**. If you `kill -INT` it manually, `run_paper.py:184` catches the signal and still attempts a graceful flatten.
+The whole run is one `systemd` job — there is **no per-tick service**. If you `kill -INT` it manually, `runners/run_paper.py:184` catches the signal and still attempts a graceful flatten.
 
 ### 4.3 Live observability
 
@@ -437,11 +437,11 @@ Markets drift. Last quarter's gate parameters (`rv_iv_threshold`, `rehedge_thres
 
 `deploy/run_weekly_autoresearch.sh` runs three steps under the systemd unit:
 
-1. **Fetch** the last 30 trading days of NIFTY data via `fetch_historical_data.py --days 30`.
-2. **Run** `run_autoresearch.py` with `--window-days 5`. The runner reserves the last 5-day window as a hold-out (see `run_autoresearch.py:117`), so the reported "Validation run" is on data the optimizer never trained on.
+1. **Fetch** the last 30 trading days of NIFTY data via `python -m market_data.fetch_historical_data --days 30`.
+2. **Run** `runners/run_autoresearch.py` with `--window-days 5`. The runner reserves the last 5-day window as a hold-out (see `runners/run_autoresearch.py:117`), so the reported "Validation run" is on data the optimizer never trained on.
 3. **Stage, do not promote.** Before the run, the existing `best_params.json` (if any) is copied to `best_params.preautoresearch.<date>.json`. After the run, the freshly-written `best_params.json` is renamed to `candidate_params_<date>.json` and the prior `best_params.json` is restored. Production-relevant state — `config.ini` — is never touched.
 
-This is deliberate. `dynamic_hedger.py` and `run_paper.py` don't read `best_params.json` at all (live params come from `config.ini`), so promotion is a manual, reviewed edit.
+This is deliberate. `dynamic_hedger.py` and `runners/run_paper.py` don't read `best_params.json` at all (live params come from `config.ini`), so promotion is a manual, reviewed edit.
 
 ### 5.3 Tunables (env vars)
 
@@ -473,7 +473,7 @@ diff <(jq -r 'to_entries|sort_by(.key)|map("\(.key)=\(.value)")|.[]' candidate_p
 column -t -s $'\t' results.tsv | tail -50
 ```
 
-**Promote only if** the candidate beat the baseline on the hold-out (the last block printed by `run_autoresearch.py`) — not just on training. The April run is the cautionary tale: training Sharpe looked great, hold-out collapsed. If the candidate clears the bar, copy the diffs into `config.ini` by hand and commit.
+**Promote only if** the candidate beat the baseline on the hold-out (the last block printed by `runners/run_autoresearch.py`) — not just on training. The April run is the cautionary tale: training Sharpe looked great, hold-out collapsed. If the candidate clears the bar, copy the diffs into `config.ini` by hand and commit.
 
 ---
 
@@ -524,7 +524,7 @@ sudo -u taleb bash -c '
 sudo systemctl daemon-reload   # only if any unit file changed
 ```
 
-Avoid pulling between 09:10 and 15:30 IST. `run_paper.py` reloads `config.ini` and `holidays.csv` only at startup, so config edits take effect on the next day's fire — this is intentional, since a mid-session reload would void the day's risk accounting.
+Avoid pulling between 09:10 and 15:30 IST. `runners/run_paper.py` reloads `config.ini` and `holidays.csv` only at startup, so config edits take effect on the next day's fire — this is intentional, since a mid-session reload would void the day's risk accounting.
 
 ### 6.5 Migrate the runners to a non-root user (least privilege — audit 2.6)
 
@@ -636,9 +636,9 @@ Edit anything that doesn't survive this review. Commit the edits before the cuto
 
 ### 7.4 Code and config changes
 
-The paper runner deliberately refuses to start in live mode (`run_paper.py:153`) so that a stray `trading_mode = live` cannot accidentally place real orders through it. The cutover therefore requires a separate live runner — keep both files so rollback is `systemctl` only, not a `git revert`.
+The paper runner deliberately refuses to start in live mode (`runners/run_paper.py:153`) so that a stray `trading_mode = live` cannot accidentally place real orders through it. The cutover therefore requires a separate live runner — keep both files so rollback is `systemctl` only, not a `git revert`.
 
-1. **Create `run_live.py`** by copying `run_paper.py` and deleting the paper-mode guard. Specifically, in the new file, remove these three lines (currently `run_paper.py:153-155`):
+1. **Create `run_live.py`** by copying `runners/run_paper.py` and deleting the paper-mode guard. Specifically, in the new file, remove these three lines (currently `runners/run_paper.py:153-155`):
 
    ```python
    if not hedger._is_paper_mode:
@@ -725,7 +725,7 @@ Four escalation levels, gentlest first:
    ```
    Tomorrow's session won't fire, but today's continues to manage existing positions.
 
-2. **Mid-session interrupt — flatten and exit now.** `run_paper.py:184` (and your copied `run_live.py`) catches `SIGINT` and attempts a graceful flatten:
+2. **Mid-session interrupt — flatten and exit now.** `runners/run_paper.py:184` (and your copied `run_live.py`) catches `SIGINT` and attempts a graceful flatten:
    ```bash
    sudo systemctl kill -s SIGINT taleb-hedger-live.service
    journalctl -u taleb-hedger-live.service -f   # watch the flatten
@@ -744,7 +744,7 @@ Then in `config.ini` set `trading_mode = paper` and commit. The live unit files 
 
 ### 7.9 Pair-trading first live session — pre-flight checklist
 
-This is the cutover procedure for `pair_trading` (`run_paper_pairs.py` / `pair-paper.service`) — the first live trading deployment in this repo. Goes in parallel with the taleb-hedger cutover in §7.1–7.8.
+This is the cutover procedure for `pair_trading` (`runners/run_paper_pairs.py` / `pair-paper.service`) — the first live trading deployment in this repo. Goes in parallel with the taleb-hedger cutover in §7.1–7.8.
 
 **Before the first live session, EVERY item must be checked. Tick them off in order; do not skip.**
 
@@ -1094,12 +1094,12 @@ will either fail outright or come up frozen.
 
 | Symptom                                                   | First thing to check                                                                |
 | --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `taleb-hedger.service` exits 2 immediately                | `config.ini` has `trading_mode != paper` (`run_paper.py:153`) — paper mode required |
+| `taleb-hedger.service` exits 2 immediately                | `config.ini` has `trading_mode != paper` (`runners/run_paper.py:153`) — paper mode required |
 | Auth fails: "TOTP rejected"                               | TOTP seed in `.env` doesn't match Kite's record. Re-enroll 2FA, copy the new seed   |
 | Service runs but no trades                                | Normal on low-vol days. Check `logs/paper-<date>.log` for entry-gate misses         |
 | Timer schedule looks wrong by 5h30m                       | `OnCalendar` line missing the `Asia/Kolkata` suffix; service's `TZ=` alone is not enough — pin it on the timer |
 | `journalctl` shows nothing                                | Service didn't start. `systemctl status` will show whether the unit was triggered   |
-| Autoresearch produced no `candidate_params_<date>.json`   | `run_autoresearch.py` failed mid-run; check the log for a stack trace               |
+| Autoresearch produced no `candidate_params_<date>.json`   | `runners/run_autoresearch.py` failed mid-run; check the log for a stack trace               |
 | Disk filling up                                           | Rotate `data_cache/` quarterly — the optimizer only needs the last ~30 days        |
 
 ---
@@ -1273,10 +1273,10 @@ the universe:
 cd /opt/taleb-karpathy-kite
 
 # Option A — every NIFTY-50 spot, 90 days back
-./.venv/bin/python fetch_bars.py --backfill --days 90
+./.venv/bin/python -m market_data.fetch_bars --backfill --days 90
 
 # Option B — every F&O STF (recommended), sourced from your bhavcopy archive
-./.venv/bin/python fetch_bars.py --backfill --days 90 \
+./.venv/bin/python -m market_data.fetch_bars --backfill --days 90 \
     --symbols "$(awk -F',' '$5=="STF"{print $8}' \
                   data_cache/bhavcopy_raw/bhavcopy_fo_*.csv \
                   | sort -u | paste -sd,)"
@@ -1328,7 +1328,7 @@ deploy/
 ├── run_weekly_autoresearch.sh     # wrapper: fetch → sweep → stage candidate
 ├── fetch-bars.service             # daily 30-min bars updater oneshot
 ├── fetch-bars.timer               # daily 16:30 IST trigger
-├── run_daily_bars_update.sh       # wrapper: fetch_bars.py --update + log
+├── run_daily_bars_update.sh       # wrapper: python -m market_data.fetch_bars --update + log
 ├── dashboard-backend.service      # long-running uvicorn (FastAPI)
 ├── nginx-dashboard.conf.example   # nginx site for SPA + API proxy
 └── build-frontend.sh              # npm ci + npm run build wrapper

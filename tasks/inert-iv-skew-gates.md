@@ -28,7 +28,7 @@ What is STILL inert, under the live config (`enable_regime_dispatch=true`):
 CORE (always):
 - [x] taleb_karpathy.py: add the 9 `regime_*` fields to `tunable_params`.
 - [x] taleb_karpathy.py: build `RegimeThresholds(...)`, pass to `classify()`.
-- [x] autoresearch_loop.py TUNABLE_RANGES: add the 9 `regime_*` params.
+- [x] runners/autoresearch_loop.py TUNABLE_RANGES: add the 9 `regime_*` params.
 - [x] config_template.ini + config.ini: document/seed the 9 new defaults.
 
 OPTIONAL (decided: include first two, skip experiment bump):

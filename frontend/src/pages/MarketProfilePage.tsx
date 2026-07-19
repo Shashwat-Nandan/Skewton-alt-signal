@@ -272,11 +272,11 @@ function EmptyUniverse() {
       </CardHeader>
       <CardContent>
         <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs">
-{`python fetch_bars.py --backfill --days 90
+{`python -m market_data.fetch_bars --backfill --days 90
 # or pick a few symbols:
-python fetch_bars.py --backfill --days 90 --symbols RELIANCE,INFY,HDFCBANK
+python -m market_data.fetch_bars --backfill --days 90 --symbols RELIANCE,INFY,HDFCBANK
 # then daily:
-python fetch_bars.py --update`}
+python -m market_data.fetch_bars --update`}
         </pre>
       </CardContent>
     </Card>

@@ -5,7 +5,7 @@ installation (H2), and the HeartbeatTracker silent-fail counter (H3).
 `tick_one` returns a TickOutcome NamedTuple with two booleans:
   - attempted_execution: drives per-attempt state persist
   - errored: drives silent-fail heartbeat (True iff every op that ran
-    raised — see TickOutcome docstring in run_paper_pairs.py)
+    raised — see TickOutcome docstring in runners/run_paper_pairs.py)
 
 State-file persistence semantics (atomicity, durability, fsync ordering)
 live in test_run_paper_pairs_state.py; this file is just about *when* the
@@ -25,7 +25,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from run_paper_pairs import (
+from runners.run_paper_pairs import (
     HeartbeatTracker,
     install_signal_handlers,
     tick_one,

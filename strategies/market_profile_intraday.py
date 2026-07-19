@@ -9,7 +9,7 @@ names print `trend_up` at once — the next-day continuation survives cost and i
 monotone in K. So the tradeable unit is the *day*, not the name.
 
 This module is pure decision logic (no I/O, no Kite, no DB) so it is unit-
-testable and the paper runner (`run_paper_mp.py`) and the backtest can share it.
+testable and the paper runner (`runners/run_paper_mp.py`) and the backtest can share it.
 Given the edge is consistent-but-underpowered (single regime, t<1.4), the
 `KillSwitch` is not optional — it halts new entries the moment forward paper
 turns against us (Rule 12; the efficiency review: do not run a silent bleeder).
@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from market_profile import Bar, market_generated_indicators
+from core.market_profile import Bar, market_generated_indicators
 
 
 @dataclass

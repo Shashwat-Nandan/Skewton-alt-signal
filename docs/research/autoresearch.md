@@ -26,7 +26,7 @@ historical data with held-out validation, and writes a new
 
 ## Overview
 
-`autoresearch_loop.py` (651 lines) implements the loop. `run_autoresearch.py`
+`runners/autoresearch_loop.py` (651 lines) implements the loop. `runners/run_autoresearch.py`
 (344 lines) is the runner with windowed/holdout splits and CLI flags.
 `deploy/taleb-autoresearch.timer` fires it weekly.
 
@@ -37,8 +37,8 @@ T-0 band tightening). NOT immutable safety rails (max loss, no naked
 shorts, total capital, etc.).
 
 What doesn't get tuned (yet): `pair_trading` or `varsity_equity_swing`.
-Sweep scripts exist for them (`sweep_pair_params.py`,
-`sweep_arbitrage_thresholds.py`) but aren't on the weekly cron — they
+Sweep scripts exist for them (`research/sweep_pair_params.py`,
+`research/sweep_arbitrage_thresholds.py`) but aren't on the weekly cron — they
 are ops tools the operator runs manually.
 
 ## Theoretical pattern
@@ -48,7 +48,7 @@ The Karpathy "autoresearch" pattern is documented in
 COMPLEMENTS that with implementation specifics — when the loop fires,
 what it actually mutates, and how its outputs reach the live strategy.
 
-The high-level pattern from `autoresearch_loop.py:48–63`:
+The high-level pattern from `runners/autoresearch_loop.py:48–63`:
 
 ```
 1. Snapshot current params as "baseline"
@@ -83,7 +83,7 @@ half-life better.
 
 `deploy/taleb-autoresearch.service` runs:
 ```
-…/python …/run_autoresearch.py --experiments 100 --metric net_pnl \
+…/python -m runners.run_autoresearch --experiments 100 --metric net_pnl \
   --data data_cache/NIFTY_<from>_<to>_eod.csv \
   --hold-out-days 5
 ```
@@ -120,7 +120,7 @@ operator-managed):
 
 ## Mutation strategy
 
-`_mutate_one_param` (around line 250+ of `autoresearch_loop.py`):
+`_mutate_one_param` (around line 250+ of `runners/autoresearch_loop.py`):
 
 1. Pick a random parameter from `TUNABLE_RANGES.keys()`
 2. Read current value
@@ -140,7 +140,7 @@ Each candidate is evaluated by `_run_experiment` which:
 
 1. Loads historical data (CSV from
    `data_cache/NIFTY_<from>_<to>_eod.csv` — produced by
-   `fetch_historical_data.py` or `fetch_bhavcopy.py`)
+   `market_data/fetch_historical_data.py` or `market_data/fetch_bhavcopy.py`)
 2. Splits into N non-overlapping windows of `window_days=5` each
    (`run_autoresearch._split_data_into_windows`, line 38)
 3. Runs `backtest.run_backtest(strategy, window)` for each window
@@ -152,7 +152,7 @@ Each candidate is evaluated by `_run_experiment` which:
 Window step = `window_days` (non-overlapping) prevents data leakage
 between windows used for the same experiment.
 
-`MockKite` (imported from `backtest.py`) replays the historical CSV as
+`MockKite` (imported from `research/backtest.py`) replays the historical CSV as
 synthetic Kite quotes so the strategy's `_get_spot_price` and
 `_get_options_chain` work transparently in the loop.
 
@@ -188,7 +188,7 @@ in the variance penalty.
 
 ## Hold-out validation
 
-`run_autoresearch.py:_split_data_into_windows` reserves the last
+`runners/run_autoresearch.py:_split_data_into_windows` reserves the last
 `--hold-out-days` trading days exclusively for validation:
 
 ```python
@@ -208,7 +208,7 @@ seen the validation data during the sweep.
 
 1. **Immutable params NEVER mutated** — `TUNABLE_RANGES` is the
    allow-list; `max_daily_loss_pct`, `no_naked_shorts`, etc. are
-   off-limits (line 17 of `autoresearch_loop.py`).
+   off-limits (line 17 of `runners/autoresearch_loop.py`).
 2. **`mc_worst_path_loss_pct` capped** at 10% per range — even the
    most aggressive candidate can't propose >10% daily loss budget.
 3. **Drawdown rejection** — `max_drawdown_threshold` (default in
@@ -293,7 +293,7 @@ Failure alert: nonzero exit → `notify-failure@taleb-autoresearch.service`
 ## Known issues
 
 1. **Backtest contract drift for varsity_equity_swing (EQ-FU-2)** —
-   `backtest_varsity_equity.py` doesn't apply the gap-skip / max-age
+   `research/backtest_varsity_equity.py` doesn't apply the gap-skip / max-age
    filters that live `_fill_pending_entries` enforces. Autoresearch
    for equity-swing (when enabled) would optimise against a higher
    trade count than live delivers. See
@@ -301,14 +301,14 @@ Failure alert: nonzero exit → `notify-failure@taleb-autoresearch.service`
 
 2. **No autoresearch for pair_trading or varsity_equity_swing** — only
    `taleb_karpathy` is on the cron. Manual sweeps via
-   `sweep_pair_params.py` / `sweep_arbitrage_thresholds.py`.
+   `research/sweep_pair_params.py` / `research/sweep_arbitrage_thresholds.py`.
 
 3. **Manual data-window curation** — the historical CSV must be
-   refreshed periodically (`fetch_historical_data.py` or
-   `fetch_bhavcopy.py`). The cron service has the CSV path hardcoded;
+   refreshed periodically (`market_data/fetch_historical_data.py` or
+   `market_data/fetch_bhavcopy.py`). The cron service has the CSV path hardcoded;
    stale data → params optimised against an outdated regime.
 
-4. **Synthetic data fallback** — `run_autoresearch.py` defaults to
+4. **Synthetic data fallback** — `runners/run_autoresearch.py` defaults to
    `backtest.generate_synthetic_data` if no `--data` flag is given.
    Useful for smoke tests; not appropriate for production sweeps.
 
@@ -325,11 +325,11 @@ Failure alert: nonzero exit → `notify-failure@taleb-autoresearch.service`
 
 | File | Role |
 |---|---|
-| `autoresearch_loop.py` | `HedgeResearchLoop` class, mutation + accept/reject |
-| `run_autoresearch.py` | Runner: data load, windowed split, holdout, CLI |
-| `backtest.py` | `run_backtest`, `generate_synthetic_data`, `MockKite` |
+| `runners/autoresearch_loop.py` | `HedgeResearchLoop` class, mutation + accept/reject |
+| `runners/run_autoresearch.py` | Runner: data load, windowed split, holdout, CLI |
+| `research/backtest.py` | `run_backtest`, `generate_synthetic_data`, `MockKite` |
 | `strategies/taleb_karpathy.py` | `_apply_best_params` consumer (line 117); `get_strategy_metrics` |
-| `sweep_entry_params.py`, `sweep_pair_params.py`, `sweep_rehedge_params.py`, `sweep_arbitrage_thresholds.py`, `sweep_rv_iv_gate.py`, `sweep_top.py` | Per-dimension sweep tools (manual / dev) |
+| `research/sweep_entry_params.py`, `research/sweep_pair_params.py`, `research/sweep_rehedge_params.py`, `research/sweep_arbitrage_thresholds.py`, `research/sweep_rv_iv_gate.py`, `research/sweep_top.py` | Per-dimension sweep tools (manual / dev) |
 | `config.ini` | `[autoresearch]` section: `eval_cycles_per_experiment`, `metric`, `max_drawdown_threshold`, `results_file`, `log_file`, `mutation_step_size` |
 | `best_params.json` | Active live params (read by hedger at boot) |
 | `best_params.preautoresearch.<DATE>.json` | Pre-sweep rollback snapshots |

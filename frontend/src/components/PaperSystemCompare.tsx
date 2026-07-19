@@ -22,7 +22,7 @@ import type {
 } from "@/lib/types";
 
 const DEFAULT_DAYS = 5;
-// "kalman" = the Kalman-filter pairs forward A/B test (run_paper_kalman_pairs.py).
+// "kalman" = the Kalman-filter pairs forward A/B test (runners/run_paper_kalman_pairs.py).
 // Shows alongside the static baseline/persistent books once that runner is live;
 // the compare endpoint renders empty cells for any system without a sidecar yet.
 const DEFAULT_SYSTEMS = "baseline,persistent,kalman";

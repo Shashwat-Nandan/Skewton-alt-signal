@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kite_throttle import (
+from core.kite_throttle import (
     KiteRateLimiter,
     throttle_kite,
     DEFAULT_THROTTLED_METHODS,

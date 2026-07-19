@@ -2,7 +2,7 @@
 
 Surfaces the loop-engineering pilot (PR #60) for the operator:
   * daily positions + Kalman-vs-MA performance, read from the per-session EOD
-    sidecars `run_paper_kalman_trend.py` writes
+    sidecars `runners/run_paper_kalman_trend.py` writes
     (``data_cache/kalman_trend_eod_<date>.json``), and
   * the loop-specific bits the other strategy tabs don't have — the independent
     checker verdict, the kill-switch (risk monitor) status, and the compounding

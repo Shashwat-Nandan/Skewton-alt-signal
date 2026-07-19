@@ -19,7 +19,7 @@ import logging
 
 import pytest
 
-import run_paper_pairs
+from runners import run_paper_pairs
 
 
 # Mirror of ExecStart in deploy/pair-paper-persistent-live.service —
@@ -57,7 +57,7 @@ def gated_main(monkeypatch, tmp_path):
     monkeypatch.delenv("ALLOW_LIVE_MODE", raising=False)
 
     def run(argv):
-        monkeypatch.setattr("sys.argv", ["run_paper_pairs.py", *argv])
+        monkeypatch.setattr("sys.argv", ["runners/run_paper_pairs.py", *argv])
         return run_paper_pairs.main()
 
     return run

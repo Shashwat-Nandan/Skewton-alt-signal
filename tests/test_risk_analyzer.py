@@ -1,12 +1,12 @@
-"""Tests for risk_analyzer.py — MC, stability, bleed, hedge decision."""
+"""Tests for core/risk_analyzer.py — MC, stability, bleed, hedge decision."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import pytest
-from greeks_engine import GreeksEngine, OptionContract
-from risk_analyzer import RiskAnalyzer
+from core.greeks_engine import GreeksEngine, OptionContract
+from core.risk_analyzer import RiskAnalyzer
 
 
 @pytest.fixture
@@ -258,7 +258,7 @@ class TestBlockBootstrapMC:
         # WHY: consecutive blocks are the mechanism that preserves vol
         # clustering; an iid resample (block_size=1 behaviour) would destroy
         # it and quietly reintroduce the Gaussian-shape problem.
-        from risk_analyzer import RiskAnalyzer
+        from core.risk_analyzer import RiskAnalyzer
         rng = np.random.default_rng(3)
         emp = real_returns
         out = RiskAnalyzer._block_bootstrap_returns(rng, emp, n=20, block_size=5)
@@ -281,7 +281,7 @@ class TestBlockBootstrapMC:
         # WHY: the change is shape-only — the live gate already calibrates
         # SCALE via daily_vol=rv/√365, and the bootstrap must respect that
         # calibration, not resurrect the historical average vol level.
-        from risk_analyzer import RiskAnalyzer
+        from core.risk_analyzer import RiskAnalyzer
         rng = np.random.default_rng(5)
         daily_vol = 0.02
         scale = daily_vol / float(np.std(real_returns))
@@ -295,7 +295,7 @@ class TestBlockBootstrapMC:
         # returns with a drift would shift every path's central tendency (a
         # location change), biasing worst_path/mean_pnl in trending windows.
         # A strongly-drifted pool must still produce ~zero-mean daily draws.
-        from risk_analyzer import RiskAnalyzer
+        from core.risk_analyzer import RiskAnalyzer
         # Big positive drift (+0.5%/day) on top of small vol.
         drifted = np.array([0.005 + 0.001 * ((-1) ** i) for i in range(40)])
         assert drifted.mean() > 0.004          # the pool is heavily drifted
@@ -329,7 +329,7 @@ class TestBlockBootstrapMC:
         # WHY (C4): the whole point — the −2.1% day must actually appear in
         # generated paths at bootstrap frequency, where N(0, σ) at the same σ
         # almost never produces it.
-        from risk_analyzer import RiskAnalyzer
+        from core.risk_analyzer import RiskAnalyzer
         rng = np.random.default_rng(9)
         seen_tail = any(
             float(np.min(RiskAnalyzer._block_bootstrap_returns(

@@ -272,7 +272,7 @@ future (e.g., near vs. far month). Mechanics & rationale:
   is the storage/convenience-yield economics, not a statistical accident.
 - **Key subtlety:** *constructing a continuous, gap-free spread series* across
   contract rolls is non-trivial and a source of backtest error. (This maps
-  directly to our `backtest_calendar_meanreversion.py` and the arbitrage
+  directly to our `research/backtest_calendar_meanreversion.py` and the arbitrage
   margin/roll work.)
 
 ### 5.4 Futures intermarket spreads
@@ -435,12 +435,12 @@ exists.
 
 ## Relevance to this codebase
 
-- **Pair trading** (`docs/strategies/pair_trading.md`, `backtest_pairs.py`) is a
+- **Pair trading** (`docs/strategies/pair_trading.md`, `research/backtest_pairs.py`) is a
   direct implementation of Ch. 3–4: cointegrating spread, z-score entry/exit,
   hedge-ratio estimation. Ch. 3.4's **Kalman dynamic hedge ratio** and Ch. 3.6's
   **data-error danger** are the most actionable upgrades to evaluate.
-- **Calendar/arbitrage** (`backtest_calendar_meanreversion.py`,
-  `backtest_arbitrage.py`) is Ch. 5.3–5.4: term-structure/intermarket spreads,
+- **Calendar/arbitrage** (`research/backtest_calendar_meanreversion.py`,
+  `research/backtest_arbitrage.py`) is Ch. 5.3–5.4: term-structure/intermarket spreads,
   with the continuous-series-construction and roll/margin subtleties the book
   warns about (and that our 2026-06-17 calendar-margin work hit head-on).
 - **Taleb-Karpathy** (`docs/strategies/taleb_framework.md`) lives off the same

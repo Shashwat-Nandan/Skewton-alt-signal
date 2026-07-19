@@ -11,7 +11,7 @@ code and the same on-disk caches:
 
 | System | Entry point | What it does |
 | --- | --- | --- |
-| Headless daemons | `run_paper.py` (Taleb-Karpathy), `run_paper_pairs.py` (pairs — incl. the live `pair-paper-persistent-live` runner), `run_paper_arbitrage.py` (calendar spreads), `run_equity_swing.py` (equity swing) | Mon–Fri, systemd-timer driven: paper/live-trade the session, persist state, exit cleanly. Four strategies, one per runner. |
+| Headless daemons | `runners/run_paper.py` (Taleb-Karpathy), `runners/run_paper_pairs.py` (pairs — incl. the live `pair-paper-persistent-live` runner), `runners/run_paper_arbitrage.py` (calendar spreads), `runners/run_equity_swing.py` (equity swing) | Mon–Fri, systemd-timer driven: paper/live-trade the session, persist state, exit cleanly. Four strategies, one per runner. |
 | Browser dashboard | `backend/main.py` (FastAPI) + `frontend/` (React/Vite) | Pick a strategy + mode in a UI, watch live signals / paper trades / P&L. **Never** trades live. |
 
 Live trading is **off** in the dashboard by design — it stays on the
@@ -42,10 +42,10 @@ $EDITOR .env         # KITE_API_KEY/SECRET/USER_ID/PASSWORD/TOTP_KEY,
 cd frontend && npm ci && npm run dev                            # SPA on :5173
 
 # 4. Or run paper-trading once (refuses outside 09:15–15:30 IST unless --force)
-.venv/bin/python run_paper.py --force
+.venv/bin/python -m runners.run_paper --force
 
 # 5. Or run the Varsity-style equity-swing scan once (Nifty 200, cron-driven)
-.venv/bin/python run_equity_swing.py --scan close --mode paper --force
+.venv/bin/python -m runners.run_equity_swing --scan close --mode paper --force
 ```
 
 For the full VPS install (systemd + nginx + Let's Encrypt) see
@@ -69,19 +69,19 @@ Top-level Python entry points (most are CLI scripts):
 
 | File | Role |
 | --- | --- |
-| `run_paper.py` | Daily unattended Taleb-Karpathy paper-trader; fires from `taleb-hedger.timer` |
-| `run_paper_pairs.py` | Daily pair-trading runner (baseline + persistent systems); fires from `pair-paper*.timer`. The live pair runner is `pair-paper-persistent-live` |
-| `run_paper_arbitrage.py` | Daily calendar-spread arbitrage runner; fires from `arbitrage-paper.timer` |
-| `run_equity_swing.py` | Twice-daily Varsity equity scan (fires from `equity-swing-{open,close}.timer`) |
-| `run.py` | Headless mode + autoresearch loop |
-| `run_autoresearch.py` | Standalone parameter sweep with hold-out validation |
-| `backtest.py` / `backtest_pairs.py` / `backtest_arbitrage.py` / `backtest_varsity_equity.py` | Strategy-specific backtest harnesses |
-| `screen_pairs.py` | Engle-Granger cointegration screen on NIFTY-50 stock futures |
-| `fetch_historical_data.py` / `fetch_bars.py` / `fetch_bhavcopy.py` / `fetch_bhavcopy_eq.py` / `fetch_fii_dii.py` | Data ingestion (option chains, 30-min bars, F&O bhavcopy, EQ bhavcopy, FII/DII cash flows) |
-| `market_profile.py` | TPO / value-area computation (pure, no I/O) |
-| `kite_auth.py` | Headless TOTP login (the dashboard uses OAuth instead — see below) |
-| `greeks_engine.py` / `risk_analyzer.py` / `trade_proposer.py` | Greeks, Taleb-style risk tooling, proposal generation |
-| `analyze_rv_iv_regime.py` / `variance_pnl_gate.py` | RV/IV regime gating |
+| `runners/run_paper.py` | Daily unattended Taleb-Karpathy paper-trader; fires from `taleb-hedger.timer` |
+| `runners/run_paper_pairs.py` | Daily pair-trading runner (baseline + persistent systems); fires from `pair-paper*.timer`. The live pair runner is `pair-paper-persistent-live` |
+| `runners/run_paper_arbitrage.py` | Daily calendar-spread arbitrage runner; fires from `arbitrage-paper.timer` |
+| `runners/run_equity_swing.py` | Twice-daily Varsity equity scan (fires from `equity-swing-{open,close}.timer`) |
+| `runners/run.py` | Headless mode + autoresearch loop |
+| `runners/run_autoresearch.py` | Standalone parameter sweep with hold-out validation |
+| `research/backtest.py` / `research/backtest_pairs.py` / `research/backtest_arbitrage.py` / `research/backtest_varsity_equity.py` | Strategy-specific backtest harnesses |
+| `core/screen_pairs.py` | Engle-Granger cointegration screen on NIFTY-50 stock futures |
+| `market_data/fetch_historical_data.py` / `market_data/fetch_bars.py` / `market_data/fetch_bhavcopy.py` / `market_data/fetch_bhavcopy_eq.py` / `market_data/fetch_fii_dii.py` | Data ingestion (option chains, 30-min bars, F&O bhavcopy, EQ bhavcopy, FII/DII cash flows) |
+| `core/market_profile.py` | TPO / value-area computation (pure, no I/O) |
+| `core/kite_auth.py` | Headless TOTP login (the dashboard uses OAuth instead — see below) |
+| `core/greeks_engine.py` / `core/risk_analyzer.py` / `core/trade_proposer.py` | Greeks, Taleb-style risk tooling, proposal generation |
+| `research/analyze_rv_iv_regime.py` / `core/variance_pnl_gate.py` | RV/IV regime gating |
 | `sweep_*.py` | Focused parameter grid runners |
 
 ---
@@ -95,7 +95,7 @@ one of `signals` (log only) / `paper` (in-memory simulation) / `live`
 | Name | File | What it does |
 | --- | --- | --- |
 | `taleb_karpathy` | `strategies/taleb_karpathy.py` | Long-gamma straddle hedger: rehedges delta on a threshold, harvests gamma vs theta bleed. The flagship strategy and the one the autoresearch loop tunes. |
-| `pair_trading` | `strategies/pair_trading.py` | Long-short on cointegrated stock-futures pairs (screened by `screen_pairs.py`). Z-score entry/exit on the spread. |
+| `pair_trading` | `strategies/pair_trading.py` | Long-short on cointegrated stock-futures pairs (screened by `core/screen_pairs.py`). Z-score entry/exit on the spread. |
 | `arbitrage` | `strategies/arbitrage.py` | Cash–futures basis (signals only — no SLB) plus calendar-spread term-structure trades (executable). |
 | `varsity_equity_swing` | `strategies/varsity_equity_swing.py` | Medium-term equity swing on Nifty 200 — trend + ATR risk (Varsity Module 9), plus optional Market Profile, OI confluence, and FII/DII flow overlays. Cron-driven, not tick-driven. |
 
@@ -109,7 +109,7 @@ pull from.
 
 Kite has two ways in, and this repo uses both:
 
-- **Headless TOTP** (`kite_auth.py`) — `.env` carries `KITE_USER_ID`,
+- **Headless TOTP** (`core/kite_auth.py`) — `.env` carries `KITE_USER_ID`,
   `KITE_PASSWORD`, `KITE_TOTP_KEY` (the 2FA seed). The script
   generates the OTP itself, so the daily systemd job runs unattended.
 - **OAuth redirect** (`backend/kite_oauth.py`) — the dashboard sends
@@ -227,7 +227,7 @@ identically.
   the ~100-strike chains we run; would matter at scale.
 - **`data_cache/` is append-only by convention** — strategies read,
   never write. The fetchers are the only writers.
-- **NIFTY-50 universe is hardcoded** in `screen_pairs.py`. Update by
+- **NIFTY-50 universe is hardcoded** in `core/screen_pairs.py`. Update by
   hand when constituents change.
 - **The dashboard refuses live mode unconditionally** (`POST /runs` with
   `mode=live` returns 403, regardless of environment — `ALLOW_LIVE_MODE`

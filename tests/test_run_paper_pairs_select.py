@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from run_paper_pairs import select_pairs
+from runners.run_paper_pairs import select_pairs
 
 
 def _row(last_data_date: str) -> str:
@@ -85,7 +85,7 @@ def test_stale_csv_error_message_is_helpful(tmp_path, log):
         select_pairs(top=3, log=log, candidates_path=csv, max_age_days=7.0)
     msg = str(exc_info.value)
     assert str(csv) in msg
-    assert "screen_pairs.py" in msg
+    assert "core.screen_pairs" in msg
     assert "--max-csv-age-days" in msg
 
 
@@ -169,5 +169,5 @@ def test_missing_csv_still_raises_filenotfound(tmp_path, log):
     """Pre-existing behaviour: nonexistent path raises FileNotFoundError
     BEFORE the freshness check runs."""
     csv = tmp_path / "does-not-exist.csv"
-    with pytest.raises(FileNotFoundError, match="screen_pairs.py first"):
+    with pytest.raises(FileNotFoundError, match=r"core\.screen_pairs.* first"):
         select_pairs(top=3, log=log, candidates_path=csv, max_age_days=7.0)

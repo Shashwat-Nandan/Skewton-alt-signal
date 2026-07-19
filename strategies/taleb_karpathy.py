@@ -23,17 +23,17 @@ from dataclasses import dataclass, field, fields
 import numpy as np
 import pandas as pd
 
-from data_cache_io import find_tables, read_table
-from greeks_engine import (
+from core.data_cache_io import find_tables, read_table
+from core.greeks_engine import (
     GreeksEngine, OptionContract, PortfolioGreeks,
     implied_volatility_bisect, time_to_expiry,
 )
-from trade_proposer import TradeProposer, TradeProposal
-from risk_analyzer import (
+from core.trade_proposer import TradeProposer, TradeProposal
+from core.risk_analyzer import (
     RiskAnalyzer, MonteCarloReport, StabilityReport,
     BleedForecast, HedgeDecision,
 )
-from regime_classifier import (
+from core.regime_classifier import (
     RegimeFeatures, Structure, Thresholds as RegimeThresholds, classify,
 )
 
@@ -339,7 +339,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             # Phase 3.1 regime-classifier cutoffs. These are the thresholds the
             # classifier ACTUALLY routes on when enable_regime_dispatch=True, so
             # they must be tunable for the autoresearch loop to optimise the
-            # structure-routing it picks (regime_classifier.py promised this but
+            # structure-routing it picks (core/regime_classifier.py promised this but
             # the call site passed no Thresholds — the cutoffs were inert).
             # Fallbacks mirror regime_classifier.Thresholds defaults exactly.
             "regime_straddle_iv_pct_max": self.config.getfloat(
@@ -376,7 +376,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         }
 
         # Overlay autoresearch optimum on top of config defaults so the
-        # output of run_autoresearch.py actually reaches live trading.
+        # output of runners/run_autoresearch.py actually reaches live trading.
         # Disable with [strategy] use_best_params = false in config.ini.
         if self.config.getboolean("strategy", "use_best_params", fallback=True):
             bp_path = Path(self.config.get(
@@ -1300,7 +1300,7 @@ class TalebKarpathyStrategy(BaseStrategy):
     # ══════════════════════════════════════════════════════════
 
     def serialize_state(self) -> Dict:
-        """Snapshot HedgeState so run_paper.py can persist it between sessions.
+        """Snapshot HedgeState so runners/run_paper.py can persist it between sessions.
         Counterpart of restore_state(). Used when the runner is configured to
         hold positions overnight rather than EOD-flatten (2026-05-19).
 
@@ -1393,7 +1393,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         """Inverse of serialize_state(). Fails loudly on shape mismatch — a
         corrupted or partial state file must not silently degrade into a
         fresh-start strategy (Rule 12)."""
-        from greeks_engine import OptionContract
+        from core.greeks_engine import OptionContract
         s = blob["state"]
         self.state.positions = [
             OptionContract(
@@ -2553,7 +2553,7 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     def _load_spot_history(self):
         # Seed _spot_history with one underlying_price per date from the most
-        # recent EOD CSV produced by fetch_historical_data.py. Daily granularity
+        # recent EOD CSV produced by market_data/fetch_historical_data.py. Daily granularity
         # is sufficient for the RV/IV regime gate's default 5-day window.
         cache_dir = Path("data_cache")
         if not cache_dir.exists():

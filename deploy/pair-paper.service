@@ -38,7 +38,7 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # (no --mode live) until top-8 clears its own paper window (safety rule 3). The
 # host runs this via a systemd drop-in (pair-paper.service.d/10-top8.conf); see
 # tasks/todo.md (2026-07-18 baseline top-8) for the deferred live prerequisites.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_pairs.py --top 8 --max-leg-notional 1000000 --max-daily-loss-inr 100000
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_pairs --top 8 --max-leg-notional 1000000 --max-daily-loss-inr 100000
 # ------------------------------------
 
 # M-O5: auto-restart on segfault / non-zero exit. Successful exit (clean

@@ -163,7 +163,7 @@ def poll_once(
     if config is None:
         config = RiskConfig.from_skill(strategy, root=state_root)
     if halt_path is None:
-        from runner_common import HALT_NEW_ENTRIES_PATH
+        from core.runner_common import HALT_NEW_ENTRIES_PATH
         halt_path = HALT_NEW_ENTRIES_PATH
 
     equities = read_book_equities(runner_state)
@@ -201,7 +201,7 @@ def main() -> int:  # pragma: no cover  (long-running host process, 1-min cadenc
     import time
     from datetime import datetime
 
-    from runner_common import (
+    from core.runner_common import (
         assert_timezone_ist,
         install_signal_handlers,
     )

@@ -39,8 +39,8 @@ def main() -> int:
     parser.add_argument("--underlying", default="NIFTY")
     args = parser.parse_args()
 
-    from autoresearch_loop import HedgeResearchLoop
-    from backtest import MockKite, generate_synthetic_data, list_captured_sessions
+    from runners.autoresearch_loop import HedgeResearchLoop
+    from research.backtest import MockKite, generate_synthetic_data, list_captured_sessions
     from strategies import TalebKarpathyStrategy
 
     if not list_captured_sessions(args.underlying):
@@ -81,7 +81,7 @@ def main() -> int:
     # relative comparison and the absolute bar the loop now actually applies
     # under a vetoed seed (_evaluate_experiment / vetoed_baseline_abs_floor)
     # — so the headline can't be an artifact of the seed's status.
-    from autoresearch_loop import VETO_FITNESS
+    from runners.autoresearch_loop import VETO_FITNESS
     floor = loop.vetoed_baseline_abs_floor
     seed_vetoed = seed_fit <= VETO_FITNESS
 

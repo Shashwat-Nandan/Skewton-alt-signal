@@ -637,7 +637,7 @@ Minimal, surgical changes; reuse what exists.
   JSONL as a local audit mirror.
 - **Exit/stop/target must be emitted as signals, not just internal state.**
   Today strategies manage exits in-process (e.g. pair runner's stop logic in
-  `run_paper_pairs.py`, the "Close all (safety trigger)" lines in the taleb
+  `runners/run_paper_pairs.py`, the "Close all (safety trigger)" lines in the taleb
   log). For the business, **every position-changing decision the master makes
   must become a published signal** — otherwise subscribers can't exit. This is
   the single biggest change to the strategy layer. Audit each strategy for
@@ -839,7 +839,7 @@ Reuse the existing FastAPI dashboard (`backend/`, `frontend/`) as the
 
 ## 12. Kill switches (precise semantics)
 
-Reuse the existing taxonomy from `runner_common.py`
+Reuse the existing taxonomy from `core/runner_common.py`
 (`HALT_ALL` vs `HALT_NEW_ENTRIES`) — it's the right mental model — but make it
 multi-level:
 

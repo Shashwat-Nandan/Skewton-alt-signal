@@ -1,6 +1,6 @@
 """Buy-on-Gap paper-trading P&L for the dashboard.
 
-Reads the per-day EOD sidecar JSONs that ``run_paper_buy_on_gap.py`` writes
+Reads the per-day EOD sidecar JSONs that ``runners/run_paper_buy_on_gap.py`` writes
 (``data_cache/buy_on_gap_paper{,_<system>}_eod_<date>.json``) and exposes a
 daily + cumulative P&L series plus the day's open intraday positions.
 

@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import optimize_kalman_trend as o
+from research import optimize_kalman_trend as o
 
 
 # ──────────────────────────────────────────────────────────────────────────

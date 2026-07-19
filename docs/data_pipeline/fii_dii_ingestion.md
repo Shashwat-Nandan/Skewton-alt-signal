@@ -17,7 +17,7 @@ into `varsity_equity_swing`'s entry score.
 
 ## Overview
 
-`fetch_fii_dii.py` (143 lines) pulls the latest day's FII/DII (Foreign
+`market_data/fetch_fii_dii.py` (143 lines) pulls the latest day's FII/DII (Foreign
 Institutional Investor / Domestic Institutional Investor) aggregate
 cash-market flows from NSE's report endpoint.
 
@@ -133,7 +133,7 @@ silently degrades the FII gate but doesn't break the strategy.
 
 | File | Role |
 |---|---|
-| `fetch_fii_dii.py` | Scraper |
+| `market_data/fetch_fii_dii.py` | Scraper |
 | `data_cache/fii_dii/YYYY-MM-DD.json` | Per-day cache |
 | `strategies/_fii_dii.py` | Consumer: 5d cumulative net signal |
 | `strategies/varsity_equity_swing.py` (`_signal_at`) | Uses `fii_boost` in scoring |

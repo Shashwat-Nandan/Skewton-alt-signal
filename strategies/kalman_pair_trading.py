@@ -46,7 +46,7 @@ from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 from .base import BaseStrategy, ExecutionMode
 from .kalman_filter import KalmanPairFilter, Model

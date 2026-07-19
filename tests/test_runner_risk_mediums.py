@@ -24,7 +24,7 @@ class _FakeStrategy:
 
 
 def test_long_break_warning_fires_when_book_open(monkeypatch, caplog):
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     caplog.set_level(logging.WARNING, logger="")
     s_open = _FakeStrategy("AAA", "BBB", position="LONG_SPREAD")
     s_flat = _FakeStrategy("CCC", "DDD", position="FLAT")
@@ -39,7 +39,7 @@ def test_long_break_warning_fires_when_book_open(monkeypatch, caplog):
 
 
 def test_no_warning_when_no_open_book(monkeypatch, caplog):
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     caplog.set_level(logging.WARNING, logger="")
     args = SimpleNamespace(force_flatten_on_exit=False, system="baseline", mode="paper")
     monkeypatch.setattr(rpp, "write_state_file", lambda *a, **k: None)
@@ -50,7 +50,7 @@ def test_no_warning_when_no_open_book(monkeypatch, caplog):
 
 
 def test_no_warning_when_force_flatten_set(monkeypatch, caplog):
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     caplog.set_level(logging.WARNING, logger="")
     args = SimpleNamespace(force_flatten_on_exit=True, system="baseline", mode="paper")
     monkeypatch.setattr(rpp, "write_state_file", lambda *a, **k: None)
@@ -63,13 +63,13 @@ def test_no_warning_when_force_flatten_set(monkeypatch, caplog):
 
 
 def test_calendar_days_helper_skips_weekend():
-    from run_paper_pairs import _calendar_days_until_next_trading_day
+    from runners.run_paper_pairs import _calendar_days_until_next_trading_day
     # Friday 2026-05-29 → Mon 2026-06-01 = 3 calendar days
     assert _calendar_days_until_next_trading_day(date(2026, 5, 29), set()) == 3
 
 
 def test_calendar_days_helper_skips_holiday():
-    from run_paper_pairs import _calendar_days_until_next_trading_day
+    from runners.run_paper_pairs import _calendar_days_until_next_trading_day
     # Thursday with Friday as a holiday → Mon
     holidays = {date(2026, 5, 29)}  # Friday is a holiday
     assert _calendar_days_until_next_trading_day(
@@ -103,7 +103,7 @@ def _kite_with_positions(positions):
 
 
 def test_entry_price_drift_warns_does_not_block(caplog):
-    from run_paper_pairs import reconcile_with_broker
+    from runners.run_paper_pairs import reconcile_with_broker
     caplog.set_level(logging.WARNING, logger="")
     s = _LiveStrategy("AAA", "BBB", [
         _Leg("AAA26APRFUT", quantity=1, lot_size=100, entry_price=1000.0),
@@ -120,7 +120,7 @@ def test_entry_price_drift_warns_does_not_block(caplog):
 
 
 def test_entry_price_within_tolerance_no_warn(caplog):
-    from run_paper_pairs import reconcile_with_broker
+    from runners.run_paper_pairs import reconcile_with_broker
     caplog.set_level(logging.WARNING, logger="")
     s = _LiveStrategy("AAA", "BBB", [
         _Leg("AAA26APRFUT", quantity=1, lot_size=100, entry_price=1000.0),
@@ -134,7 +134,7 @@ def test_entry_price_within_tolerance_no_warn(caplog):
 
 
 def test_share_mismatch_still_blocks(caplog):
-    from run_paper_pairs import reconcile_with_broker
+    from runners.run_paper_pairs import reconcile_with_broker
     s = _LiveStrategy("AAA", "BBB", [
         _Leg("AAA26APRFUT", quantity=1, lot_size=100, entry_price=1000.0),
     ])
@@ -154,7 +154,7 @@ def test_offsetting_legs_across_pairs_reconcile_against_broker_net(caplog):
     comparison false-flagged BOTH legs, halting entries mid-session and
     refusing the next day's start while state and broker actually agreed.
     Expected shares must be summed across strategies per tradingsymbol."""
-    from run_paper_pairs import reconcile_with_broker
+    from runners.run_paper_pairs import reconcile_with_broker
     caplog.set_level(logging.WARNING, logger="")
     s1 = _LiveStrategy("BHA", "MMM", [
         _Leg("BHA26JULFUT", quantity=-1, lot_size=475, entry_price=1900.0),
@@ -183,7 +183,7 @@ def test_offsetting_legs_aggregate_mismatch_still_blocks():
     """Aggregation must not weaken the gate: if the summed expectation
     disagrees with the broker net, refuse to start and name every
     contributing pair."""
-    from run_paper_pairs import reconcile_with_broker
+    from runners.run_paper_pairs import reconcile_with_broker
     s1 = _LiveStrategy("BHA", "MMM", [
         _Leg("MMM26JULFUT", quantity=1, lot_size=200, entry_price=3200.0),
     ])
@@ -208,7 +208,7 @@ def _live_leg_strategy():
 
 def test_mid_session_clean_reconcile_no_halt(tmp_path, monkeypatch):
     # A matching broker book → no drift, no HALT_NEW_ENTRIES, returns False.
-    import run_paper_pairs as rp
+    from runners import run_paper_pairs as rp
     halt = tmp_path / "HALT_NEW_ENTRIES"
     monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
     s = _live_leg_strategy()
@@ -225,7 +225,7 @@ def test_mid_session_drift_halts_new_entries_without_raising(tmp_path, monkeypat
     # Share mismatch mid-session must NOT raise (would crash the live loop) —
     # it touches HALT_NEW_ENTRIES and returns True so existing positions still
     # exit while no new exposure opens.
-    import run_paper_pairs as rp
+    from runners import run_paper_pairs as rp
     halt = tmp_path / "HALT_NEW_ENTRIES"
     monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
     caplog.set_level(logging.CRITICAL, logger="")
@@ -242,7 +242,7 @@ def test_mid_session_drift_halts_new_entries_without_raising(tmp_path, monkeypat
 
 def test_mid_session_kite_failure_halts_not_raises(tmp_path, monkeypatch):
     # A kite.positions() outage mid-session must also halt-new, not crash.
-    import run_paper_pairs as rp
+    from runners import run_paper_pairs as rp
     halt = tmp_path / "HALT_NEW_ENTRIES"
     monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
     s = _live_leg_strategy()
@@ -254,7 +254,7 @@ def test_mid_session_kite_failure_halts_not_raises(tmp_path, monkeypatch):
 
 def test_mid_session_noop_for_paper(tmp_path, monkeypatch):
     # Paper books have no broker truth → no-op, no HALT, no kite call.
-    import run_paper_pairs as rp
+    from runners import run_paper_pairs as rp
     halt = tmp_path / "HALT_NEW_ENTRIES"
     monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
     s = _live_leg_strategy()
@@ -283,7 +283,7 @@ class _BreachStrategy:
 
 
 def test_halt_daily_loss_path_persistent_is_canonical():
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     # The LIVE (persistent) runner keeps the canonical flag so its Telegram
     # alert (deploy/pair-halt-alert.path) and `rm` runbook stay valid unchanged.
     assert rpp.halt_daily_loss_path("persistent") == rpp.HALT_DAILY_LOSS_PATH
@@ -291,7 +291,7 @@ def test_halt_daily_loss_path_persistent_is_canonical():
 
 
 def test_halt_daily_loss_path_baseline_is_namespaced():
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     p = rpp.halt_daily_loss_path("baseline")
     # WHY: distinct from the canonical flag, so a baseline (paper) breach can
     # never touch the live persistent runner's breaker.
@@ -303,7 +303,7 @@ def test_baseline_breach_does_not_touch_live_flag(tmp_path):
     # A baseline paper loss breach must touch ONLY its own flag; the canonical
     # HALT_DAILY_LOSS the live persistent runner reads must stay absent —
     # otherwise a paper loss would freeze the real-money book's entries.
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     live_flag = tmp_path / "HALT_DAILY_LOSS"
     baseline_flag = tmp_path / "HALT_DAILY_LOSS_baseline"
     breaching = _BreachStrategy(session_delta=-200_000.0)   # ₹2L loss > ₹1L cap
@@ -316,7 +316,7 @@ def test_baseline_breach_does_not_touch_live_flag(tmp_path):
 def test_halt_state_reads_only_its_own_daily_loss_flag(tmp_path, monkeypatch):
     # _HaltState bound to the baseline flag must ignore the canonical/live flag:
     # a live-runner breach must not suspend the baseline runner and vice-versa.
-    import run_paper_pairs as rpp
+    from runners import run_paper_pairs as rpp
     monkeypatch.setattr(rpp, "HALT_ALL_PATH", tmp_path / "HALT_ALL")
     monkeypatch.setattr(rpp, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES")
     baseline_flag = tmp_path / "HALT_DAILY_LOSS_baseline"

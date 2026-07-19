@@ -1,4 +1,4 @@
-"""Tests for verify_pair_paper.py — focused on the --system parameterization
+"""Tests for scripts/verify_pair_paper.py — focused on the --system parameterization
 added 2026-05-17. Full end-to-end testing is left to integration; this just
 covers the filename / payload-routing logic that previously assumed baseline."""
 from __future__ import annotations
@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import verify_pair_paper as vpp
+from scripts import verify_pair_paper as vpp
 
 
 @pytest.fixture

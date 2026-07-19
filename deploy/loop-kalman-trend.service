@@ -15,7 +15,7 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
-# PAPER ONLY. The orchestrator wraps run_paper_kalman_trend.py (the existing paper
+# PAPER ONLY. The orchestrator wraps runners/run_paper_kalman_trend.py (the existing paper
 # runner) via kite_engine: it reads STATE.md first, runs the intraday A/B session
 # (09:15→15:25), then runs the independent deterministic checker, writes a retro
 # lesson IFF notable, and persists the run summary. No live order path.

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from screen_pairs import (
+from core.screen_pairs import (
     _half_life,
     _hedge_ratio,
     screen_pairs,

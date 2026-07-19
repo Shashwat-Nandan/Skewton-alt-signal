@@ -30,12 +30,12 @@ venv; neither is currently a project dependency). Timings are warm-cache.
 
 | Store | Format | Size | Writers | Readers |
 |---|---|---|---|---|
-| `data_cache/ticks/` (8 raw sessions) | JSONL, 1 tick/line | 40 GB | `tick_capture.py` (append, 1 proc) | `backtest.load_captured_tape`, autoresearch replay |
+| `data_cache/ticks/` (8 raw sessions) | JSONL, 1 tick/line | 40 GB | `market_data/tick_capture.py` (append, 1 proc) | `backtest.load_captured_tape`, autoresearch replay |
 | `data_cache/ticks/` (32 archived) | JSONL + zstd -3 | 4.4 GB (~140 MB/day) | `tick-retention.timer` | same |
 | EOD option chains (`NIFTY_*_eod.csv` etc.) | CSV | 535 MB / 99 files | fetch scripts | backtests, sweeps |
 | `bhavcopy_raw/` + `bhavcopy_eq_raw/` | CSV, 541+ files | 3.8 GB | fetch timers | pair screening |
-| `stf_5min/` | CSV, 48 files | 12 MB | `fetch_5min_stf.py` | kalman-pairs backtests |
-| `dashboard.db` | SQLite (WAL) | 34 MB | **FastAPI backend + `run_equity_swing.py` + `fetch_bars.py` + scripts — concurrent processes** | dashboard, verify scripts |
+| `stf_5min/` | CSV, 48 files | 12 MB | `market_data/fetch_5min_stf.py` | kalman-pairs backtests |
+| `dashboard.db` | SQLite (WAL) | 34 MB | **FastAPI backend + `runners/run_equity_swing.py` + `market_data/fetch_bars.py` + scripts — concurrent processes** | dashboard, verify scripts |
 | Signal bus (`logs/signal-bus/<strategy>/YYYY-MM-DD.jsonl`) | append-only JSONL, schema-validated | small | signal publisher(s) | consumer.py, future OMS plane |
 | Runner state (`*_state*.json`), EOD snapshots (`*_eod_*.json`) | JSON, atomic rewrite | ~140 files | each paper/live runner | same runner on restart; dashboard routers |
 | Trade logs (`*_trades.tsv`) | TSV | small | backtests/runners | ad-hoc analysis |
@@ -105,7 +105,7 @@ issue for the SaaS plane, unlike vectorbt).
 
 ### 3.2 Where Parquet is wrong (don't force it)
 
-**The tick capture path.** `tick_capture.py` appends one JSON line per tick
+**The tick capture path.** `market_data/tick_capture.py` appends one JSON line per tick
 so that a crash mid-session loses at most one line, and the retention timer
 zstd's old sessions. Parquet is not appendable — writing it live means
 buffering row groups in memory inside the capture process, which is exactly

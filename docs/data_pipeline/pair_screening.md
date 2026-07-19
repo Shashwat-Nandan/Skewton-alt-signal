@@ -8,8 +8,8 @@ honest.
 ## Contents
 - [Overview](#overview)
 - [Two crons](#two-crons)
-- [Screener: screen_pairs.py](#screener-screen_pairspy)
-- [Verifier: verify_pair_paper.py](#verifier-verify_pair_paperpy)
+- [Screener: core/screen_pairs.py](#screener-screen_pairspy)
+- [Verifier: scripts/verify_pair_paper.py](#verifier-verify_pair_paperpy)
 - [Outputs](#outputs)
 - [Quality floors (baseline vs persistent)](#quality-floors-baseline-vs-persistent)
 - [Downstream consumers](#downstream-consumers)
@@ -22,10 +22,10 @@ honest.
 
 Pair trading needs two inputs:
 1. **Pair candidates** — which pairs are cointegrated *right now*?
-   Produced weekly by `screen_pairs.py`.
+   Produced weekly by `core/screen_pairs.py`.
 2. **β drift check** — has the hedge ratio of a HELD position drifted
    far enough that the position is no longer hedged? Produced daily by
-   `verify_pair_paper.py`.
+   `scripts/verify_pair_paper.py`.
 
 Both read the F&O bhavcopy archive (see
 [`bhavcopy_ingestion.md`](./bhavcopy_ingestion.md)) and emit structured
@@ -35,8 +35,8 @@ output that the pair-trading runner consumes at next session start.
 
 | Cron | Schedule | Script | Output |
 |---|---|---|---|
-| screen-pairs | Mon–Fri 19:00 IST | `screen_pairs.py` | `data_cache/pair_candidates.csv` (and `_persistent.csv` variant) |
-| pair-verify | Mon–Fri 16:00 IST | `verify_pair_paper.py` | `logs/pair-verify-YYYY-MM-DD.{log,json}` |
+| screen-pairs | Mon–Fri 19:00 IST | `core/screen_pairs.py` | `data_cache/pair_candidates.csv` (and `_persistent.csv` variant) |
+| pair-verify | Mon–Fri 16:00 IST | `scripts/verify_pair_paper.py` | `logs/pair-verify-YYYY-MM-DD.{log,json}` |
 | pair-verify-persistent | Mon–Fri 16:00 IST | same script, `--system persistent` | `logs/pair-verify-persistent-*.{log,json}` |
 
 Sequencing:
@@ -50,13 +50,13 @@ emit reports / candidates that the next morning's pair-paper run reads
 at boot). Safe to run multiple times — re-running produces identical
 output for the same inputs.
 
-## Screener: screen_pairs.py
+## Screener: core/screen_pairs.py
 
 550 lines. Pipeline:
 
 ### 1. Universe
 Default: `NIFTY_50` list at line 46 — 50 NIFTY 50 constituents. Single
-source of truth — `fetch_bars.py` imports it too. Override with
+source of truth — `market_data/fetch_bars.py` imports it too. Override with
 `--universe FILE` (one symbol per line).
 
 ### 2. Front-month panel build (`load_front_month_panel`, line 59)
@@ -113,7 +113,7 @@ Top-N (default --top 12) qualifying pairs → `pair_candidates.csv` (and
 the persistent variant if invoked with that flag). Columns:
 `symbol_a, symbol_b, hedge_ratio, halflife_d, pvalue, corr, rank`.
 
-## Verifier: verify_pair_paper.py
+## Verifier: scripts/verify_pair_paper.py
 
 332 lines. Runs daily after the pair-paper session ends.
 
@@ -183,8 +183,8 @@ strategy doc.
 
 | Consumer | Reads |
 |---|---|
-| `run_paper_pairs.py` (next morning boot) | `pair_candidates_*.csv` → instantiate one strategy per pair |
-| `verify_pair_paper.py` | both the screener output AND the pair-paper state file |
+| `runners/run_paper_pairs.py` (next morning boot) | `pair_candidates_*.csv` → instantiate one strategy per pair |
+| `scripts/verify_pair_paper.py` | both the screener output AND the pair-paper state file |
 | Dashboard `/pair/candidates` route | `pair_candidates_*.csv` |
 | `pair_paper_compare` router | β drift comparisons |
 
@@ -203,10 +203,10 @@ strategy doc.
 
 | File | Role |
 |---|---|
-| `screen_pairs.py` | Weekly screener: panel build, cointegration, OLS β, rank |
-| `verify_pair_paper.py` | Daily β-drift check for held positions |
+| `core/screen_pairs.py` | Weekly screener: panel build, cointegration, OLS β, rank |
+| `scripts/verify_pair_paper.py` | Daily β-drift check for held positions |
 | `strategies/pair_trading.py` | Consumes candidate CSV at init |
-| `run_paper_pairs.py` | Loads candidates + state at session boot |
+| `runners/run_paper_pairs.py` | Loads candidates + state at session boot |
 | `data_cache/bhavcopy_raw/` | Input: F&O bhavcopy archive |
 | `data_cache/pair_candidates.csv` | Output: baseline candidates |
 | `data_cache/pair_candidates_persistent.csv` | Output: persistent candidates |

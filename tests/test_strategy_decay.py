@@ -23,7 +23,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import strategy_decay as sd  # noqa: E402
+from scripts import strategy_decay as sd  # noqa: E402
 
 
 def _replay(monthly, first, last, **kw):

@@ -1,7 +1,7 @@
 """Market-Profile trend_up paper-book P&L for the dashboard.
 
 Reads the ``mp_trend_positions`` / ``mp_trend_runs`` tables that
-``run_paper_mp.py`` writes into dashboard.db and exposes a cumulative net-P&L
+``runners/run_paper_mp.py`` writes into dashboard.db and exposes a cumulative net-P&L
 series, the day's open (overnight) positions, and a summary.
 
 Read-only and paper-only: this book never touches an order path. The tables are

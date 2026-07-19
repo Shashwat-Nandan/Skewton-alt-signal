@@ -185,7 +185,7 @@ the slippage saved — measure before trusting.*
 The `q γ σ² (T−t)` term is a clean way to **quantify the carrying cost of
 inventory** in backtests — e.g., to penalize strategies that sit on large
 overnight books, or to set position caps as a function of realized vol. Useful
-in `risk_analyzer.py` / the autoresearch objective, where "inventory risk" is
+in `core/risk_analyzer.py` / the autoresearch objective, where "inventory risk" is
 currently implicit.
 
 *Applicability: low-medium. Analysis tooling, not a P&L source.*
@@ -198,7 +198,7 @@ currently implicit.
    the idea isn't re-litigated later. (This file is that record.)
 2. **Worth a small spike:** the reservation-price EOD-unwind rule (6.1) and the
    patient-limit execution layer (6.2), both as opt-in helpers in
-   `order_executor.py` / `runner_common.py`, measured against current
+   `order_executor.py` / `core/runner_common.py`, measured against current
    market-order execution on paper before any live use.
 3. Keep AS in mind for the **SaaS platform** angle: an "execution-quality /
    inventory-aware exit" layer is a credible feature for a signal→OMS product,

@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 from .arbitrage import ArbitrageStrategy, CalendarPosition
 from .base import ExecutionMode
@@ -412,7 +412,7 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
         so the strategy can still start in environments without the archive.
         """
         try:
-            from backtest_arbitrage import load_stf_panel
+            from research.backtest_arbitrage import load_stf_panel
             panel = load_stf_panel(universe=list(self.universe))
         except Exception as e:
             logger.warning(

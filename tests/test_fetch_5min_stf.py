@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from fetch_5min_stf import (
+from market_data.fetch_5min_stf import (
     _is_immediate_successor,
     backadjust_merge,
     load_existing,

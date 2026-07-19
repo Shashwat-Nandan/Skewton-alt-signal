@@ -20,7 +20,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import strategy_scoreboard as sb  # noqa: E402
+from scripts import strategy_scoreboard as sb  # noqa: E402
 
 
 # ── kill rule (now the decay state machine — see strategy_decay.py) ───────
@@ -34,7 +34,7 @@ def _decay_row(monthly, slug="s1", parked_reason=None, partial_months=()):
 
 
 def _fresh_ledger():
-    import strategy_decay as sd
+    from scripts import strategy_decay as sd
     return {"version": sd.LEDGER_VERSION, "strategies": {}}
 
 
@@ -290,7 +290,7 @@ def test_operator_can_park_a_slug_before_any_ledger_exists(tmp_path):
     # WHY: --park/--unpark used to validate against the ledger, so on a fresh
     # install a VALID slug was reported "unknown (known: none yet)" until a
     # full run had written the file (2026-07-19 review).
-    import strategy_decay as sd
+    from scripts import strategy_decay as sd
     ledger = _fresh_ledger()
     rows = sb.build_rows(tmp_path, _empty_db(tmp_path), TODAY)
     sb.ensure_entries(rows, ledger)

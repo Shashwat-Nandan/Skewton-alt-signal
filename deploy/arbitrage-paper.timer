@@ -6,11 +6,11 @@ Documentation=man:systemd.timer(5)
 # 09:13 IST — staggered after taleb-hedger (09:10) and pair-paper (09:11/09:12)
 # so the TOTP logins don't collide on the same .kite_session.json. The shared
 # session is fine; staggering just dodges a worst-case mid-rotation race.
-# run_paper_arbitrage.py self-gates on 09:15 anyway, so it waits for the open.
+# runners/run_paper_arbitrage.py self-gates on 09:15 anyway, so it waits for the open.
 OnCalendar=Mon..Fri *-*-* 09:13:00 Asia/Kolkata
 
 # If the VPS was asleep or systemd missed the window, run once to catch up.
-# run_paper_arbitrage.py refuses to start after 15:30 — safe to be Persistent.
+# runners/run_paper_arbitrage.py refuses to start after 15:30 — safe to be Persistent.
 Persistent=true
 
 # Jitter to avoid thundering-herd Kite logins on multi-account VPSes.

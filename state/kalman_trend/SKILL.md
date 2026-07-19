@@ -4,7 +4,7 @@ Procedure manual for the Kalman-trend loop, read at the start of every session
 (paper §II-B). Hard rules and accumulated lessons live here; the per-signal
 checker reads its gate thresholds from `## Rules` so the Phase-6 recalibration
 audit can tighten them in one place. Seeded 2026-06-28 from
-`tasks/kalman-trend-findings.md` and `run_paper_kalman_trend.py`.
+`tasks/kalman-trend-findings.md` and `runners/run_paper_kalman_trend.py`.
 
 ## Goal
 Run an intraday Kalman-vs-MA trend A/B (forward parity) on NIFTY + BANKNIFTY

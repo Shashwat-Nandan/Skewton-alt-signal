@@ -28,7 +28,7 @@ def _candidate(symbol_a, symbol_b, *, beta=0.5, corr=0.85, hl=3.0, p=0.01,
 
 
 def test_load_cross_runner_leg_counts_skips_own(tmp_path):
-    from run_paper_pairs import load_cross_runner_leg_counts
+    from runners.run_paper_pairs import load_cross_runner_leg_counts
     own = tmp_path / "pair_paper_state_baseline.json"
     sib = tmp_path / "pair_paper_state_persistent.json"
     own.write_text(json.dumps({"pairs": [
@@ -44,7 +44,7 @@ def test_load_cross_runner_leg_counts_skips_own(tmp_path):
 
 
 def test_load_cross_runner_leg_counts_handles_malformed(tmp_path):
-    from run_paper_pairs import load_cross_runner_leg_counts
+    from runners.run_paper_pairs import load_cross_runner_leg_counts
     (tmp_path / "pair_paper_state_bad.json").write_text("not json")
     (tmp_path / "pair_paper_state_good.json").write_text(json.dumps({
         "pairs": [{"pair": ["X", "Y"], "state": {"legs": [{"q": 1}]}}],
@@ -54,7 +54,7 @@ def test_load_cross_runner_leg_counts_handles_malformed(tmp_path):
 
 
 def test_classify_seeds_block_admit_at_cap():
-    from run_paper_pairs import classify_pair_candidates, LEG_CONCENTRATION_CAP
+    from runners.run_paper_pairs import classify_pair_candidates, LEG_CONCENTRATION_CAP
     df = pd.DataFrame([
         _candidate("AAA", "BBB"),
         _candidate("AAA", "CCC"),
@@ -68,7 +68,7 @@ def test_classify_seeds_block_admit_at_cap():
 
 
 def test_classify_seeds_admit_when_below_cap():
-    from run_paper_pairs import classify_pair_candidates
+    from runners.run_paper_pairs import classify_pair_candidates
     df = pd.DataFrame([
         _candidate("AAA", "BBB"),
     ])
@@ -83,7 +83,7 @@ def test_max_pvalue_override_admits_marginal_pair():
     cointegration p sits between the default 0.025 ceiling and the persistent
     0.05 ceiling is dropped as 'quality' by default but admitted when
     max_pvalue=0.05 is passed. corr / half-life still gate normally."""
-    from run_paper_pairs import classify_pair_candidates
+    from runners.run_paper_pairs import classify_pair_candidates
     df = pd.DataFrame([
         _candidate("COAL", "ITC", p=0.028, corr=0.89),   # p in the dead-band
     ])
@@ -101,7 +101,7 @@ def test_max_pvalue_override_does_not_relax_corr_or_halflife():
     """Loosening the p ceiling must NOT admit pairs failing the economic gates
     (correlation, half-life) — those are system-agnostic. A weak-correlation
     pair with a fine p-value stays dropped even at max_pvalue=0.05."""
-    from run_paper_pairs import classify_pair_candidates
+    from runners.run_paper_pairs import classify_pair_candidates
     df = pd.DataFrame([
         _candidate("WEAK", "CORR", p=0.01, corr=0.54),   # great p, corr < 0.65
         _candidate("SLOW", "REV", p=0.01, corr=0.90, hl=9.0),  # HL > 5d
@@ -114,7 +114,7 @@ def test_max_pvalue_override_does_not_relax_corr_or_halflife():
 def test_max_pvalue_none_preserves_default_ceiling():
     """max_pvalue=None (every existing caller) behaves exactly as before:
     the module's QUALITY_MAX_PVALUE constant governs the floor."""
-    from run_paper_pairs import classify_pair_candidates, QUALITY_MAX_PVALUE
+    from runners.run_paper_pairs import classify_pair_candidates, QUALITY_MAX_PVALUE
     just_over = QUALITY_MAX_PVALUE + 0.001
     just_under = QUALITY_MAX_PVALUE - 0.001
     df = pd.DataFrame([
@@ -138,7 +138,7 @@ def test_quality_max_pvalue_typo_tripwire_rejects(bad):
     import os
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     r = subprocess.run(
-        [sys.executable, "run_paper_pairs.py", "--system", "persistent",
+        [sys.executable, "-m", "runners.run_paper_pairs", "--system", "persistent",
          "--quality-max-pvalue", bad, "--force"],
         cwd=repo, capture_output=True, text=True, timeout=60,
     )

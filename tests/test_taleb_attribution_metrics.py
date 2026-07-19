@@ -16,7 +16,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from greeks_engine import PortfolioGreeks
+from core.greeks_engine import PortfolioGreeks
 from strategies.taleb_karpathy import HedgeState, TalebKarpathyStrategy
 
 FIXED_NOW = datetime(2026, 7, 18, 11, 0)
@@ -220,7 +220,7 @@ def test_end_of_session_appends_dated_jsonl(tmp_path):
     # WHY: the sidecar is the dated record Phase-0 proved was missing. Two
     # sessions must yield two lines (append, never overwrite), each parseable
     # with its own date — this is what makes future sessions auditable.
-    import run_paper
+    from runners import run_paper
 
     class _FakeHedger:
         def __init__(self):
@@ -263,7 +263,7 @@ def test_attribution_write_failure_does_not_block_state_persist(tmp_path):
     # WHY: attribution is measurement, state persistence is safety. A broken
     # sidecar path must never cost the book its restore file (Rule 12: the
     # exception is logged loudly instead).
-    import run_paper
+    from runners import run_paper
 
     class _FakeHedger:
         def __init__(self):

@@ -35,11 +35,11 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo
 
   echo "[1/3] Refreshing F&O bhavcopy ($BHAVCOPY_DAYS days)..."
-  "$PY" fetch_bhavcopy.py --days "$BHAVCOPY_DAYS"
+  "$PY" -m market_data.fetch_bhavcopy --days "$BHAVCOPY_DAYS"
 
   echo
   echo "[2/3] Screening cointegrated pairs (baseline single-window)..."
-  "$PY" screen_pairs.py
+  "$PY" -m core.screen_pairs
 
   echo
   # Persistence screen: only admits pairs that pass p<0.05 in ≥2 rolling
@@ -48,7 +48,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # screener logs an error and exits 0; the persistent runner then
   # gracefully reports an empty book). See tasks/todo.md (2026-05-17).
   echo "[3/3] Screening cointegrated pairs (persistent: ≥2 of N windows)..."
-  "$PY" screen_pairs.py \
+  "$PY" -m core.screen_pairs \
       --persistence-min 2 \
       --output data_cache/pair_candidates_persistent.csv
 

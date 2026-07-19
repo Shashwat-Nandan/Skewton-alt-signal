@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Weekly MP trend_up fine-tune report.
 #
-# Re-runs the pre-registered fine-tune experiments (mp_finetune.py) over the
+# Re-runs the pre-registered fine-tune experiments (scripts/mp_finetune.py) over the
 # accumulated mp_features table. As forward paper days accrue, this is the
 # standing re-cut that decides whether K>=6 / the 2-day hold graduate from
 # "candidate" to a runner change (docs/market-profile-book-analysis.md §5.4).
@@ -25,7 +25,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo "============================================================"
   echo "MP fine-tune report — $TODAY"
   echo "============================================================"
-  "$PY" "$PROJECT_DIR/mp_finetune.py" --cost-bps 25
+  "$PY" -m scripts.mp_finetune --cost-bps 25
   echo
   echo "Forward-book snapshot (mp_trend_runs):"
   "$PY" - <<'PYEOF'

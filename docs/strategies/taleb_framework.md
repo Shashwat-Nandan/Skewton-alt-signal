@@ -227,7 +227,7 @@ Theta is NOT linear — it accelerates as expiry approaches:
 - 1 DTE: theta is extreme (expiry gamma spikes)
 
 Our system flattens any leg whose last trading day is today
-(via `legs_expire_on(today)` in `run_paper.py`), to prevent
+(via `legs_expire_on(today)` in `runners/run_paper.py`), to prevent
 settlement risk. Intraday on T-0, however, scalping is **allowed
 and tightened** via the Phase 5 `t0_band_factor` knob (default
 1.0 = disabled). Setting `t0_band_factor = 0.33` exploits the

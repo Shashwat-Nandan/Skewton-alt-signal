@@ -4,7 +4,7 @@ Source: Palomar, *Portfolio Optimization* (2025), Ch. 15 §§15.3–15.6 (PDF no
 repo: `portfolio-optimization-book.pdf`). Page cites are book pages.
 
 Trigger: the live paper implementation (`strategies/kalman_pair_trading.py` +
-`run_paper_kalman_pairs.py`) inherited its *selection* and *signal thresholds*
+`runners/run_paper_kalman_pairs.py`) inherited its *selection* and *signal thresholds*
 from the static cointegration system, not from the Kalman chapter. User asked to
 re-base selection + trading logic on the paper. Backtest-gated.
 
@@ -59,13 +59,13 @@ SUPERSEDED below after P1 backtest showed book values lose more on NIFTY.
 
 - [ ] **P0 — confirm the native-z conflict** with user (drop vs log-only).
 - [ ] **P1 — backtest the book's rules BEFORE touching the runner.** In
-      `backtest_kalman_pairs.py` / `sweep_kalman_pairs.py`: thresholded strategy,
+      `research/backtest_kalman_pairs.py` / `research/sweep_kalman_pairs.py`: thresholded strategy,
       entry s₀∈{1,1.5,2}, exit at 0, lookback∈{63,126}. Head-to-head vs current
       (2.0/0.75/60). Report trips, net P&L (post-cost), win%, half-life. If the
       book's exit-at-0 bleeds on NIFTY (our prior sweep preferred 0.75), that is a
       FINDING to surface, not silently override.
 - [ ] **P2 — selection re-base.** Replace corr-prefilter+composite-rank in
-      `screen_pairs.py` (or a kalman-specific screen) with NPD prescreen →
+      `core/screen_pairs.py` (or a kalman-specific screen) with NPD prescreen →
       cointegration-test gate. Decide top-N policy (book has none → cap by NPD/
       liquidity, not by composite score).
 - [ ] **P3 — strategy/config changes**, gated on P1: `entry_z`→s₀ default 1,
@@ -223,11 +223,11 @@ FUTURES; only daily bhavcopy exists for them → must fetch 5-min.
 
 Built (this dev env has NO valid Kite session — its cached token was superseded by a
 later login today; refused to fresh-login per rule):
-- `fetch_5min_stf.py` — reuses CACHED session only (aborts, never logs in), pulls
+- `market_data/fetch_5min_stf.py` — reuses CACHED session only (aborts, never logs in), pulls
   5-min CONTINUOUS front-month futures (NFO, continuous=True roll-stitch), writes
   data_cache/stf_5min/<SYM>.csv. Pure fns unit-checked; the live Kite call needs
   host validation.
-- `backtest_kalman_pairs.py --timeframe 5min` — seeds/screens on DAILY bhavcopy
+- `python -m research.backtest_kalman_pairs --timeframe 5min` — seeds/screens on DAILY bhavcopy
   BEFORE the 5-min window (OOS), replays entry/exit on 5-min bars, steps the filter
   once per day (D1). New: load_5min_panel, run_replay_5min, _main_5min, _screen.
   Default timeframe is now 5min; daily path kept via --timeframe daily.
@@ -235,8 +235,8 @@ later login today; refused to fresh-login per rule):
   intraday decision, panel loader). All green.
 
 ### HOST RUNBOOK (operator, after close, reuse cached session)
-1. On the VPS: `python fetch_5min_stf.py --days 90`  (writes data_cache/stf_5min/)
-2. `python backtest_kalman_pairs.py --timeframe 5min --top 12`  (+ --train-fraction
+1. On the VPS: `python -m market_data.fetch_5min_stf --days 90`  (writes data_cache/stf_5min/)
+2. `python -m research.backtest_kalman_pairs --timeframe 5min --top 12`  (+ --train-fraction
    to slide the daily seed/screen window). Re-check whether the gate/threshold/
    selection findings hold at 5-min resolution (note: ~60–90d window = likely one
    regime, far narrower than the 532-day daily test).
@@ -245,7 +245,7 @@ CAVEAT: until this runs, the re-base is validated on DAILY only.
 ## 5-MIN REVALIDATION RESULTS (2026-07-04) — the pending host runbook, RUN
 
 Data: data_cache/stf_5min/ (48 syms, 2026-04-29→2026-07-02, 3,300 bars/sym;
-fetched via the #80-fixed fetch_5min_stf.py). All numbers = momentum, top-12
+fetched via the #80-fixed market_data/fetch_5min_stf.py). All numbers = momentum, top-12
 composite-screened OOS on the pre-window daily panel, ₹ net of costs.
 
 **HEADLINE (Rule 12): the shipped daily-validated config LOSES at 5-min.**
@@ -265,7 +265,7 @@ fixed-roster full window):
   (−492k vs −659k adverse; +92k vs +57k in-regime) → **keep 0.05**.
 - exit 0.25 vs 0.0: wash across halves (7/9 full-window cells prefer 0.25 but
   halves split) → keep book exit-at-0 (Rule 3). Confirmed by issue #66's targeted
-  exit×debounce measurement (validate_kalman_exit.py; see tasks/todo.md #66
+  exit×debounce measurement (research/validate_kalman_exit.py; see tasks/todo.md #66
   FINDINGS): the exit-band ranking is NOT robust — exit_z=0.25 wins the continuous
   full-window (~₹10k) but 0.0 wins both split-halves; the swing is within noise on
   an n≈22 net-negative sample. A 0.25 band does convert one near-mean stall, but

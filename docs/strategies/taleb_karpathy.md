@@ -9,7 +9,7 @@ runs in paper mode under a systemd timer.
 - [Overview](#overview)
 - [Theoretical foundation](#theoretical-foundation)
 - [Cron schedule & systemd unit](#cron-schedule--systemd-unit)
-- [Process lifecycle (run_paper.py)](#process-lifecycle-run_paperpy)
+- [Process lifecycle (runners/run_paper.py)](#process-lifecycle-run_paperpy)
 - [Entry signal pipeline](#entry-signal-pipeline)
 - [Position structure](#position-structure)
 - [Rehedging logic](#rehedging-logic)
@@ -38,7 +38,7 @@ let you "scalp" the rebuilt gamma while the time-decay rent (theta) is
 paid at a slower rate than the scalp earns.
 
 The implementation lives in `strategies/taleb_karpathy.py` (2028 lines).
-The runner is `run_paper.py`. The strategy is launched once per trading
+The runner is `runners/run_paper.py`. The strategy is launched once per trading
 day by `taleb-hedger.service` at 09:10 IST, runs through the bell, and
 persists state at session-end for the next morning.
 
@@ -60,12 +60,12 @@ Key concepts you must know to navigate this doc:
 
 | Concept | One-line summary | Defined in code |
 |---|---|---|
-| Discrete delta | Delta using actual spot bumps rather than the closed-form Greek | `greeks_engine.py` |
-| Shadow gamma | Asymmetric gamma split into γ_up and γ_down (biased assets) | `greeks_engine.py` |
-| Alpha | Gamma cost: `theta / gamma` — straddle's daily rent per unit of curvature | `greeks_engine.py` |
-| Bleed | Forecast P&L drift if held overnight at current Greeks | `risk_analyzer.py` |
-| Lock delta | Maximum directional exposure under extreme regime shift | `greeks_engine.py` |
-| Regime classifier | Routes between straddle, calendar, risk reversal, etc. based on IV/RV/skew | `regime_classifier.py` |
+| Discrete delta | Delta using actual spot bumps rather than the closed-form Greek | `core/greeks_engine.py` |
+| Shadow gamma | Asymmetric gamma split into γ_up and γ_down (biased assets) | `core/greeks_engine.py` |
+| Alpha | Gamma cost: `theta / gamma` — straddle's daily rent per unit of curvature | `core/greeks_engine.py` |
+| Bleed | Forecast P&L drift if held overnight at current Greeks | `core/risk_analyzer.py` |
+| Lock delta | Maximum directional exposure under extreme regime shift | `core/greeks_engine.py` |
+| Regime classifier | Routes between straddle, calendar, risk reversal, etc. based on IV/RV/skew | `core/regime_classifier.py` |
 
 ## Cron schedule & systemd unit
 
@@ -82,7 +82,7 @@ RandomizedDelaySec=60
 - **Mon–Fri** — the runner self-gates on `holidays.csv` (raises if the
   file is stale, per commit `58af67a`).
 - **Persistent=true** — if the VPS missed the window, run once on catch-up.
-  `run_paper.py` refuses to start after 15:30 IST.
+  `runners/run_paper.py` refuses to start after 15:30 IST.
 - **RandomizedDelaySec=60** — jitter to avoid simultaneous Kite logins on
   multi-account VPSes.
 
@@ -93,7 +93,7 @@ Type=oneshot
 WorkingDirectory=/opt/taleb-karpathy-kite        # see Architecture note
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=…/.env
-ExecStart=…/.venv/bin/python …/run_paper.py
+ExecStart=…/.venv/bin/python -m runners.run_paper
 OnFailure=notify-failure@%n.service
 ```
 
@@ -106,23 +106,23 @@ which posts a structured Telegram alert (per commit `561feba`).
 > checkout *is* the deploy checkout). Verify with
 > `systemctl cat taleb-hedger.service` before assuming.
 
-## Process lifecycle (run_paper.py)
+## Process lifecycle (runners/run_paper.py)
 
 The runner is a single straight-line process per session:
 
 | Phase | Wall clock | What happens | Source |
 |---|---|---|---|
-| Boot | 09:10 | Setup logging, parse args, load `holidays.csv` | `run_paper.py:_setup_logging`, `:load_holidays` |
-| Auth | 09:10 | TOTP auto-login via `kite_auth.KiteAuthManager` | `run_paper.py` (auth block) |
+| Boot | 09:10 | Setup logging, parse args, load `holidays.csv` | `runners/run_paper.py:_setup_logging`, `:load_holidays` |
+| Auth | 09:10 | TOTP auto-login via `kite_auth.KiteAuthManager` | `runners/run_paper.py` (auth block) |
 | Restore | 09:10 | If `data_cache/taleb_paper_state.json` exists, call `restore_state(blob)` | `strategies/taleb_karpathy.py:935` |
-| Backup | 09:10 | `_state_backup.archive_state_backup` rolls a snapshot ring | `run_paper.py:36` |
-| Wait | 09:10–09:15 | Sleep to the bell | `run_paper.py` (wait loop) |
-| Tick | 09:15–15:25 | 60-second loop: `scan_and_propose` → `check_and_rehedge` → mark-to-market | `run_paper.py` |
-| Session end | 15:25 | Persist state to disk via `serialize_state()`; write EOD report; flush IV/spot history | `run_paper.py` |
+| Backup | 09:10 | `_state_backup.archive_state_backup` rolls a snapshot ring | `runners/run_paper.py:36` |
+| Wait | 09:10–09:15 | Sleep to the bell | `runners/run_paper.py` (wait loop) |
+| Tick | 09:15–15:25 | 60-second loop: `scan_and_propose` → `check_and_rehedge` → mark-to-market | `runners/run_paper.py` |
+| Session end | 15:25 | Persist state to disk via `serialize_state()`; write EOD report; flush IV/spot history | `runners/run_paper.py` |
 | Exit | 15:25–15:30 | Process exits 0 (or 1 on error → triggers notify-failure) |  |
 
 EOD does NOT force-flatten by default (2026-05-19 change documented in
-`run_paper.py` header). Open positions survive into the next session via
+`runners/run_paper.py` header). Open positions survive into the next session via
 `taleb_paper_state.json`. The only session-end exits are
 (a) `--force-flatten-on-exit` ops hatch and
 (b) a held leg whose contract expires today (`legs_expire_on(today)` at
@@ -452,7 +452,7 @@ overlay from `best_params.json` (line 282).
 
 ## Greeks computation
 
-Provided by `greeks_engine.py`:
+Provided by `core/greeks_engine.py`:
 - Black-Scholes via `OptionContract.greeks(spot, T)` for analytic Greeks
 - Discrete delta via spot-bump differencing (`compute_portfolio_greeks(positions, spot, T)`)
 - Shadow gamma (γ_up, γ_down) for asymmetric assets
@@ -538,20 +538,20 @@ on nonzero exit.
 |---|---|
 | `strategies/taleb_karpathy.py` | Strategy class, scan/rehedge/exit logic |
 | `strategies/base.py` | `BaseStrategy` contract, `validate_order`, ExecutionMode |
-| `run_paper.py` | Runner: auth, restore, tick loop, persist |
-| `greeks_engine.py` | Greeks, IV solver, shadow gamma, alpha |
-| `risk_analyzer.py` | Monte Carlo, stability, bleed forecast, hedge decision |
-| `trade_proposer.py` | `TradeProposal` dataclass, `propose_delta_neutral` / `propose_for_structure` |
-| `regime_classifier.py` | Phase 3.1 structure routing |
-| `variance_pnl_gate.py` | Auxiliary variance/PnL gating |
-| `kite_auth.py` | TOTP auto-login |
+| `runners/run_paper.py` | Runner: auth, restore, tick loop, persist |
+| `core/greeks_engine.py` | Greeks, IV solver, shadow gamma, alpha |
+| `core/risk_analyzer.py` | Monte Carlo, stability, bleed forecast, hedge decision |
+| `core/trade_proposer.py` | `TradeProposal` dataclass, `propose_delta_neutral` / `propose_for_structure` |
+| `core/regime_classifier.py` | Phase 3.1 structure routing |
+| `core/variance_pnl_gate.py` | Auxiliary variance/PnL gating |
+| `core/kite_auth.py` | TOTP auto-login |
 | `config.ini` | All defaults under `[strategy]` |
 | `best_params.json` | Autoresearch overlay (applied at boot) |
 | `holidays.csv` | Self-gates the runner |
 | `data_cache/taleb_paper_state.json` | Persisted session state |
 | `data_cache/iv_history_NIFTY.json` | ATM IV percentile reference |
 | `data_cache/state_backups/taleb_paper_state.*.json` | Backup ring (3 kept) |
-| `_state_backup.py` | Backup ring helpers |
+| `core/_state_backup.py` | Backup ring helpers |
 | `logs/paper-YYYY-MM-DD.log` | Per-day session log |
 | `deploy/taleb-hedger.service` | systemd service |
 | `deploy/taleb-hedger.timer` | systemd timer (09:10 IST Mon–Fri) |

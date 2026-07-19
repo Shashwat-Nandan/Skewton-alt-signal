@@ -1,4 +1,4 @@
-"""Regression guards for the backtest_pairs.py strategy bootstrap (2026-06-02).
+"""Regression guards for the research/backtest_pairs.py strategy bootstrap (2026-06-02).
 
 `make_strategy` builds PairTradingStrategy via __new__ to skip __init__'s
 bhavcopy seed, then sets attributes by hand. That hand-list silently drifted
@@ -20,9 +20,9 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from backtest_pairs import MockKitePair, make_strategy
+from research.backtest_pairs import MockKitePair, make_strategy
 from strategies.base import validate_order
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 def _init_self_attrs() -> set:

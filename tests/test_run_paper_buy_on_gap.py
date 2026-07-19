@@ -19,7 +19,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import run_paper_buy_on_gap as r
+from runners import run_paper_buy_on_gap as r
 from strategies.buy_on_gap import BuyOnGapStrategy, GapPosition
 
 LOG = logging.getLogger("test")

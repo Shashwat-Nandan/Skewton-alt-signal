@@ -32,14 +32,14 @@ session: one row per instrument with OHLCV. Two flavours used here:
 UDiFF format (NSE's modern bhavcopy schema) is used by both, since July
 2024. Older legacy formats are not parsed here.
 
-Source: `fetch_bhavcopy.py` (F&O, 451 lines) and `fetch_bhavcopy_eq.py`
+Source: `market_data/fetch_bhavcopy.py` (F&O, 451 lines) and `market_data/fetch_bhavcopy_eq.py`
 (EQ cash, 213 lines).
 
 ## Two pipelines
 
 | Aspect | EQ cash | F&O |
 |---|---|---|
-| Script | `fetch_bhavcopy_eq.py` | `fetch_bhavcopy.py` |
+| Script | `market_data/fetch_bhavcopy_eq.py` | `market_data/fetch_bhavcopy.py` |
 | Timer | `fetch-bhavcopy-eq.timer` @ 18:00 IST Mon–Fri | (no timer — manual / on-demand) |
 | Service | `fetch-bhavcopy-eq.service` | none deployed |
 | Raw cache | `data_cache/bhavcopy_eq_raw/bhavcopy_eq_<yyyymmdd>.parquet` | `data_cache/bhavcopy_raw/bhavcopy_fo_<yyyymmdd>.parquet` |
@@ -48,7 +48,7 @@ Source: `fetch_bhavcopy.py` (F&O, 451 lines) and `fetch_bhavcopy_eq.py`
 | Volume per day | ~2k EQ rows (NSE listed) | ~50k F&O rows (all expiries × strikes × types) |
 
 The F&O flow runs manually or via the screener as a side-effect
-(`screen_pairs.py` triggers downloads when running its 508-day panel
+(`core/screen_pairs.py` triggers downloads when running its 508-day panel
 build). There's no daily F&O cron because pair-trading uses only EOD
 front-month data and the screener refreshes weekly.
 
@@ -71,7 +71,7 @@ https://www.nseindia.com/`. Without these, NSE returns 403 or empty.
 
 Akamai gating: works cleanly from the production VPS but may 503 from
 short-lived dev environments / cloud IPs that haven't built up a
-reputation cookie history. Documented in `fetch_bhavcopy_eq.py:21–23`.
+reputation cookie history. Documented in `market_data/fetch_bhavcopy_eq.py:21–23`.
 
 ## EQ cash bhavcopy
 
@@ -122,20 +122,20 @@ the per-symbol files (dedupe by `date`).
 ## F&O bhavcopy
 
 ### Run cadence
-On-demand via `fetch_bhavcopy.py`. Common invocations:
+On-demand via `market_data/fetch_bhavcopy.py`. Common invocations:
 
 ```bash
 # Backfill range
-python fetch_bhavcopy.py --from-date 2024-01-01 --to-date 2026-05-09
+python -m market_data.fetch_bhavcopy --from-date 2024-01-01 --to-date 2026-05-09
 
 # Last N days (rolling backfill)
-python fetch_bhavcopy.py --days 60 --underlying NIFTY
+python -m market_data.fetch_bhavcopy --days 60 --underlying NIFTY
 
 # Nearest-expiry only (smaller output for testing)
-python fetch_bhavcopy.py --from-date 2025-01-01 --to-date 2026-04-18 --nearest-expiry-only
+python -m market_data.fetch_bhavcopy --from-date 2025-01-01 --to-date 2026-04-18 --nearest-expiry-only
 ```
 
-The screener (`screen_pairs.py`) calls into this script implicitly when
+The screener (`core/screen_pairs.py`) calls into this script implicitly when
 its 508-day rolling panel needs fresh files.
 
 ### Download
@@ -190,7 +190,7 @@ fire that catches up at 19:30 produces the same end-state as a clean
 ## Fail-loud staleness guard
 
 Per commit `7177dde`. The downstream runners
-(`run_equity_swing.py:_assert_holiday_data_fresh`, `:270`) refuse to
+(`runners/run_equity_swing.py:_assert_holiday_data_fresh`, `:270`) refuse to
 proceed if the EQ panel max date is < today at close-scan time. Logs:
 
 ```
@@ -213,11 +213,11 @@ worst case) with a warning at >1 day.
 |---|---|
 | `strategies/_eq_data.load_equity_panel` | `data_cache/equity_ohlcv/<SYMBOL>.parquet` (legacy `.csv` honored) |
 | `strategies/varsity_equity_swing` (entire strategy) | via `_eq_data` |
-| `backtest_varsity_equity.py` | via `_eq_data` |
+| `research/backtest_varsity_equity.py` | via `_eq_data` |
 | `strategies/_oi_signal.build_oi_panel` | `data_cache/bhavcopy_raw/bhavcopy_fo_<yyyymmdd>.parquet` (F&O) |
-| `screen_pairs.py` | `data_cache/bhavcopy_raw/` (508-day panel build) |
+| `core/screen_pairs.py` | `data_cache/bhavcopy_raw/` (508-day panel build) |
 | `strategies/pair_trading` (init seeding) | via `screen_pairs.load_front_month_panel` |
-| `analyze_rv_iv_regime.py` | both raw caches |
+| `research/analyze_rv_iv_regime.py` | both raw caches |
 
 ## Holiday calendar dependency
 
@@ -231,7 +231,7 @@ downstream runners would treat the missing day as a working day with
 NO panel data — silently broken until the next bhavcopy lands.
 
 Both runners enforce holiday-file freshness at boot (`_assert_holiday_data_fresh`
-in `run_paper.py`, `run_paper_pairs.py`, `run_equity_swing.py`). Per
+in `runners/run_paper.py`, `runners/run_paper_pairs.py`, `runners/run_equity_swing.py`). Per
 `58af67a` (C7 in live-readiness): refuse to start if `holidays.csv` is
 empty, missing future entries, or has < `_HOLIDAYS_PER_YEAR_FLOOR=8`
 entries for the current year.
@@ -271,9 +271,9 @@ Failure alerts: nonzero exit triggers `notify-failure@fetch-bhavcopy-eq.service`
 
 | File | Role |
 |---|---|
-| `fetch_bhavcopy_eq.py` | EQ cash fetcher (cron-driven) |
-| `fetch_bhavcopy.py` | F&O fetcher (manual / on-demand) |
-| `fetch_historical_data.py` | Older Kite-API-based historical fetcher (mostly superseded by bhavcopy) |
+| `market_data/fetch_bhavcopy_eq.py` | EQ cash fetcher (cron-driven) |
+| `market_data/fetch_bhavcopy.py` | F&O fetcher (manual / on-demand) |
+| `market_data/fetch_historical_data.py` | Older Kite-API-based historical fetcher (mostly superseded by bhavcopy) |
 | `holidays.csv` | Calendar |
 | `data_cache/bhavcopy_eq_raw/` | EQ raw cache |
 | `data_cache/bhavcopy_raw/` | F&O raw cache |
@@ -281,8 +281,8 @@ Failure alerts: nonzero exit triggers `notify-failure@fetch-bhavcopy-eq.service`
 | `data_cache/nifty200.csv` | Default universe for `--universe` |
 | `strategies/_eq_data.py` | Downstream EQ panel loader |
 | `strategies/_oi_signal.py` | Downstream OI signal builder |
-| `screen_pairs.py` | Downstream universe builder |
-| `analyze_rv_iv_regime.py` | Downstream RV/IV analysis |
+| `core/screen_pairs.py` | Downstream universe builder |
+| `research/analyze_rv_iv_regime.py` | Downstream RV/IV analysis |
 | `deploy/fetch-bhavcopy-eq.service` / `.timer` | EQ systemd cron |
 | `deploy/notify-failure@.service` | Failure alert |
 | `logs/bars-update-*.log` | EQ fetch logs |

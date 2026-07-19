@@ -11,7 +11,7 @@ in two parallel variants — `baseline` (broader, 12 pairs) and
 - [Overview](#overview)
 - [Two systems: baseline vs persistent](#two-systems-baseline-vs-persistent)
 - [Cron schedule & systemd units](#cron-schedule--systemd-units)
-- [Process lifecycle (run_paper_pairs.py)](#process-lifecycle-run_paper_pairspy)
+- [Process lifecycle (runners/run_paper_pairs.py)](#process-lifecycle-run_paper_pairspy)
 - [Cointegration & hedge ratio](#cointegration--hedge-ratio)
 - [Z-score signal and rolling spread history](#z-score-signal-and-rolling-spread-history)
 - [Entry path](#entry-path)
@@ -33,14 +33,14 @@ in two parallel variants — `baseline` (broader, 12 pairs) and
 ## Overview
 
 Strategy lives in `strategies/pair_trading.py` (1100+ lines). Runner is
-`run_paper_pairs.py`. Two systemd timer pairs invoke the same script
+`runners/run_paper_pairs.py`. Two systemd timer pairs invoke the same script
 with different candidate-CSV inputs and config files, producing the
 `baseline` and `persistent` variants.
 
 The edge: NSE-listed stock-futures pairs that have been historically
 cointegrated tend to mean-revert when their normalised spread drifts to
 ~±2σ from the rolling mean. The pair is selected weekly by
-`screen_pairs.py`; per-pair β (hedge ratio) is locked at screening time
+`core/screen_pairs.py`; per-pair β (hedge ratio) is locked at screening time
 and stored in `pair_candidates_*.csv`. A `pair_verify.py` cron re-runs
 the screening logic mid-week to catch β drift on held positions.
 
@@ -52,7 +52,7 @@ Mode dispatch (line 22-26):
 ## Two systems: baseline vs persistent
 
 Both share the same strategy code (`strategies/pair_trading.py`) and
-runner (`run_paper_pairs.py`). They differ in input candidate-CSV and
+runner (`runners/run_paper_pairs.py`). They differ in input candidate-CSV and
 quality-floor knobs.
 
 | Aspect | baseline | persistent |
@@ -103,11 +103,11 @@ Service hardening identical to taleb-hedger: `Type=oneshot`,
 `UMask=0027`, `ProtectSystem=strict`, `ReadWritePaths=<logs, data_cache,
 repo root>`, `OnFailure=notify-failure@%n.service`.
 
-## Process lifecycle (run_paper_pairs.py)
+## Process lifecycle (runners/run_paper_pairs.py)
 
 | Phase | What happens | Source |
 |---|---|---|
-| Boot | Logging setup, holiday gate, kill-switch check | `run_paper_pairs.py:_setup_logging` and HALT_* path checks |
+| Boot | Logging setup, holiday gate, kill-switch check | `runners/run_paper_pairs.py:_setup_logging` and HALT_* path checks |
 | Config injection | `ensure_pair_config()` — if `[pair_trading]` section missing or no `max_leg_notional`, write derived config to `data_cache/.pair_paper_config.ini` | line 68-97 |
 | Candidates load | Read `pair_candidates_*.csv`, apply quality floor, log "Selected N of M requested pairs" | (search `Selected.*pair` in source) |
 | Auth | TOTP via `kite_auth` | shared with taleb-hedger |
@@ -125,7 +125,7 @@ via `--force-flatten-on-exit` ops hatch.
 
 ## Cointegration & hedge ratio
 
-Screener (`screen_pairs.py` — see
+Screener (`core/screen_pairs.py` — see
 [`docs/data_pipeline/pair_screening.md`](../data_pipeline/pair_screening.md)
 for the full pipeline) computes for each candidate pair (A, B):
 - Engle-Granger cointegration test on log-prices over 508 trading days
@@ -296,7 +296,7 @@ Screener re-computes β weekly; held positions might have an entry-time
 Rationale: changing β mid-position would silently alter the hedge ratio
 of an open trade, invalidating the entry thesis.
 
-`pair-verify.timer` runs `verify_pair_paper.py` daily to detect β drift
+`pair-verify.timer` runs `scripts/verify_pair_paper.py` daily to detect β drift
 on held positions and emit warnings to `logs/pair-verify-*.json` and
 `logs/pair-verify-*.log`. See
 [`docs/data_pipeline/pair_screening.md`](../data_pipeline/pair_screening.md).
@@ -359,7 +359,7 @@ Persistence cadence:
 
 EOD sidecar `pair_paper_eod_<date>.json` written at session end with
 per-pair `generate_eod_report()` output — consumed by the dashboard and
-by `verify_pair_paper.py`.
+by `scripts/verify_pair_paper.py`.
 
 ## Live-mode cutover (2026-05-21)
 
@@ -434,7 +434,7 @@ From `[strategy]` (shared):
 |---|---|---|
 | `total_capital` | 500000 | Reference base for percentage calcs |
 
-CLI flags on `run_paper_pairs.py`:
+CLI flags on `runners/run_paper_pairs.py`:
 
 | Flag | Purpose |
 |---|---|
@@ -505,12 +505,12 @@ From `tasks/live-readiness-deferred.md` Highs section:
 |---|---|
 | `strategies/pair_trading.py` | `PairTradingStrategy`, `PairState`, `PairLeg` |
 | `strategies/base.py` | `BaseStrategy`, `validate_order` |
-| `run_paper_pairs.py` | Runner: multi-pair tick loop, persistence, ORPHAN load |
-| `screen_pairs.py` | Weekly screener (β / HL / p-value / corr) |
-| `verify_pair_paper.py` | Daily β-drift verification |
-| `trade_proposer.py` | `TradeProposal` dataclass |
-| `kite_auth.py` | TOTP auto-login |
-| `_state_backup.py` | Backup ring helpers |
+| `runners/run_paper_pairs.py` | Runner: multi-pair tick loop, persistence, ORPHAN load |
+| `core/screen_pairs.py` | Weekly screener (β / HL / p-value / corr) |
+| `scripts/verify_pair_paper.py` | Daily β-drift verification |
+| `core/trade_proposer.py` | `TradeProposal` dataclass |
+| `core/kite_auth.py` | TOTP auto-login |
+| `core/_state_backup.py` | Backup ring helpers |
 | `config.ini` | `[pair_trading]` section + shared `[strategy]` |
 | `data_cache/pair_candidates.csv` | Baseline screener output |
 | `data_cache/pair_candidates_persistent.csv` | Persistent screener output |

@@ -16,8 +16,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import run_paper_mp as rp
-from market_profile import Bar
+from runners import run_paper_mp as rp
+from core.market_profile import Bar
 from strategies.market_profile_intraday import MPTrendConfig
 
 

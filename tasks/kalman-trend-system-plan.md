@@ -117,11 +117,11 @@ pairs system (Rule 3/8).
 ## 3. Reuse map (repo infrastructure only — algorithm stays the paper's)
 
 **Reused (no fork):**
-- `runner_common.py` — locks, holiday/weekend gate, market-hours loop, IST
+- `core/runner_common.py` — locks, holiday/weekend gate, market-hours loop, IST
   assert, disk/heartbeat, signal handlers, atomic state persist.
 - `strategies/base.py` — `BaseStrategy`, `_emit_signal`/signal-contract seam,
   `TradeProposal`, `proposal_to_leg`, `uuid7`, `estimate_transaction_cost`.
-- **`equity_pending_entries` next-day-open fill** (`run_equity_swing.py`) — the
+- **`equity_pending_entries` next-day-open fill** (`runners/run_equity_swing.py`) — the
   paper enters with a **market order for the open** *after* a close-computed
   signal; this is exactly market-on-open at the next session. Reuse this
   mechanism (queue at close, fill at open, gap handling). Do not reinvent.
@@ -147,7 +147,7 @@ surface.
 
 ## 4. Success criteria (Rule 4)
 
-1. **Reproduces the paper.** `validate_kalman_trend.py` runs the full pipeline
+1. **Reproduces the paper.** `research/validate_kalman_trend.py` runs the full pipeline
    (filter + CMA-ES/L1 fit + fixed-tick exits + 6mo/6mo split) on a daily index-
    futures series and **recovers the paper's qualitative result: optimized Kalman
    OOS Sharpe materially beats the MA-crossover baseline OOS Sharpe**, with the
@@ -226,7 +226,7 @@ surface.
     experiment isn't reproducible at face value. **Consequence:** the correctness
     gate targets the paper's *qualitative* claim (optimized Kalman beats MA
     crossover OOS), **not** the literal Table-2 vector.
-- [x] `optimize_kalman_trend.py` — pure: the fixed-tick trend `simulate` (daily-
+- [x] `research/optimize_kalman_trend.py` — pure: the fixed-tick trend `simulate` (daily-
       close stop/target approximation, documented), `kalman_direction` (Alg 4) +
       `ma_direction` (Alg 5) causal signals, `run_cmaes` (the paper's optimizer,
       `cmaes` dep added to requirements.in/lock), and `fit_kalman_trend` /
@@ -252,11 +252,11 @@ surface.
       on reversal; **CMA-ES+L1 shrinks irrelevant params to ~0** (the paper's
       sparsity mechanism); the Kalman fit finds a profitable, multi-trade strategy
       on a regime-switching series; the fit rejects unstable models 3/4.
-- [x] **Correctness gate:** `validate_kalman_trend.py` — 6mo train / 6mo test,
+- [x] **Correctness gate:** `research/validate_kalman_trend.py` — 6mo train / 6mo test,
       fits Kalman + MA on train, compares **TEST** Sharpe across **multiple seeds**
       (a single-seed pass is cherry-picking — finding #3). Missing data → clean
       exit 2 with remediation; genuine Kalman<MA → exit 1.
-  - [x] **BANKNIFTY fetch wired + run** (`fetch_index_daily.py`, 5 tests): resolves
+  - [x] **BANKNIFTY fetch wired + run** (`market_data/fetch_index_daily.py`, 5 tests): resolves
         the F&O symbol → NSE spot name (BANKNIFTY→"NIFTY BANK"), reuses `.env`
         (`load_dotenv`) + the Kite session, writes `data_cache/BANKNIFTY_daily.csv`
         (gitignored). Fetched 271 daily closes (2025-05-23→2026-06-25).
@@ -279,7 +279,7 @@ fills are the one thing backtests can't model). Built **fully intraday**:
   interchangeable engines (kalman one-step forecast / MA crossover), fixed-tick
   stop/target with `check_exit` for intraday fills between 5-min bars, warmup,
   full serialize/restore. 13 tests.
-- `run_paper_kalman_trend.py` — two books per instrument (NIFTY+BANKNIFTY futures)
+- `runners/run_paper_kalman_trend.py` — two books per instrument (NIFTY+BANKNIFTY futures)
   stepped on identical 5-min bars; pure core (BarAggregator, InstrumentBooks,
   eod_report, warmup `fit_params`) is unit-tested (6 tests); Kite-wired main() is
   host-smoke-test-only. EOD sidecar `kalman_trend_eod_<date>.json` reports
@@ -290,7 +290,7 @@ fills are the one thing backtests can't model). Built **fully intraday**:
 
 **The backtest verdict below stands (this is a forward A/B, not a refutation):**
 On 8.2 years of NIFTY/BANKNIFTY daily (2018–2026, 2035 bars, walk-forward, pooled OOS):
-- **Option B** (reduced 4-param fit + walk-forward, `backtest_kalman_trend.py`)
+- **Option B** (reduced 4-param fit + walk-forward, `research/backtest_kalman_trend.py`)
   removed the single-split overfit. On ~1yr it looked promising (BANKNIFTY 3/3
   configs beat MA), but that was a 4–6-fold small-sample artifact.
 - **Deep history (28 folds): Kalman LOSES to a plain MA crossover.** NIFTY Kalman
@@ -322,7 +322,7 @@ On 8.2 years of NIFTY/BANKNIFTY daily (2018–2026, 2035 bars, walk-forward, poo
       skipped+logged; paper mode requires a notional cap.
 
 ### Phase 2 — Backtest = reproduce the paper (THE GATE)
-- [ ] `backtest_kalman_trend.py` — **single 6mo train / 6mo test** split (B §6) on
+- [ ] `research/backtest_kalman_trend.py` — **single 6mo train / 6mo test** split (B §6) on
       daily bars for a chosen instrument (NIFTY/BANKNIFTY futures first, then any
       requested stock/index). Runs the **CMA-ES+L1 fit on train**, evaluates on
       test, and computes the paper's metric set: net/gross P&L (after
@@ -337,8 +337,8 @@ On 8.2 years of NIFTY/BANKNIFTY daily (2018–2026, 2035 bars, walk-forward, poo
       half after costs (the paper's claim). If not → research note, stop (Rule 12).
 
 ### Phase 3 — Paper runner (only if Phase 2 = GO)
-- [ ] `run_paper_kalman_trend.py` — mirrors `run_paper_kalman_pairs.py` /
-      `run_equity_swing.py` via `runner_common`: TOTP auth (**reuse cached Kite
+- [ ] `runners/run_paper_kalman_trend.py` — mirrors `runners/run_paper_kalman_pairs.py` /
+      `runners/run_equity_swing.py` via `runner_common`: TOTP auth (**reuse cached Kite
       session — never fresh-login while a live runner is active**), holiday/
       weekend gate, daily close state update, **signal → market-on-open via the
       `equity_pending_entries` mechanism**, fixed-tick stop/target management,

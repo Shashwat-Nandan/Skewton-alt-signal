@@ -5,7 +5,7 @@ After=network-online.target
 OnFailure=notify-failure@%n.service
 
 [Service]
-# Measurement only: re-runs mp_finetune.py over mp_features and snapshots the
+# Measurement only: re-runs scripts/mp_finetune.py over mp_features and snapshots the
 # forward paper book. No Kite auth, no trading. Output → journald + dated log.
 Type=oneshot
 # --- EDIT THESE FOR YOUR VPS ---

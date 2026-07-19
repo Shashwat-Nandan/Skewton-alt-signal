@@ -2,7 +2,7 @@
 Invoked via systemd-run so .env is loaded by systemd, not read by Claude.
 """
 import json
-from kite_auth import KiteAuthManager
+from core.kite_auth import KiteAuthManager
 
 # Open positions (entry data sourced from yesterday's state file + today's journal)
 positions = [

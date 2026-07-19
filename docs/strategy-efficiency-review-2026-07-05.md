@@ -10,7 +10,7 @@ improvements that move the book toward net-positive fastest.
 `dashboard.db` (`equity_positions`), and the installed systemd timers. Nothing
 is quoted from prior docs without re-verification. Code claims were checked
 against `main` (e.g. the C-1 phantom-fill fix landed in `730d726`; the startup
-bhavcopy preload in `run_paper_pairs.py:1242`; `calendar_entry_annual = 0.05`
+bhavcopy preload in `runners/run_paper_pairs.py:1242`; `calendar_entry_annual = 0.05`
 is now the code+template default).
 
 **Honesty notes (Rule 12).**
@@ -89,7 +89,7 @@ Efficiency improvements, in order of expected impact:
    episode proved the ratio objective picks candidates that lose *more*; the
    host has since been on `metric = net_pnl`, so nothing to do here.
 2. **Rehedge economics gate**: only rehedge when expected scalp from the move
-   exceeds ~2× the futures round-trip cost. `sweep_rehedge_params.py` exists;
+   exceeds ~2× the futures round-trip cost. `research/sweep_rehedge_params.py` exists;
    sweep on tape with the corrected objective. At ₹207 gross/rehedge, wider
    bands almost certainly dominate.
 3. **Per-structure cost hurdle at entry**: refuse any structure whose modeled
@@ -244,7 +244,7 @@ directly changes what the live pair runner can safely size to (§2.1).
 **E4 — Fix the autoresearch objective (Taleb).**
 *(Correction 2026-07-05, week-2 verification: ALREADY DONE.)* Both the host
 config.ini and config_template.ini set `[autoresearch] metric = net_pnl`
-(cost-inclusive: realized-net + unrealized), `autoresearch_loop.py` handles
+(cost-inclusive: realized-net + unrealized), `runners/autoresearch_loop.py` handles
 P&L metrics explicitly (`PNL_METRICS` — no-trade sessions are a defined 0),
 and the CLI help itself warns that `gamma_theta_ratio` is "DECOUPLED from
 money (2026-06-14) — don't optimize it alone". The no-promote guards
@@ -268,7 +268,7 @@ lose.
 ## 4. What is already fixed (verified on main, do not re-litigate)
 
 - C-1 phantom-fill: COMPLETE-whitelist in taleb + arbitrage (`730d726`).
-- Startup blind window: bhavcopy panel preloaded once (`run_paper_pairs.py:1242`).
+- Startup blind window: bhavcopy panel preloaded once (`runners/run_paper_pairs.py:1242`).
 - Kalman-trend A/B now charges 2.5/side (`f5e4fe6`); kalman-pairs expiry
   flatten (PR #69); pairs entry_z 1.0→1.5 after 5-min revalidation (#81).
 - Cost model: STT rates corrected (2026-06-15), FUT exchange-charge 10x fixed,
@@ -299,7 +299,7 @@ lose.
    per-structure gate (§2.2 item 3) existed but was gating on a COST-FREE,
    fixed-1%-vol MC simulation with a −₹10k host floor. Shipped: the MC
    estimator now charges entry/exit/rehedge costs and simulates at live RV;
-   `sweep_rehedge_params.py --tape` replays captured sessions; the 10-session
+   `python -m research.sweep_rehedge_params --tape` replays captured sessions; the 10-session
    sweep confirmed §2.2's prediction (band 1.2 beats 0.9: costs halved,
    scalp UP; `cost_hurdle_factor` inert on tape — the band is the lever;
    left to the weekly net_pnl sweep, range already covers 1.2). The

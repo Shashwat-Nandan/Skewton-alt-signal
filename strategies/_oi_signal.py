@@ -40,7 +40,7 @@ from typing import Iterable, List
 
 import pandas as pd
 
-from data_cache_io import find_tables, read_table
+from core.data_cache_io import find_tables, read_table
 
 logger = logging.getLogger(__name__)
 

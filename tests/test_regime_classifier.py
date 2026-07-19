@@ -3,7 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from regime_classifier import (
+from core.regime_classifier import (
     RegimeFeatures, Structure, Thresholds, classify,
 )
 

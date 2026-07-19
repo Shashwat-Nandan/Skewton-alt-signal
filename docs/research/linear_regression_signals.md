@@ -9,7 +9,7 @@
 > from a backtest coincidence.
 >
 > This doc summarises the **mechanics**, then maps them onto *our* codebase:
-> what we already do right (`screen_pairs.py` OLS, `run_autoresearch.py`
+> what we already do right (`core/screen_pairs.py` OLS, `runners/run_autoresearch.py`
 > hold-out), where we are exposed (the hand-weighted `varsity_equity_swing`
 > score, sweep scripts with no multiple-testing correction), and a scoped
 > implementation path aimed at **profitability**, not at adding theory for
@@ -21,7 +21,7 @@
 
 1. **Alpha is the intercept that survives after known factors are removed.**
    We already compute regression intercepts and their t-stats in
-   `screen_pairs.py` (`_fit`, `_error_ratio`). The same `OLS(y, add_constant(x))`
+   `core/screen_pairs.py` (`_fit`, `_error_ratio`). The same `OLS(y, add_constant(x))`
    machinery is the tool for grading *any* candidate signal.
 2. **Our biggest single exposure is `varsity_equity_swing`'s additive score.**
    It blends factors with hand-set `score += 1.0` boosts
@@ -80,7 +80,7 @@ model = sm.OLS(y, sm.add_constant(x)).fit()   # add_constant creates the interce
 print(model.params)                            # [a, b]
 ```
 
-The codebase already does exactly this — see `screen_pairs.py:161-163`:
+The codebase already does exactly this — see `core/screen_pairs.py:161-163`:
 
 ```python
 def _fit(y, x):
@@ -183,7 +183,7 @@ print("R-squared:", round(model.rsquared, 4))
 > The beginner asks *how big is the return*. The professional asks *how
 > confident am I this return is not an accident*. That shift is the whole
 > game. We already lean on `t`/`SE` of the intercept in
-> `screen_pairs.py:_error_ratio` — extend the same reflex to every signal.
+> `core/screen_pairs.py:_error_ratio` — extend the same reflex to every signal.
 
 ---
 
@@ -206,7 +206,7 @@ model = sm.OLS(y_tr, X_tr).fit()
 oos_pred = model.predict(X_te)        # judge on unseen data only
 ```
 
-We **already do this** in `run_autoresearch.py:_split_data_into_windows`
+We **already do this** in `runners/run_autoresearch.py:_split_data_into_windows`
 (reserves the last `holdout_days` and never lets them into any training
 window). The gap is that the *signal-construction* scripts (`sweep_*.py`,
 the additive equity score) don't route through a comparable hold-out.
@@ -252,8 +252,8 @@ about how many times you went fishing. (For Sharpe specifically, the
 Deflated/PSR Sharpe of Bailey–López de Prado is the sharper tool; Bonferroni
 is the cheap, correct first step.)
 
-> **This is our most actionable gap.** `sweep_top.py`, `sweep_pair_params.py`,
-> `sweep_arbitrage_thresholds.py`, etc. each pick a best-of-many by Sharpe and
+> **This is our most actionable gap.** `research/sweep_top.py`, `research/sweep_pair_params.py`,
+> `research/sweep_arbitrage_thresholds.py`, etc. each pick a best-of-many by Sharpe and
 > report it with no penalty for the search width. The reported edge is
 > inflated by the count of configurations tried.
 
@@ -291,11 +291,11 @@ signal's IC has faded enough to retire it.
 
 | Component | File | Where it sits on the regression discipline |
 |---|---|---|
-| **Pair screening** | `screen_pairs.py` | ✅ Real OLS: hedge ratio = `OLS(y, add_constant(x)).slope`, intercept SE via `_error_ratio`, Engle-Granger `coint`, AR(1) half-life. This is the *model* for how every signal should be graded. |
+| **Pair screening** | `core/screen_pairs.py` | ✅ Real OLS: hedge ratio = `OLS(y, add_constant(x)).slope`, intercept SE via `_error_ratio`, Engle-Granger `coint`, AR(1) half-life. This is the *model* for how every signal should be graded. |
 | **Equity-swing score** | `strategies/varsity_equity_swing.py:413-430` | ⚠️ Un-fitted multi-factor model. `score += 1.0` for trend strength, Market-Profile-above-VAH, OI long-buildup, FII-net-positive. Each `+1.0` is an *implicit coefficient* nobody regressed against forward returns or IC-tested. |
 | **FII/DII & OI overlays** | `strategies/_fii_dii.py`, `strategies/_oi_signal.py` | Candidate *factors* (`X₁…Xₖ`) for a real multi-factor regression — currently consumed as boolean boosts, not fitted weights. |
-| **Autoresearch** | `run_autoresearch.py`, `autoresearch_loop.py` | ✅ Hold-out splitter exists (§5.1). ⚠️ Accept/reject is single-metric (Sharpe) with no Newey-West / multiple-testing penalty (§5.3–5.4). |
-| **Parameter sweeps** | `sweep_*.py`, `sweep_top.py` | ⚠️ Best-of-many by Sharpe, no Bonferroni/deflated-Sharpe — inflated reported edge. |
+| **Autoresearch** | `runners/run_autoresearch.py`, `runners/autoresearch_loop.py` | ✅ Hold-out splitter exists (§5.1). ⚠️ Accept/reject is single-metric (Sharpe) with no Newey-West / multiple-testing penalty (§5.3–5.4). |
+| **Parameter sweeps** | `sweep_*.py`, `research/sweep_top.py` | ⚠️ Best-of-many by Sharpe, no Bonferroni/deflated-Sharpe — inflated reported edge. |
 | **Pair Kalman upgrade** | `docs/research/epchan_algorithmic_trading.md` §3.4 | The *dynamic* (time-varying) version of the OLS hedge ratio — the natural next step once static-regression grading is in place. |
 
 **The headline learning:** we already trust OLS where it's load-bearing
@@ -322,7 +322,7 @@ stable hold-out IC."*
 
 ### Step 1 — A shared `factor_eval` harness (highest leverage)
 
-One small, pure module (mirrors `market_profile.py`: pure, no I/O) that any
+One small, pure module (mirrors `core/market_profile.py`: pure, no I/O) that any
 backtest or sweep can call. Inputs: a factor series and aligned forward
 returns. Outputs: intercept, HAC p-value, mean IC, IC information-ratio,
 hold-out IC, and a single `verdict` boolean.
@@ -403,6 +403,6 @@ to prove the dynamic version actually beats the static one out-of-sample.
 - [`../strategies/varsity_equity_swing.md`](../strategies/varsity_equity_swing.md) —
   the strategy whose additive score Step 2 targets.
 - [`../strategies/pair_trading.md`](../strategies/pair_trading.md) — the
-  consumer of `screen_pairs.py`'s OLS hedge ratios.
+  consumer of `core/screen_pairs.py`'s OLS hedge ratios.
 - [`../../screen_pairs.py`](../../screen_pairs.py) — the in-repo reference for
   doing OLS the right way (`_fit`, `_error_ratio`, `_half_life`).

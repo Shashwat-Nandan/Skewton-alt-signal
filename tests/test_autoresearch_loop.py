@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from autoresearch_loop import PNL_METRICS, ZERO_TRADE_PENALTY, HedgeResearchLoop
+from runners.autoresearch_loop import PNL_METRICS, ZERO_TRADE_PENALTY, HedgeResearchLoop
 
 
 def _loop(**attrs):
@@ -63,8 +63,8 @@ class TestJointPairsConsistency:
         )
         monkeypatch.setattr(HedgeResearchLoop, "JOINT_PAIRS",
                             [("min_rv_iv_ratio", "rv_window_days")])
-        monkeypatch.setattr("autoresearch_loop.random.random", lambda: 0.0)
-        monkeypatch.setattr("autoresearch_loop.random.choice", lambda seq: seq[0])
+        monkeypatch.setattr("runners.autoresearch_loop.random.random", lambda: 0.0)
+        monkeypatch.setattr("runners.autoresearch_loop.random.choice", lambda seq: seq[0])
         monkeypatch.setattr(np.random, "normal", lambda *a, **k: 0.01)
         # Should not raise (no usable joint pair → single-param walk).
         params, name, old, new = loop._propose_mutation()
@@ -213,12 +213,12 @@ def _patch_backtest(monkeypatch, metrics_seq):
         calls["i"] += 1
         return {"metrics": m}
 
-    monkeypatch.setattr("backtest.list_captured_sessions", lambda u: [])
-    monkeypatch.setattr("backtest.load_iv_skew_seed",
+    monkeypatch.setattr("research.backtest.list_captured_sessions", lambda u: [])
+    monkeypatch.setattr("research.backtest.load_iv_skew_seed",
                         lambda u, drop_recent=0: ([], []))
-    monkeypatch.setattr("backtest.generate_synthetic_data",
+    monkeypatch.setattr("research.backtest.generate_synthetic_data",
                         lambda **k: object())
-    monkeypatch.setattr("backtest.run_backtest", fake_run_backtest)
+    monkeypatch.setattr("research.backtest.run_backtest", fake_run_backtest)
 
 
 class TestRunExperiment:
@@ -369,13 +369,13 @@ class TestTapeCache:
             loads["n"] += 1
             return pd.DataFrame({"session": [date_iso]})
 
-        monkeypatch.setattr("backtest.list_captured_sessions",
+        monkeypatch.setattr("research.backtest.list_captured_sessions",
                             lambda u: list(sessions))
-        monkeypatch.setattr("backtest.load_captured_tape", fake_load)
-        monkeypatch.setattr("backtest.load_iv_skew_seed",
+        monkeypatch.setattr("research.backtest.load_captured_tape", fake_load)
+        monkeypatch.setattr("research.backtest.load_iv_skew_seed",
                             lambda u, drop_recent=0: ([], []))
         monkeypatch.setattr(
-            "backtest.run_backtest",
+            "research.backtest.run_backtest",
             lambda *a, **k: {"metrics": {
                 "gamma_theta_ratio": 1.0, "total_trades": 3,
                 "max_drawdown": 0,
@@ -396,7 +396,7 @@ class TestTapeCache:
         self._patch_tape(monkeypatch, ["2026-01-01"])
         seen = []
         monkeypatch.setattr(
-            "backtest.run_backtest",
+            "research.backtest.run_backtest",
             lambda data, **k: (seen.append(data), {"metrics": {
                 "gamma_theta_ratio": 1.0, "total_trades": 3,
                 "max_drawdown": 0,
@@ -430,7 +430,7 @@ class TestTapeCache:
             raise duckdb.InvalidInputException(
                 'Malformed JSON in file "ticks-2026-01-01.jsonl.zst"')
 
-        monkeypatch.setattr("backtest.load_captured_tape", broken_load)
+        monkeypatch.setattr("research.backtest.load_captured_tape", broken_load)
         loop = _run_loop(eval_cycles=1)
         before = copy.deepcopy(loop.hedger.tunable_params)
         with pytest.raises(duckdb.InvalidInputException, match="Malformed"):
@@ -447,7 +447,7 @@ class TestTapeCache:
         def broken_backtest(*a, **k):
             raise ValueError("bad params blew up the backtest")
 
-        monkeypatch.setattr("backtest.run_backtest", broken_backtest)
+        monkeypatch.setattr("research.backtest.run_backtest", broken_backtest)
         loop = _run_loop(eval_cycles=1)
         before = copy.deepcopy(loop.hedger.tunable_params)
         assert loop._run_experiment({"gamma_scalp_band_pct": 9.9}) == -999999.0
@@ -466,7 +466,7 @@ class TestTapeCache:
             return {"metrics": {"gamma_theta_ratio": 1.0, "total_trades": 3,
                                 "max_drawdown": 0}}
 
-        monkeypatch.setattr("backtest.run_backtest", counting_backtest)
+        monkeypatch.setattr("research.backtest.run_backtest", counting_backtest)
         loop = _run_loop(eval_cycles=5)
         loop._run_experiment({"gamma_scalp_band_pct": 1.1})
         assert runs["n"] == 2      # one backtest per session, no wrap
@@ -479,7 +479,7 @@ class TestTapeCache:
         # fitness comparable across experiments.
         current = ["2026-01-01", "2026-01-02"]
         loads = self._patch_tape(monkeypatch, current)
-        monkeypatch.setattr("backtest.list_captured_sessions",
+        monkeypatch.setattr("research.backtest.list_captured_sessions",
                             lambda u: list(current))
         loop = _run_loop(eval_cycles=2)
         loop._run_experiment({"gamma_scalp_band_pct": 1.1})
@@ -492,8 +492,8 @@ class TestTapeCache:
 # ── sweep_quality() — the shared verdict (2026-07-02 review fix) ──
 
 class TestSweepQualityMethod:
-    """One definition for both entrypoints: run_autoresearch.py's weekly
-    sweep and run.py's LOOP-FOREVER mode (whose Ctrl+C save used to write
+    """One definition for both entrypoints: runners/run_autoresearch.py's weekly
+    sweep and runners/run.py's LOOP-FOREVER mode (whose Ctrl+C save used to write
     best_params.json permanently verdict-less)."""
 
     def _loop_with(self, records, best, seed=-100.0):
@@ -573,12 +573,12 @@ class TestReplayWindowPreflight:
             return pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-01 09:15:00"]),
                                  "last_price": [100.0]})
 
-        monkeypatch.setattr("backtest.list_captured_sessions", fake_list)
-        monkeypatch.setattr("backtest.load_captured_tape", fake_load)
-        monkeypatch.setattr("backtest.load_iv_skew_seed",
+        monkeypatch.setattr("research.backtest.list_captured_sessions", fake_list)
+        monkeypatch.setattr("research.backtest.load_captured_tape", fake_load)
+        monkeypatch.setattr("research.backtest.load_iv_skew_seed",
                             lambda u, drop_recent=0: ([], []))
         monkeypatch.setattr(
-            "backtest.run_backtest",
+            "research.backtest.run_backtest",
             lambda *a, **k: {"metrics": {"gamma_theta_ratio": 1.0,
                                          "total_trades": 3,
                                          "max_drawdown": 0.0}})
@@ -603,7 +603,7 @@ class TestReplayWindowPreflight:
         # synthetic-GBM fallback path, not a crash and not the sentinel.
         loop = _run_loop(eval_cycles=2)
         self._patch_tapes(monkeypatch, sessions=["s1", "s2"], empty=("s1", "s2"))
-        monkeypatch.setattr("backtest.generate_synthetic_data", lambda **k: object())
+        monkeypatch.setattr("research.backtest.generate_synthetic_data", lambda **k: object())
         fitness = loop._run_experiment({"gamma_scalp_band_pct": 1.2})
         assert loop._replay_sessions == []
         assert fitness != -999999.0
@@ -724,7 +724,7 @@ class TestConvexityEdgeFitness:
 # tail session, refuse zero-trade "improvements", bound bleed.
 # ──────────────────────────────────────────────────────────
 
-from autoresearch_loop import (  # noqa: E402
+from runners.autoresearch_loop import (  # noqa: E402
     build_validation_verdict,
     load_daily_moves,
     pick_holdout_sessions,

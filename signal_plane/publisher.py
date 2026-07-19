@@ -51,7 +51,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from runner_common import acquire_lock, durable_write_text
+from core.runner_common import acquire_lock, durable_write_text
 from signal_plane.bus import FileBus, RedisStreamBus
 from signal_plane.contract import SignalEnvelope, closes_group
 from signal_plane.validation import SignalValidationError, validate_signal

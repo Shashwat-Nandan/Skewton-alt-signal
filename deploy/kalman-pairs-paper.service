@@ -22,7 +22,7 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # PAPER ONLY — the Kalman strategy raises NotImplementedError on --mode live
 # until the forward test validates an edge (Phase 2 = conditional GO). Runs on
 # the same candidate universe as pair-paper so the books are comparable.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper_kalman_pairs.py --top 10 --max-leg-notional 1000000
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_kalman_pairs --top 10 --max-leg-notional 1000000
 # -------------------------------
 
 # Auto-restart on crash / non-zero exit. A clean 15:25 IST teardown returns 0

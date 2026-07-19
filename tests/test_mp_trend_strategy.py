@@ -14,7 +14,7 @@ from typing import List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from market_profile import Bar
+from core.market_profile import Bar
 from strategies.market_profile_intraday import (
     MPTrendConfig,
     check_kill,

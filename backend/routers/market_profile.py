@@ -11,7 +11,7 @@ Market Profile API.
        single profile. In `daily` mode the response includes one profile
        per trading day.
 
-The compute lives in `market_profile.py`; this router is just glue
+The compute lives in `core/market_profile.py`; this router is just glue
 between the SQLite store and that pure function.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from .. import bars as bars_db
-from market_profile import (
+from core.market_profile import (
     Bar,
     composite_to_dict,
     compute_composite,
@@ -77,8 +77,8 @@ def get_profile(
             status_code=404,
             detail=(
                 f"{sym!r} not in bars_universe. "
-                f"Run `python fetch_bars.py --add-symbols {sym}` then "
-                f"`python fetch_bars.py --backfill --symbols {sym}`."
+                f"Run `python -m market_data.fetch_bars --add-symbols {sym}` then "
+                f"`python -m market_data.fetch_bars --backfill --symbols {sym}`."
             ),
         )
 
@@ -95,7 +95,7 @@ def get_profile(
             status_code=404,
             detail=(
                 f"No {period_minutes}m bars stored for {sym} in the last {days} days. "
-                f"Run `python fetch_bars.py --backfill --symbols {sym}`."
+                f"Run `python -m market_data.fetch_bars --backfill --symbols {sym}`."
             ),
         )
 

@@ -3,7 +3,7 @@ Equity-swing API.
 
   GET  /api/equity/positions?status=open|closed
        Returns rows from the ``equity_positions`` table written by
-       ``run_equity_swing.py``. Default returns both, with OPEN first.
+       ``runners/run_equity_swing.py``. Default returns both, with OPEN first.
 
   GET  /api/equity/signals?date=YYYY-MM-DD
        Tails ``logs/signals-<date>.jsonl`` and returns the subset emitted
@@ -316,7 +316,7 @@ def get_fii_dii(
         raise HTTPException(
             status_code=503,
             detail=(
-                "FII/DII cache empty. Run `python fetch_fii_dii.py` on the host. "
+                "FII/DII cache empty. Run `python -m market_data.fetch_fii_dii` on the host. "
                 "Cache dir: ./data_cache/fii_dii/"
             ),
         )

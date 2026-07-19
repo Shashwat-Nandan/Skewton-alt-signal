@@ -65,7 +65,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # Non-fatal: tape replay does not need this CSV. If Kite auth has
   # expired or the API rate-limits, the autoresearch step below still
   # runs against captured tape.
-  "$PY" fetch_historical_data.py --days "$DAYS" --underlying "$UNDERLYING" || \
+  "$PY" -m market_data.fetch_historical_data --days "$DAYS" --underlying "$UNDERLYING" || \
       echo "    WARN: fetch failed; autoresearch will still run on tape."
   echo
 
@@ -79,7 +79,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # forward the _migrations history into the candidate.
   CANDIDATE="candidate_params_$TODAY.json"
 
-  # 2026-05-27: drop --data so run_autoresearch.py:198 takes the
+  # 2026-05-27: drop --data so runners/run_autoresearch.py:198 takes the
   # captured-tape replay path. The CSV-based path replayed daily bars
   # (12 ticks/day) and can't exercise an intraday objective. Tape sessions
   # live in data_cache/ticks/ticks-*.jsonl.
@@ -110,7 +110,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   # 90 days (only 8 sessions stay raw). Experiment budget cut above pays
   # the runtime bill.
   echo "[2/3] Running autoresearch ($EXPERIMENTS experiments, $EVAL_CYCLES-session tape replay)..."
-  "$PY" run_autoresearch.py \
+  "$PY" -m runners.run_autoresearch \
       --underlying "$UNDERLYING" \
       --experiments "$EXPERIMENTS" \
       --metric convexity_edge \

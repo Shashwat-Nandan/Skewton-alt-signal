@@ -17,7 +17,7 @@ from strategies.arbitrage import (
     CalendarLeg,
     CalendarTrade,
 )
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 # ──────────────────────────────────────────────────────────
@@ -1452,7 +1452,7 @@ class TestReviewFixes20260711:
         # new __init__-only attribute silently killed every backtest tick
         # (AttributeError swallowed per-tick → clean 0-trade result). The
         # builder must produce an instance whose scan/rehedge paths run.
-        import backtest_arbitrage as ba
+        from research import backtest_arbitrage as ba
         import pandas as pd
         from datetime import date as _date
         panel = pd.DataFrame([
@@ -1504,7 +1504,7 @@ class TestReviewFixes20260711:
         # Rule 12: a systematic per-tick failure (the AttributeError class of
         # bug) must raise at the end, not return a clean flat 0-trade result
         # that sweeps then treat as a measurement.
-        import backtest_arbitrage as ba
+        from research import backtest_arbitrage as ba
         import pandas as pd
         from datetime import date as _date
         days = [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")]

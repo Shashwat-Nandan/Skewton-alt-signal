@@ -75,7 +75,7 @@ class TestEffectiveParams:
 def _bare_loop():
     """A HedgeResearchLoop with only the four attrs _save_best_params
     touches — avoids the heavy constructor (which needs a hedger)."""
-    from autoresearch_loop import HedgeResearchLoop
+    from runners.autoresearch_loop import HedgeResearchLoop
     loop = HedgeResearchLoop.__new__(HedgeResearchLoop)
     loop.best_params = {"alpha": 1.5, "gamma_scalp_band_pct": 0.4}
     loop.primary_metric = "gamma_theta_ratio"

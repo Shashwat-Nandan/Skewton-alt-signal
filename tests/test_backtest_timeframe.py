@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from backtest_timeframe import STANDARD_TIMEFRAME, warn_coarse_timeframe
+from core.backtest_timeframe import STANDARD_TIMEFRAME, warn_coarse_timeframe
 
 
 def test_daily_warns_loudly(caplog):

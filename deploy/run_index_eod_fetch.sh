@@ -2,7 +2,7 @@
 # Daily index EOD option-chain snapshot fetch (issue #162).
 #
 # Tops up data_cache/{underlying}_*_eod.parquet for each index in INDEX_EOD_
-# UNDERLYINGS via fetch_bhavcopy.py, which reads NSE's FREE PUBLIC F&O bhavcopy
+# UNDERLYINGS via market_data/fetch_bhavcopy.py, which reads NSE's FREE PUBLIC F&O bhavcopy
 # archive (underlying_price = the UDiFF UndrlygPric column). The fetch is
 # idempotent — already-cached days are skipped — so re-running is cheap.
 #
@@ -44,7 +44,7 @@ for u in $UNDERLYINGS; do
   # Do NOT let one underlying's failure skip the others (set -e would abort);
   # capture per-underlying status and fail loud at the end so notify-failure@
   # fires while every index still gets its attempt.
-  if ! "$PY" fetch_bhavcopy.py --underlying "$u" --days "$DAYS" >>"$LOG_FILE" 2>&1; then
+  if ! "$PY" -m market_data.fetch_bhavcopy --underlying "$u" --days "$DAYS" >>"$LOG_FILE" 2>&1; then
     echo "[$(date '+%H:%M:%S')] FETCH FAILED for $u (see $LOG_FILE)" | tee -a "$LOG_FILE"
     rc=1
   fi

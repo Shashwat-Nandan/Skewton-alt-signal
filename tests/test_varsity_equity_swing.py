@@ -28,7 +28,7 @@ from strategies.varsity_equity_swing import (
     EquityPosition,
     VarsityEquitySwingStrategy,
 )
-from backtest_varsity_equity import EquityBacktester, ZERO_TRADE_PENALTY
+from research.backtest_varsity_equity import EquityBacktester, ZERO_TRADE_PENALTY
 
 
 class _NullKite:

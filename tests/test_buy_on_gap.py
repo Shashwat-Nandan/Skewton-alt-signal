@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategies.base import OrderValidationError, validate_order
 from strategies.buy_on_gap import BuyOnGapStrategy, GapPosition
-from backtest_buy_on_gap import BuyOnGapBacktester, ZERO_TRADE_PENALTY
-from trade_proposer import TradeProposal
+from research.backtest_buy_on_gap import BuyOnGapBacktester, ZERO_TRADE_PENALTY
+from core.trade_proposer import TradeProposal
 
 
 class _NullKite:

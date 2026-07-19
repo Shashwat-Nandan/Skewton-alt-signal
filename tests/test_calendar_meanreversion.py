@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from strategies.arbitrage import ArbitrageState, CalendarLeg, CalendarTrade
 from strategies.calendar_meanreversion import CalendarMeanReversionStrategy
-from trade_proposer import TradeProposal
+from core.trade_proposer import TradeProposal
 
 
 # ──────────────────────────────────────────────────────────
@@ -473,7 +473,7 @@ class TestIndexPanelIngestion:
         if not list(archive.glob("bhavcopy_fo_*.csv")):
             pytest.skip("No bhavcopy archive in data_cache — skipping IDF panel test.")
 
-        from backtest_arbitrage import load_stf_panel
+        from research.backtest_arbitrage import load_stf_panel
         panel = load_stf_panel(instrument_types=("IDF",))
         assert not panel.empty
         present = set(panel["symbol"].unique())
@@ -490,8 +490,8 @@ class TestIndexPanelIngestion:
         if not list(archive.glob("bhavcopy_fo_*.csv")):
             pytest.skip("No bhavcopy archive in data_cache — skipping IDF panel test.")
 
-        from backtest_arbitrage import load_stf_panel
-        from backtest_calendar_meanreversion import build_spread_history
+        from research.backtest_arbitrage import load_stf_panel
+        from research.backtest_calendar_meanreversion import build_spread_history
         panel = load_stf_panel(universe=["NIFTY", "BANKNIFTY"], instrument_types=("IDF",))
         spread_h, vol_h = build_spread_history(panel)
         # Both indices should yield a non-trivial spread series.

@@ -18,11 +18,11 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # (taleb_paper_state_BANKNIFTY.json, .taleb_paper_BANKNIFTY.lock,
 # paper_BANKNIFTY-*.log), so it runs concurrently with the NIFTY
 # taleb-hedger.service without touching its state. PAPER-ONLY.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python /opt/taleb-karpathy-kite/run_paper.py --config /opt/taleb-karpathy-kite/config_banknifty.ini
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper --config /opt/taleb-karpathy-kite/config_banknifty.ini
 # --------------------------------
 
 TimeoutStartSec=0
-# run_paper.py installs a SIGTERM→KeyboardInterrupt handler → clean stop exits
+# runners/run_paper.py installs a SIGTERM→KeyboardInterrupt handler → clean stop exits
 # 130; whitelist it so an operator stop doesn't false-page OnFailure. A genuine
 # silent-fail breach exits 1 → OnFailure still alerts.
 SuccessExitStatus=130

@@ -6,7 +6,7 @@
 # KEEP_ARCHIVE_DAYS.
 #
 # 2026-07-18: the archive format is now columnar parquet (ZSTD, depth-dropped)
-# instead of a whole-file .jsonl.zst. tape_to_parquet.py converts + fail-loud
+# instead of a whole-file .jsonl.zst. market_data/tape_to_parquet.py converts + fail-loud
 # verifies (row-count parity) then deletes the raw JSONL; _tape_path prefers
 # parquet > raw > legacy .zst, so the pre-2026-07-18 .zst backlog still
 # replays and ages out via KEEP_ARCHIVE_DAYS below. Parquet halves the on-disk
@@ -20,7 +20,7 @@
 # sessions the per-run parse cost.
 #
 # Safety: a raw JSONL is removed ONLY after the parquet's row count is verified
-# against it (inside tape_to_parquet.py). The newest files (including today's
+# against it (inside market_data/tape_to_parquet.py). The newest files (including today's
 # open capture) are never touched.
 set -euo pipefail
 
@@ -36,7 +36,7 @@ exec 9>"$TICKS_DIR/.retention.lock"
 flock -n 9 || { echo "Another retention run holds the lock — exiting."; exit 0; }
 
 PY="${PY:-$PROJECT_DIR/.venv/bin/python}"
-# cd into the project so `tape_to_parquet.py` (and its `import backtest`)
+# cd into the project so `market_data/tape_to_parquet.py` (and its `import backtest`)
 # resolve; the tape DIRECTORY is passed explicitly via --ticks-dir below, so a
 # non-default $TICKS_DIR is honoured rather than silently resolved against cwd.
 cd "$PROJECT_DIR"
@@ -54,7 +54,7 @@ if (( ${#raw[@]} > KEEP_RAW )); then
         # Converts + verifies row-count parity, then deletes the JSONL. Any
         # failure exits non-zero and set -e aborts (raw tape left intact).
         # --ticks-dir keeps the convert on the same dir this loop globbed.
-        "$PY" tape_to_parquet.py "$d" --ticks-dir "$TICKS_DIR"
+        "$PY" -m market_data.tape_to_parquet "$d" --ticks-dir "$TICKS_DIR"
         archived=$((archived + 1))
     done
 fi

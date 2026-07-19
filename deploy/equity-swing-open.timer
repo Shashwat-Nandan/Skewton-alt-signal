@@ -9,7 +9,7 @@ Documentation=man:systemd.timer(5)
 OnCalendar=Mon..Fri *-*-* 09:30:00 Asia/Kolkata
 
 # If the VPS was asleep / systemd missed the window, run once to catch up.
-# run_equity_swing.py refuses to take new entries at the open scan and
+# runners/run_equity_swing.py refuses to take new entries at the open scan and
 # only checks exits, so a late catch-up won't open marginal positions.
 Persistent=true
 

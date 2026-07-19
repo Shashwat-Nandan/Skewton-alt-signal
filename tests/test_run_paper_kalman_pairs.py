@@ -22,8 +22,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import backtest_kalman_pairs as BT
-import run_paper_kalman_pairs as R
+from research import backtest_kalman_pairs as BT
+from runners import run_paper_kalman_pairs as R
 from strategies.kalman_pair_trading import KalmanPairStrategy
 
 

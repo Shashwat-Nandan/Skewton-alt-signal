@@ -1,6 +1,6 @@
 """Tests for the /pair-paper-compare endpoint.
 
-The endpoint reads on-disk EOD JSON sidecars written by run_paper_pairs.py
+The endpoint reads on-disk EOD JSON sidecars written by runners/run_paper_pairs.py
 (``data_cache/pair_paper{,_<system>}_eod_<date>.json``) and merges them into
 a per-day + aggregate comparison. These tests stub the data_cache dir and
 write synthetic sidecars to exercise the merge logic.

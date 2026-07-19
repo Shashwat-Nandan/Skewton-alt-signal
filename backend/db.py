@@ -82,7 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_pnl_run_id ON pnl_snapshots (run_id, id);
 -- Market Profile data
 -- ──────────────────────────────────────────────────────────
 -- bars_universe: every symbol whose 30-min bars we want to track. Populated
--- by fetch_bars.py on first --backfill run; the dashboard reads this to
+-- by market_data/fetch_bars.py on first --backfill run; the dashboard reads this to
 -- populate the symbol selector.
 CREATE TABLE IF NOT EXISTS bars_universe (
     symbol TEXT PRIMARY KEY,

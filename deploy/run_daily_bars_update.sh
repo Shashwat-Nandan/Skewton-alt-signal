@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily bars updater. Runs `fetch_bars.py --update` for every symbol in
+# Daily bars updater. Runs `python -m market_data.fetch_bars --update` for every symbol in
 # bars_universe so the Market Profile dashboard always reflects the most
 # recent close. Idempotent — if today's bars are already in, the script
 # inserts 0 new rows and exits cleanly.
@@ -27,7 +27,7 @@ PY="$PROJECT_DIR/.venv/bin/python"
   echo "Project: $PROJECT_DIR"
   echo
 
-  "$PY" fetch_bars.py --update
+  "$PY" -m market_data.fetch_bars --update
 
   echo
   echo "Done."

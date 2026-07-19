@@ -12,7 +12,7 @@ overfitting / optimizer noise, not edge.
   L1 penalty on the filter params; single **6-month train / 6-month test** split.
 - Baseline: MA crossover (Algorithm 5), its params **also** CMA-ES-fit on train.
 - Data: NIFTY (246 daily closes, the cached 1-yr F&O underlying) and BANKNIFTY
-  (271 daily closes, fetched via `fetch_index_daily.py`). Cost 2.5 pts/side.
+  (271 daily closes, fetched via `market_data/fetch_index_daily.py`). Cost 2.5 pts/side.
 - Deviation forced by finding #2 (Phase 0): model 4's free Φ diverges, so the fit
   uses the stable model 1. The literal 18-param model-4 fit is not reproducible.
 
@@ -67,7 +67,7 @@ Re-ran with the anti-overfit discipline the single-split protocol lacked:
 - **Reduced 4-param Kalman fit** (`fit_kalman_reduced`): ONE filter knob (velocity
   process std) + µ/stop/target; R and P₀ seeded from the data. Fewer params = the
   regularization. (Down from 8 params; built on the stable Newtonian model 2.)
-- **Walk-forward** (`backtest_kalman_trend.py`): many rolling train→test folds;
+- **Walk-forward** (`research/backtest_kalman_trend.py`): many rolling train→test folds;
   fit on each train, score the immediately-following OOS test, multi-seed.
 - **Pooled OOS metric:** concatenate the non-overlapping test-slice daily P&L
   across folds → ONE Sharpe. (A per-20-bar-window Sharpe is dominated by the
@@ -89,7 +89,7 @@ Re-ran with the anti-overfit discipline the single-split protocol lacked:
   expected small-sample symptom. **Suggestive, not conclusive.**
 
 ## Deep history — the deciding test (8.2 years, 2018-04 → 2026-06, 2035 bars)
-Fetched multi-year NIFTY/BANKNIFTY daily via Kite (`fetch_index_daily.py --days
+Fetched multi-year NIFTY/BANKNIFTY daily via Kite (`python -m market_data.fetch_index_daily --days
 3000`) and re-ran the walk-forward with many folds (pooled OOS Sharpe, 3 seeds):
 
 | config train/test/step | folds | NIFTY Kal | NIFTY MA | NIFTY win | BN Kal | BN MA | BN win |
@@ -122,7 +122,7 @@ MA is the better (and far simpler) trend follower here.
 # Intraday (5-min) re-test (2026-06-27)
 User hypothesis: the daily-close backtest hides intraday entry/exit dynamics
 where the lower-lag Kalman could win. Fetched 9000 5-min bars each (NIFTY,
-BANKNIFTY; ~6 months) via `fetch_index_daily.py --interval 5minute` and re-ran
+BANKNIFTY; ~6 months) via `python -m market_data.fetch_index_daily --interval 5minute` and re-ran
 the walk-forward on 5-min bars (windows now in bars; absolute Sharpe mis-
 annualized but the Kalman-vs-MA comparison is unaffected).
 
@@ -329,7 +329,7 @@ fitted logic).
 Ran the spec's "do this first" case: trailing stop **+ keep** the 15:25 flatten
 (no overnight hold → no gap/margin blockers). Walk-forward 20 folds × 5 seeds, T
 fit on TRAIN only, short/long/offset held at the incumbent #121 flatten-aware
-fit, both instruments, costs 2.5 and 8.0. Script: `experiment_kalman_trail.py`.
+fit, both instruments, costs 2.5 and 8.0. Script: `research/experiment_kalman_trail.py`.
 
 > **Numbers below are the CORRECTED re-run (2026-07-14, post-code-review).** The
 > first run had three harness defects: trade counts summed across seeds (~5×
@@ -408,7 +408,7 @@ Note the live book polls prices intrabar (`check_exit`), so live trailing would
 differ from ANY close-only backtest.
 
 Per `feedback_data_resolution_over_backtest`: re-fetch 5-min OHLC rather than
-ship a caveated backtest. `experiment_kalman_trail.py` is parameterised and cheap
+ship a caveated backtest. `research/experiment_kalman_trail.py` is parameterised and cheap
 to re-run once the data exists.
 
 ## Read

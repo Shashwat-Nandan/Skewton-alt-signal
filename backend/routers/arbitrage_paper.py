@@ -1,6 +1,6 @@
 """Arbitrage paper-trading P&L for the dashboard.
 
-Reads the per-day EOD sidecar JSONs that `run_paper_arbitrage.py` writes
+Reads the per-day EOD sidecar JSONs that `runners/run_paper_arbitrage.py` writes
 (``data_cache/arbitrage_paper{,_<system>}_eod_<date>.json``) and exposes a
 daily + cumulative P&L series plus the current open calendar spreads.
 

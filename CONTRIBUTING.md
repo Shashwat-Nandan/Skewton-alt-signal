@@ -71,7 +71,7 @@ uv pip compile requirements-dev.in --generate-hashes --output-file requirements-
 2. CI must be green: `ci` (ruff + pytest + frontend build), `lockfile` (if you
    touched deps), and `security` (secret scan, deps audit, signature check).
 3. A [CODEOWNER](./CODEOWNERS) reviews — **required** for money-affecting paths
-   (`strategies/`, `signal_plane/`, `loop_engine/`, `backend/`, `risk_analyzer.py`,
+   (`strategies/`, `signal_plane/`, `loop_engine/`, `backend/`, `core/risk_analyzer.py`,
    the runners, `deploy/`). No self-merge of those paths.
 4. Squash-merge with a Conventional-Commit title. Keep `main` linear.
 

@@ -61,7 +61,7 @@ z-band, cost-hurdle): `static` (Kalman α≈0 = frozen β), `basic` (α=1e-5),
   losses.
 - Kalman tracking **beats static in both**; absolute profitability is
   regime/selection-dependent. The live baseline's apparent edge is concentration-
-  and regime-driven (in the 2-year run the trusted `backtest_pairs.py` is +₹950k
+  and regime-driven (in the 2-year run the trusted `research/backtest_pairs.py` is +₹950k
   but *entirely* one degenerate negative-β pair, LT/BAJFINANCE, +₹5.89M with a
   −₹6.2M drawdown; strip it and it's ≈ −₹4.9M).
 
@@ -83,8 +83,8 @@ z-band, cost-hurdle): `static` (Kalman α≈0 = frozen β), `basic` (α=1e-5),
 ## Reproduce
 ```
 # Test A (real month, live pairs) — see scratchpad/real_month_compare logic
-python backtest_kalman_pairs.py --top 10 --train-fraction 0.5            # Test B
-python backtest_kalman_pairs.py --top 10 --train-fraction 0.5 --min-edge-multiplier 25
-python sweep_kalman_pairs.py     --top 12 --train-fraction 0.5
+python -m research.backtest_kalman_pairs --top 10 --train-fraction 0.5            # Test B
+python -m research.backtest_kalman_pairs --top 10 --train-fraction 0.5 --min-edge-multiplier 25
+python -m research.sweep_kalman_pairs     --top 12 --train-fraction 0.5
 ```
 (Each screens ~1,225 pairs on the train slice — ~60s — so run once, not in a loop.)

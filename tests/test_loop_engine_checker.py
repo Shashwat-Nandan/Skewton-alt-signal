@@ -143,8 +143,8 @@ def test_annotated_threshold_value_is_tolerated(tmp_path):
 def test_adapter_pools_oos_returns_and_feeds_gates(monkeypatch):
     """The adapter must turn each fold's points-PnL into fractional returns
     (pnl/close) and pool them — verify with a canned fold so cmaes isn't run."""
-    import backtest_kalman_trend as bt
-    import optimize_kalman_trend as o
+    from research import backtest_kalman_trend as bt
+    from research import optimize_kalman_trend as o
 
     closes = np.full(260, 100.0)                 # flat price; 5 folds @100/30/30
 
@@ -165,8 +165,8 @@ def test_adapter_pools_oos_returns_and_feeds_gates(monkeypatch):
 def test_adapter_rejects_a_no_trade_candidate(monkeypatch):
     """A candidate that never trades (zero PnL → NaN Sharpe) must be REJECTED, not
     pass by default — the honest outcome for the NO-GO strategy (§VI-A)."""
-    import backtest_kalman_trend as bt
-    import optimize_kalman_trend as o
+    from research import backtest_kalman_trend as bt
+    from research import optimize_kalman_trend as o
 
     closes = np.full(260, 100.0)
 
@@ -185,10 +185,10 @@ def test_adapter_rejects_a_no_trade_candidate(monkeypatch):
 def test_default_checker_examines_every_symbol(monkeypatch):
     """The production checker must gate EVERY traded symbol (not a single-index
     proxy) and combine — wired without Kite, gating the real (NO-GO) edge."""
-    import backtest_kalman_trend as bt
+    from research import backtest_kalman_trend as bt
     import loop_engine.checker as ckmod
-    import optimize_kalman_trend as o
-    import validate_kalman_trend as vt
+    from research import optimize_kalman_trend as o
+    from research import validate_kalman_trend as vt
 
     seen = []
 
@@ -216,10 +216,10 @@ def test_default_checker_examines_every_symbol(monkeypatch):
 def test_default_checker_fails_closed_on_missing_symbol_data(monkeypatch):
     """A symbol whose daily data is missing must FAIL the verdict, not be silently
     dropped (§VI-A: a low rejection rate is a warning sign, not a pass)."""
-    import backtest_kalman_trend as bt
+    from research import backtest_kalman_trend as bt
     import loop_engine.checker as ckmod
-    import optimize_kalman_trend as o
-    import validate_kalman_trend as vt
+    from research import optimize_kalman_trend as o
+    from research import validate_kalman_trend as vt
 
     def _load(symbol):
         if symbol == "BANKNIFTY":

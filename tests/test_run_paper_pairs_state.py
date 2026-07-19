@@ -23,8 +23,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import run_paper_pairs
-from run_paper_pairs import (
+from runners import run_paper_pairs
+from runners.run_paper_pairs import (
     acquire_runner_lock,
     build_orphan_strategies,
     end_of_session,
