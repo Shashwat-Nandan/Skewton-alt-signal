@@ -402,6 +402,13 @@ class TalebKarpathyStrategy(BaseStrategy):
             "circuit_breaker_pause_minutes": self.config.getint("strategy", "circuit_breaker_pause_minutes"),
             "total_capital": self.config.getfloat("strategy", "total_capital"),
             "max_positions": self.config.getint("strategy", "max_positions"),
+            # Issue #160: how the MC entry-gate paths are generated —
+            # "gbm" (iid Gaussian, pre-#160 behaviour) or "bootstrap"
+            # (block-bootstrap of real daily returns). IMMUTABLE on purpose:
+            # the autoresearch sweep must never flip the gate's distribution
+            # mid-search. Default gbm = merge changes nothing; the operator
+            # enables bootstrap per-config, paper first (safety rule 3).
+            "mc_path_source": self._read_mc_path_source(),
         }
 
         self.underlying = self.config["strategy"]["underlying"]
@@ -431,6 +438,19 @@ class TalebKarpathyStrategy(BaseStrategy):
         # entry has typically already fired.
         self._spot_history: List[Tuple[datetime, float]] = []
         self._spot_history_max_size = 2000  # ~1.5 days of 1-min ticks or weeks of 5-min
+        # Issue #160: DATED daily close-to-close log returns (date, return)
+        # from the same EOD snapshot _load_spot_history parses — the MC entry
+        # gate's empirical pool when mc_path_source=bootstrap. A SEPARATE list
+        # from _spot_history on purpose: that one is tick-appended and capped
+        # at 2000 samples, so a few live sessions would evict the daily
+        # anchors and silently starve the bootstrap back to Gaussian. Rebuilt
+        # each session start (the runner restarts daily; the EOD file is
+        # refreshed by the nightly fetch). Dates are kept so the gate can
+        # filter to returns strictly BEFORE the current session — a no-op live
+        # (newest EOD is yesterday's) but essential in tape replay, where the
+        # newest EOD snapshot otherwise leaks future returns into a past
+        # session's gate (look-ahead).
+        self._daily_return_history: List[Tuple[date, float]] = []
         # Phase 1.3: rolling history of (25Δ put IV − 25Δ call IV) used to
         # rank current skew. Persisted alongside _atm_iv_history.
         self._skew_history: List[float] = []
@@ -716,9 +736,15 @@ class TalebKarpathyStrategy(BaseStrategy):
                     "tape replay) — falling back to 0.01/day (~16%% ann.); "
                     "the expectancy gate is running on the uncalibrated "
                     "constant this tick.")
+            # Issue #160: with mc_path_source=bootstrap, feed the gate real
+            # daily returns (block-bootstrapped per path in risk_analyzer;
+            # falls back to Gaussian loudly if the pool is too thin). Default
+            # gbm → None → behaviour identical to pre-#160.
+            mc_empirical = self._mc_empirical_returns()
             mc = self.risk.path_dependence_monte_carlo(
                 test_positions, spot, T, n_paths=50, trading_days=max(int(T*365), 5),
                 seed=mc_seed, daily_vol=mc_daily_vol,
+                empirical_returns=mc_empirical,
             )
             self.state.monte_carlo_report = mc
 
@@ -2398,6 +2424,35 @@ class TalebKarpathyStrategy(BaseStrategy):
             return 50.0
         return percentileofscore(self._skew_history, skew)
 
+    def _mc_empirical_returns(self) -> Optional[List[float]]:
+        """Empirical daily-return pool for the bootstrap MC gate (issue #160),
+        or None when mc_path_source != bootstrap (→ Gaussian paths).
+
+        Returns dated on/after the current session are excluded: live this is
+        a no-op (the newest EOD snapshot is yesterday's, all dates are past),
+        but in tape replay the snapshot spans dates AFTER the replayed session,
+        and without this filter a past session's gate would resample its own
+        future (look-ahead). Thinning below min_empirical is handled loudly in
+        risk_analyzer (falls back to Gaussian, path_source='gbm')."""
+        if self.immutable_params.get("mc_path_source") != "bootstrap":
+            return None
+        today = self._clock().date()
+        return [r for d, r in self._daily_return_history if d < today]
+
+    def _read_mc_path_source(self) -> str:
+        """Validated [strategy] mc_path_source (issue #160). Unknown values
+        warn loudly and fall back to gbm — the entry path must not crash on a
+        config typo, but the operator must see the intended source was NOT
+        applied (Rule 12)."""
+        raw = self.config.get("strategy", "mc_path_source", fallback="gbm").strip()
+        if raw not in ("gbm", "bootstrap"):
+            logger.warning(
+                "[strategy] mc_path_source=%r is not one of ('gbm', "
+                "'bootstrap') — using gbm. Fix the config to enable the "
+                "bootstrap MC gate.", raw)
+            return "gbm"
+        return raw
+
     def _record_spot_sample(self, ts: datetime, spot: float):
         """Append a spot quote to the rolling history. Dedup on timestamp so
         the same tick doesn't get counted twice when both scan_and_propose
@@ -2532,6 +2587,18 @@ class TalebKarpathyStrategy(BaseStrategy):
         if seeded:
             self._spot_history = seeded[-self._spot_history_max_size:]
             logger.info("Seeded %d daily spot samples from %s", len(self._spot_history), path)
+            # Issue #160: DATED daily log returns for the bootstrap MC pool,
+            # from the FULL deduped daily series (not the tick-capped copy
+            # above). Each return is dated by the SECOND day (the day the move
+            # is realized), so the gate can exclude returns >= the current
+            # session date (look-ahead guard on tape replay).
+            closes = np.array([s for _, s in seeded], dtype=float)
+            if len(closes) >= 2 and np.all(closes > 0):
+                rets = np.diff(np.log(closes))
+                rdates = [ts.date() for ts, _ in seeded[1:]]
+                self._daily_return_history = list(zip(rdates, rets))
+                logger.info("MC bootstrap pool: %d daily returns from %s",
+                            len(self._daily_return_history), path)
 
     def _apply_risk_filters(self, proposals, spot):
         """

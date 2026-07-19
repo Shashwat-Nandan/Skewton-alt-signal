@@ -51,6 +51,13 @@ class MonteCarloReport:
     pnl_5th_percentile: float = 0.0
     pnl_95th_percentile: float = 0.0
     var_95: float = 0.0
+    # How the per-path daily returns were generated: "gbm" (iid Gaussian at
+    # daily_vol, shuffled per path — the pre-#160 behaviour) or
+    # "block_bootstrap" (per-path circular block resamples of real daily
+    # returns, rescaled to daily_vol — fat tails + vol clustering preserved).
+    # Consumers (entry-gate logs, dashboards) must be able to tell which
+    # distribution a pass/fail came from (Rule 12).
+    path_source: str = "gbm"
     path_results: List[PathSimResult] = field(default_factory=list)
 
 
@@ -112,6 +119,9 @@ class RiskAnalyzer:
         trading_days: int = 30,
         seed: Optional[int] = None,
         charge_costs: bool = True,
+        empirical_returns: Optional[np.ndarray] = None,
+        block_size: int = 5,
+        min_empirical: int = 20,
     ) -> MonteCarloReport:
         """
         Taleb Ch 16, Tables 16.2-16.4: Shuffle the same returns into different
@@ -126,15 +136,56 @@ class RiskAnalyzer:
         rehedge-heavy structures (the kalman-trend #77 failure mode), and the
         mc_min_mean_pnl entry gate compares this number against a rupee
         floor, so the paths must be in net-of-cost rupees to mean anything.
+
+        empirical_returns (issue #160): real daily returns to resample instead
+        of Gaussian draws. With >= min_empirical samples of nonzero variance,
+        each path gets its OWN circular block-bootstrap sample (blocks of
+        block_size consecutive returns), DEMEANED then rescaled so the pool's
+        std equals daily_vol — a shape-only change: fat tails and vol
+        clustering enter at their real frequency while the drift is removed
+        and the scale calibration is untouched. Fewer
+        samples (or None) falls back to the Gaussian path, loudly, with
+        report.path_source = "gbm" so the fallback is never mistaken for the
+        bootstrap distribution.
         """
         rng = np.random.default_rng(seed)
-        base_returns = rng.normal(0, daily_vol, trading_days)
+
+        emp = None
+        if empirical_returns is not None:
+            emp = np.asarray(empirical_returns, dtype=float)
+            emp = emp[np.isfinite(emp)]
+            emp_std = float(np.std(emp)) if len(emp) else 0.0
+            if len(emp) < min_empirical or emp_std <= 0:
+                logger.warning(
+                    "MC: %d usable empirical returns (< %d, or zero variance)"
+                    " — falling back to Gaussian paths this gate run",
+                    len(emp), min_empirical)
+                emp = None
+            else:
+                # DEMEAN before scaling so the change is truly shape-only. The
+                # Gaussian path is driftless (mean 0); resampling raw returns
+                # would carry the window's directional drift into the paths
+                # (e.g. a trending window shifts every worst_path in one
+                # direction), which is a location change, not the fat-tail /
+                # vol-clustering SHAPE the gate is meant to gain. std is
+                # unchanged by demeaning, so emp_std stays the scale anchor.
+                emp = emp - float(np.mean(emp))
+        use_bootstrap = emp is not None
+        if use_bootstrap:
+            emp_scale = daily_vol / emp_std
+        else:
+            base_returns = rng.normal(0, daily_vol, trading_days)
 
         report = MonteCarloReport(n_paths=n_paths)
+        report.path_source = "block_bootstrap" if use_bootstrap else "gbm"
         all_pnls = []
 
         for path_id in range(n_paths):
-            shuffled = rng.permutation(base_returns)
+            if use_bootstrap:
+                shuffled = emp_scale * self._block_bootstrap_returns(
+                    rng, emp, trading_days, block_size)
+            else:
+                shuffled = rng.permutation(base_returns)
             result = self._simulate_single_path(
                 positions, spot, T, shuffled, rehedge_threshold_delta,
                 charge_costs=charge_costs
@@ -155,12 +206,25 @@ class RiskAnalyzer:
         report.var_95 = -float(np.percentile(pnls, 5))
 
         logger.info(
-            "Monte Carlo (%d paths): Mean P/L=%.0f  Worst=%.0f  Best=%.0f  "
+            "Monte Carlo (%d paths, %s): Mean P/L=%.0f  Worst=%.0f  Best=%.0f  "
             "Std=%.0f  Profitable=%.1f%%  VaR95=%.0f",
-            n_paths, report.mean_pnl, report.worst_path_pnl, report.best_path_pnl,
-            report.std_pnl, report.pct_profitable, report.var_95
+            n_paths, report.path_source, report.mean_pnl, report.worst_path_pnl,
+            report.best_path_pnl, report.std_pnl, report.pct_profitable,
+            report.var_95
         )
         return report
+
+    @staticmethod
+    def _block_bootstrap_returns(rng, emp: np.ndarray, n: int,
+                                 block_size: int) -> np.ndarray:
+        """Circular block bootstrap: sample random start indices, take
+        block_size CONSECUTIVE returns from each (wrapping at the end), and
+        concatenate to length n. Consecutive blocks preserve the short-range
+        vol clustering an iid resample would destroy — the point of #160."""
+        n_blocks = (n + block_size - 1) // block_size
+        starts = rng.integers(0, len(emp), size=n_blocks)
+        idx = (starts[:, None] + np.arange(block_size)[None, :]) % len(emp)
+        return emp[idx].reshape(-1)[:n]
 
     def _simulate_single_path(
         self, positions, spot, T, daily_returns, rehedge_threshold,

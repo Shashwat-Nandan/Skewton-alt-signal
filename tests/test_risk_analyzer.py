@@ -3,6 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import numpy as np
 import pytest
 from greeks_engine import GreeksEngine, OptionContract
 from risk_analyzer import RiskAnalyzer
@@ -207,3 +208,131 @@ class TestMonteCarloCosts:
         # Long gamma earns more when realized vol is higher — the sign of the
         # regime dependence the fixed 1% hid.
         assert wild.mean_pnl > calm.mean_pnl
+
+
+# ──────────────────────────────────────────────────────────
+# Issue #160 — block-bootstrap MC paths. Each test encodes the C4 failure
+# ("GBM-tuned edge") the change exists to fix: the gate must be able to see
+# real fat tails and vol clustering, must label its distribution, and must
+# never silently swap distributions on a thin pool.
+# ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def real_returns():
+    # 40 daily returns with clustering (a calm run, then a volatile cluster
+    # containing a real −2.1% tail — like the 2026-05..07 NIFTY window).
+    calm = [0.001, -0.002, 0.0015, -0.001, 0.002] * 6
+    cluster = [-0.021, 0.015, -0.012, 0.019, -0.008,
+               0.011, -0.015, 0.009, -0.006, 0.004]
+    return np.array(calm + cluster)
+
+
+class TestBlockBootstrapMC:
+    def test_bootstrap_report_is_labeled(self, analyzer, long_straddle, real_returns):
+        r = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=10, trading_days=10,
+            seed=7, empirical_returns=real_returns,
+        )
+        assert r.path_source == "block_bootstrap"
+
+    def test_thin_pool_falls_back_to_gbm_identically(self, analyzer, long_straddle):
+        # WHY: a pool below min_empirical must not half-bootstrap — it falls
+        # back to the EXACT Gaussian behaviour (same seed → same numbers as a
+        # no-pool run) and labels itself gbm, so a pass/fail from the fallback
+        # is never mistaken for the bootstrap distribution (Rule 12).
+        thin = np.array([0.001, -0.002, 0.003])
+        r_thin = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=10, trading_days=5,
+            seed=11, empirical_returns=thin,
+        )
+        r_none = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, n_paths=10, trading_days=5,
+            seed=11, empirical_returns=None,
+        )
+        assert r_thin.path_source == "gbm"
+        assert r_thin.mean_pnl == r_none.mean_pnl
+        assert r_thin.worst_path_pnl == r_none.worst_path_pnl
+
+    def test_blocks_are_consecutive_circular_slices(self, real_returns):
+        # WHY: consecutive blocks are the mechanism that preserves vol
+        # clustering; an iid resample (block_size=1 behaviour) would destroy
+        # it and quietly reintroduce the Gaussian-shape problem.
+        from risk_analyzer import RiskAnalyzer
+        rng = np.random.default_rng(3)
+        emp = real_returns
+        out = RiskAnalyzer._block_bootstrap_returns(rng, emp, n=20, block_size=5)
+        assert len(out) == 20
+        circ = np.concatenate([emp, emp[:5]])
+        windows = {tuple(circ[i:i + 5]) for i in range(len(emp))}
+        for b in range(0, 20, 5):
+            assert tuple(out[b:b + 5]) in windows, \
+                f"block at {b} is not a consecutive slice of the pool"
+
+    def test_bootstrap_is_seed_deterministic(self, analyzer, long_straddle, real_returns):
+        kw = dict(n_paths=15, trading_days=10, seed=21,
+                  empirical_returns=real_returns)
+        a = analyzer.path_dependence_monte_carlo(long_straddle, 22000, 30 / 365, **kw)
+        b = analyzer.path_dependence_monte_carlo(long_straddle, 22000, 30 / 365, **kw)
+        assert a.mean_pnl == b.mean_pnl
+        assert a.worst_path_pnl == b.worst_path_pnl
+
+    def test_returns_rescaled_to_daily_vol(self, real_returns):
+        # WHY: the change is shape-only — the live gate already calibrates
+        # SCALE via daily_vol=rv/√365, and the bootstrap must respect that
+        # calibration, not resurrect the historical average vol level.
+        from risk_analyzer import RiskAnalyzer
+        rng = np.random.default_rng(5)
+        daily_vol = 0.02
+        scale = daily_vol / float(np.std(real_returns))
+        draws = np.concatenate([
+            scale * RiskAnalyzer._block_bootstrap_returns(rng, real_returns, 30, 5)
+            for _ in range(300)])
+        assert abs(float(np.std(draws)) - daily_vol) / daily_vol < 0.15
+
+    def test_generated_paths_are_demeaned(self):
+        # WHY (#160 review): the change must be SHAPE-only. Resampling raw
+        # returns with a drift would shift every path's central tendency (a
+        # location change), biasing worst_path/mean_pnl in trending windows.
+        # A strongly-drifted pool must still produce ~zero-mean daily draws.
+        from risk_analyzer import RiskAnalyzer
+        # Big positive drift (+0.5%/day) on top of small vol.
+        drifted = np.array([0.005 + 0.001 * ((-1) ** i) for i in range(40)])
+        assert drifted.mean() > 0.004          # the pool is heavily drifted
+        rng = np.random.default_rng(4)
+        daily_vol = 0.01
+        emp = drifted - drifted.mean()
+        scale = daily_vol / float(np.std(emp))
+        draws = np.concatenate([
+            scale * RiskAnalyzer._block_bootstrap_returns(rng, emp, 30, 5)
+            for _ in range(300)])
+        # Demeaned + rescaled: mean ≈ 0 (drift removed), std ≈ daily_vol.
+        assert abs(float(np.mean(draws))) < 0.1 * daily_vol
+        assert abs(float(np.std(draws)) - daily_vol) / daily_vol < 0.15
+
+    def test_bootstrap_report_mean_not_drift_shifted(self, analyzer, long_straddle):
+        # WHY: end-to-end — a driftful pool fed through the public API must not
+        # produce a systematically different mean_pnl than its demeaned twin
+        # (the demean happens inside path_dependence_monte_carlo).
+        rng_pool = np.random.default_rng(1).normal(0.004, 0.007, 40)  # +drift
+        kw = dict(n_paths=40, trading_days=10, seed=3)
+        drifted = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365, empirical_returns=rng_pool, **kw)
+        demeaned = analyzer.path_dependence_monte_carlo(
+            long_straddle, 22000, 30 / 365,
+            empirical_returns=rng_pool - rng_pool.mean(), **kw)
+        # Identical because the function demeans internally.
+        assert drifted.mean_pnl == demeaned.mean_pnl
+        assert drifted.worst_path_pnl == demeaned.worst_path_pnl
+
+    def test_real_tail_reaches_the_paths(self, real_returns):
+        # WHY (C4): the whole point — the −2.1% day must actually appear in
+        # generated paths at bootstrap frequency, where N(0, σ) at the same σ
+        # almost never produces it.
+        from risk_analyzer import RiskAnalyzer
+        rng = np.random.default_rng(9)
+        seen_tail = any(
+            float(np.min(RiskAnalyzer._block_bootstrap_returns(
+                rng, real_returns, 30, 5))) <= -0.021 + 1e-12
+            for _ in range(50))
+        assert seen_tail

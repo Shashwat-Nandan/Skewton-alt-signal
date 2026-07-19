@@ -3386,3 +3386,89 @@ class TestMarkingFallbacks:
         props = h._generate_close_all_proposals()
         assert len(props) == 1
         assert props[0].option_type == "PE"   # option close survived
+
+
+# ──────────────────────────────────────────────────────────
+# Issue #160 — MC path-source config + bootstrap return pool.
+# ──────────────────────────────────────────────────────────
+
+
+class TestMcPathSource:
+    def _hedger_with_config(self, value=None):
+        import configparser
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        cfg = configparser.ConfigParser()
+        cfg.add_section("strategy")
+        if value is not None:
+            cfg.set("strategy", "mc_path_source", value)
+        h.config = cfg
+        return h
+
+    def test_default_is_gbm(self):
+        # WHY: merge must change nothing until the operator opts in — the
+        # live hedger keeps the pre-#160 Gaussian gate by default
+        # (safety rule 3: paper validates bootstrap first).
+        assert self._hedger_with_config()._read_mc_path_source() == "gbm"
+
+    def test_bootstrap_opt_in(self):
+        assert (self._hedger_with_config("bootstrap")._read_mc_path_source()
+                == "bootstrap")
+
+    def test_typo_falls_back_to_gbm_not_crash(self, caplog):
+        # WHY: the entry path must not crash on a config typo, but the
+        # operator must SEE the intended source was not applied (Rule 12).
+        import logging as _logging
+        caplog.set_level(_logging.WARNING)
+        assert (self._hedger_with_config("boostrap")._read_mc_path_source()
+                == "gbm")
+        assert any("mc_path_source" in r.message for r in caplog.records)
+
+    def test_daily_return_pool_built_from_eod_snapshot(self, tmp_path, monkeypatch):
+        # WHY: the pool must come from the EOD snapshot rebuilt each session
+        # start — NOT the tick-appended _spot_history, whose 2000-sample cap
+        # would evict the daily anchors after a few live sessions and
+        # silently starve the bootstrap back to Gaussian. Each return must be
+        # dated by the day it is REALIZED (the second close) so the gate can
+        # exclude future returns on tape replay.
+        import datetime as _dt
+        import numpy as _np
+        import pandas as _pd
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        closes = [24000.0, 24240.0, 23997.6, 24100.0]
+        _pd.DataFrame({
+            "timestamp": [f"2026-07-{d:02d} 15:30:00" for d in range(1, 5)],
+            "underlying_price": closes,
+        }).to_csv(dc / "NIFTY_20260701_20260731_eod.csv", index=False)
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.underlying = "NIFTY"
+        h._spot_history = []
+        h._spot_history_max_size = 2000
+        h._daily_return_history = []
+        h._load_spot_history()
+        dates = [d for d, _ in h._daily_return_history]
+        rets = [r for _, r in h._daily_return_history]
+        assert dates == [_dt.date(2026, 7, 2), _dt.date(2026, 7, 3),
+                         _dt.date(2026, 7, 4)]
+        assert _np.allclose(rets, _np.diff(_np.log(_np.array(closes))))
+
+    def test_mc_empirical_returns_gbm_is_none_bootstrap_filters_future(self):
+        # WHY (#160 review): the gate pool must exclude returns dated on/after
+        # the current session — a no-op live, but the look-ahead guard that
+        # stops a tape replay of a past session from resampling its own
+        # future. And gbm must pass None so the risk path is byte-identical
+        # to pre-#160.
+        import datetime as _dt
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h._clock = lambda: datetime(2026, 7, 10, 9, 20)
+        h._daily_return_history = [
+            (_dt.date(2026, 7, 8), -0.021),
+            (_dt.date(2026, 7, 9), 0.004),
+            (_dt.date(2026, 7, 10), 0.010),   # same day — not yet knowable
+            (_dt.date(2026, 7, 13), -0.008),  # future
+        ]
+        h.immutable_params = {"mc_path_source": "gbm"}
+        assert h._mc_empirical_returns() is None
+        h.immutable_params = {"mc_path_source": "bootstrap"}
+        assert h._mc_empirical_returns() == [-0.021, 0.004]

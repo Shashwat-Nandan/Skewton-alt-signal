@@ -1,4 +1,77 @@
-# Taleb fitness-objective redesign — measure the edge, not the noise (PLAN 2026-07-18, NOT STARTED — awaiting operator sign-off)
+# MC entry-gate: block-bootstrap tape paths, replace Gaussian (issue #160, PLAN 2026-07-19 — awaiting operator sign-off)
+
+The Taleb live entry gates (mc_min_mean_pnl expectancy floor +
+mc_worst_path_loss_pct worst-path cap, taleb_karpathy.py ~705-760) run
+RiskAnalyzer.path_dependence_monte_carlo, whose paths are `rng.normal(0,
+daily_vol, 30)` shuffled per path — iid Gaussian. Since 2026-07-06 the SCALE
+(daily_vol) is calibrated to live realized vol; what stays synthetic is the
+SHAPE: no fat tails, no vol clustering. Audit C4 ("GBM-tuned edge"): the gate
+pass/fail is only loosely related to the distribution the book actually trades.
+
+## Facts gathered 2026-07-19
+- MC call site: n_paths=50, trading_days=max(int(T·365),5), daily_vol=rv/√365
+  (fallback 0.01 + loud log), deterministic seed.
+- `_spot_history` holds ~42 daily (ts, spot) samples IN MEMORY at gate time
+  (seeded from newest {u}_*_eod parquet at startup, appended live) → ~41 real
+  daily returns incl. the −2.12%/+1.99% tails. No I/O needed on the entry path.
+- Gate flow: mean_pnl < floor → reject; |worst_path| > cap → scale down or
+  reject if any leg would drop below 1 lot.
+
+## Design (pending two operator decisions below)
+- **A. Generator** (risk_analyzer): `path_dependence_monte_carlo(...,
+  empirical_returns=None, block_size=5, min_empirical=20)`. With ≥20 empirical
+  returns: circular block bootstrap — per path, sample random starting
+  indices, take consecutive blocks, concatenate to trading_days — preserving
+  clustering + fat tails. Rescale sampled returns to the SAME daily_vol the
+  call already passes (shape-only change; scale semantics identical to today,
+  clean A/B). Insufficient/None → current Gaussian, `path_source="gbm"` in
+  MonteCarloReport + loud log (fallback is labeled, Rule 12).
+- **B. Caller** (taleb_karpathy): build empirical_returns from _spot_history
+  log-returns; config `[strategy] mc_path_source` (IMMUTABLE param — the
+  autoresearch sweep must NOT be able to flip it), default `gbm` in code so
+  merge+deploy changes nothing until the operator enables `bootstrap`
+  per-config (paper first, live later — safety rule 3).
+- **C. Offline A/B + threshold report** (script, not live code): replay recent
+  tape sessions under both sources; diff entry decisions + MC stats
+  (mean/worst/VaR distributions). Output = the evidence pack for the operator
+  threshold decision (mc_min_mean_pnl / mc_worst_path_loss_pct stay UNTOUCHED
+  in this work — standing rule).
+- **D. Rollout** (operator): enable on NIFTY paper config → observe ≥1 week →
+  BANKNIFTY paper → live flip, each an explicit operator step.
+- Deferred (noted in issue): regime-stratified sampling; intraday blocks.
+
+## Checkable items
+- [x] Phase A (2026-07-19): `_block_bootstrap_returns` (circular consecutive
+      blocks) + `empirical_returns/block_size/min_empirical` params on
+      `path_dependence_monte_carlo` + `MonteCarloReport.path_source` + loud
+      thin-pool fallback. 6 Rule-9 tests (labeling, identical-fallback,
+      consecutive-slices, seed determinism, rescale-to-daily_vol, real tail
+      reaches paths).
+- [x] Phase B (2026-07-19): immutable `mc_path_source` (default gbm, validated,
+      typo→warn+gbm) + `_daily_return_history` pool built in
+      `_load_spot_history` from the EOD snapshot (NOT the tick-capped
+      _spot_history — 2000-sample eviction would starve the pool) + MC call
+      wiring. 4 tests. Full suite 1437 passed.
+- [x] Phase C script (2026-07-19): `scripts/mc_gate_ab_bootstrap.py` — replays
+      last N sessions under both sources (temp secrets config in system temp,
+      0600, deleted), diffs trades/P&L/gate rejections + MC distributions.
+      2-session smoke: same entries, bootstrap worst-path wider (−8,116 vs
+      −7,481), means shifted (+200 vs −1,088 on 07-16).
+- [x] Phase C evidence (2026-07-19, CORRECTED after review fixes, 10 sessions
+      07-06→07-17, table on PR #161): 4/10 differ; totals A(gbm) −17,539 vs
+      B(bootstrap) −8,507 (B +₹9,032, ~all from 07-10 alone — weak P&L
+      evidence, strong distribution evidence). B halved the 07-10 middle-short
+      loss (−16,377→−7,739) — SURVIVED the look-ahead fix (real). 07-13 flipped
+      bootstrap win→loss (−2,672→−5,118) once the gate lost future sight.
+      Distribution quality: gbm still produces POSITIVE "worst" paths
+      (+139,861 — cap blind); bootstrap worst-path always negative
+      [−131,288, −8,188]. (First run said B +11,478; it was look-ahead-biased.)
+- [ ] Phase D: operator rollout steps documented (docs/ + this file);
+      enable on NIFTY paper config → ≥1 week → BANKNIFTY → live (operator).
+
+---
+
+# Taleb fitness-objective redesign — measure the edge, not the noise (PLAN 2026-07-18, COMPLETE — Phases 0-4 merged: PRs #151/#152/#153/#154; follow-ups issues #159/#160)
 
 Weekly autoresearch is mechanically healthy but 8 weeks of candidates show NO
 convergence (see memory 2026-07-18): in-sample best fitness negative every week,
