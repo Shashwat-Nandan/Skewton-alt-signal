@@ -321,3 +321,24 @@
   tests they turn a missing fixture into a plausible-but-wrong run.
   When writing a strategy-level test, populate `_cached_futures` for
   every leg the strategy will touch, not just the entry legs.
+
+## Test against REAL serialized shapes, not assumed ones
+- Incident: the new `scripts/portfolio_view.py` (cross-strategy portfolio
+  view) shipped with reader tests that all passed, but a `/code-review`
+  found two crashes that fire only when a position is OPEN: the arbitrage
+  reader called `.values()` on `open_calendars` (serialized as a LIST,
+  arbitrage.py:550) and `collect()` iterated buy_on_gap `state.positions`
+  as a list (it is a DICT keyed by symbol, buy_on_gap.py:632).
+- Root cause: the tests fed fixtures built from a scoping *summary* of the
+  state shapes ("dict keyed by underlying") rather than the actual
+  serialize methods / on-disk files. The fabricated shapes matched the
+  reader's wrong assumption, so red never showed. The real state files
+  were FLAT at build time, so the live run didn't exercise the open path.
+- Rule: when a reader parses another module's persisted output, derive the
+  test fixture from that module's real `serialize`/`to_dict` (or a real
+  on-disk file with an open position), never from prose. If the live
+  artifact is empty, construct the open shape from the producer's code, not
+  from memory. Same family as the parity-gate rule — assert against the
+  producer, not against your assumption. Belt-and-suspenders for a
+  read-only tool: tolerate list-or-dict containers and isolate each source
+  so one shape change can't crash the whole view.

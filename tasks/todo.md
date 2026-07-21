@@ -1,3 +1,38 @@
+# Phase 2 — read-only portfolio view, PR 4 (2026-07-21)
+
+Report §4.5. Branch `research/portfolio-view`. First Phase 2 item; §4.4
+(exec events on bus) + §4.5b (live greeks/broker router) deferred.
+
+- [x] `scripts/portfolio_view.py` — cross-strategy net exposure per
+      underlying, read-only/offline (state JSON + dashboard.db), mirrors
+      strategy_scoreboard. Pure dict-in readers per shape (pair/kalman/
+      arbitrage/taleb/equity/gap/mp) + thin disk/DB loaders. Delta-1
+      (futures/equity) exact; OPTION delta EXCLUDED + flagged (needs live
+      spot → Phase 2b). Flags SHARED underlyings (>1 strategy = the
+      margin/exposure overlap no runner sees). `--json` output.
+- [x] `tests/test_portfolio_view.py` (9 cases: delta-1 netting, FLAT
+      no-leak, SHARED detection, option-delta-excluded, taleb underlying
+      from file identity, equity open-only, arbitrage leg grouping, json)
+- [x] Live run surfaced a REAL overlap: HCLTECH held by pair:baseline +
+      mp_trend simultaneously.
+- [x] /code-review high (14/14 verify): 2 REAL CRASHES caught (my tests
+      used fabricated shapes that masked them) — arbitrage open_calendars
+      is a LIST not dict (.values() crashed); buy_on_gap positions is a
+      DICT not list (iterated to symbol strings → crash); both only when a
+      position is open. Fixed via _as_list tolerance + real-shape tests.
+      Also: removed dead taleb FUT branch (confirms NO hedge double-count),
+      fixed 'arbitrage(?)' mode label, isolated each source in collect()
+      (loud-but-non-fatal per-source skip). LESSON: test against REAL
+      serialized shapes, not assumed ones (parity-gate principle).
+- [x] full suite green; PR (scripts/+tests/ only, read-only — not money path)
+
+Deferred Phase 2b (needs live spot / Kite): net OPTION delta by
+underlying via core.greeks_engine, and the broker-truth join
+(kite.positions() net bucket) — best as a backend /api/portfolio router
+(runs with quotes); §4.4 execution-events-on-bus separate PR.
+
+---
+
 # Phase 1 — equity cost-model migration, PR 3 (2026-07-21)
 
 Report §4.1. Branch `research/equity-cost-model`. Migrate varsity_swing
