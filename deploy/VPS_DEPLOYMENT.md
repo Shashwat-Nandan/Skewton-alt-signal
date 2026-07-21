@@ -7,6 +7,17 @@ This guide walks through deploying the Taleb dynamic hedger on a Linux VPS so th
 
 Both are driven by `systemd` timers. Cron is **not** used — the units in `deploy/` already cover the same job with better restart, logging, and timezone semantics.
 
+> **Repo renamed 2026-07-18 (issue #130):** the GitHub repo is now
+> **`skewton-signal`** (was `taleb-karpathy-kite`). The local git remote is
+> already updated, and GitHub 301-redirects the old URL, so nothing here is
+> broken. The GitHub repo name is **decoupled** from the install directory:
+> the `/opt/taleb-karpathy-kite` **template** path below and the production
+> host's actual `/root/algo-trading/taleb-karpathy-kite` checkout are
+> deliberately left unchanged — a repo rename does not require a directory
+> rename, and the units reference the directory, not the repo. If you clone
+> fresh, `git clone git@github.com:Skewton/skewton-signal.git .` into whatever
+> directory you use and keep the path substitution below consistent.
+
 ---
 
 ## 1. What runs and when

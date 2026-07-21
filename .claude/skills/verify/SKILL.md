@@ -3,7 +3,7 @@ name: verify
 description: How to exercise this repo's data loaders and backtest CLIs end-to-end on the deploy host (read-only surfaces, no Kite auth needed).
 ---
 
-# Verifying changes in taleb-karpathy-kite
+# Verifying changes in skewton-signal
 
 Env: `.venv/bin/python` (the systemd units use it too). This machine IS the
 deploy host — real market data lives in `data_cache/`.

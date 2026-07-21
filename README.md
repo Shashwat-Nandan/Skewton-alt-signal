@@ -1,4 +1,4 @@
-# taleb-karpathy-kite
+# skewton-signal
 
 Automated options-portfolio management for Indian derivatives via the
 Zerodha Kite API, built on Nassim Taleb's *Dynamic Hedging* framework
