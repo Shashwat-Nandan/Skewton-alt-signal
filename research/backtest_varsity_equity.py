@@ -14,17 +14,18 @@ Walk the OHLCV panel one trading day at a time. On each date:
 
 Costs
 -----
-Round-trip fees applied on each completed trade:
-  * Brokerage: free (Zerodha delivery flat 0)
-  * STT delivery sell-side: 0.1 %
-  * Exchange tx + SEBI + GST stack: ~0.0035 % each side
+Costs come from the shared ``core.costs.estimate_equity_cost`` DELIVERY
+model — the SAME function the paper runner books, so backtest and paper
+never diverge (Rule 7, §4.1). Statutory Zerodha CNC charges:
+  * Brokerage: free (Zerodha delivery)
+  * STT: 0.1 % on BOTH buy and sell (the crux — a flat round-trip % could
+    not express this; the old 0.20 % constant undercounted it)
+  * Exchange tx (NSE) + SEBI + GST stack
   * Stamp duty (buy): 0.015 %
-  * Slippage: 0.05 % each side (configurable)
+  * Slippage: ``--slippage-bps`` per side (default 5 bps), the one
+    modelling assumption, kept separate from the statutory charges.
 
-Total RT cost ≈ **0.20 %** of notional, applied symmetrically. This is
-generous compared to live execution but matches the Varsity calendar lesson
-(`tasks/lessons.md`): err on the conservative side so the backtest never
-flatters live results.
+Delivery round-trip works out to ≈ 0.22 % statutory + slippage.
 
 Scoring sentinels
 -----------------
@@ -66,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 ZERO_TRADE_PENALTY = -1e6
 
-ROUND_TRIP_COST_PCT = 0.20  # 0.10% sell STT + ~0.10% slippage+GST/exchange/stamp
+DEFAULT_SLIPPAGE_BPS = 5.0  # per side; statutory charges from core.costs
 
 
 @dataclass
@@ -96,10 +97,9 @@ class EquityBacktester:
         self,
         panel: pd.DataFrame,
         params_overrides: Optional[Dict] = None,
-        cost_pct: float = ROUND_TRIP_COST_PCT,
+        slippage_bps: Optional[float] = None,
     ):
         self.panel = panel
-        self.cost_pct = cost_pct
 
         class _NullKite:
             pass
@@ -109,6 +109,11 @@ class EquityBacktester:
         )
         if params_overrides:
             self.strategy.params.update(params_overrides)
+        if slippage_bps is not None:
+            self.strategy.params["slippage_bps"] = slippage_bps
+        # Backtest and paper share the strategy's cost model (Rule 7): the
+        # exit/entry cost below both route through self.strategy._cost, so a
+        # cost change lands in both paths at once.
         self.strategy.set_panel(panel, sorted(panel["symbol"].unique().tolist()))
         self.strategy._ensure_features()
 
@@ -167,9 +172,9 @@ class EquityBacktester:
                 if gap_atr > PENDING_GAP_ATR_THRESHOLD:
                     self.n_skipped_gap += 1
                     continue
-            # cost on entry
+            # cost on entry (shared delivery model — Rule 7 parity w/ paper)
             notional = open_px * proposal.quantity
-            entry_cost = notional * self.cost_pct / 200.0  # half RT on entry
+            entry_cost = self.strategy._cost(open_px, proposal.quantity, "BUY")
             cash -= notional + entry_cost
             # rebuild SL/target around the actual fill (not yesterday's close)
             k_sl = self.strategy.params["atr_stop_multiplier"]
@@ -214,14 +219,12 @@ class EquityBacktester:
                     continue
                 exit_px = ex.price
                 notional_exit = exit_px * pos.qty
-                exit_cost = notional_exit * self.cost_pct / 200.0  # half RT on exit
+                exit_cost = self.strategy._cost(exit_px, pos.qty, "SELL")
                 cash += notional_exit - exit_cost
                 gross_pnl = (exit_px - pos.entry_px) * pos.qty
-                costs = (pos.entry_px * pos.qty + exit_px * pos.qty) * self.cost_pct / 200.0 * 2
-                net_pnl = gross_pnl - (
-                    pos.entry_px * pos.qty * self.cost_pct / 200.0
-                    + exit_px * pos.qty * self.cost_pct / 200.0
-                )
+                entry_cost = self.strategy._cost(pos.entry_px, pos.qty, "BUY")
+                costs = entry_cost + exit_cost  # true round-trip (was 2x-inflated)
+                net_pnl = gross_pnl - costs
                 holding = self.strategy._trading_days_between(pos.entry_dt, dt)
                 risk_at_entry = (pos.entry_px - pos.initial_sl) * pos.qty
                 rmult = (net_pnl / risk_at_entry) if risk_at_entry > 0 else 0.0
@@ -229,6 +232,7 @@ class EquityBacktester:
                 pos.exit_px = exit_px
                 pos.exit_reason = (ex.greeks_snapshot or {}).get("exit_reason", "MANUAL")
                 pos.pnl = net_pnl
+                pos.costs = costs
                 pos.status = "CLOSED"
                 self.strategy.closed_positions.append(pos)
                 self.trade_log.append(TradeRecord(
@@ -314,6 +318,7 @@ class EquityBacktester:
             "avg_holding_days": round(avg_hold, 2),
             "gross_pnl": round(gross, 2),
             "net_pnl": round(net, 2),
+            "transaction_costs": round(sum(t.costs for t in self.trade_log), 2),
             "sharpe": round(float(sharpe), 3),
             "max_drawdown_pct": round(max_dd * 100, 2),
             "cagr_pct": round(cagr * 100, 2),
@@ -371,7 +376,9 @@ def main():
     p.add_argument("--atr-stop", type=float, default=None)
     p.add_argument("--rr", type=float, default=None)
     p.add_argument("--time-stop", type=int, default=None)
-    p.add_argument("--cost-pct", type=float, default=ROUND_TRIP_COST_PCT)
+    p.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS,
+                   help="Modelled slippage per side, bps of turnover (default 5.0); "
+                        "statutory delivery charges come from core.costs")
     p.add_argument("--mp", choices=["off", "on"], default="on",
                    help="Phase-2 Market Profile gate (default: on)")
     p.add_argument("--oi", choices=["off", "on"], default="off",
@@ -405,7 +412,7 @@ def main():
     overrides["mp_enabled"] = 1 if args.mp == "on" else 0
     overrides["oi_enabled"] = 1 if args.oi == "on" else 0
 
-    bt = EquityBacktester(panel, params_overrides=overrides, cost_pct=args.cost_pct)
+    bt = EquityBacktester(panel, params_overrides=overrides, slippage_bps=args.slippage_bps)
     summary = bt.run()
 
     print("=" * 78)
@@ -421,7 +428,7 @@ def main():
           f"{bt.strategy.params['risk_reward']:.1f}")
     print(f"  MP gate / OI gate : {'on ' if args.mp == 'on' else 'off'} / "
           f"{'on ' if args.oi == 'on' else 'off'}")
-    print(f"  Round-trip cost   : {args.cost_pct:.2f} %")
+    print(f"  Slippage/side     : {args.slippage_bps:.1f} bps  (+ statutory delivery charges)")
     print("-" * 78)
     if summary["total_trades"] == 0:
         print(f"  No trades fired. Score sentinel: {summary['score']}")

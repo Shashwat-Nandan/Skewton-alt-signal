@@ -36,7 +36,7 @@ class _NullKite:
 TEST_PARAMS = {
     "std_window": 10, "ma_window": 10, "min_avg_turnover_cr": 1.0,
     "gap_std_mult": 1.0, "max_positions": 5, "stop_loss_pct": 5.0,
-    "cost_pct": 0.10, "total_capital": 1_000_000.0,
+    "slippage_bps": 5.0, "total_capital": 1_000_000.0,
 }
 
 
@@ -253,7 +253,7 @@ class TestExit:
         pos = GapPosition(symbol="AAA", entry_dt=pd.Timestamp("2024-02-01"),
                           entry_px=100.0, qty=100, stop_px=95.0, gap_ret=-0.03,
                           gap_z=-1.5, rationale="x")
-        s = _strategy({"cost_pct": 0.10})
+        s = _strategy({"slippage_bps": 0.0})  # statutory charges only, deterministic
         s.positions["AAA"] = pos
         s._force_close = True
         s.set_current_date(pd.Timestamp("2024-02-01"))
@@ -262,11 +262,15 @@ class TestExit:
         exits = s.check_and_rehedge()
         assert len(exits) == 1 and exits[0].transaction_type == "SELL"
         s.execute_proposals(exits)
-        # gross = (103-100)*100 = 300; cost = 0.10% of notional, half each leg:
-        # entry 100*100*0.0005=5, exit 103*100*0.0005=5.15 → net ≈ 289.85
+        # net pnl = gross − (entry + exit) cost from the SHARED equity model;
+        # the sell leg carries the intraday STT the buy leg does not (§4.1).
+        from core.costs import estimate_equity_cost
+        entry_c = estimate_equity_cost(100.0, 100, "BUY", "intraday", slippage_bps=0.0)
+        exit_c = estimate_equity_cost(103.0, 100, "SELL", "intraday", slippage_bps=0.0)
         closed = s.closed_positions[0]
         assert closed.exit_reason == "CLOSE"
-        assert closed.pnl == pytest.approx(300 - 5 - 5.15, abs=0.01)
+        assert closed.pnl == pytest.approx(300 - entry_c - exit_c, abs=0.01)
+        assert exit_c > entry_c  # sell-side STT makes the exit leg dearer
 
     def test_catastrophic_stop_takes_priority(self):
         pos = GapPosition(symbol="AAA", entry_dt=pd.Timestamp("2024-02-01"),

@@ -322,6 +322,36 @@ class TestPositionStateMachine:
         assert exits[0].greeks_snapshot["exit_reason"] == "MANUAL"
         assert exits[0].price == 100.0  # flattened at close
 
+    def test_paper_exit_books_net_of_delivery_cost(self):
+        """Pre-migration, varsity paper booked GROSS P&L (zero cost) while the
+        backtest charged cost_pct — paper overstated returns and diverged from
+        the backtest (§4.1 zero-cost-in-paper class). Now the paper exit nets
+        the shared delivery round-trip cost, and the sign matters: on a small
+        gross win the delivery STT (0.1% both sides) can flip it to a net
+        loss."""
+        from core.costs import estimate_equity_cost
+        from core.trade_proposer import TradeProposal
+
+        def _prop(px, side):
+            return TradeProposal(
+                tradingsymbol="AAA", instrument_token=0, strike=0.0, expiry="",
+                option_type="EQ", lot_size=1, quantity=100, price=px,
+                transaction_type=side, iv=0.0, bid_ask_spread_pct=0.0,
+                margin_required=0.0, rationale="t",
+                greeks_snapshot={"sl": 95.0, "target": 110.0, "atr": 2.0,
+                                 "exit_reason": "TARGET_HIT"},
+            )
+        s = self._exit_ready_strategy()  # slippage_bps default 5.0
+        s.set_current_date(pd.Timestamp("2025-01-02"))
+        s._paper_execute(_prop(100.0, "BUY"))
+        s._paper_execute(_prop(101.0, "SELL"))
+        pos = s.closed_positions[0]
+        entry_c = estimate_equity_cost(100.0, 100, "BUY", "delivery", slippage_bps=5.0)
+        exit_c = estimate_equity_cost(101.0, 100, "SELL", "delivery", slippage_bps=5.0)
+        assert pos.pnl == pytest.approx(100.0 - entry_c - exit_c, abs=0.01)
+        assert pos.costs == pytest.approx(entry_c + exit_c, abs=0.01)
+        assert pos.pnl < 100.0  # NET is below the ₹100 gross — costs are booked
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Integration: backtest end-to-end

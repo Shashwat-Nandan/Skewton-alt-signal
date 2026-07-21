@@ -1,3 +1,36 @@
+# Phase 1 — equity cost-model migration, PR 3 (2026-07-21)
+
+Report §4.1. Branch `research/equity-cost-model`. Migrate varsity_swing
++ buy_on_gap off their per-strategy flat cost_pct onto one shared
+`core.costs.estimate_equity_cost` (delivery vs intraday), rates verified
+against zerodha.com/charges 2026-07-21.
+
+- [x] `core.costs.estimate_equity_cost(price, qty, side, product,
+      slippage_bps)` — itemised statutory Zerodha charges (STT 0.1%
+      both-side DELIVERY vs 0.025% sell-only INTRADAY is the crux a flat
+      % can't express) + separate slippage; +7 tests
+- [x] buy_on_gap: `_cost(price,qty,side)` → intraday model; cost_pct →
+      slippage_bps (default 5); backtest CLI --cost-pct → --slippage-bps
+- [x] varsity: fixed the PAPER ZERO-COST BUG (paper booked gross P&L,
+      backtest charged cost_pct → divergence + overstated forward P&L);
+      `_cost` delivery model in _paper_execute AND backtester (Rule 7 one
+      path); EquityPosition.costs field; net/gross/costs in EOD report +
+      backtest summary; fixed the backtest's 2x-inflated costs field
+- [x] Disclosed deltas (584d NIFTY200 / gap universe), MODEST (not
+      sign-flipping): varsity net +80,305 → +68,669 (delivery ~0.22%+slip
+      > old flat 0.20%; sharpe 0.56→0.49, trades unchanged 125);
+      buy_on_gap net −70,997 → −76,110 (costs 85,274→90,387, trades 286).
+- [x] full suite 1511 passed (fixed a missed caller: test_backtest_eq_
+      pending_filters used EquityBacktester(cost_pct=) + a zero-cost cash
+      assertion — both migrated)
+- [x] /code-review high (13/13 verify): 3 CONFIRMED, all fixed —
+      config_template cost_pct→slippage_bps (silent-drop), stale
+      --cost-pct docstring, removed write-only self.transaction_costs
+      accumulator (generate_eod_report already sums pos.costs)
+- [ ] PR (touches strategies/ → rule 5 review)
+
+---
+
 # Phase 1 — intra-bar open-aware exits, PR 2 (2026-07-21)
 
 Report §4.7; branch `research/intrabar-exits`. PR 1 (#168) MERGED = 0ffebe0.

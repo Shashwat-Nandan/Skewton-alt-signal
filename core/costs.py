@@ -1,9 +1,11 @@
-"""Canonical Indian F&O transaction-cost model.
+"""Canonical Indian transaction-cost model (F&O + equity cash).
 
 Single home for cost estimation shared by every strategy and research
-harness (moved verbatim from ``strategies/taleb_karpathy.py`` 2026-07-21;
-that module re-exports these names — see
-docs/research/nautilustrader-evaluation-2026-07-21.md §4.1).
+harness (F&O function moved verbatim from ``strategies/taleb_karpathy.py``
+2026-07-21; that module re-exports it — see
+docs/research/nautilustrader-evaluation-2026-07-21.md §4.1). Equity-cash
+model added 2026-07-21 for the varsity-swing / buy-on-gap migration off
+their per-strategy flat cost_pct.
 
 Import convention (Rule 7 — one monkeypatch target, not two): code on the
 strategy plane (``strategies/``, ``runners/``) keeps importing via
@@ -94,3 +96,67 @@ def estimate_transaction_cost(
         slippage = turnover * 0.0005  # 0.05%
 
     return brokerage + stt + exchange_charges + sebi + gst + stamp + slippage
+
+
+# NSE equity-cash exchange transaction charge ≈ ₹297/cr = 0.00297% of
+# turnover (NSE cash segment, verified via zerodha.com/charges 2026-07-21).
+# BSE and some scrip categories differ; exposed as a parameter for those.
+_NSE_EQUITY_EXCHANGE_RATE = 0.0000297
+
+
+def estimate_equity_cost(
+    price: float, quantity: int, transaction_type: str,
+    product: str = "delivery",
+    slippage_bps: float = 0.0,
+    exchange_rate: float = _NSE_EQUITY_EXCHANGE_RATE,
+) -> float:
+    """Estimate per-ORDER transaction cost for an Indian equity-cash trade.
+
+    Itemises the statutory Zerodha charges (brokerage, STT, exchange txn,
+    SEBI, GST, stamp duty) plus an optional slippage allowance. Rates
+    verified against zerodha.com/charges on 2026-07-21.
+
+    The STT asymmetry is the whole point of routing both equity strategies
+    through one function (§4.1): DELIVERY pays STT 0.1% on BOTH sides,
+    INTRADAY pays STT 0.025% on the SELL side only. Getting that wrong (as
+    a flat round-trip % does) silently mis-grades every swing/gap backtest.
+
+    Args:
+        price: per-share price.
+        quantity: number of shares (always positive).
+        transaction_type: "BUY" or "SELL".
+        product: "delivery"/"CNC" (multi-day swing, e.g. varsity) or
+            "intraday"/"MIS" (same-day, e.g. buy_on_gap).
+        slippage_bps: modelled slippage for THIS side, in basis points of
+            turnover (a modelling assumption, kept separate from the
+            statutory charges; the caller owns it).
+        exchange_rate: exchange transaction-charge fraction (default NSE).
+
+    Returns:
+        Total estimated cost for this one order in INR (always >= 0).
+    """
+    turnover = price * quantity
+    if turnover <= 0:
+        return 0.0
+    is_buy = transaction_type == "BUY"
+
+    if product in ("delivery", "CNC"):
+        brokerage = 0.0  # Zerodha equity delivery is brokerage-free
+        stt = turnover * 0.001  # 0.10% on BOTH buy and sell
+        stamp = turnover * 0.00015 if is_buy else 0.0  # 0.015% buy side
+    elif product in ("intraday", "MIS"):
+        brokerage = min(20.0, turnover * 0.0003)  # ₹20 or 0.03%, lower
+        stt = 0.0 if is_buy else turnover * 0.00025  # 0.025% SELL side only
+        stamp = turnover * 0.00003 if is_buy else 0.0  # 0.003% buy side
+    else:
+        raise ValueError(
+            f"unknown equity product {product!r}; expected "
+            "'delivery'/'CNC' or 'intraday'/'MIS'"
+        )
+
+    exchange = turnover * exchange_rate
+    sebi = turnover * 0.000001  # ₹10 per crore
+    gst = (brokerage + exchange + sebi) * 0.18  # 18% on brokerage+exchange+SEBI
+    slippage = turnover * slippage_bps / 1e4
+
+    return brokerage + stt + exchange + sebi + gst + stamp + slippage

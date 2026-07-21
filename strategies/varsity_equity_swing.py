@@ -40,6 +40,7 @@ from typing import Dict, List, Literal, Optional
 
 import pandas as pd
 
+from core.costs import estimate_equity_cost
 from core.intrabar import adjudicate_long_exit
 from core.trade_proposer import TradeProposal
 
@@ -81,7 +82,8 @@ class EquityPosition:
     exit_dt: Optional[pd.Timestamp] = None
     exit_px: Optional[float] = None
     exit_reason: Optional[ExitReason] = None
-    pnl: float = 0.0
+    pnl: float = 0.0  # NET of round-trip costs once closed
+    costs: float = 0.0  # round-trip transaction cost booked at close
 
     def __post_init__(self):
         if self.current_sl == 0.0:
@@ -110,6 +112,7 @@ class EquityPosition:
             "exit_px": round(self.exit_px, 2) if self.exit_px is not None else None,
             "exit_reason": self.exit_reason,
             "pnl": round(self.pnl, 2),
+            "costs": round(self.costs, 2),
             "rationale": self.rationale,
         }
 
@@ -162,6 +165,8 @@ class VarsityEquitySwingStrategy(BaseStrategy):
         "volume_surge_multiple":  1.5,          # vol > k * 20d avg = surge
         "min_avg_turnover_cr":    50.0,         # ₹ crore daily turnover (20d median)
         "trail_activate_R":       1.0,          # activate Chandelier once unrealised >= R*risk
+        "slippage_bps":           5.0,          # modelled slippage per side (bps of turnover);
+                                                # statutory delivery charges come from core.costs
         # Phase 2 — Market Profile gate (volume-weighted value area, daily bars)
         # Default OFF: backtest 2026-05-10 showed neutral-to-slightly-negative
         # Sharpe contribution on the 125-day STF-proxy archive (lessons.md
@@ -526,6 +531,15 @@ class VarsityEquitySwingStrategy(BaseStrategy):
             ))
         return proposals
 
+    def _cost(self, price: float, qty: int, side: str) -> float:
+        """Per-leg DELIVERY cost via the shared equity model (core.costs):
+        statutory Zerodha CNC charges (STT 0.1% both sides) + configured
+        slippage. One function for paper and backtest (§4.1)."""
+        return estimate_equity_cost(
+            price, qty, side, product="delivery",
+            slippage_bps=self.params["slippage_bps"],
+        )
+
     def check_and_rehedge(self) -> List[TradeProposal]:
         """Walk open positions; emit exit proposals for SL/target/time-stop/trail."""
         self._ensure_features()
@@ -670,7 +684,14 @@ class VarsityEquitySwingStrategy(BaseStrategy):
             pos.exit_dt = self._current_date
             pos.exit_px = proposal.price
             pos.exit_reason = snap.get("exit_reason", "MANUAL")
-            pos.pnl = (proposal.price - pos.entry_px) * pos.qty
+            # Book BOTH legs' delivery costs (recomputed at close so a restart
+            # mid-hold can't drop the entry leg). Pre-fix this was gross P&L
+            # with zero costs — paper overstated returns and diverged from the
+            # backtest (§4.1 zero-cost-in-paper class).
+            entry_cost = self._cost(pos.entry_px, pos.qty, "BUY")
+            exit_cost = self._cost(pos.exit_px, pos.qty, "SELL")
+            pos.costs = entry_cost + exit_cost
+            pos.pnl = (proposal.price - pos.entry_px) * pos.qty - pos.costs
             pos.status = "CLOSED"
             self.closed_positions.append(pos)
             logger.info("[PAPER CLOSE] %s qty=%d @ ₹%.2f reason=%s pnl=₹%s",
@@ -683,7 +704,10 @@ class VarsityEquitySwingStrategy(BaseStrategy):
         n_closed = len(self.closed_positions)
         wins = [p for p in self.closed_positions if p.pnl > 0]
         losses = [p for p in self.closed_positions if p.pnl <= 0]
-        gross_pnl = sum(p.pnl for p in self.closed_positions)
+        # p.pnl is NET of costs; reconstruct gross = net + booked costs.
+        net_pnl = sum(p.pnl for p in self.closed_positions)
+        total_costs = sum(p.costs for p in self.closed_positions)
+        gross_pnl = net_pnl + total_costs
         unrealised = sum((p.last_mtm_px - p.entry_px) * p.qty for p in self.positions.values())
         avg_hold = (sum(self._trading_days_between(p.entry_dt, p.exit_dt) for p in self.closed_positions if p.exit_dt) /
                     n_closed if n_closed else 0.0)
@@ -698,6 +722,8 @@ class VarsityEquitySwingStrategy(BaseStrategy):
             "closed_count": n_closed,
             "win_rate": round(win_rate, 4),
             "gross_pnl": round(gross_pnl, 2),
+            "net_pnl": round(net_pnl, 2),
+            "transaction_costs": round(total_costs, 2),
             "unrealised_pnl": round(unrealised, 2),
             "avg_hold_days": round(avg_hold, 2),
             "avg_win": round(avg_win, 2),

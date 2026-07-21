@@ -20,10 +20,11 @@ intraday print can fill the stop.
 
 Costs
 -----
-Round-trip intraday cost (default 0.15 % of notional, applied half on entry,
-half on exit) is booked inside the strategy's paper-execute path, so the
+Intraday costs come from the shared ``core.costs.estimate_equity_cost``
+model (statutory Zerodha MIS charges — STT 0.025 % sell-side only — plus
+per-side slippage), booked inside the strategy's paper-execute path, so the
 backtest P&L already nets costs — identical accounting to the live paper runner
-(Rule 7). Override with ``--cost-pct``.
+(Rule 7). Tune slippage with ``--slippage-bps`` (default 5 bps/side).
 
 Scoring sentinel
 ----------------
@@ -195,8 +196,9 @@ def main():
     p.add_argument("--no-trend-filter", action="store_true",
                    help="Disable the 'open above long MA' refinement")
     p.add_argument("--stop-loss-pct", type=float, default=None)
-    p.add_argument("--cost-pct", type=float, default=None,
-                   help="Round-trip cost %% of notional (default 0.15)")
+    p.add_argument("--slippage-bps", type=float, default=None,
+                   help="Modelled slippage per side, bps of turnover (default 5.0); "
+                        "statutory intraday charges come from core.costs")
     p.add_argument("--ledger-out", default="data_cache/buy_on_gap_trades.tsv")
     p.add_argument("--report-json", default=None)
     p.add_argument("--quiet", action="store_true")
@@ -223,7 +225,7 @@ def main():
     if args.ma_window is not None:     overrides["ma_window"] = args.ma_window
     if args.no_trend_filter:           overrides["use_trend_filter"] = 0
     if args.stop_loss_pct is not None: overrides["stop_loss_pct"] = args.stop_loss_pct
-    if args.cost_pct is not None:      overrides["cost_pct"] = args.cost_pct
+    if args.slippage_bps is not None:  overrides["slippage_bps"] = args.slippage_bps
 
     bt = BuyOnGapBacktester(panel, params_overrides=overrides)
     summary = bt.run()
@@ -239,7 +241,7 @@ def main():
     print(f"  Trend filter      : {'on (open > %d-MA)' % int(pr['ma_window']) if int(pr['use_trend_filter']) else 'off'}")
     print(f"  Max positions/day : {int(pr['max_positions'])}  (equal-weight, {pr['max_gross_exposure_pct']:.0f}% gross)")
     print(f"  Catastrophic stop : {pr['stop_loss_pct']:.1f}% below entry")
-    print(f"  Round-trip cost   : {pr['cost_pct']:.2f} %")
+    print(f"  Slippage/side     : {pr['slippage_bps']:.1f} bps  (+ statutory MIS charges)")
     print("-" * 78)
     if summary["total_trades"] == 0:
         print(f"  No trades fired. Score sentinel: {summary['score']}")

@@ -58,6 +58,7 @@ from typing import Dict, List, Literal, Optional
 
 import pandas as pd
 
+from core.costs import estimate_equity_cost
 from core.trade_proposer import TradeProposal
 
 from ._eq_data import load_equity_panel
@@ -176,7 +177,8 @@ class BuyOnGapStrategy(BaseStrategy):
         "max_gap_down_pct":       20.0,         # skip blowups (news/halt) gap < -this%
         "stop_loss_pct":          5.0,          # catastrophic intraday stop (% below entry)
         "min_avg_turnover_cr":    50.0,         # ₹ crore, 20d median — liquidity gate
-        "cost_pct":               0.15,         # round-trip intraday cost, % of notional
+        "slippage_bps":           5.0,          # modelled slippage per side (bps of turnover);
+                                                # statutory intraday charges come from core.costs
     }
 
     def __init__(self, kite, config_path: str = "config.ini", mode: Optional[str] = None):
@@ -523,15 +525,21 @@ class BuyOnGapStrategy(BaseStrategy):
                 results.append(self._paper_execute(proposal))
         return results
 
-    def _cost(self, notional: float) -> float:
-        """Half the round-trip cost (applied on each of entry and exit)."""
-        return notional * self.params["cost_pct"] / 100.0 / 2.0
+    def _cost(self, price: float, qty: int, side: str) -> float:
+        """Per-leg intraday cost via the shared equity model (core.costs):
+        statutory Zerodha MIS charges + configured slippage. Replaces the
+        old flat round-trip cost_pct — the STT here is sell-side-only, which
+        the flat % could not express (§4.1)."""
+        return estimate_equity_cost(
+            price, qty, side, product="intraday",
+            slippage_bps=self.params["slippage_bps"],
+        )
 
     def _paper_execute(self, proposal: TradeProposal) -> Dict:
         sym = proposal.tradingsymbol
         if proposal.transaction_type == "BUY":
             snap = proposal.greeks_snapshot or {}
-            cost = self._cost(proposal.price * proposal.quantity)
+            cost = self._cost(proposal.price, proposal.quantity, "BUY")
             self.transaction_costs += cost
             self.realized_pnl -= cost  # entry cost realized immediately
             pos = GapPosition(
@@ -554,7 +562,7 @@ class BuyOnGapStrategy(BaseStrategy):
                 logger.warning("paper exit for %s but no open position", sym)
                 return {"status": "NO_POSITION", "tradingsymbol": sym}
             snap = proposal.greeks_snapshot or {}
-            cost = self._cost(proposal.price * pos.qty)
+            cost = self._cost(proposal.price, pos.qty, "SELL")
             self.transaction_costs += cost
             gross = (proposal.price - pos.entry_px) * pos.qty
             self.realized_pnl += gross - cost
@@ -563,7 +571,7 @@ class BuyOnGapStrategy(BaseStrategy):
             pos.exit_reason = snap.get("exit_reason", "MANUAL")
             # Net P&L of this trade: gross minus BOTH legs' costs (entry cost was
             # booked at open; record it on the position for the ledger).
-            entry_cost = self._cost(pos.entry_px * pos.qty)
+            entry_cost = self._cost(pos.entry_px, pos.qty, "BUY")
             pos.pnl = gross - cost - entry_cost
             pos.status = "CLOSED"
             self.closed_positions.append(pos)
@@ -657,6 +665,6 @@ class BuyOnGapStrategy(BaseStrategy):
         from .base import reconcile_ledger
         ledger = (
             sum(p.pnl for p in self.closed_positions)
-            - sum(self._cost(p.entry_px * p.qty) for p in self.positions.values())
+            - sum(self._cost(p.entry_px, p.qty, "BUY") for p in self.positions.values())
         )
         reconcile_ledger(self.realized_pnl, ledger, logger, self.name)

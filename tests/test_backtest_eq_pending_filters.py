@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import pandas as pd
+import pytest
 
 from research.backtest_varsity_equity import EquityBacktester
 from strategies.varsity_equity_swing import (
@@ -44,7 +45,7 @@ def _build_panel(symbol: str, rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def _make_backtester(panel: pd.DataFrame) -> EquityBacktester:
-    bt = EquityBacktester(panel=panel, cost_pct=0.0)
+    bt = EquityBacktester(panel=panel, slippage_bps=0.0)
     bt.strategy.set_panel(panel, sorted(panel["symbol"].unique().tolist()))
     bt.strategy._ensure_features()
     return bt
@@ -181,8 +182,11 @@ def test_fill_decrements_cash_and_books_position():
     fill_dt = pd.Timestamp("2026-05-05")
     new_cash = bt._fill_queued(fill_dt, [(prop, signal_dt)],
                                 cash=1_000_000.0)
-    # 10 shares × 1010 = 10_100 → cash drops by that (cost_pct=0 in fixture)
-    assert new_cash == 1_000_000.0 - 10_100.0
+    # 10 shares × 1010 = 10_100 notional + the statutory delivery entry cost
+    # (slippage_bps=0 in the fixture, but STT/stamp/exchange are never zero).
+    from core.costs import estimate_equity_cost
+    entry_cost = estimate_equity_cost(1010.0, 10, "BUY", "delivery", slippage_bps=0.0)
+    assert new_cash == pytest.approx(1_000_000.0 - 10_100.0 - entry_cost)
     pos = bt.strategy.positions["INFY"]
     assert pos.entry_px == 1010.0
     assert pos.qty == 10
