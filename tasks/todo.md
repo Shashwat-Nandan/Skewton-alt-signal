@@ -1,3 +1,24 @@
+# NautilusTrader evaluation — research report (2026-07-21)
+
+- [x] Research NautilusTrader docs (architecture, backtesting, execution, live,
+      data, orders, portfolio, message bus, cache, adapters, greeks, license)
+- [x] Ground comparison in current repo internals (runner loop, executor,
+      backtest harnesses, state, signal_plane, risk)
+- [x] Write report → `docs/research/nautilustrader-evaluation-2026-07-21.md`
+
+**Review:** Verdict = do NOT migrate (no Kite adapter; proven money-path
+guards; Rule 7 / backtest-libs precedent). Adopt 8 ideas incrementally,
+ranked in report §4; top three: (1) shared `research/engine/`
+CostModel + MockBroker across the ~10 bespoke harnesses, (2) dual
+timestamps `ts_event`/`ts_init` on tape capture, (3) continuous execution
+reconciliation (in-flight-unresolved ledger, trade_id dedup, external-order
+adoption — money path, CODEOWNERS). Phased sequencing in report §7;
+SaaS-plane read-across (BrokerAdapter = 3-part adapter decomposition,
+reconciliation report types, REDUCING kill-switch semantic) in §5. No code
+changed in this session.
+
+---
+
 # Root-directory reorganisation (2026-07-19)
 
 Move the 65 tracked root `.py` modules into topical top-level packages and
