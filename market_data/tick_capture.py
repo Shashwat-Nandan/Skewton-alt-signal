@@ -191,10 +191,20 @@ def on_ticks(ws, ticks):
         except Exception as e:
             _LOG.warning("ws.close() in on_ticks failed: %s", e)
         return
+    # Dual-timestamp discipline (NautilusTrader eval §4.2): Kite's
+    # exchange_timestamp is the event time; ts_recv_ns is when WE received
+    # the tick (epoch ns, one stamp per callback batch — ticks in a batch
+    # arrive together). The pair makes feed latency and clock skew
+    # measurable per record, and lets parse-time validation distinguish a
+    # bad exchange clock (the 1970 epoch-zero bins that OOMed the
+    # 2026-07-06 sweep) from a bad local clock. Raw capture never drops a
+    # tick for a bad timestamp — filtering stays a parse-time decision.
+    ts_recv_ns = time.time_ns()
     with _OUT_LOCK:
         for t in ticks:
             tok = t.get("instrument_token")
             t["tradingsymbol"] = _TOKEN_TO_SYMBOL.get(tok, "?")
+            t["ts_recv_ns"] = ts_recv_ns
             _OUT_FILE.write(json.dumps(_serialise(t), default=str) + "\n")
             _TICK_COUNT += 1
         _OUT_FILE.flush()

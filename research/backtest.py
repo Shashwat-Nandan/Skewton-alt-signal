@@ -341,6 +341,14 @@ _TAPE_PARQUET_COLUMNS = {
     "oi_day_low": "BIGINT",
     "exchange_timestamp": "TIMESTAMP",
     "tradingsymbol": "VARCHAR",
+    # Local receive time, epoch ns (capture adds it from 2026-07-21). With
+    # exchange_timestamp this makes latency/clock-skew measurable per record —
+    # see tick_capture.on_ticks. Older JSONL/zst tapes read NULL via these
+    # declared columns, but parquet tapes archived BEFORE this date lack the
+    # column entirely and their raw JSONL is retention-deleted (cannot be
+    # reconverted) — a multi-session read_parquet over the archive must pass
+    # union_by_name=true or it will Binder-Error on those files.
+    "ts_recv_ns": "BIGINT",
 }
 
 

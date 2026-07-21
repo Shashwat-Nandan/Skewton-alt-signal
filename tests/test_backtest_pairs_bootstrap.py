@@ -20,7 +20,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from research.backtest_pairs import MockKitePair, make_strategy
+from research.backtest_pairs import make_strategy
+from research.engine import MockBroker
 from strategies.base import validate_order
 from core.trade_proposer import TradeProposal
 
@@ -51,7 +52,7 @@ def _build():
     panel = pd.DataFrame(
         {"AAA": [100.0, 101.0, 102.0], "BBB": [50.0, 50.5, 51.0]}, index=idx
     )
-    kite = MockKitePair(panel, {"AAA": 10, "BBB": 20})
+    kite = MockBroker(panel, {"AAA": 10, "BBB": 20})
     s = make_strategy(
         "AAA", "BBB", 1.0, kite,
         entry_z=2.0, exit_z=0.75, stop_z=4.0,
@@ -75,7 +76,7 @@ def test_make_strategy_covers_all_init_attrs():
 
 
 def test_mock_futures_symbols_pass_pre_submit_validation():
-    """MockKitePair's synthetic FUT tradingsymbols must satisfy the pre-submit
+    """MockBroker's synthetic FUT tradingsymbols must satisfy the pre-submit
     validate_order regex, or every backtest entry order is rejected and no
     position ever opens (the '_BTFUT' underscore bug)."""
     _, kite = _build()

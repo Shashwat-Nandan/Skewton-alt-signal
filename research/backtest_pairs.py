@@ -35,6 +35,7 @@ from core.data_cache_io import find_tables, read_table
 
 
 from core.screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
+from research.engine import MockBroker
 from strategies.pair_trading import (
     DEFAULT_MARGIN_HEADROOM,
     PairState,
@@ -48,80 +49,9 @@ RAW_DIR = CACHE_DIR / "bhavcopy_raw"
 CANDIDATES_PATH = CACHE_DIR / "pair_candidates.csv"
 
 
-# ──────────────────────────────────────────────────────────
-# MockKite for stock-futures pair backtests
-# ──────────────────────────────────────────────────────────
-
-class MockKitePair:
-    """
-    Minimal Kite stand-in. Each `quote()` returns the close price of the
-    *current* tick (date). `instruments("NFO")` returns synthetic non-
-    expiring FUT rows so PairTradingStrategy._resolve_futures resolves
-    once and caches.
-    """
-
-    VARIETY_REGULAR = "regular"
-    PRODUCT_NRML = "NRML"
-    ORDER_TYPE_LIMIT = "LIMIT"
-    VALIDITY_DAY = "DAY"
-    TRANSACTION_TYPE_BUY = "BUY"
-    TRANSACTION_TYPE_SELL = "SELL"
-
-    def __init__(self, panel: pd.DataFrame, lot_sizes: Dict[str, int]):
-        # panel: DataFrame indexed by trading date, columns are symbols, values are close prices.
-        self.panel = panel
-        self.lot_sizes = lot_sizes
-        self._date_idx = 0
-        self._orders: List[dict] = []
-
-    @property
-    def current_date(self) -> pd.Timestamp:
-        return self.panel.index[self._date_idx]
-
-    def advance(self) -> bool:
-        if self._date_idx + 1 < len(self.panel):
-            self._date_idx += 1
-            return True
-        return False
-
-    def quote(self, symbols: List[str]) -> Dict[str, dict]:
-        out = {}
-        for sym in symbols:
-            base = sym.split(":", 1)[-1]              # "NFO:RELIANCE-BTFUT" → "RELIANCE-BTFUT"
-            underlying = base[: -len("-BTFUT")] if base.endswith("-BTFUT") else base
-            if underlying in self.panel.columns:
-                px = float(self.panel.iloc[self._date_idx][underlying])
-                out[sym] = {
-                    "last_price": px,
-                    "depth": {
-                        "buy": [{"price": px * 0.9985}],
-                        "sell": [{"price": px * 1.0015}],
-                    },
-                }
-        return out
-
-    def instruments(self, exchange: str) -> List[dict]:
-        if exchange != "NFO":
-            return []
-        rows = []
-        for sym in self.panel.columns:
-            rows.append({
-                "name": sym,
-                "tradingsymbol": f"{sym}-BTFUT",
-                "instrument_type": "FUT",
-                "lot_size": int(self.lot_sizes.get(sym, 1)),
-                "expiry": "2099-12-31",   # never rolls during a backtest
-                "instrument_token": abs(hash(sym)) % 1_000_000,
-            })
-        return rows
-
-    def place_order(self, **kwargs):
-        order_id = f"BT-{len(self._orders)}-{self._date_idx}"
-        self._orders.append({**kwargs, "order_id": order_id, "date": str(self.current_date)})
-        return order_id
-
-    def profile(self):
-        return {"user_name": "Backtest", "user_id": "BT0", "exchanges": ["NFO"], "products": ["NRML"]}
+# Mock broker: shared research/engine.MockBroker (moved from a local
+# MockKitePair 2026-07-21; defaults are byte-identical for this harness —
+# parity in tests/test_mock_broker.py).
 
 
 # ──────────────────────────────────────────────────────────
@@ -157,7 +87,7 @@ def load_top_pairs(n: int, path: Path = CANDIDATES_PATH) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────
 
 def make_strategy(
-    symbol_a: str, symbol_b: str, hedge_ratio: float, kite: MockKitePair,
+    symbol_a: str, symbol_b: str, hedge_ratio: float, kite: MockBroker,
     *, entry_z: float, exit_z: float, stop_z: float,
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
@@ -276,7 +206,7 @@ def backtest_one(
         # Cap to lookback_days * 3 so the buffer doesn't grow unbounded.
         seed_spreads = seed_spreads[-(lookback_days * 3):]
 
-    mock = MockKitePair(pair_panel, lot_sizes)
+    mock = MockBroker(pair_panel, lot_sizes)
     s = make_strategy(
         a, b, hedge, mock,
         entry_z=entry_z, exit_z=exit_z, stop_z=stop_z,

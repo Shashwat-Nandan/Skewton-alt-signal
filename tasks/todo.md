@@ -1,3 +1,50 @@
+# Phase 1 — shared research engine, PR 1 (2026-07-21)
+
+From `docs/research/nautilustrader-evaluation-2026-07-21.md` §7 Phase 1.
+Branch `research/engine-phase1`. Scope deliberately surgical; no
+money-path behavior change (re-export shim keeps every live import site
+and the tests' `tk.estimate_transaction_cost` monkeypatch working).
+
+- [x] Baseline parity run on main — NOTE (Rule 12): both candidate files
+      produce **0 trades** in the daily harness even at entry-z 1.25 /
+      min-edge 0 (all current candidates have negative β). The E2E diff is
+      therefore weak; parity rests on the exhaustive unit gate below.
+      The 0-trade observation deserves its own investigation (not this PR).
+- [x] `core/costs.py`: moved verbatim; taleb re-exports (same objects, so
+      existing `tk.estimate_transaction_cost` monkeypatches still bind)
+- [x] `research/engine/mock_broker.py` + backtest_pairs/test migration.
+      Parity gate: legacy class from `git show 5243952` vs MockBroker on the
+      real 547-day panel — every quote/instruments/profile/order identical.
+- [x] `market_data/tick_capture.py` stamps `ts_recv_ns` (per callback batch);
+      `_TAPE_PARQUET_COLUMNS` carries it; old tapes read NULL (declared
+      columns), replay readers unaffected.
+- [x] `tests/test_costs.py` (re-export contract, pinned legacy FUT rate,
+      zero-turnover guard) + `tests/test_mock_broker.py` (behavioral)
+- [x] Post-change E2E diff clean; ruff clean; pytest 1488 passed, 0 skips
+- [x] PR (research plane; costs shim touches strategies/ → flag rule 5)
+
+Deferred to next PRs (recorded in report §4/§7): intra-bar open-aware
+exit adjudication (core/intrabar.py; first consumer = varsity equity —
+its SL-before-target elif chain books SL_HIT even when the bar OPENS
+above target, shared by backtest AND run_equity_swing paper path),
+varsity/buy_on_gap CostModel migration, execution-events-on-bus,
+portfolio view. STALE ITEM REMOVED: "kalman_trend runner
+cost_per_unit=0.0 fix" was already shipped on main (COST_PER_UNIT_POINTS
++ restore re-assert, issue #77, + costed warmup fit).
+
+Post-review fixes applied (2026-07-21, /code-review high on PR #168):
+ts_recv_ns old-parquet contract corrected (pre-2026-07-21 parquet
+archives lack the column and can't be reconverted — readers need
+union_by_name), core/costs import convention clarified (strategy plane
+keeps importing via the taleb shim = the monkeypatch target),
+symbol_suffix="" now quotes panel columns directly instead of silently
+emptying every quote (+test), research/engine docstring states the real
+invariant (never on a LIVE path; paper runners do import research),
+negative-turnover cases actually asserted, duplicate zero-price
+assertion dropped. Suite 1489 passed.
+
+---
+
 # NautilusTrader evaluation — research report (2026-07-21)
 
 - [x] Research NautilusTrader docs (architecture, backtesting, execution, live,
