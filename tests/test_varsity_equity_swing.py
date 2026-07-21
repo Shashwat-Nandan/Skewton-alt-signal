@@ -270,6 +270,58 @@ class TestPositionStateMachine:
         assert len(exits) == 1
         assert exits[0].greeks_snapshot["exit_reason"] == "TIME_STOP"
 
+    def _exit_ready_strategy(self):
+        s = VarsityEquitySwingStrategy(_NullKite(), config_path="/dev/null", mode="paper")
+        s.params["trend_short_window"] = 20
+        s.params["trend_long_window"] = 50
+        s.params["mp_enabled"] = 0
+        s.params["oi_enabled"] = 0
+        return s
+
+    def test_ratcheted_trail_books_trail_stop_not_initial_sl(self):
+        """Review finding #1: once the trail ratchets above initial_sl, the
+        EFFECTIVE stop is current_sl. A bar trading down through the trail
+        must book TRAIL_STOP at current_sl — not SL_HIT at the lower
+        initial_sl, which flips a locked-in winner into a mislabeled loss
+        (price cannot reach initial_sl without first crossing the trail)."""
+        s = self._exit_ready_strategy()
+        n = 80
+        dates = pd.bdate_range("2024-10-01", periods=n)
+        rows = [(d, "X", 100, 100.5, 99.5, 100.0, 1_000_000) for d in dates[:-1]]
+        # today spans down through the trail (105) to the initial-SL region (94)
+        rows.append((dates[-1], "X", 106, 106, 94, 99, 1_000_000))
+        panel = pd.DataFrame(rows, columns=["date","symbol","open","high","low","close","volume"])
+        s.set_panel(panel)
+        pos = self._make_position(entry_px=100.0, initial_sl=95.0, target=120.0)
+        pos.current_sl = 105.0  # trail already ratcheted up (locked-in profit)
+        s.positions["X"] = pos
+        s.set_current_date(dates[-1])
+        s._ensure_features()
+        exits = s.check_and_rehedge()
+        assert len(exits) == 1
+        assert exits[0].greeks_snapshot["exit_reason"] == "TRAIL_STOP"
+        assert exits[0].price == 105.0  # the trail, a profit — not 95 (a loss)
+
+    def test_corrupt_levels_force_flatten_not_hold(self):
+        """Review finding #2: a restored position with target <= current_sl
+        (bad DB/edit) must be FLATTENED (risk reduced), not held. An earlier
+        cut `continue`d past every exit check, leaving unbounded real-money
+        exposure open indefinitely."""
+        s = self._exit_ready_strategy()
+        n = 80
+        dates = pd.bdate_range("2024-10-01", periods=n)
+        rows = [(d, "X", 100, 101, 99, 100.0, 1_000_000) for d in dates]
+        panel = pd.DataFrame(rows, columns=["date","symbol","open","high","low","close","volume"])
+        s.set_panel(panel)
+        pos = self._make_position(entry_px=100.0, initial_sl=95.0, target=90.0)  # target < sl
+        s.positions["X"] = pos
+        s.set_current_date(dates[-1])
+        s._ensure_features()
+        exits = s.check_and_rehedge()
+        assert len(exits) == 1, "corrupt-level position must be flattened, not held"
+        assert exits[0].greeks_snapshot["exit_reason"] == "MANUAL"
+        assert exits[0].price == 100.0  # flattened at close
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Integration: backtest end-to-end

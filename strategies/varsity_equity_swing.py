@@ -40,6 +40,7 @@ from typing import Dict, List, Literal, Optional
 
 import pandas as pd
 
+from core.intrabar import adjudicate_long_exit
 from core.trade_proposer import TradeProposal
 
 from . import _indicators as ind
@@ -540,56 +541,73 @@ class VarsityEquitySwingStrategy(BaseStrategy):
             if any(pd.isna(x) for x in (high, low, close)):
                 continue
 
-            # Update high-watermark and Chandelier trail.
-            # Sanity: a chandelier value above today's close means the
-            # rolling-max in the indicator window is anchored to a stale
-            # bar (typical cause: corporate-action split where pre-split
-            # highs remain in the proxy data — see lessons.md dividend
-            # lesson, same shape opposite sign). Reject such values rather
-            # than ratcheting the trail stop into a non-fillable region.
-            if high > pos.high_watermark:
-                pos.high_watermark = high
-            unrealised = (close - pos.entry_px) * pos.qty
-            risk_at_entry = (pos.entry_px - pos.initial_sl) * pos.qty
-            chand = row["chandelier"]
-            if (
-                not pd.isna(chand)
-                and unrealised >= self.params["trail_activate_R"] * risk_at_entry
-                and chand > pos.current_sl
-                and chand < close  # sanity: stop must be below current price
-            ):
-                pos.current_sl = float(chand)
-
-            # Exit checks (priority order: SL → target → trail → time-stop).
-            # Each candidate exit price must lie within today's [low, high]
-            # range — a "fill" outside that range would be physically
-            # impossible. If the recorded SL/target is unreachable today,
-            # fall through to the next condition.
             exit_reason: Optional[ExitReason] = None
             exit_px: Optional[float] = None
-            if low <= pos.initial_sl <= high:
-                exit_reason, exit_px = "SL_HIT", pos.initial_sl
-            elif low <= pos.target <= high:
-                exit_reason, exit_px = "TARGET_HIT", pos.target
-            elif (low <= pos.current_sl <= high
-                    and pos.current_sl > pos.initial_sl):
-                exit_reason, exit_px = "TRAIL_STOP", pos.current_sl
-            elif low <= pos.initial_sl:
-                # Gapped through the stop — fill at the day's open or the
-                # stop, whichever is worse (more conservative).
-                exit_reason, exit_px = "SL_HIT", min(pos.initial_sl, float(row["open"]))
-            elif high >= pos.target:
-                # Gapped through target — fill at open if it's already past target.
-                exit_reason, exit_px = "TARGET_HIT", max(pos.target, float(row["open"]))
+
+            # Adjudicate exits against the stop/target as they stand at the
+            # START of this bar (the trailing stop is ratcheted AFTER, below,
+            # for subsequent bars). Ratcheting the trail with today's high and
+            # then adjudicating today's open/low against it would be intra-bar
+            # lookahead — a stop derived from a high that prints later in the
+            # day cannot fill an order at this morning's open.
+
+            # Corrupt exit levels (target <= effective stop) are not a market
+            # scenario — they mean a bad DB restore / edit. The SAFE response
+            # is to FLATTEN (reduce real-money risk), not to hold: an earlier
+            # cut `continue`d here, which disabled SL/target/trail/time-stop
+            # and left the position riding unbounded exposure. Force a
+            # protective market exit at close and log loud (Rule 12).
+            if not pos.target > pos.current_sl:
+                logger.critical(
+                    "%s: corrupt exit levels (target=%.2f <= current_sl=%.2f, "
+                    "initial_sl=%.2f) — force-flattening at close %.2f; inspect "
+                    "restored state", sym, pos.target, pos.current_sl,
+                    pos.initial_sl, float(close),
+                )
+                exit_reason, exit_px = "MANUAL", float(close)
             else:
-                days_held = self._trading_days_between(pos.entry_dt, self._current_date)
-                if days_held >= int(self.params["time_stop_days"]):
-                    exit_reason, exit_px = "TIME_STOP", float(close)
+                # One open-aware adjudication against the EFFECTIVE stop
+                # (current_sl — starts at initial_sl, only ratchets up, never
+                # above target). This is the binding downside stop, so a bar
+                # that trades down through the ratcheted trail books at the
+                # trail, not at the lower initial_sl. Relabel to TRAIL_STOP
+                # when the trail has moved; semantics live in core/intrabar.py.
+                verdict = adjudicate_long_exit(
+                    float(row["open"]), high, low, pos.current_sl, pos.target,
+                )
+                if verdict is not None:
+                    reason, exit_px = verdict
+                    if reason == "SL_HIT" and pos.current_sl > pos.initial_sl:
+                        reason = "TRAIL_STOP"
+                    exit_reason = reason
+                else:
+                    days_held = self._trading_days_between(pos.entry_dt, self._current_date)
+                    if days_held >= int(self.params["time_stop_days"]):
+                        exit_reason, exit_px = "TIME_STOP", float(close)
 
             pos.last_mtm_px = float(close)
             pos.last_mtm_dt = self._current_date
 
             if exit_reason is None:
+                # No exit — NOW ratchet the Chandelier trail for subsequent
+                # bars using today's high. Sanity: a chandelier at/above the
+                # close means the rolling-max is anchored to a stale bar
+                # (corporate-action split leaving pre-split highs in proxy
+                # data — see lessons.md); reject rather than trailing the stop
+                # into a non-fillable region, and never above the target.
+                if high > pos.high_watermark:
+                    pos.high_watermark = high
+                unrealised = (close - pos.entry_px) * pos.qty
+                risk_at_entry = (pos.entry_px - pos.initial_sl) * pos.qty
+                chand = row["chandelier"]
+                if (
+                    not pd.isna(chand)
+                    and unrealised >= self.params["trail_activate_R"] * risk_at_entry
+                    and chand > pos.current_sl
+                    and chand < close
+                    and chand < pos.target
+                ):
+                    pos.current_sl = float(chand)
                 continue
 
             exits.append(TradeProposal(

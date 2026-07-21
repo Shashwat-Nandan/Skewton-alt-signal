@@ -1,3 +1,92 @@
+# Phase 1 — intra-bar open-aware exits, PR 2 (2026-07-21)
+
+Report §4.7; branch `research/intrabar-exits`. PR 1 (#168) MERGED = 0ffebe0.
+
+- [x] `core/intrabar.py::adjudicate_long_exit` — gap-opens fill at the OPEN
+      (open ≤ stop → SL at open; open ≥ target → TARGET at open), intra-bar
+      races stay pessimistic (stop before target), NaN open falls through
+      to touch checks
+- [x] `strategies/varsity_equity_swing.py::check_and_rehedge` uses it
+      (trail/time-stop unchanged; shared by backtest AND run_equity_swing
+      paper path — fixes booking SL_HIT on days that OPENED above target)
+- [x] `tests/test_intrabar.py` (8 cases incl. degraded NaN input);
+      existing varsity exit tests unaffected (their bars don't gap)
+- [x] Before/after delta (584 dates, NIFTY200 defaults): net −₹62,816 →
+      −₹71,994. 5/115 trades changed, zero reason flips: 4 gap-down stops
+      re-priced to the open (−₹9.2k, the honest-fill correction) + 1
+      gap-up target to the open (+₹54). The open-above-target rescue case
+      absent in-window (needs a huge-range day); pinned by unit tests.
+- [x] ruff clean; pytest 1496 passed, 0 skips; PR opened (rule 5 review pending)
+
+## /code-review high ROUND 2 on PR #169 (2026-07-21) — 2 CONFIRMED, fixed
+
+Second review (Opus 4.8, full 11/11 verify pass) on the round-1 fixes
+found two real correctness defects the round-1 changes introduced/left:
+
+- [x] **Finding #1 (trail short-circuit):** the SL/target pass used
+      `initial_sl`, firing before the trail pass, so a trailed-up winner
+      that traded down through its ratcheted stop booked SL_HIT at the
+      lower initial_sl (a mislabeled loss). Fixed: single adjudication
+      against the EFFECTIVE stop (`current_sl`), relabel SL_HIT→TRAIL_STOP
+      when trailed. Dropped the now-unused target=inf trail pass.
+- [x] **Finding #2 (corrupt-level `continue`):** round-1 quarantined a
+      target≤stop position by `continue`-ing past ALL exits incl.
+      time-stop + MTM → unbounded held exposure. Fixed: force-flatten at
+      close (reason MANUAL) + CRITICAL log; the SAFE action is to reduce
+      risk, not freeze.
+- [x] Fixing #1 surfaced a PRE-EXISTING intra-bar trail LOOKAHEAD (on
+      main, not introduced here): chandelier_stop_long uses
+      `high.rolling().max()` WITHOUT `.shift(1)` (donchian shifts, this
+      doesn't), so it includes today's high; legacy ratcheted the trail
+      with today's high then filled against today's open/low. Fixed by
+      reordering: adjudicate exits against the START-of-bar trail, THEN
+      ratchet for subsequent bars.
+
+REVISED disclosed delta (584 dates, NIFTY200) — the lookahead removal
+dominates and is large + SIGN-FLIPPING: net **−₹62,816 → +₹80,305**
+(sharpe −0.25→+0.56, maxDD −17.1%→−11.7%, trades 115→125). The
+lookahead was systematically trail-stopping winners early at a
+same-day-computed stop inside the same bar's range (e.g. FORCEMOT: was
+TRAIL_STOP @9127 +₹1,992, now rides to TARGET @10899 +₹19,694). Because
+exit dates shift, freed-capital timing changes which later entries fire
+(trade population changes — not a per-trade parity diff). Tests: added
+effective-stop + corrupt-flatten cases; intrabar 14 cases.
+
+⚠️ This is now well beyond the original "open-aware gap fills" scope and
+flips the strategy's backtested sign. Needs operator decision before
+merge — do NOT self-merge (rule 5 + magnitude). The lookahead also
+affected the LIVE/paper forward record and every prior varsity backtest.
+
+## /code-review high on PR #169 (2026-07-21) — fixes applied
+
+Workflow verify pass was cut short by the session usage limit (7/11
+agents died; "0 findings" was NOT a clean pass — Rule 12); the 11
+finder candidates were verified inline instead. 4 real groups, fixed:
+
+- [x] Trail stop routed through the adjudicator as a stop-only second
+      pass (target=inf): gapped-through trails now fill at the open
+      (legacy + first cut: in-range-only → position silently rode below
+      its own trail; on trail-above-target days legacy booked physically
+      impossible fills at the trail level)
+- [x] Corrupt levels (target ≤ stop): adjudicator raises (fail loud);
+      strategy pre-checks per position, CRITICAL-logs and quarantines it
+      so one bad restore can't mislabel a loser TARGET_HIT or abort
+      sibling exits
+- [x] Open trusted only within the bar's own [low,high] (split/proxy
+      corruption); all fills clamped in-range — gapped level with no
+      usable open prices at the LOW (pessimistic in-range print; legacy
+      filled above the day's high on exactly the worst gap-down days)
+- [x] Docs: full semantics live in core/intrabar.py; caller comment is
+      a pointer (was a drift-prone restatement)
+
+FINAL disclosed delta: net −₹62,816 → −₹74,499 (sharpe −0.25→−0.30,
+maxDD −17.1%→−18.2%); 7/115 trades changed, zero reason flips, same
+exit dates: 4 gap-down stops → open, 2 trail gap fills → open (FORCEMOT
+legacy "fill" 9127 on a day that opened 8910), 1 gap-up target → open
+(+₹54). Tests 8→14 cases.
+
+---
+
 # Phase 1 — shared research engine, PR 1 (2026-07-21)
 
 From `docs/research/nautilustrader-evaluation-2026-07-21.md` §7 Phase 1.
