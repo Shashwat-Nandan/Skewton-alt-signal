@@ -36,6 +36,14 @@ Full findings: docs/research/delivery-percentage-strategy-2026-07-22.md.
   Revisit triggers: pre-2024 price backfill, sector map for cluster breadth,
   distribution (short) side. Data pipeline + feature layer are kept (merged);
   no fetch timer installed on purpose.
+- **2026-07-22 extended-horizon re-test (revisit #1 executed same day):**
+  equity_ohlcv extended to 2022-01 from deliv_raw's own OHLC columns
+  (cross-validated, 0 split artifacts in booked trades). Train (609d) flips
+  POSITIVE: 77 trades +₹103.4k Sharpe 0.80; holdout unchanged +₹47.5k / 1.15;
+  positive 3 of 4 entry years (2024 the sole loser — the old NO-GO was a
+  window-truncation artifact). **H1 now passes all pre-registered gates**;
+  Phase D paper build = operator decision. Overlay evidence contradictory →
+  deliv_enabled stays 0. Details in the findings doc.
 
 # A0 — retain depth in the parquet tick tape (2026-07-22)
 

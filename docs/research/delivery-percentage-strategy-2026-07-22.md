@@ -79,3 +79,54 @@ likely value:
 
 Raw run artifacts: `da_train/da_holdout/sw_*.json` in the session scratchpad;
 per-trade ledger of the holdout run in `data_cache/delivery_accum_trades.tsv`.
+
+---
+
+## Extended-horizon re-test — 2026-07-22 (revisit trigger #1 executed)
+
+**Data extension.** NSE serves no CM bhavcopy before the 2024-03 UDiFF
+cutover (probed: 404s), but the already-backfilled `deliv_raw/`
+sec_bhavdata days carry full OHLC+volume. `data_cache/equity_ohlcv/` was
+extended 2022-01-03 → 2024-03-01 (563 days, 197/209 symbols, 106,330 rows)
+from that local archive — cross-validated against the CM-sourced tables on
+overlap days (clean), dedup-checked (zero). Existing CM rows win on any
+overlap. **Caveat:** pre-2024 prices are unadjusted for splits/bonuses —
+mitigated by an artifact audit: **0 of 77 train trades contain a >30 %
+single-bar close move inside the hold**, so no corporate action touches any
+booked P&L.
+
+**H1 standalone on the full window** (same pre-registered defaults and
+gates, train 2023-01-01→2025-05-31 now genuinely 609 trading days):
+
+| Run | Trades | Win % | Net P&L | Sharpe | Max DD |
+|---|---|---|---|---|---|
+| Train (long) | 77 | 50.6 | **+₹103,439** | 0.80 | −6.3 % |
+| Holdout (unchanged) | 29 | 37.9 | +₹47,537 | 1.15 | −5.4 % |
+
+By entry year: 2023 +₹78k (70 % win) · **2024 −₹29k (34 %)** · 2025 +₹43k ·
+2026 +₹59k — positive in 3 of 4 years. **The original NO-GO's
+"net-negative in-sample" was a truncation artifact**: the short window was
+dominated by 2024, the one bad regime. Exit mix train: 31 SL / 28 time /
+15 target / 3 trail.
+
+**H1 verdict revised: passes all pre-registered promotion gates** on the
+extended horizon (in-sample positive, holdout 29 trades, holdout Sharpe
+1.15 > 0, expectancy > 0 net of full delivery costs). Phase D (paper
+deployment) is now a live operator decision, not a dead end. Discipline
+note: this was the pre-declared revisit trigger with unchanged gates and an
+unchanged holdout — not a parameter re-fit; still, it is a second look, so
+paper-first remains mandatory and no live conversation is warranted.
+
+**H2 overlay stays OFF.** Long-train A/B: on +₹174k / 0.97 vs off −₹15k /
+0.03 (strongly pro) — but the earlier short-train swing A/B was largely
+meaningless (SMA-200 could not even warm up until ~2024-12 on the truncated
+panel), and the holdout still mildly favors off (0.37 vs 0.55).
+Contradictory across windows → inconclusive, default stays 0; re-visit
+after the standalone's paper period settles the data question.
+
+**Next steps (operator):** (1) decide Phase D paper build per the original
+plan (runner + db tables + router + scoreboard row + 19:45 fetch timer);
+(2) if built, pre-register the paper kill rule before first session;
+(3) optionally productize the one-off extension script
+(session scratchpad `extend_ohlcv_from_deliv_raw.py`) if pre-2024 OHLCV
+should be rebuildable from scratch.
