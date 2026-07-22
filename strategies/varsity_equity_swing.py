@@ -199,6 +199,15 @@ class VarsityEquitySwingStrategy(BaseStrategy):
         "fii_enabled":            1,            # 0/1 master toggle
         "fii_lookback":           5,            # bars (= trading days)
         "fii_boost_when_positive": 1,           # 0/1 score+1 when fii_net_5d > 0
+        # Delivery-percentage overlay (2026-07-22, Varsity "who's holding").
+        # Default OFF until the Phase-C A/B backtest shows holdout uplift.
+        # Boost-only by design: delivery is a "where to look" screen, not a
+        # bottom-caller — it must never veto an otherwise-valid setup.
+        "deliv_enabled":          0,            # 0/1 master toggle
+        "deliv_boost_pctile":     0.90,         # own-history pctile ≥ this → score+1
+        "deliv_boost_when_high":  1,            # 0/1 enable the boost
+        "deliv_lag_days":         1,            # bars; sec_bhavdata publishes ~19:00 IST,
+                                                # after the 18:30 close scan → lag 1
     }
 
     def __init__(self, kite, config_path: str = "config.ini", mode: Optional[str] = None):
@@ -344,6 +353,30 @@ class VarsityEquitySwingStrategy(BaseStrategy):
                     fdf["fii_net_5d"] = float("nan")
                     fdf["fii_boost"] = 0
 
+        # Delivery-percentage overlay — per-symbol (not broadcast) merge,
+        # lagged by deliv_lag_days (data publishes after the close scan).
+        # NaN = no delivery history → no boost, never a veto.
+        if int(p.get("deliv_enabled", 0)):
+            from ._delivery import build_delivery_features
+            deliv_feats = build_delivery_features(
+                price_panel=self._panel,
+                hits_threshold=p["deliv_boost_pctile"],
+            )
+            if deliv_feats.empty:
+                # WARNING, not info (code-review 2026-07-22): deliv_enabled=1
+                # with no data is a config/data mismatch the operator asked
+                # for and isn't getting — must survive default log filters.
+                logger.warning("deliv_enabled=1 but delivery cache is EMPTY — "
+                               "boost will be neutral everywhere")
+            lag = int(p.get("deliv_lag_days", 1))
+            for sym, fdf in feats.items():
+                if not deliv_feats.empty:
+                    sub = deliv_feats[deliv_feats["symbol"] == sym].set_index("date")
+                    merged = sub["deliv_pctile"].reindex(fdf.index)
+                    fdf["deliv_pctile"] = merged.shift(lag) if lag > 0 else merged
+                else:
+                    fdf["deliv_pctile"] = float("nan")
+
         self._features = feats
         self._features_dirty = False
 
@@ -435,6 +468,18 @@ class VarsityEquitySwingStrategy(BaseStrategy):
                 and int(fii_boost or 0) == 1):
             score += 1.0
 
+        # Delivery boost: own-history delivery percentile is extreme —
+        # someone is taking ownership into this setup. Boost-only (no veto).
+        deliv_pctile = row.get("deliv_pctile")
+        deliv_note = ""
+        if int(self.params.get("deliv_enabled", 0)):
+            if (int(self.params.get("deliv_boost_when_high", 0))
+                    and deliv_pctile is not None and not pd.isna(deliv_pctile)
+                    and deliv_pctile >= self.params["deliv_boost_pctile"]):
+                score += 1.0
+            if deliv_pctile is not None and not pd.isna(deliv_pctile):
+                deliv_note = f"; delivPct={deliv_pctile:.2f}"
+
         trigger = "breakout" if breakout else "pullback_to_ema20"
         fii_note = ""
         if not pd.isna(fii_net_5d):
@@ -442,7 +487,7 @@ class VarsityEquitySwingStrategy(BaseStrategy):
         rationale = (
             f"trend SMA{int(self.params['trend_short_window'])}>SMA{int(self.params['trend_long_window'])} "
             f"ADX={adx_v:.1f}; trigger={trigger}; "
-            f"ATR={atr_v:.2f}; gap={gap:.2f}%; oi={oi_class}{mp_note}{fii_note}"
+            f"ATR={atr_v:.2f}; gap={gap:.2f}%; oi={oi_class}{mp_note}{fii_note}{deliv_note}"
         )
         return {
             "score": score,

@@ -86,7 +86,7 @@ move was one-timeframe-only.
 We have **two** market-profile implementations, and neither trades the book's
 edge:
 
-| | `market_profile.py` (TPO engine) | `strategies/_market_profile_eq.py` (daily VA) |
+| | `core/market_profile.py` (TPO engine) | `strategies/_market_profile_eq.py` (daily VA) |
 |---|---|---|
 | Data | 30-min bars (`backend/bars.db`) | daily bhavcopy bars |
 | Computes | POC / VAH / VAL / IB / TPO letters / composite | `mp_vah` / `mp_poc` / `mp_val` (volume-weighted) |
@@ -116,7 +116,7 @@ weakest use and is left untouched.
 
 ## 3. What we built (Phase 1) — `market_generated_indicators()`
 
-`market_profile.py` now exposes a pure function
+`core/market_profile.py` now exposes a pure function
 `market_generated_indicators(bars, *, prior)` → `DayIndicators`, codifying
 Dalton's qualitative descriptions into **deterministic geometry** (Rule 5 —
 geometry, not model judgment). Thresholds are stated inline in the source and
@@ -166,9 +166,18 @@ index-intraday only.
 
 ## 5. Measured verdict (first run, 2026-07-13)
 
-`log_mp_features.py` logged **5,184 instrument-days** (48 F&O names, 30-min bars,
-2026-02-02 → 07-13) and `mp_edge_report.py --cost-bps 15` produced the first
-edge read. Two findings, both important:
+`scripts/log_mp_features.py` logged **5,184 instrument-days** (48 F&O names, 30-min bars,
+2026-02-02 → 07-13) and `python -m research.mp_edge_report --cost-bps 15` produced the first
+edge read. **Cost-basis correction (2026-07-18): 15 bps understated cost.** This
+is an *overnight-delivery* trade (long at today's close, exit next day), so the
+STT alone is 0.1% buy + 0.1% sell = **20 bps round-trip**; with stamp/exchange/DP
+the honest round-trip is **~25 bps** (15 bps is the *intraday* level, cf.
+`buy_on_gap` `cost_pct=0.15`). The default cost basis for this strategy is now
+**25 bps**. Scope of the restatement: **only §(b)'s table and the
+out-of-sample check were re-run at 25 bps (2026-07-18, data extended to
+07-17)**; the "Robustness" bullets further below are unchanged **GROSS /
+pre-cost** figures from the 2026-07-13 run and are labeled as such — do NOT
+read them as net-of-cost evidence. Two findings, both important:
 
 **(a) The same-day "edge" is a definitional artifact — not a signal.** The
 `open_type` / `day_shape` classifiers consume `close`, and
@@ -180,18 +189,36 @@ prints a LEAKAGE banner; same-day is demoted to a descriptive/consistency
 section and must be ignored for go/no-go.
 
 **(b) The honest next-day predictive edge is weak, and asymmetric.** Trading each
-bucket in its implied direction, net of 15 bps round-trip:
+bucket in its implied direction, net of **25 bps** round-trip (re-run 2026-07-18,
+data extended to 2026-07-17):
 
-| Family | Result (next_day, net of 15 bps) |
+| Family | Result (next_day, net of 25 bps) |
 |---|---|
-| `open_type` | **No edge** — every bucket negative net (best `open_test_drive_up` −4.7 bps, ~50% win). |
-| `balance_state` | **No edge** — `higher`/`lower` actually *mean-revert* next-day (raw −16.5 / +11.6 bps), the opposite of their same-day label; all buckets negative net. |
-| `day_shape` | **One bucket only:** `trend_up` = +23.5 net bps, 56.5% win, n=437. `trend_down` fails (−12.4 net). |
+| `open_type` | **No edge** — every bucket negative net (best `open_test_drive_up` −14.3 bps at 25 bps cost, was −4.7 at 15 bps; ~52% win). |
+| `balance_state` | **No edge** — `higher`/`lower` actually *mean-revert* next-day, the opposite of their same-day label; all buckets negative net. |
+| `day_shape` | **One bucket only:** `trend_up` = **+9.9 net bps** (was +23.5 at 15 bps), 56.1% win, n=453. `trend_down` fails (−22.4 net). |
 
 So the sole survivor is `day_shape = trend_up` on the next-day horizon
-(+23.5 net bps, 56.5% win, n=437).
+(**+9.9 net bps** at honest cost, 56.1% win, n=453) — the honest cost roughly
+**halves** the in-sample edge.
 
-**Robustness of `trend_up` (deepened 2026-07-13):**
+**Out-of-sample check (`python -m scripts.mp_finetune --cost-bps 25`, 2026-07-18).** The
+configured lever (K≥3, h=1) does **not** hold up out-of-sample: TRAIN net
++20.6 bps (t=1.94) but **HOLD net +7.9 bps, win 47.9%, t=0.50** — statistically
+indistinguishable from zero, and this is net of *charges only* (no slippage).
+Longer holds (h=2/h=3) and higher K look far better in the holdout (h=3 HOLD
+net +74 bps, t=2.8) but with the tell-tale *train-worse / hold-better*
+inversion on ~20–30 holdout trades over a single favourable ~6-week window —
+holdout mining, not a stable edge; **not promotable**
+(`feedback_no_promote_if_zero_trade_holdout`). Verdict unchanged: keep
+`trend_up` **paper-only under the kill-switch**; the only path to a robust
+margin is trading it via single-stock **futures** (STT ≈ 2 bps round-trip vs
+20 bps delivery), which is an instrument redesign, not a config change.
+
+**Robustness of `trend_up` (deepened 2026-07-13 — every figure in these
+bullets is GROSS / pre-cost from the 15-bps-era run; net at 25 bps is roughly
+25 bps lower per trade. The *shape* of these tests, not their levels, is the
+evidence):**
 - **Beats drift.** The always-long baseline is only +0.7 bps this window, so
   `vs_drift_bps = +37.7` — the edge is *not* beta. (The report now prints a
   drift baseline and a `vs_drift_bps` column so this test is standing, not
@@ -200,16 +227,22 @@ So the sole survivor is `day_shape = trend_up` on the next-day horizon
   median symbol +32.8 bps — not a handful of names.
 - **Persistent.** Positive in 5 of 6 months (Feb +33, Mar −15, Apr +68,
   May +35, Jun +30, Jul +56).
-- **Not tail-driven** (`mp_trend_robustness.py`): trim 1%/1% → +35.4 bps,
+- **Not tail-driven** (`research/mp_trend_robustness.py`): trim 1%/1% → +35.4 bps,
   trim 5%/5% → +31.7, winsorize 5% → +34.0. The edge survives removing extreme
   moves — the right-skew (mean 38 vs median 19) does *not* mean a few prints
   carry it.
-- **Statistically real on this sample:** t-stat **4.51**, win-rate z **2.73**
-  (both clear ~2). Survives dropping the best 5 names (+27.5 bps).
+- **Statistically real on this sample (GROSS, pre-cost):** t-stat **4.51**,
+  win-rate z **2.73** (both clear ~2). Survives dropping the best 5 names
+  (+27.5 bps). NB this is the *gross* single-name t; net of honest cost and
+  out-of-sample it collapses (see next bullet).
 - **Real caveats that keep it short of a build:**
-  - **Thin after realistic cost.** Breakeven round-trip = 38.5 bps. It clears
-    15 bps (+23.5 net) but an *overnight delivery* hold costs ~25–30 bps
-    (STT ~20 bps round-trip + charges), leaving only **+8–13 net bps**.
+  - **Thin after realistic cost — and not significant out-of-sample.**
+    Breakeven round-trip = 38.5 bps. At the honest **25 bps** (overnight
+    delivery: STT ~20 bps round-trip + charges) the in-sample net is
+    **+9.9 bps** (was +23.5 at the understated 15 bps). Worse, the configured
+    lever (K≥3, h=1) does not survive a holdout: `mp_finetune --cost-bps 25`
+    gives **HOLD net +7.9 bps, win 47.9%, t=0.50** (2026-07-18) — indistinct
+    from zero, and that is still pre-slippage.
   - **Gap-dependent.** 62% of the edge is the overnight gap
     (close→next_open = 23.9 of 38.5 bps) → it **requires holding overnight**
     and wearing gap risk; a next-open entry misses most of it.
@@ -227,7 +260,7 @@ momentum-continuation lead — the strongest MP-derived signal in the book — b
 
 ### 5.1 Portfolio backtest — the signal does NOT graduate (2026-07-13)
 
-`backtest_mp_trend.py` turns the signal into the actual tradeable portfolio
+`research/backtest_mp_trend.py` turns the signal into the actual tradeable portfolio
 (long every `trend_up` name at its close, equal-weight per day, exit next close,
 net of 25 bps overnight-delivery cost). It **fails the gate**:
 
@@ -252,7 +285,7 @@ rescue hypothesis does:
 
 ### 5.2 Rescue — the broad-momentum-day filter (2026-07-13)
 
-`backtest_mp_trend.py --fit-min-signals` tests one idea: the edge concentrates
+`python -m research.backtest_mp_trend --fit-min-signals` tests one idea: the edge concentrates
 on **broad-momentum days** — when ≥K names print `trend_up` at once. K is fit on
 TRAIN only, then confirmed on the untouched HOLDOUT (leakage-free: the day's
 signal count is known at the close):
@@ -279,7 +312,7 @@ and halts itself if the edge decays. Shipped:
   (`classify_day_longs`, K default 3), equal-weight sizing, cost-aware P&L, and
   `check_kill` (halts new entries on 6% drawdown or ₹40k cum-loss, after ≥20
   trades). Unit-tested (`tests/test_mp_trend_strategy.py`).
-- `run_paper_mp.py` — EOD paper runner (no Kite, no order path): exits
+- `runners/run_paper_mp.py` — EOD paper runner (no Kite, no order path): exits
   yesterday's longs at today's close, classifies breadth, opens today's longs if
   broad-momentum + not halted. Persists to `mp_trend_positions` / `mp_trend_runs`
   in dashboard.db. `--replay` reproduces the book from history.
@@ -296,7 +329,7 @@ orders** and consumes no capital. The decisive missing evidence remains a
 **down-regime** (§6, operator backfill); the kill switch is what makes it safe
 to run forward while that accumulates.
 
-### 5.4 Fine-tune experiments (2026-07-14, `mp_finetune.py`)
+### 5.4 Fine-tune experiments (2026-07-14, `scripts/mp_finetune.py`)
 
 Operator asked to raise profit-per-trade and optimise trade count. Four
 **pre-registered** hypotheses (stated in the script docstring before results),
@@ -320,7 +353,7 @@ train/holdout as before, net of 25 bps:
 **Decision: deployed runner stays K=3 / h=1.** The K=3 book is a strict
 superset of every K≥k book (same names, subset of days), so the live paper
 runner is the maximal data collector; K=6 and h=2 are re-cut **offline** from
-the same book by re-running `mp_finetune.py` as forward days accrue. Promote a
+the same book by re-running `scripts/mp_finetune.py` as forward days accrue. Promote a
 lever only when the forward window confirms it — this holdout is semi-worn from
 repeated reads and no longer counts as fresh OOS.
 
@@ -333,9 +366,9 @@ next-day evidence above does not yet justify it.
 ## 6. Path to trading (evidence gates)
 
 1. **Phase 1 (done):** indicator layer + tests. No orders.
-2. **Phase 2:** `log_mp_features.py` logs `DayIndicators` nightly for
+2. **Phase 2:** `scripts/log_mp_features.py` logs `DayIndicators` nightly for
    NIFTY/BANKNIFTY (30-min) and the equity daily panel (with
-   `warn_coarse_timeframe`) into `dashboard.db.mp_features`; `mp_edge_report.py`
+   `warn_coarse_timeframe`) into `dashboard.db.mp_features`; `research/mp_edge_report.py`
    joins to forward outcomes and prints hit-rate + mean forward return bucketed
    by `open_type` / `day_shape` / `balance_state`. **This report is the go/no-go
    gate.** No orders.

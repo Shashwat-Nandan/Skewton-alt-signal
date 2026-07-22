@@ -1,43 +1,21 @@
 """
-Backtest harness for the Varsity equity-swing strategy.
+Backtest harness for the delivery-accumulation strategy.
 
-Replay model
-------------
-Walk the OHLCV panel one trading day at a time. On each date:
-  1. ``check_and_rehedge`` runs first — exits triggered (SL hit during the
-     day, target hit, time stop, Chandelier trail). Exit fills happen at the
-     stop / target price (intraday touch model) or at the close for time
-     stops.
-  2. ``scan_and_propose`` runs at the close. Proposals are queued for the
-     next trading day's **open** to avoid look-ahead — a strategy that sees
-     today's close and trades today's close is fitting in-sample.
+Replay model, cost model, and fill filters are identical to
+``research/backtest_varsity_equity.py`` (Rule 7: same strategy methods,
+same ``core.costs.estimate_equity_cost`` DELIVERY charges, same
+EQ-FU-2 next-day-open fill queue with gap-skip and max-age). The only
+additions are the delivery panel injection and delivery-specific CLI
+overrides.
 
-Costs
------
-Costs come from the shared ``core.costs.estimate_equity_cost`` DELIVERY
-model — the SAME function the paper runner books, so backtest and paper
-never diverge (Rule 7, §4.1). Statutory Zerodha CNC charges:
-  * Brokerage: free (Zerodha delivery)
-  * STT: 0.1 % on BOTH buy and sell (the crux — a flat round-trip % could
-    not express this; the old 0.20 % constant undercounted it)
-  * Exchange tx (NSE) + SEBI + GST stack
-  * Stamp duty (buy): 0.015 %
-  * Slippage: ``--slippage-bps`` per side (default 5 bps), the one
-    modelling assumption, kept separate from the statutory charges.
-
-Delivery round-trip works out to ≈ 0.22 % statutory + slippage.
-
-Scoring sentinels
------------------
-``ZERO_TRADE_PENALTY = -1e6`` returned when no trades fire (so an
-autoresearch sweep can't mistake "no signal" for "neutral score" — see the
-flat-fitness lesson).
+The strategy's ``deliv_lag_days`` default (1) is left untouched here so
+the tested signal equals the deployable one: day-D scans act on day-D−1
+delivery, matching a 19:45 IST fetch timer vs an 18:30 close scan.
 
 CLI::
 
-    python -m research.backtest_varsity_equity
-    python -m research.backtest_varsity_equity --short-window 20 --long-window 50
-    python -m research.backtest_varsity_equity --capital 2000000 --start 2025-12-01
+    python -m research.backtest_delivery_accum --source cache --start 2023-01-01 --end 2025-05-31
+    python -m research.backtest_delivery_accum --entry-pctile 0.95 --min-hits 3
 """
 from __future__ import annotations
 
@@ -53,14 +31,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-
-from strategies._eq_data import load_equity_panel, load_universe
 from core.backtest_timeframe import warn_coarse_timeframe
-from strategies.varsity_equity_swing import (
+from strategies._delivery import load_delivery_panel
+from strategies._eq_data import load_equity_panel, load_universe
+from strategies.delivery_accumulation import (
+    DeliveryAccumulationStrategy,
     EquityPosition,
     PENDING_GAP_ATR_THRESHOLD,
     PENDING_MAX_AGE_DAYS,
-    VarsityEquitySwingStrategy,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,16 +64,13 @@ class TradeRecord:
     R_multiple: float  # net_pnl / risk_at_entry
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Replay engine
-# ──────────────────────────────────────────────────────────────────────────────
-
-class EquityBacktester:
-    """Walk-forward replay of VarsityEquitySwingStrategy over an OHLCV panel."""
+class DeliveryBacktester:
+    """Walk-forward replay of DeliveryAccumulationStrategy over an OHLCV panel."""
 
     def __init__(
         self,
         panel: pd.DataFrame,
+        deliv_panel: Optional[pd.DataFrame] = None,
         params_overrides: Optional[Dict] = None,
         slippage_bps: Optional[float] = None,
     ):
@@ -103,27 +78,21 @@ class EquityBacktester:
 
         class _NullKite:
             pass
-        # Strategy in paper mode, in-memory book.
-        self.strategy = VarsityEquitySwingStrategy(
+        self.strategy = DeliveryAccumulationStrategy(
             kite=_NullKite(), config_path="/dev/null", mode="paper",
         )
         if params_overrides:
             self.strategy.params.update(params_overrides)
         if slippage_bps is not None:
             self.strategy.params["slippage_bps"] = slippage_bps
-        # Backtest and paper share the strategy's cost model (Rule 7): the
-        # exit/entry cost below both route through self.strategy._cost, so a
-        # cost change lands in both paths at once.
         self.strategy.set_panel(panel, sorted(panel["symbol"].unique().tolist()))
+        if deliv_panel is not None:
+            self.strategy.set_delivery_panel(deliv_panel)
         self.strategy._ensure_features()
 
         self.trade_log: List[TradeRecord] = []
         self.equity_curve: List[Tuple[pd.Timestamp, float]] = []
         self.daily_returns: List[float] = []
-        # EQ-FU-2 instrumentation — counts gap-skip and stale-skip drops
-        # for the summary. autoresearch consumers can read these to spot
-        # parameter sweeps where the would-be trade count is artificially
-        # inflated by the live-vs-backtest filter gap.
         self.n_skipped_gap: int = 0
         self.n_skipped_stale: int = 0
 
@@ -138,20 +107,8 @@ class EquityBacktester:
         return None if pd.isna(v) else float(v)
 
     def _fill_queued(self, dt: pd.Timestamp,
-                      queued: List[Tuple], cash: float) -> float:
-        """EQ-FU-2 fill loop, extracted from run() so tests can drive the
-        real production logic instead of re-implementing it.
-
-        `queued` is the list of (proposal, signal_dt) tuples generated by
-        yesterday's close-scan. Applies the SAME filters as live's
-        _fill_pending_entries:
-          - panel missing / non-positive open → SKIPPED_STALE
-          - age > PENDING_MAX_AGE_DAYS         → SKIPPED_STALE
-          - gap > PENDING_GAP_ATR_THRESHOLD    → SKIPPED_GAP
-        Books position and mutates cash on a clean fill; counters
-        (n_skipped_gap / n_skipped_stale) increment on each skip.
-        Returns the new cash balance.
-        """
+                     queued: List[Tuple], cash: float) -> float:
+        """Next-open fill loop — same filters as the swing harness (EQ-FU-2)."""
         for proposal, signal_dt in queued:
             open_px = self._open_price(proposal.tradingsymbol, dt)
             if open_px is None or open_px <= 0:
@@ -159,9 +116,6 @@ class EquityBacktester:
                 continue
             age_days = (dt - signal_dt).days
             if age_days > PENDING_MAX_AGE_DAYS:
-                # Stale: live would mark SKIPPED_STALE. In a clean
-                # daily-step backtest this branch never fires (age==1)
-                # unless the panel skips days; kept for Rule 7 parity.
                 self.n_skipped_stale += 1
                 continue
             snap = proposal.greeks_snapshot or {}
@@ -172,11 +126,9 @@ class EquityBacktester:
                 if gap_atr > PENDING_GAP_ATR_THRESHOLD:
                     self.n_skipped_gap += 1
                     continue
-            # cost on entry (shared delivery model — Rule 7 parity w/ paper)
             notional = open_px * proposal.quantity
             entry_cost = self.strategy._cost(open_px, proposal.quantity, "BUY")
             cash -= notional + entry_cost
-            # rebuild SL/target around the actual fill (not yesterday's close)
             k_sl = self.strategy.params["atr_stop_multiplier"]
             rr = self.strategy.params["risk_reward"]
             sl = open_px - k_sl * atr_v
@@ -196,22 +148,14 @@ class EquityBacktester:
             raise RuntimeError("empty panel — cannot backtest")
         capital = self.strategy.params["total_capital"]
         cash = capital
-        # EQ-FU-2: queue carries (proposal, signal_dt) tuples so the
-        # max-age filter (PENDING_MAX_AGE_DAYS) is computable. signal_dt
-        # is the date of the close-scan that emitted the proposal.
         queued: List[Tuple] = []
 
         for i, dt in enumerate(dates):
             self.strategy.set_current_date(dt)
 
-            # 1) Execute queued opens at today's open. EQ-FU-2 applies the
-            # SAME gap-skip + max-age filters as live's _fill_pending_entries,
-            # so autoresearch sweeps optimise against the trade count that
-            # live will actually deliver.
             cash = self._fill_queued(dt, queued, cash)
             queued = []
 
-            # 2) Run intraday exit checks against today's high/low
             exits = self.strategy.check_and_rehedge()
             for ex in exits:
                 pos = self.strategy.positions.pop(ex.tradingsymbol, None)
@@ -223,7 +167,7 @@ class EquityBacktester:
                 cash += notional_exit - exit_cost
                 gross_pnl = (exit_px - pos.entry_px) * pos.qty
                 entry_cost = self.strategy._cost(pos.entry_px, pos.qty, "BUY")
-                costs = entry_cost + exit_cost  # true round-trip (was 2x-inflated)
+                costs = entry_cost + exit_cost
                 net_pnl = gross_pnl - costs
                 holding = self.strategy._trading_days_between(pos.entry_dt, dt)
                 risk_at_entry = (pos.entry_px - pos.initial_sl) * pos.qty
@@ -243,13 +187,9 @@ class EquityBacktester:
                     holding_days=holding, R_multiple=rmult,
                 ))
 
-            # 3) Scan at close for tomorrow's entries. EQ-FU-2: tag each
-            # proposal with today's date so the next-day filler can apply
-            # the same max-age filter live uses.
             proposals = self.strategy.scan_and_propose()
             queued = [(p, dt) for p in proposals]
 
-            # 4) Mark equity curve at today's close
             mtm = sum(self._mtm_value(p, dt) for p in self.strategy.positions.values())
             equity = cash + mtm
             self.equity_curve.append((dt, equity))
@@ -261,12 +201,18 @@ class EquityBacktester:
         return self.summary()
 
     def _mtm_value(self, pos: EquityPosition, dt: pd.Timestamp) -> float:
+        # Fallback is the LAST KNOWN close (last_mtm_px, maintained by
+        # check_and_rehedge; == entry_px only before the first mark), NOT
+        # entry value: an entry-value fallback silently erased the open loss
+        # of any position whose symbol stopped printing bars mid-backtest —
+        # inflating equity/Sharpe exactly for the distressed names this
+        # strategy buys (code-review 2026-07-22).
         f = self.strategy._features.get(pos.symbol)
         if f is None or dt not in f.index:
-            return pos.entry_px * pos.qty
+            return pos.last_mtm_px * pos.qty
         close = f.loc[dt, "close"]
         if pd.isna(close):
-            return pos.entry_px * pos.qty
+            return pos.last_mtm_px * pos.qty
         return float(close) * pos.qty
 
     # ── Reporting ──────────────────────────────────────────────────────────
@@ -294,16 +240,13 @@ class EquityBacktester:
         )
         avg_hold = sum(t.holding_days for t in self.trade_log) / n
         avg_R = sum(t.R_multiple for t in self.trade_log) / n
-        # Equity-curve metrics
         rets = np.array(self.daily_returns) if self.daily_returns else np.array([0.0])
         ann = math.sqrt(252)
         sharpe = (rets.mean() / rets.std() * ann) if rets.std() > 1e-9 else 0.0
-        # drawdown
         equity = np.array([eq for _, eq in self.equity_curve])
         peak = np.maximum.accumulate(equity)
         dd = (equity - peak) / peak
         max_dd = float(dd.min()) if len(dd) else 0.0
-        # CAGR
         n_days = len(self.equity_curve)
         cagr = ((equity[-1] / equity[0]) ** (252.0 / n_days) - 1.0) if n_days > 1 else 0.0
         calmar = (cagr / abs(max_dd)) if max_dd < 0 else float("inf")
@@ -327,11 +270,6 @@ class EquityBacktester:
             "ending_equity": round(self.equity_curve[-1][1], 2) if self.equity_curve else None,
             "n_dates": len(self.equity_curve),
             "score": float(sharpe),
-            # EQ-FU-2: visibility into how many signals the live filter
-            # would have dropped. autoresearch dashboards can plot the
-            # filter-rate so a parameter sweep that yields high backtest
-            # PnL but high gap-skip rate is flagged as "live will fire
-            # fewer trades than the screen suggests".
             "n_skipped_gap": self.n_skipped_gap,
             "n_skipped_stale": self.n_skipped_stale,
         }
@@ -355,45 +293,38 @@ class EquityBacktester:
         return agg
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
-
 def main():
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)-8s %(message)s")
 
-    p = argparse.ArgumentParser(description="Varsity equity-swing backtest")
+    p = argparse.ArgumentParser(description="Delivery-accumulation backtest")
     p.add_argument("--universe", default="data_cache/nifty200.csv")
-    p.add_argument("--source", default="auto", choices=["auto", "cache", "stf"],
-                   help="OHLCV source preference (default auto: per-symbol cache then STF proxy)")
+    p.add_argument("--source", default="cache", choices=["auto", "cache", "stf"],
+                   help="OHLCV source (default cache: delivery data is EQ-series, "
+                        "so the STF proxy would mismatch the signal's instrument)")
     p.add_argument("--start", default=None, help="YYYY-MM-DD inclusive")
     p.add_argument("--end", default=None, help="YYYY-MM-DD inclusive")
     p.add_argument("--capital", type=float, default=1_000_000.0)
     p.add_argument("--risk-pct", type=float, default=1.0)
-    p.add_argument("--short-window", type=int, default=None)
-    p.add_argument("--long-window", type=int, default=None)
-    p.add_argument("--adx-threshold", type=float, default=None)
+    p.add_argument("--entry-pctile", type=float, default=None,
+                   help="deliv_entry_pctile override (fraction 0-1)")
+    p.add_argument("--min-hits", type=int, default=None,
+                   help="deliv_min_hits override")
+    p.add_argument("--range-pos-max", type=float, default=None,
+                   help="range_pos_max override (fraction 0-1)")
     p.add_argument("--atr-stop", type=float, default=None)
     p.add_argument("--rr", type=float, default=None)
     p.add_argument("--time-stop", type=int, default=None)
-    p.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS,
-                   help="Modelled slippage per side, bps of turnover (default 5.0); "
-                        "statutory delivery charges come from core.costs")
-    p.add_argument("--mp", choices=["off", "on"], default="on",
-                   help="Phase-2 Market Profile gate (default: on)")
-    p.add_argument("--oi", choices=["off", "on"], default="off",
-                   help="Phase-2 OI confluence gate (default: off — see DEFAULTS rationale)")
-    p.add_argument("--deliv", choices=["off", "on"], default="off",
-                   help="delivery-percentage boost overlay (default: off — "
-                        "pending Phase-C A/B evidence)")
-    p.add_argument("--ledger-out", default="data_cache/equity_swing_trades.tsv")
+    p.add_argument("--turnover-cr", type=float, default=None,
+                   help="min_avg_turnover_cr override")
+    p.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
+    p.add_argument("--ledger-out", default="data_cache/delivery_accum_trades.tsv")
     p.add_argument("--report-json", default=None)
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
 
-    warn_coarse_timeframe("daily", backtest="backtest_varsity_equity",
-                          reason="no 5-min equity data exists — daily EOD panel "
-                          "only; stand up forward 5-min capture (issue #63)")
+    warn_coarse_timeframe("daily", backtest="backtest_delivery_accum",
+                          reason="delivery percentage only exists at daily "
+                          "resolution (EOD sec_bhavdata); holds are multi-week")
 
     universe = load_universe(Path(args.universe))
     panel = load_equity_panel(universe=universe, source=args.source)
@@ -405,63 +336,49 @@ def main():
         print("ERROR: panel empty after date filter", file=sys.stderr)
         return 2
 
+    deliv_panel = load_delivery_panel(universe)
+    if deliv_panel.empty:
+        print("ERROR: delivery cache empty — run "
+              "`python -m market_data.fetch_deliv` first "
+              "(data_cache/equity_delivery/)", file=sys.stderr)
+        return 2
+    # NOTE: the delivery panel is NOT date-filtered — the rolling percentile
+    # needs the pre-window history; anti-lookahead is the rolling window +
+    # deliv_lag_days, not a data cutoff.
+
     overrides = {"total_capital": args.capital, "risk_per_trade_pct": args.risk_pct}
-    if args.short_window:    overrides["trend_short_window"]   = args.short_window
-    if args.long_window:     overrides["trend_long_window"]    = args.long_window
-    if args.adx_threshold is not None: overrides["adx_threshold"] = args.adx_threshold
+    if args.entry_pctile is not None:  overrides["deliv_entry_pctile"] = args.entry_pctile
+    if args.min_hits is not None:      overrides["deliv_min_hits"] = args.min_hits
+    if args.range_pos_max is not None: overrides["range_pos_max"] = args.range_pos_max
     if args.atr_stop is not None:      overrides["atr_stop_multiplier"] = args.atr_stop
     if args.rr is not None:            overrides["risk_reward"] = args.rr
     if args.time_stop is not None:     overrides["time_stop_days"] = args.time_stop
-    overrides["mp_enabled"] = 1 if args.mp == "on" else 0
-    overrides["oi_enabled"] = 1 if args.oi == "on" else 0
-    overrides["deliv_enabled"] = 1 if args.deliv == "on" else 0
-    if args.deliv == "on":
-        # Fail loud, not degenerate (code-review 2026-07-22, hardened same
-        # day): an empty cache OR one too short for the 126-bar percentile
-        # warm-up leaves deliv_pctile NaN everywhere — the overlay is
-        # silently neutral and the A/B "finds" no uplift from an overlay
-        # that never engaged. Verify actual engagement in THIS window, not
-        # mere cache presence.
-        from strategies._delivery import build_delivery_features, load_delivery_panel
-        deliv_panel = load_delivery_panel(universe)
-        feats = (build_delivery_features(deliv_panel, panel)
-                 if not deliv_panel.empty else pd.DataFrame())
-        engaged = (
-            not feats.empty
-            and feats.loc[feats["date"].isin(panel["date"].unique()),
-                          "deliv_pctile"].notna().any()
-        )
-        if not engaged:
-            print("ERROR: --deliv on but the delivery percentile never engages "
-                  "in this window (cache empty, or <126 bars of per-symbol "
-                  "history before/inside it). Backfill first, e.g. "
-                  "`python -m market_data.fetch_deliv --from-date "
-                  "<window start minus ~9 months>`.", file=sys.stderr)
-            return 2
+    if args.turnover_cr is not None:   overrides["min_avg_turnover_cr"] = args.turnover_cr
 
-    bt = EquityBacktester(panel, params_overrides=overrides, slippage_bps=args.slippage_bps)
+    bt = DeliveryBacktester(panel, deliv_panel=deliv_panel,
+                            params_overrides=overrides, slippage_bps=args.slippage_bps)
     summary = bt.run()
 
     print("=" * 78)
-    print("Varsity Equity Swing — Backtest Summary")
+    print("Delivery Accumulation — Backtest Summary")
     print("=" * 78)
     print(f"  Universe          : {len(universe)} symbols")
     print(f"  Date range        : {panel['date'].min().date()} → {panel['date'].max().date()}")
     print(f"  Trading days      : {summary.get('n_dates', 0)}")
-    print(f"  Trend windows     : {bt.strategy.params['trend_short_window']:.0f} / "
-          f"{bt.strategy.params['trend_long_window']:.0f}")
-    print(f"  ADX threshold     : {bt.strategy.params['adx_threshold']:.0f}")
+    print(f"  Entry pctile      : {bt.strategy.params['deliv_entry_pctile']:.2f} "
+          f"(min hits {bt.strategy.params['deliv_min_hits']:.0f}/5, lag "
+          f"{bt.strategy.params['deliv_lag_days']:.0f}d)")
+    print(f"  Range-pos max     : {bt.strategy.params['range_pos_max']:.2f}")
     print(f"  ATR stop / RR     : {bt.strategy.params['atr_stop_multiplier']:.1f}× / "
           f"{bt.strategy.params['risk_reward']:.1f}")
-    print(f"  MP gate / OI gate : {'on ' if args.mp == 'on' else 'off'} / "
-          f"{'on ' if args.oi == 'on' else 'off'}")
-    print(f"  Deliv overlay     : {'on ' if args.deliv == 'on' else 'off'}")
+    print(f"  Time stop         : {bt.strategy.params['time_stop_days']:.0f} days")
     print(f"  Slippage/side     : {args.slippage_bps:.1f} bps  (+ statutory delivery charges)")
     print("-" * 78)
     if summary["total_trades"] == 0:
         print(f"  No trades fired. Score sentinel: {summary['score']}")
-        print("  Likely cause: warm-up too long for the available history")
-        print(f"  (need {bt.strategy.params['trend_long_window']:.0f}+ bars before SMA-long evaluates).")
+        print("  Likely cause: percentile warm-up (need "
+              f"{bt.strategy.params['pctile_min_periods']:.0f}+ delivery bars/symbol) "
+              "or gates too tight.")
         return 1
     print(f"  Total trades      : {summary['total_trades']}")
     print(f"  Win rate          : {summary['win_rate']*100:.1f} %")
@@ -478,13 +395,11 @@ def main():
           f"₹{summary['ending_equity']:>14,.0f}")
     print("-" * 78)
 
-    # Exit-reason breakdown
     if not args.quiet and bt.trade_log:
         from collections import Counter
         c = Counter(t.exit_reason for t in bt.trade_log)
         print("  Exit reasons      : " + ", ".join(f"{k}={v}" for k, v in c.most_common()))
 
-    # Per-symbol breakdown (top 10 + bottom 5)
     if not args.quiet:
         per = bt.per_symbol_breakdown()
         if not per.empty:
@@ -495,7 +410,6 @@ def main():
                 print("\n  Bottom 5 losers (net ₹):")
                 print(per.tail(5).to_string())
 
-    # Per-trade ledger TSV
     if bt.trade_log:
         ledger = pd.DataFrame([t.__dict__ for t in bt.trade_log])
         ledger.to_csv(args.ledger_out, sep="\t", index=False)

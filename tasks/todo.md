@@ -1,3 +1,42 @@
+# Delivery-percentage strategy (Varsity "who's holding") — 2026-07-22
+
+Plan approved via cloud Ultraplan; implemented on `delivery-accum-phase-abc`.
+Full findings: docs/research/delivery-percentage-strategy-2026-07-22.md.
+
+- [x] Phase A — market_data/fetch_deliv.py (sec_bhavdata_full fetcher, raw +
+      per-symbol parquet caches, quirk handling) + tests (11) + live smoke +
+      2022-01-01→2026-07-21 backfill (1,164 sessions × 209 symbols)
+- [x] Phase B — strategies/_delivery.py (own-history rolling pctile 252/126,
+      value-pctile, 5d hit-count damper) + tests (10) incl. append-future-rows
+      anti-lookahead invariance
+- [x] Phase C — H1 strategies/delivery_accumulation.py (standalone, paper-only,
+      live raises) + research/backtest_delivery_accum.py (harness parity);
+      H2 boost-only overlay in varsity_equity_swing (deliv_enabled default 0)
+      + --deliv flag; tests (13); full suite 1568 passed, 0 skips
+- [x] Pre-registered evaluation (defaults, one holdout run each, deliv lag 1d)
+- [ ] Phase D — paper runner/timers/dashboard: **NOT BUILT — NO-GO** (below)
+
+## Review (2026-07-22)
+
+- H1 standalone (post code-review re-run): train (eff. 2024-03→2025-05)
+  34 trades **−₹63.9k** Sharpe −0.50; holdout (2025-06→2026-06) 29 trades
+  +₹47.5k Sharpe 1.15. Sign-flip across adjacent periods = regime dependence;
+  fails the net-negative-in-sample promotion rule. No post-hoc sweep run
+  (buy-on-gap lesson).
+- Code review (workflow, high; partial verify coverage — session limit):
+  3 defects fixed same-day: (1) fetch_deliv cached raw days before schema
+  validation (Akamai 200-HTML page would poison a day permanently);
+  (2) same-scan proposals each sized against the full gross cap (~6x breach
+  possible in the target selloff regime) — swing has the SAME inherited
+  defect, filed as an issue, not drive-by-fixed; (3) swing --deliv on
+  silently degenerated to baseline on an empty delivery cache (now exit 2).
+- H2 overlay: train identical on/off (boost never changes top-N); holdout ON
+  is WORSE (+₹12.1k / 0.37 vs +₹21.5k / 0.55 off). `deliv_enabled` stays 0.
+- Caveat: EQ OHLCV cache starts 2024-03 — both windows are ~1 regime each.
+  Revisit triggers: pre-2024 price backfill, sector map for cluster breadth,
+  distribution (short) side. Data pipeline + feature layer are kept (merged);
+  no fetch timer installed on purpose.
+
 # A0 — retain depth in the parquet tick tape (2026-07-22)
 
 Enabling change for the auction/order-flow reversal engine
