@@ -5,13 +5,17 @@
 # ticks-*.jsonl uncompressed, ARCHIVE the rest, delete archives older than
 # KEEP_ARCHIVE_DAYS.
 #
-# 2026-07-18: the archive format is now columnar parquet (ZSTD, depth-dropped)
-# instead of a whole-file .jsonl.zst. market_data/tape_to_parquet.py converts + fail-loud
+# 2026-07-18: the archive format is now columnar parquet (ZSTD) instead of a
+# whole-file .jsonl.zst. 2026-07-22: the 5-level depth book is retained,
+# flattened into typed columns (it was dropped before then — order-flow plan
+# A0; sessions archived 07-08/09 lost depth permanently). market_data/tape_to_parquet.py converts + fail-loud
 # verifies (row-count parity) then deletes the raw JSONL; _tape_path prefers
 # parquet > raw > legacy .zst, so the pre-2026-07-18 .zst backlog still
-# replays and ages out via KEEP_ARCHIVE_DAYS below. Parquet halves the on-disk
-# footprint of the .zst it replaces AND skips JSON parsing on every autoresearch
-# replay (only the 3 projected columns are read).
+# replays and ages out via KEEP_ARCHIVE_DAYS below. With depth retained a
+# session archive is ~roughly the size of the .zst it replaces (~320MB vs
+# ~110MB for the depth-dropped format — size the 90-day window accordingly)
+# and still skips JSON parsing on every autoresearch replay (only the
+# projected columns are read).
 #
 # 2026-07-02: backtest.list_captured_sessions / load_captured_tape read the
 # archives directly, so archiving a session no longer hides it from

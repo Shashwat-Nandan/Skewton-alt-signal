@@ -297,7 +297,8 @@ def _tape_path(date_iso: str) -> Path:
     archive (the pre-2026-07-18 backlog; DuckDB decompresses zstd natively).
 
     tick-retention.sh keeps just the newest KEEP_RAW (8) sessions raw and
-    converts the rest to columnar parquet (depth-dropped, ZSTD) — without
+    converts the rest to columnar parquet (ZSTD; depth flattened from
+    2026-07-22, dropped before that) — without
     the archive fallback, list_captured_sessions / load_captured_tape could
     never replay more than ~a week of tape, which capped the autoresearch
     fitness window at 5 sessions (the 2026-06-27 flat-plateau sweep).
@@ -316,13 +317,16 @@ def _tape_path(date_iso: str) -> Path:
     return zst
 
 
-# Columns retained when a raw JSONL tape is archived to parquet (see
-# convert_tape_to_parquet). Every FULL-mode scalar field is kept; only the
-# nested `depth` book (~75% of a tick's bytes, unused by any replay — the
-# loader synthesises bid/ask from last_price) is dropped. Ordering here is
-# the parquet column order. An explicit schema (rather than SELECT *) drops
-# depth by omission AND stops the session-header line — whose keys differ —
-# from polluting the tick schema with header-only columns.
+# Scalar columns retained when a raw JSONL tape is archived to parquet (see
+# convert_tape_to_parquet). Every FULL-mode scalar field is kept. The nested
+# `depth` book (~75% of a tick's bytes as JSON) is NOT stored as a struct —
+# from 2026-07-22 it is flattened into the 30 typed columns of
+# _TAPE_DEPTH_COLUMNS below (auction/order-flow plan A0: top-of-book enables
+# quote-rule trade classification, 5 levels enable depth-replenishment
+# detection; before that date conversion dropped depth entirely). Ordering
+# here is the parquet column order. An explicit schema (rather than SELECT *)
+# stops the session-header line — whose keys differ — from polluting the tick
+# schema with header-only columns.
 _TAPE_PARQUET_COLUMNS = {
     "tradable": "BOOLEAN",
     "mode": "VARCHAR",
@@ -347,9 +351,54 @@ _TAPE_PARQUET_COLUMNS = {
     # declared columns, but parquet tapes archived BEFORE this date lack the
     # column entirely and their raw JSONL is retention-deleted (cannot be
     # reconverted) — a multi-session read_parquet over the archive must pass
-    # union_by_name=true or it will Binder-Error on those files.
+    # union_by_name=true or it will Binder-Error on those files. The same
+    # drift applies to the _TAPE_DEPTH_COLUMNS added 2026-07-22: parquet
+    # tapes archived before then (2026-07-08/09) lack the depth columns
+    # entirely and cannot be reconverted.
     "ts_recv_ns": "BIGINT",
 }
+
+# The Kite FULL-mode 5-level depth book, as declared to read_ndjson. Each side
+# is a list of {price, quantity, orders} structs, best price first.
+_TAPE_DEPTH_LEVELS = 5
+_TAPE_DEPTH_READ_TYPE = (
+    "STRUCT(buy STRUCT(price DOUBLE, quantity BIGINT, orders BIGINT)[], "
+    "sell STRUCT(price DOUBLE, quantity BIGINT, orders BIGINT)[])"
+)
+
+# (side, column_prefix, level, field) for every flattened depth cell — the
+# single source both the column-name list and the SELECT expressions derive
+# from, so they cannot drift apart.
+_TAPE_DEPTH_FIELDS = [
+    (side, prefix, lvl, field)
+    for side, prefix in (("buy", "bid"), ("sell", "ask"))
+    for lvl in range(1, _TAPE_DEPTH_LEVELS + 1)
+    for field in ("price", "quantity", "orders")
+]
+
+# Flattened depth column names, in parquet column order: bid1_* is the best
+# bid, ask1_* the best ask. Field names mirror the Kite payload verbatim
+# (quantity, orders — Rule 11), as the scalar columns above do. NULL-vs-zero
+# semantics (measured on ticks-2026-07-10, not assumed): Kite always sends 5
+# levels per side and pads thin/pre-open books with zero structs, so an empty
+# level reads price=0/quantity=0/orders=0 — a reader must treat zeros as "no
+# quote", never as a live ₹0 bid. NULL appears only where the book itself is
+# absent: index spot ticks, the session-header line, and every row of a
+# pre-2026-07-22 parquet (those lack the columns entirely — union_by_name).
+# A depth-requiring reader must fail loud on NULL depth, not skip it (Rule 12).
+_TAPE_DEPTH_COLUMNS = [f"{p}{lvl}_{f}" for _s, p, lvl, f in _TAPE_DEPTH_FIELDS]
+
+
+def _tape_depth_select_exprs() -> List[str]:
+    """SELECT expressions flattening the nested depth struct into
+    _TAPE_DEPTH_COLUMNS (DuckDB lists are 1-indexed; out-of-range access and
+    NULL structs both yield NULL — the wanted semantics for book-less ticks,
+    and defence-in-depth should a side ever arrive with fewer than 5 entries,
+    though live Kite zero-pads instead)."""
+    return [
+        f"depth.{side}[{lvl}].{field} AS {prefix}{lvl}_{field}"
+        for side, prefix, lvl, field in _TAPE_DEPTH_FIELDS
+    ]
 
 
 # Session-header lines carry the full instrument map (100s of KB). The
@@ -495,8 +544,9 @@ def load_captured_tape(
         con.execute("SET preserve_insertion_order=true")
         if tick_path.suffix == ".parquet":
             # Parquet archive: the same 3 columns are stored typed
-            # (BIGINT/TIMESTAMP/DOUBLE) and depth-dropped at conversion, so
-            # this projects identically to the ndjson path — columnar reads
+            # (BIGINT/TIMESTAMP/DOUBLE); depth is flattened into bid*/ask*
+            # columns from 2026-07-22 (dropped before then) and this
+            # projection deliberately reads only these three — columnar reads
             # only touch these three chunks. Row order is the JSONL order
             # (conversion preserves insertion order), so the resample
             # last-in-bucket tie-break below is unchanged.
@@ -658,9 +708,11 @@ def list_captured_sessions(underlying: str = "NIFTY",
 
 
 def convert_tape_to_parquet(date_iso: str, ticks_dir: Optional[Path] = None) -> Path:
-    """Archive a raw ticks-<date>.jsonl session to columnar parquet, dropping
-    only the nested depth book (see _TAPE_PARQUET_COLUMNS). ZSTD-compressed,
-    insertion-order preserved so the replay resample's last-in-bucket
+    """Archive a raw ticks-<date>.jsonl session to columnar parquet: every
+    scalar field (_TAPE_PARQUET_COLUMNS) plus the 5-level depth book flattened
+    into typed columns (_TAPE_DEPTH_COLUMNS; the nested struct itself is not
+    stored — flat numerics ZSTD-compress well and read directly into pandas).
+    Insertion-order preserved so the replay resample's last-in-bucket
     tie-break is byte-identical to the JSONL path.
 
     ``ticks_dir`` locates the session (default ``data_cache/ticks``, the path
@@ -697,8 +749,9 @@ def convert_tape_to_parquet(date_iso: str, ticks_dir: Optional[Path] = None) -> 
     parquet = ticks / f"ticks-{date_iso}.parquet"
     tmp = parquet.with_name(parquet.name + ".tmp")
 
-    cols_sql = ", ".join(f"{k}: '{v}'" for k, v in _TAPE_PARQUET_COLUMNS.items())
-    select_sql = ", ".join(_TAPE_PARQUET_COLUMNS)
+    read_columns = {**_TAPE_PARQUET_COLUMNS, "depth": _TAPE_DEPTH_READ_TYPE}
+    cols_sql = ", ".join(f"{k}: '{v}'" for k, v in read_columns.items())
+    select_sql = ", ".join([*_TAPE_PARQUET_COLUMNS, *_tape_depth_select_exprs()])
 
     con = duckdb.connect()
     try:
@@ -716,9 +769,11 @@ def convert_tape_to_parquet(date_iso: str, ticks_dir: Optional[Path] = None) -> 
             ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)
             """, [str(raw), _TAPE_MAX_OBJECT_SIZE],
         ).fetchone()[0]
-        n_written = con.execute(
-            "SELECT COUNT(*) FROM read_parquet(?)", [str(tmp)],
-        ).fetchone()[0]
+        n_written, n_depth = con.execute(
+            "SELECT COUNT(*), "
+            "COUNT(*) FILTER (bid1_price IS NOT NULL OR ask1_price IS NOT NULL) "
+            "FROM read_parquet(?)", [str(tmp)],
+        ).fetchone()
     except BaseException:
         con.close()
         tmp.unlink(missing_ok=True)
@@ -731,6 +786,21 @@ def convert_tape_to_parquet(date_iso: str, ticks_dir: Optional[Path] = None) -> 
             f"tape→parquet row-count mismatch for {date_iso}: parquet holds "
             f"{n_written} of {written} copied rows — refusing to archive "
             "(Rule 12: a short archive would bias every sweep it enters)"
+        )
+    if n_written > 0 and n_depth == 0:
+        # Row-count parity alone cannot see this: under ignore_errors a depth
+        # payload whose shape drifted (kiteconnect upgrade, capture-mode
+        # change) transforms to NULL cell-by-cell while rows and scalars
+        # survive — and the caller then deletes the raw JSONL, losing the
+        # book permanently. Every FULL-mode F&O capture has depth on nearly
+        # all rows (index spot is the only book-less ribbon), so a whole-file
+        # zero is drift, not data.
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"tape→parquet depth flatten produced 0 populated books across "
+            f"{n_written} rows for {date_iso} — depth payload shape has "
+            "drifted; refusing to archive (Rule 12: the raw JSONL would be "
+            "deleted and the order book silently lost)"
         )
     tmp.replace(parquet)  # atomic publish onto the name _tape_path prefers
     return parquet

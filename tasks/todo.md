@@ -1,3 +1,56 @@
+# A0 — retain depth in the parquet tick tape (2026-07-22)
+
+Enabling change for the auction/order-flow reversal engine
+(docs/research/auction-orderflow-reversal-engine-2026-07-22.md §3). Time-
+sensitive: tick-retention (18:30 IST daily) converts sessions beyond
+KEEP_RAW=8 depth-less; only 2026-07-08/09 were already lost (unrecoverable —
+raw deleted). The .zst backlog (37 sessions) is never converted, keeps depth
+until 90-day pruning.
+
+- [x] `research/backtest.py`: `_TAPE_DEPTH_COLUMNS` (30 typed cols,
+      bid/ask 1–5 × price/quantity/orders, Kite field names verbatim) +
+      `_tape_depth_select_exprs()`; `convert_tape_to_parquet` declares
+      `depth` to read_ndjson and flattens it; union_by_name drift note
+      extended (pre-07-22 parquets lack the columns)
+- [x] `tests/test_tape_parquet.py`: flatten test asserts columns AND values;
+      new test proves depth-less (index spot) and short-book ticks survive
+      conversion with NULLs — guards the ignore_errors row-loss mode
+- [x] Stale "depth-dropped" comments updated (`_tape_path`,
+      deploy/tick-retention.sh)
+- [x] ruff + tests/test_tape_parquet.py green (8 passed)
+- [x] Real-session verify (2026-07-10, --keep-jsonl, 32s): rows
+      5,286,463 == scalar-only raw count (zero ticks lost); depth on all
+      5,217,549 F&O ticks (full 5-level), NULL only on NIFTY 50 spot
+      (68,914); book uncrossed 100%, LTP-inside-BBO 60% (snapshot lag —
+      the thing Phase-0 C2 measures). Size 317MB vs ~105MB depth-less
+      (~3×; raw 5.1GB → 16×)
+- [x] Full pytest suite green: 1532 passed, 0 skipped, 7m17s
+- [x] /code-review (workflow, high): 7 verified findings, ALL FIXED —
+      (1) all-NULL-depth fail-loud guard in converter (drifted payload +
+      row-parity-passes + raw deleted = permanent silent book loss);
+      (2) NULL-for-short-book contract was WRONG vs real Kite (zero-pads
+      to 5 levels; measured 12,343 bid1>0 & bid5=0 rows on 07-10) — docs
+      + zero-pad test fixed; (3) distinct per-level fixture values (catch
+      interior transposition); (4) pin duckdb malformed-depth→field-NULL
+      semantics (red on lockfile bump, not lossy in prod); (5) retention
+      size comment ~3× depth-less; (6) stale depth-dropped comment on
+      parquet read path; (7) single _TAPE_DEPTH_FIELDS source for
+      names+exprs. Post-fix: 10/10 tape tests, 07-10 reconverted through
+      guard (19s, 331MB)
+- [x] Full suite re-run after review fixes: 1534 passed, 0 skipped, 6m32s
+- [x] Commit (deploy/ comment-only edit touches a CODEOWNERS path — owner-authorized)
+
+## Review
+
+A0 delivers: forward conversions (incl. tonight's 18:30 retention of
+2026-07-10) archive the 5-level book flattened; only 07-08/09 lost depth
+(unrecoverable). Depth NULL/zero semantics measured, documented, pinned by
+tests. Destructive path now double-guarded (row parity + book-populated).
+Cost: archive ~3× the depth-less size (~320MB/session, 90-day window ≈
++19GB steady-state — fine on this host, noted in tick-retention.sh).
+
+---
+
 # Phase 2b — portfolio frontend tab, PR 6 (2026-07-21)
 
 Branch `research/portfolio-frontend`. Consumes GET /api/portfolio/exposure
