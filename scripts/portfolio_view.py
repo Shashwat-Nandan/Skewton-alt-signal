@@ -159,6 +159,12 @@ def read_taleb_blob(blob: dict, underlying: str) -> List[Contribution]:
     # hedge double-count: options (delta excluded, needs live spot) below,
     # the delta-1 hedge added once after the loop.
     for p in _as_list(st.get("positions")):
+        # CE/PE only — same filter as taleb_option_positions(), so has_options
+        # here and the greeks input there can never diverge (a non-CE/PE row,
+        # which taleb never writes, must not set has_options while being
+        # excluded from pricing → a total with silently-missing delta).
+        if (p.get("option_type") or "").upper() not in ("CE", "PE"):
+            continue
         lots = float(p.get("quantity", 0) or 0)
         lot_size = float(p.get("lot_size", 0) or 0)
         mark = p.get("current_price")
@@ -235,6 +241,28 @@ def _taleb_underlying(path: Path) -> str:
     stem = path.stem  # taleb_paper_state[_UNDERLYING]
     suffix = stem[len("taleb_paper_state"):].lstrip("_")
     return suffix or "NIFTY"
+
+
+def taleb_option_positions(cache_dir: Path) -> Dict[str, List[dict]]:
+    """Raw open OPTION position dicts per underlying, from the Taleb state
+    file(s). The offline view can only report these as premium (no delta —
+    Black-Scholes needs a live spot); the live backend router feeds them to
+    core.greeks_engine with a fetched spot to get net option delta. Kept
+    here so taleb-state location/identity lives in ONE place (this module),
+    not re-globbed in the backend. Returns ``{underlying: [pos_dict, ...]}``
+    where each pos_dict carries the OptionContract fields except spot."""
+    out: Dict[str, List[dict]] = {}
+    for path in sorted(cache_dir.glob("taleb_paper_state*.json")):
+        blob = _load_json(path)
+        if not blob:
+            continue
+        underlying = _taleb_underlying(path)
+        st = blob.get("state", {}) or {}
+        opts = [p for p in _as_list(st.get("positions"))
+                if (p.get("option_type") or "").upper() in ("CE", "PE")]
+        if opts:
+            out.setdefault(underlying, []).extend(opts)
+    return out
 
 
 def _load_sqlite_positions(db_path: Path, table: str) -> List[dict]:

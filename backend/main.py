@@ -30,6 +30,7 @@ from .routers import (
     mp_trend,
     pair_candidates,
     pair_paper_compare,
+    portfolio,
     positions,
     runs,
     strategies,
@@ -106,6 +107,7 @@ def create_app() -> FastAPI:
     app.include_router(arbitrage_paper.router, prefix="/api", dependencies=gated)
     app.include_router(buy_on_gap_paper.router, prefix="/api", dependencies=gated)
     app.include_router(positions.router, prefix="/api", dependencies=gated)
+    app.include_router(portfolio.router, prefix="/api", dependencies=gated)
     app.include_router(equity_swing.router, prefix="/api", dependencies=gated)
 
     @app.get("/", tags=["meta"])

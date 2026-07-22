@@ -1,3 +1,41 @@
+# Phase 2b — live portfolio router, PR 5 (2026-07-21)
+
+Report §4.5b. Branch `research/portfolio-router`. Scoping decisive: the
+backend ALREADY has Kite via `backend/kite_oauth.get_authenticated_kite()`
+(used by runs.py) — no new session infra; offline aggregator = fallback.
+
+- [x] `scripts.portfolio_view.taleb_option_positions(cache_dir)` — raw
+      option dicts per underlying (taleb-state location stays in ONE place)
+- [x] `backend/routers/portfolio.py` GET /api/portfolio/exposure:
+      delta-1 base from portfolio_view.collect/aggregate; if Kite session →
+      net OPTION delta per underlying via core.greeks_engine + live spot
+      (kite.ltp) + broker net (kite.positions); degrades to offline
+      (option delta null, no 401) when no session. No orders (read-only).
+      NO hedge double-count: futures_hedge_delta is in delta-1, options add
+      on top. Per-underlying quote failure drops that underlying only
+      (total stays None — never under-reports delta).
+- [x] registered in backend/main.py (gated by require_session)
+- [x] `tests/test_backend_portfolio.py` (4: offline degrade no-401,
+      option-delta-added-no-double-count, broker-net zero-qty-filtered,
+      quote-failure-degrades-not-500) + view helper covered
+- [x] /code-review high (17/17 verify): theme = fail-loud honesty. FIXED
+      3 CONFIRMED + 2 PLAUSIBLE + 2 cleanup: (0) stale daily-expiring token
+      mislabeled "live" → live now requires a broker call to succeed, else
+      honest offline label; (1) option-only underlying dropped when its
+      book row was absent → union books ∪ priced-options; (2) offline
+      no-options underlying totalled null → now = delta1 (exactly known);
+      (4) empty/zero ltp guarded (no StopIteration/log(0)); (5) has_options
+      aligned to CE/PE; (6) greeks price_steps=3 (net_delta is analytic);
+      (8) import canonical spot-symbol map. KEPT w/ rationale: (3)
+      whole-underlying None on a bad leg is fail-loud (per-leg skip would
+      under-report), (7) per-underlying ltp for isolation at N≤2.
+- [x] full suite green; PR (backend read-only + Kite READS, no order path)
+
+Deferred: frontend /portfolio tab (App.tsx route + Header nav + api.ts +
+PortfolioPage.tsx) — next increment; §4.4 exec-events-on-bus separate.
+
+---
+
 # Phase 2 — read-only portfolio view, PR 4 (2026-07-21)
 
 Report §4.5. Branch `research/portfolio-view`. First Phase 2 item; §4.4
