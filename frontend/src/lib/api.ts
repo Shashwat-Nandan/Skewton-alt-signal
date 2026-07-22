@@ -14,6 +14,7 @@ import type {
   MpTrendResponse,
   PairCandidatesResponse,
   PaperCompareResponse,
+  PortfolioResponse,
   PositionsResponse,
   RunDetail,
   RunSummary,
@@ -170,6 +171,8 @@ export const api = {
   },
 
   positions: () => http<PositionsResponse>("/positions"),
+
+  portfolioExposure: () => http<PortfolioResponse>("/portfolio/exposure"),
 
   marketProfileSymbols: () =>
     http<MarketProfileSymbol[]>("/market-profile/symbols"),

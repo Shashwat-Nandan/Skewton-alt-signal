@@ -1,3 +1,21 @@
+# Phase 2b — portfolio frontend tab, PR 6 (2026-07-21)
+
+Branch `research/portfolio-frontend`. Consumes GET /api/portfolio/exposure
+(PR #174, merged e482b96).
+
+- [x] `frontend/src/pages/PortfolioPage.tsx` — per-underlying net Δ table
+      (Net Δ1 / Option Δ / Net Δ / Notional / Strategies), live-vs-offline
+      banner from the API `note`, SHARED-overlap warning banner, broker-net
+      table when a live session answered. null Net Δ renders "—" (not 0 —
+      unknown ≠ flat). 10s poll via react-query (mirrors PositionsPage).
+- [x] types (PortfolioResponse/UnderlyingExposure/BrokerPosition) + api
+      method portfolioExposure; route in App.tsx; Wallet nav item in Header
+- [x] `npm run build` green (tsc -b type-check + vite); no python touched
+- [x] /code-review (workflow crashed on a schema-retry cap; extracted finder candidates from the journal + verified inline): FIXED market-hours poll gate, broker row-key uniqueness (NSE/BSE same symbol), isError-vs-stale-data banner contradiction; SKIPPED deltaClass dedup (would need refactoring working PositionsPage). Rebuilt green.
+- [x] PR #175 (frontend only — no money path)
+
+---
+
 # Phase 2b — live portfolio router, PR 5 (2026-07-21)
 
 Report §4.5b. Branch `research/portfolio-router`. Scoping decisive: the

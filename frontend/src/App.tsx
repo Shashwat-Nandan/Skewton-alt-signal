@@ -13,6 +13,7 @@ import { KalmanTrendPage } from "@/pages/KalmanTrendPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { MpTrendPage } from "@/pages/MpTrendPage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
+import { PortfolioPage } from "@/pages/PortfolioPage";
 import { PositionsPage } from "@/pages/PositionsPage";
 import { RunPage } from "@/pages/RunPage";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -62,6 +63,7 @@ export default function App() {
       <main className="container py-6">
         <Routes>
           <Route path="/" element={<Home />} />
+          <Route path="/portfolio" element={<PortfolioPage />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/market-profile" element={<MarketProfilePage />} />

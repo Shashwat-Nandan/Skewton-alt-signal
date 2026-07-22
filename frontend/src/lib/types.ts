@@ -599,3 +599,30 @@ export type MarketProfileResponse = {
   composite: CompositeProfile | null;
   daily?: DayProfile[];
 };
+
+// ── Cross-strategy portfolio exposure (/api/portfolio/exposure) ──────────────
+export type UnderlyingExposure = {
+  underlying: string;
+  net_delta1_units: number;         // futures + equity + futures-hedge (exact)
+  net_option_delta: number | null;  // live greeks; null offline or if unpriced
+  net_total_delta: number | null;   // delta1 + option delta; null when unknown
+  net_notional: number;
+  systems: string[];
+  shared: boolean;                  // held by >1 strategy
+  has_options: boolean;
+};
+
+export type BrokerPosition = {
+  tradingsymbol: string;
+  exchange: string;
+  quantity: number;
+  average_price: number;
+  pnl: number;
+};
+
+export type PortfolioResponse = {
+  live: boolean;                    // a working Kite session augmented this view
+  note: string;
+  underlyings: UnderlyingExposure[];
+  broker_net: BrokerPosition[] | null;
+};

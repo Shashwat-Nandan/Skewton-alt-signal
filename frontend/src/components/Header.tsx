@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink } from "react-router-dom";
 import {
   LogOut, Menu, X, Activity, BarChart3, Briefcase, CandlestickChart, GitBranch,
-  Layers, Scale, Sigma, TrendingDown, TrendingUp,
+  Layers, Scale, Sigma, TrendingDown, TrendingUp, Wallet,
   type LucideIcon,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -16,6 +16,7 @@ type NavItem = { to: string; label: string; icon?: LucideIcon; end?: boolean };
 // Single source of truth for the nav — rendered inside the hamburger menu.
 const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Strategies", end: true },
+  { to: "/portfolio", label: "Portfolio", icon: Wallet },
   { to: "/positions", label: "Positions", icon: Briefcase },
   { to: "/market-profile", label: "Market Profile", icon: BarChart3 },
   { to: "/mp-trend", label: "MP Trend (paper)", icon: CandlestickChart },
