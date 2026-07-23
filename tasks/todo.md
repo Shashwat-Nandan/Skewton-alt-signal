@@ -14,7 +14,18 @@ Full findings: docs/research/delivery-percentage-strategy-2026-07-22.md.
       H2 boost-only overlay in varsity_equity_swing (deliv_enabled default 0)
       + --deliv flag; tests (13); full suite 1568 passed, 0 skips
 - [x] Pre-registered evaluation (defaults, one holdout run each, deliv lag 1d)
-- [ ] Phase D — paper runner/timers/dashboard: **NOT BUILT — NO-GO** (below)
+- [x] Phase D — paper deployment (operator-approved 2026-07-22 after the
+      extended-horizon re-test passed the pre-registered gates):
+      runners/run_delivery_accum.py (next-open pending queue = backtested
+      fill model), delivery_* tables + helpers in backend/db.py, read-only
+      /api/delivery/* router, scoreboard row (decay auto-registers),
+      deploy/fetch-deliv.* (19:45) + delivery-accum-{open,close}.* (09:35 /
+      18:45) units
+- [ ] **Paper KILL RULE (pre-registered 2026-07-22, BEFORE first session):**
+      evaluate at the earlier of 20 closed paper trades or 8 weeks after
+      first close-scan; PARK if cumulative net realized paper P&L < 0 at
+      the checkpoint. Monthly decay machine applies as standard on top.
+      No parameter re-tuning during the paper window.
 
 ## Review (2026-07-22)
 

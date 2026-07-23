@@ -1,0 +1,16 @@
+[Unit]
+Description=Fire delivery-accum-open.service Mon-Fri at 09:35 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:35 IST — exits-only sanity pass against the panel's most recent bar,
+# staggered from equity-swing-open (09:30). New entries happen only at
+# the close scan via the pending queue.
+OnCalendar=Mon..Fri *-*-* 09:35:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=60
+
+Unit=delivery-accum-open.service
+
+[Install]
+WantedBy=timers.target

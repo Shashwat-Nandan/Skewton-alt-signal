@@ -396,6 +396,23 @@ class DeliveryAccumulationStrategy(BaseStrategy):
                     pos.last_mtm_dt.date() if pos.last_mtm_dt else "never",
                 )
                 continue
+
+            # Double-adjudication guard (code-review 2026-07-22): a bar this
+            # position was already marked against must not be judged again.
+            # The runner's open scan anchors to the SAME bar the previous
+            # close scan processed (no new bhavcopy before 18:00), and the
+            # trail ratcheted at that bar's CLOSE would otherwise be applied
+            # to that bar's own open/low — firing spurious TRAIL_STOP exits
+            # the backtest never takes. last_mtm_dt is only ever set below,
+            # AFTER adjudication, so it is exactly "last bar judged". The
+            # corrupt-levels state (target <= stop) is exempt: that must
+            # force-flatten on sight, re-seen bar or not.
+            if (pos.last_mtm_dt is not None
+                    and self._current_date <= pos.last_mtm_dt
+                    and pos.target > pos.current_sl):
+                logger.debug("%s: bar %s already adjudicated (last_mtm_dt=%s) — skip",
+                             sym, self._current_date.date(), pos.last_mtm_dt.date())
+                continue
             row = f.loc[self._current_date]
             high, low, close = row["high"], row["low"], row["close"]
             if any(pd.isna(x) for x in (high, low, close)):

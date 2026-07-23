@@ -175,6 +175,38 @@ class TestScanAndSizing:
         with pytest.raises(NotImplementedError):
             DeliveryAccumulationStrategy(_NullKite(), config_path="/dev/null", mode="live")
 
+    def test_same_bar_not_adjudicated_twice(self):
+        """The runner's open scan anchors to the SAME bar the previous close
+        scan already judged, with the trail stop ratcheted at that bar's
+        close — re-adjudicating would fire a spurious TRAIL_STOP at prices
+        the backtest never trades (code-review 2026-07-22). A bar recorded
+        in last_mtm_dt must be skipped; an unseen bar must still adjudicate."""
+        from strategies.varsity_equity_swing import EquityPosition
+        s = _strategy(_ohlcv_panel(), _deliv_panel())
+        s.set_current_date(LAST)
+        dates = pd.bdate_range("2025-01-01", periods=N_BARS)
+        low_last = s._features["AAA"].loc[LAST, "low"]
+
+        def _pos():
+            p = EquityPosition(
+                symbol="AAA", side="LONG", entry_dt=dates[-20],
+                entry_px=110.0, qty=10, initial_sl=90.0, target=200.0,
+                atr_at_entry=4.0, rationale="test")
+            p.current_sl = float(low_last) + 0.5  # ratcheted above the bar's low
+            return p
+
+        # Bar already judged (last_mtm_dt == current bar) → no exit
+        p1 = _pos()
+        p1.last_mtm_dt = LAST
+        s.positions = {"AAA": p1}
+        assert s.check_and_rehedge() == []
+        # Unseen bar (last_mtm_dt None) → the trail stop legitimately fires
+        p2 = _pos()
+        s.positions = {"AAA": p2}
+        exits = s.check_and_rehedge()
+        assert len(exits) == 1
+        assert exits[0].greeks_snapshot["exit_reason"] == "TRAIL_STOP"
+
     def test_trading_days_use_union_calendar(self):
         """The time-stop calendar must come from the panel's UNION of dates,
         not whichever symbol's frame iterates first — a truncated

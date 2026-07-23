@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire delivery-accum-close.service Mon-Fri at 18:45 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 18:45 IST — after fetch-bhavcopy-eq (18:00, gives today's EQ bar) and
+# staggered from equity-swing-close (18:30) so the two paper runners
+# don't contend for the panel caches. Delivery percentiles are lag-1 by
+# design (see fetch-deliv.timer), so today's 19:45 delivery fetch is NOT
+# a dependency of today's scan.
+OnCalendar=Mon..Fri *-*-* 18:45:00 Asia/Kolkata
+
+# Persistent catch-up: the close scan is the entries scan; a late fire
+# beats missing the day (same tradeoff as equity-swing-close).
+Persistent=true
+
+RandomizedDelaySec=60
+
+Unit=delivery-accum-close.service
+
+[Install]
+WantedBy=timers.target

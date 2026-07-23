@@ -202,6 +202,80 @@ CREATE INDEX IF NOT EXISTS idx_eq_pending_status
 
 CREATE INDEX IF NOT EXISTS idx_eq_pending_symbol
     ON equity_pending_entries (symbol, signal_dt DESC);
+
+-- ──────────────────────────────────────────────────────────
+-- Delivery-accumulation paper book (Phase D, 2026-07-22)
+-- ──────────────────────────────────────────────────────────
+-- Per-strategy tables, mirroring the equity_* trio: same lifecycle
+-- (positions / scans / pending-entry queue with next-open fills), written
+-- by runners/run_delivery_accum.py. Separate tables rather than a strategy
+-- column so the swing's live paper book is untouched (safety rule 5).
+CREATE TABLE IF NOT EXISTS delivery_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,                 -- always 'LONG' in v1
+    entry_dt TEXT NOT NULL,
+    entry_px REAL NOT NULL,
+    qty INTEGER NOT NULL,
+    initial_sl REAL NOT NULL,
+    current_sl REAL NOT NULL,
+    target REAL NOT NULL,
+    atr_at_entry REAL NOT NULL,
+    rationale TEXT,
+    last_mtm_dt TEXT,
+    last_mtm_px REAL,
+    high_watermark REAL,
+    status TEXT NOT NULL,               -- OPEN | CLOSED
+    exit_dt TEXT,
+    exit_px REAL,
+    exit_reason TEXT,                   -- SL_HIT | TARGET_HIT | TIME_STOP | TRAIL_STOP | MANUAL
+    pnl REAL,
+    opened_by_scan TEXT                 -- "open" | "close"
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliv_pos_status_dt
+    ON delivery_positions (status, entry_dt DESC);
+
+CREATE INDEX IF NOT EXISTS idx_deliv_pos_symbol
+    ON delivery_positions (symbol, entry_dt DESC);
+
+CREATE TABLE IF NOT EXISTS delivery_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_dt TEXT NOT NULL,              -- ISO timestamp
+    scan_kind TEXT NOT NULL,            -- 'open' | 'close'
+    mode TEXT NOT NULL,                 -- 'signals' | 'paper'
+    n_signals INTEGER NOT NULL DEFAULT 0,
+    n_trades INTEGER NOT NULL DEFAULT 0,
+    n_open_positions INTEGER NOT NULL DEFAULT 0,
+    n_closed_today INTEGER NOT NULL DEFAULT 0,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliv_scans_dt
+    ON delivery_scans (scan_dt DESC);
+
+CREATE TABLE IF NOT EXISTS delivery_pending_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_dt TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT 'LONG',
+    signal_close REAL NOT NULL,
+    sl_distance REAL NOT NULL,
+    target_distance REAL NOT NULL,
+    atr REAL NOT NULL,
+    qty INTEGER NOT NULL,
+    rationale TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution_note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliv_pending_status
+    ON delivery_pending_entries (status, signal_dt DESC);
+
+CREATE INDEX IF NOT EXISTS idx_deliv_pending_symbol
+    ON delivery_pending_entries (symbol, signal_dt DESC);
 """
 
 
@@ -684,3 +758,216 @@ def list_equity_scans(limit: int = 50) -> List[Dict[str, Any]]:
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────
+# Delivery-accumulation paper book + scans (Phase D, 2026-07-22)
+# ──────────────────────────────────────────────────────────
+# Mirrors the equity_* helper trio 1:1 against the delivery_* tables.
+# Deliberately cloned rather than parameterized: db.py's convention is one
+# explicit function per statement, and issue #191 tracks consolidating the
+# whole lifecycle in its own reviewed pass.
+
+def insert_delivery_position(pos_dict: Dict[str, Any], opened_by_scan: str) -> int:
+    """Insert a fresh OPEN delivery-accum position. Returns the row id."""
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO delivery_positions
+            (symbol, side, entry_dt, entry_px, qty, initial_sl, current_sl, target,
+             atr_at_entry, rationale, last_mtm_dt, last_mtm_px, high_watermark,
+             status, opened_by_scan)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+        """,
+        (
+            pos_dict["symbol"], pos_dict.get("side", "LONG"),
+            pos_dict["entry_dt"], pos_dict["entry_px"], pos_dict["qty"],
+            pos_dict["initial_sl"], pos_dict.get("current_sl", pos_dict["initial_sl"]),
+            pos_dict["target"], pos_dict.get("atr_at_entry", 0.0),
+            pos_dict.get("rationale"),
+            pos_dict.get("last_mtm_dt"), pos_dict.get("last_mtm_px"),
+            pos_dict.get("high_watermark", pos_dict["entry_px"]),
+            opened_by_scan,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def update_delivery_position_mtm(
+    position_id: int,
+    last_mtm_dt: str,
+    last_mtm_px: float,
+    current_sl: float,
+    high_watermark: float,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE delivery_positions
+           SET last_mtm_dt    = ?,
+               last_mtm_px    = ?,
+               current_sl     = ?,
+               high_watermark = ?
+         WHERE id = ?
+        """,
+        (last_mtm_dt, last_mtm_px, current_sl, high_watermark, position_id),
+    )
+
+
+def close_delivery_position(
+    position_id: int,
+    exit_dt: str,
+    exit_px: float,
+    exit_reason: str,
+    pnl: float,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE delivery_positions
+           SET status      = 'CLOSED',
+               exit_dt     = ?,
+               exit_px     = ?,
+               exit_reason = ?,
+               pnl         = ?
+         WHERE id = ?
+        """,
+        (exit_dt, exit_px, exit_reason, pnl, position_id),
+    )
+
+
+def list_delivery_positions(status: Optional[str] = None,
+                            limit: int = 500) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    if status is None:
+        rows = conn.execute(
+            """
+            SELECT * FROM delivery_positions
+             ORDER BY (status='OPEN') DESC, entry_dt DESC, id DESC
+             LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM delivery_positions WHERE status = ? "
+            " ORDER BY entry_dt DESC, id DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_delivery_scan(
+    scan_dt: str, scan_kind: str, mode: str,
+    n_signals: int, n_trades: int,
+    n_open_positions: int, n_closed_today: int,
+    notes: Optional[str] = None,
+) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO delivery_scans
+            (scan_dt, scan_kind, mode, n_signals, n_trades,
+             n_open_positions, n_closed_today, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (scan_dt, scan_kind, mode, n_signals, n_trades,
+         n_open_positions, n_closed_today, notes),
+    )
+    return int(cur.lastrowid)
+
+
+def list_delivery_scans(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM delivery_scans ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_delivery_pending_entry(
+    signal_dt: str,
+    symbol: str,
+    side: str,
+    signal_close: float,
+    sl_distance: float,
+    target_distance: float,
+    atr: float,
+    qty: int,
+    rationale: Optional[str],
+) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO delivery_pending_entries
+            (signal_dt, symbol, side, signal_close, sl_distance, target_distance,
+             atr, qty, rationale, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+        """,
+        (signal_dt, symbol, side, signal_close, sl_distance, target_distance,
+         atr, qty, rationale, datetime.now().isoformat()),
+    )
+    return int(cur.lastrowid)
+
+
+def list_delivery_pending_entries(status: str = "PENDING",
+                                  limit: int = 500) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM delivery_pending_entries WHERE status = ? "
+        " ORDER BY signal_dt ASC, id ASC LIMIT ?",
+        (status, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_delivery_pending_entry_for_symbol(symbol: str) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM delivery_pending_entries "
+        " WHERE symbol = ? AND status = 'PENDING' LIMIT 1",
+        (symbol,),
+    ).fetchone()
+    return row is not None
+
+
+def update_delivery_pending_entry_status(
+    pending_id: int,
+    status: str,
+    note: Optional[str] = None,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE delivery_pending_entries
+           SET status         = ?,
+               resolved_at    = ?,
+               resolution_note = ?
+         WHERE id = ?
+        """,
+        (status, datetime.now().isoformat(), note, pending_id),
+    )
+
+
+def fill_delivery_pending_entry(
+    pos_dict: Dict[str, Any],
+    opened_by_scan: str,
+    pending_id: int,
+    fill_px: float,
+) -> int:
+    """Atomically open a delivery position and mark its pending row FILLED
+    (same single-transaction contract as fill_pending_entry, EQ-FU-3)."""
+    conn = get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        pid = insert_delivery_position(pos_dict, opened_by_scan)
+        update_delivery_pending_entry_status(
+            pending_id, "FILLED",
+            note=f"position id={pid} @ ₹{fill_px:.2f}",
+        )
+        conn.commit()
+        return pid
+    except Exception:
+        conn.rollback()
+        raise

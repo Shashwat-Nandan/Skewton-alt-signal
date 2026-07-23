@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire fetch-deliv.service Mon-Fri at 19:45 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 19:45 IST — NSE publishes sec_bhavdata_full ~18:30-19:30, later than the
+# UDiFF bhavcopy. Day-D delivery therefore lands AFTER the 18:45 close
+# scan; the strategy's deliv_lag_days=1 encodes exactly this: the day-D
+# scan consumes day D-1 delivery fetched by yesterday's run. --days 5
+# catch-up means one missed evening self-heals on the next fire.
+OnCalendar=Mon..Fri *-*-* 19:45:00 Asia/Kolkata
+
+# Persistent catch-up: fetch_deliv is idempotent (raw day cache +
+# per-symbol dedup merge), so a late fire is safe.
+Persistent=true
+
+RandomizedDelaySec=120
+
+Unit=fetch-deliv.service
+
+[Install]
+WantedBy=timers.target

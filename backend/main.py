@@ -23,6 +23,7 @@ from .routers import (
     auth,
     buy_on_gap_paper,
     dashboard_session,
+    delivery_accum,
     equity_swing,
     kalman_pairs,
     kalman_trend,
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(positions.router, prefix="/api", dependencies=gated)
     app.include_router(portfolio.router, prefix="/api", dependencies=gated)
     app.include_router(equity_swing.router, prefix="/api", dependencies=gated)
+    app.include_router(delivery_accum.router, prefix="/api", dependencies=gated)
 
     @app.get("/", tags=["meta"])
     def root():

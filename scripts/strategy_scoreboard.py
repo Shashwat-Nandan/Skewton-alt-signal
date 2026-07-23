@@ -276,6 +276,53 @@ def equity_swing_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
         con.close()
 
 
+def delivery_accum_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
+    """dashboard.db delivery_positions — same extraction contract as
+    equity_swing_monthly (closed pnl by exit month, cum from all closed,
+    open unrealized from last_mtm_px)."""
+    if not db_path.exists():
+        print(f"  [warn] {db_path} not found — delivery accum figures "
+              "unavailable", file=sys.stderr)
+        SKIPPED.append(str(db_path))
+        return {}, 0.0, 0.0
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = con.cursor()
+        # Missing table = vanished data source, and that must be LOUD
+        # (code-review 2026-07-22): the runner creates the schema on its
+        # first scan, so a missing table here means db-path drift or a
+        # never-run migration — a silent zero row would let the kill rule
+        # and decay machine adjudicate on fabricated empty history.
+        try:
+            cur.execute("SELECT 1 FROM delivery_positions LIMIT 1")
+        except sqlite3.OperationalError:
+            print(f"  [warn] delivery_positions table missing in {db_path} — "
+                  "delivery accum figures unavailable (runner never ran here, "
+                  "or db-path drift)", file=sys.stderr)
+            SKIPPED.append(f"{db_path}:delivery_positions")
+            return {}, 0.0, 0.0
+        monthly: Monthly = {}
+        for m, s in cur.execute(
+                "SELECT substr(exit_dt,1,7), SUM(COALESCE(pnl,0)) FROM delivery_positions "
+                "WHERE status != 'OPEN' AND exit_dt IS NOT NULL GROUP BY 1"):
+            monthly[m] = float(s or 0.0)
+        (cum,) = cur.execute("SELECT COALESCE(SUM(COALESCE(pnl,0)), 0) "
+                             "FROM delivery_positions WHERE status != 'OPEN'").fetchone()
+        (n_unmonthed,) = cur.execute(
+            "SELECT COUNT(*) FROM delivery_positions "
+            "WHERE status != 'OPEN' AND exit_dt IS NULL").fetchone()
+        if n_unmonthed:
+            print(f"  [warn] {n_unmonthed} closed delivery position(s) have no "
+                  "exit_dt — included in cum, absent from monthly columns",
+                  file=sys.stderr)
+        (unreal,) = cur.execute(
+            "SELECT COALESCE(SUM((COALESCE(last_mtm_px, entry_px) - entry_px) * qty), 0) "
+            "FROM delivery_positions WHERE status = 'OPEN'").fetchone()
+        return monthly, float(cum), float(unreal)
+    finally:
+        con.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Kill rule → decay state machine (2026-07-19)
 # ──────────────────────────────────────────────────────────────────────────
@@ -465,6 +512,9 @@ def build_rows(data_cache: Path, db_path: Path, today: date) -> List[dict]:
 
     m, cum, u = equity_swing_monthly(db_path)
     add("equity_swing", "equity swing (paper)", m, cum, u)
+
+    m, cum, u = delivery_accum_monthly(db_path)
+    add("delivery_accum", "delivery accum (paper)", m, cum, u)
 
     kal, ma, last = kalman_trend_monthly(data_cache)
     add("kalman_trend", "kalman_trend A/B: kalman", kal,
