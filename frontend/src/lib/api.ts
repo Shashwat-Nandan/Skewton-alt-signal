@@ -170,6 +170,29 @@ export const api = {
     return http<EquityPendingEntriesResponse>(`/equity/pending-entries${qs}`);
   },
 
+  // Delivery-accumulation paper book — same response shapes as /equity/*
+  // (the delivery_* tables mirror the equity_* trio), so the Equity* types
+  // are reused rather than cloned.
+  deliveryPositions: (status?: "open" | "closed", limit?: number) => {
+    const q = new URLSearchParams();
+    if (status) q.set("status", status);
+    if (limit != null) q.set("limit", String(limit));
+    const qs = q.toString();
+    return http<EquityPositionsResponse>(`/delivery/positions${qs ? `?${qs}` : ""}`);
+  },
+  deliverySignals: (date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : "";
+    return http<EquitySignalsResponse>(`/delivery/signals${qs}`);
+  },
+  deliveryScans: (limit?: number) => {
+    const qs = limit != null ? `?limit=${limit}` : "";
+    return http<EquityScansResponse>(`/delivery/scans${qs}`);
+  },
+  deliveryPendingEntries: (status?: string) => {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+    return http<EquityPendingEntriesResponse>(`/delivery/pending-entries${qs}`);
+  },
+
   positions: () => http<PositionsResponse>("/positions"),
 
   portfolioExposure: () => http<PortfolioResponse>("/portfolio/exposure"),
