@@ -21,9 +21,10 @@ operator-owned only.
       (monkeypatched DATA_CACHE; asserts scoped flag touched, fleet flag NOT)
 - [x] Docs: `state/kalman_trend/SKILL.md` risk-monitor rule line (rule-float
       parser lines untouched); VPS runbook has no monitor-flag mention — skipped
-- [ ] Operator steps (post-merge, after 15:30 IST): `rm data_cache/HALT_NEW_ENTRIES`;
-      next session's risk monitor re-trips the scoped `HALT_NEW_ENTRIES_kalman_trend`
-      (kalman stays halted — correct, it is NO-GO); pair runners resume entries
+- [x] Operator steps (post-merge, after 15:30 IST): `rm data_cache/HALT_NEW_ENTRIES`
+      DONE 2026-07-23 17:1x IST; next session's risk monitor re-trips the scoped
+      `HALT_NEW_ENTRIES_kalman_trend` (kalman stays halted — correct, it is NO-GO);
+      pair runners resume entries from 2026-07-24 09:15
 
 ## Review — 2026-07-23
 
@@ -32,6 +33,24 @@ threshold, cadence, or pair-runner behaviour changed; the shared flag keeps its
 operator-owned semantics for every runner. The kalman book's dd-latch behaviour
 (drawdown-from-peak never resets) is unchanged and now correctly confines its
 freeze to kalman_trend itself.
+
+**Code-review addendum (merged in #196, second commit):** 6 verified findings
+fixed — orchestrator `risk()` default mode also observes the shared operator
+flag (no false-green 'ok' while entries frozen); dashboard RiskBadge/halted
+prefix-match `HALT_NEW_ENTRIES*` and show the actual flag name; VPS runbook §
+escalation-0 documents scoped flags + their resume step; risk-monitor test also
+monkeypatches `HALT_NEW_ENTRIES_PATH` (assertion now load-bearing, regression
+sandboxed); incident docstring says ₹25,358 vs ₹20k threshold; `main()` passes
+one strategy name to both `from_skill` and `poll_once`. Final: 1590 passed,
+0 skips; frontend builds. MERGED to main 60c447d + deployed (SPA rebuilt,
+dashboard-backend restarted, stale shared flag removed post-close).
+
+**Deploy-host repairs (same evening):** frontend build was broken on the host —
+nvm node 20.9.0 too old for locked typescript 7.0.2 / rolldown-vite (extensionless
+ESM bin + missing native binding after `npm ci`). Fixed: `nvm install 20`
+(20.20.2, set default) + clean `npm ci` + rebuild. Separate pending chore:
+`deploy/redeploy.sh` exits 11 on lockfile drift (PyPI churn since 07-18 pins,
+NOT this PR) — needs the usual `uv pip compile --upgrade` chore(deps) PR.
 
 ---
 
