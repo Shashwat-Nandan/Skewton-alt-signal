@@ -28,9 +28,11 @@ to assert alpha.
 - A candidate that fails ANY gate is killed and the rejection is logged to
   STATE.md. A low rejection rate is a warning sign (verifier looseness), not a
   win (paper §VI-A).
-- Risk monitor (Phase 4, isolated process): trips HALT_NEW_ENTRIES when the paper
-  book's realized-P&L drawdown-from-peak breaches (NOT the paper's flatten-all —
-  this repo has no such primitive and HALT_ALL would trap open positions):
+- Risk monitor (Phase 4, isolated process): trips HALT_NEW_ENTRIES_kalman_trend
+  (the SCOPED flag — never the shared HALT_NEW_ENTRIES, which halts every runner;
+  2026-07-15 incident) when the paper book's realized-P&L drawdown-from-peak
+  breaches (NOT the paper's flatten-all — this repo has no such primitive and
+  HALT_ALL would trap open positions):
   - kill_switch_drawdown_rupees: 20000
 
 ## Lessons

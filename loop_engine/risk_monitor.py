@@ -7,10 +7,14 @@ SEPARATE process. It shares NOTHING with the maker but the atomically-written
 runner state file: it reads realized P&L out of that JSON as plain numbers and
 never imports the strategy code, so it cannot inherit the maker's drift.
 
-On a drawdown breach it trips HALT_NEW_ENTRIES (the existing kill switch — Rule 7),
-which stops new risk while letting stop-bounded open positions exit normally. It
-does NOT use HALT_ALL (that freezes exits too, trapping positions) and the paper's
-literal "flatten-all" has no primitive in this repo. The breach is logged as a
+On a drawdown breach it trips HALT_NEW_ENTRIES_<strategy> (its OWN scoped kill
+switch — core.runner_common.scoped_halt_new_entries_path), which stops new risk for
+THIS strategy while letting stop-bounded open positions exit normally. It must NOT
+trip the shared HALT_NEW_ENTRIES: that flag is operator-owned and halts every
+runner — on 2026-07-15 this monitor tripped it on a paper drawdown and froze the
+LIVE pair runner's entries for six sessions. It does NOT use HALT_ALL (that
+freezes exits too, trapping positions) and the paper's literal "flatten-all" has
+no primitive in this repo. The breach is logged as a
 hard incident lesson in STATE.md. The monitor cannot be overridden by the maker or
 checker; structurally it sits outside the loop and observes it.
 
@@ -155,16 +159,18 @@ def poll_once(
     strategy: str = "kalman_trend",
     state_root: Optional[Path] = None,
 ) -> RiskReading:
-    """One poll: read per-book equity → update peaks → trip HALT_NEW_ENTRIES on a
-    breach. FAILS CLOSED, never open: an unreadable runner state skips the poll
+    """One poll: read per-book equity → update peaks → trip the strategy's scoped
+    HALT_NEW_ENTRIES_<strategy> flag on a breach. FAILS CLOSED, never open: an unreadable runner state skips the poll
     (peaks preserved, no spurious trip), and a corrupt monitor state trips the kill
     switch. Idempotent on an already-set flag.
     """
     if config is None:
         config = RiskConfig.from_skill(strategy, root=state_root)
     if halt_path is None:
-        from core.runner_common import HALT_NEW_ENTRIES_PATH
-        halt_path = HALT_NEW_ENTRIES_PATH
+        # Scoped flag (HALT_NEW_ENTRIES_<strategy>) — never the shared one; see
+        # the module docstring for the 2026-07-15 fleet-freeze incident.
+        from core.runner_common import scoped_halt_new_entries_path
+        halt_path = scoped_halt_new_entries_path(strategy)
 
     equities = read_book_equities(runner_state)
     if equities is None:
@@ -179,7 +185,7 @@ def poll_once(
         prior_peaks = _load_peaks(monitor_state)
     except CorruptMonitorState as exc:
         msg = (f"RISK MONITOR FAULT: peak state {monitor_state.name} is corrupt "
-               f"({exc}) — high-water mark lost, FAILING CLOSED, HALT_NEW_ENTRIES tripped")
+               f"({exc}) — high-water mark lost, FAILING CLOSED, {halt_path.name} tripped")
         _trip(halt_path, strategy, state_root, msg)
         return RiskReading(equities=equities, peaks={}, worst_book=None,
                            worst_drawdown=float("nan"), breached=True)
@@ -193,7 +199,7 @@ def poll_once(
         _trip(halt_path, strategy, state_root,
               f"RISK KILL: book {reading.worst_book} realized drawdown "
               f"₹{reading.worst_drawdown:.0f} ≥ ₹{config.kill_switch_drawdown_rupees:.0f} "
-              f"(equity ₹{eq:.0f}, peak ₹{peak:.0f}) — HALT_NEW_ENTRIES tripped")
+              f"(equity ₹{eq:.0f}, peak ₹{peak:.0f}) — {halt_path.name} tripped")
     return reading
 
 
@@ -210,13 +216,17 @@ def main() -> int:  # pragma: no cover  (long-running host process, 1-min cadenc
                         format="%(asctime)s %(levelname)s %(message)s")
     assert_timezone_ist(logger)
     install_signal_handlers(logger)
-    config = RiskConfig.from_skill()
+    # One strategy name feeding BOTH the SKILL.md threshold lookup and the
+    # scoped halt-flag derivation in poll_once — passing it to only one of the
+    # two would measure strategy A's threshold but trip strategy B's flag.
+    strategy = "kalman_trend"
+    config = RiskConfig.from_skill(strategy)
     logger.info("risk monitor up: kill switch at ₹%.0f drawdown-from-peak",
                 config.kill_switch_drawdown_rupees)
 
     close_t = datetime.now().replace(hour=15, minute=25, second=0, microsecond=0)
     while datetime.now() < close_t:
-        r = poll_once(config)
+        r = poll_once(config, strategy=strategy)
         if not r.evaluable:
             logger.info("worst dd unknown (runner state unreadable)")
         else:

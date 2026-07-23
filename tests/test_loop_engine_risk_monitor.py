@@ -109,6 +109,31 @@ def test_breach_trips_halt_and_logs_incident(tmp_path):
                for le in memory.read_state("kt", root=tmp_path).lessons)
 
 
+def test_default_halt_flag_is_scoped_per_strategy_not_fleet_wide(tmp_path, monkeypatch):
+    """The monitor polices ONE strategy's paper book, so its default kill switch
+    must be the scoped HALT_NEW_ENTRIES_<strategy> — never the shared
+    HALT_NEW_ENTRIES, which halts entries for EVERY runner. On 2026-07-15 a
+    ₹25,358 kalman_trend paper drawdown tripped the shared flag and silently
+    froze the LIVE pair runner's entries for ~6.5 sessions."""
+    import core.runner_common as rc
+    monkeypatch.setattr(rc, "DATA_CACHE", tmp_path)
+    # HALT_NEW_ENTRIES_PATH is bound at import time, so patching DATA_CACHE
+    # alone would not redirect it — and a regression to the shared-flag default
+    # would then touch the REAL data_cache/HALT_NEW_ENTRIES on the deploy host.
+    # Patch it too, so the fleet-flag assertion below is load-bearing.
+    monkeypatch.setattr(rc, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES")
+    runner, monitor = tmp_path / "runner.json", tmp_path / "monitor.json"
+    _peaks_file(monitor, {"NIFTY:kalman": 30000.0, "NIFTY:ma": 0.0})
+    _write_runner_state(runner, [("NIFTY", 0, 0, 75)])      # kalman 0 → dd 30k
+
+    r = rm.poll_once(rm.RiskConfig(20000), runner_state=runner, monitor_state=monitor,
+                     strategy="kt", state_root=tmp_path)    # halt_path defaulted
+
+    assert r.breached
+    assert (tmp_path / "HALT_NEW_ENTRIES_kt").exists()
+    assert not (tmp_path / "HALT_NEW_ENTRIES").exists()     # fleet flag untouched
+
+
 def test_unreadable_runner_state_skips_poll_no_spurious_trip(tmp_path):
     """After a high, a momentarily-missing runner state must NOT read as a ₹0
     collapse and trip — fail closed = skip, peaks preserved (§the spurious-trip bug)."""

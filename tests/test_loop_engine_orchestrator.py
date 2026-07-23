@@ -92,6 +92,28 @@ def test_risk_seam_observes_the_kill_switch_flag(tmp_path):
     assert memory.read_state("kt", root=tmp_path).last_run["risk"] == "HALT_NEW_ENTRIES"
 
 
+def test_risk_seam_default_mode_reports_shared_operator_flag(tmp_path, monkeypatch):
+    """The runner's entry gate ORs the scoped flag with the shared operator-owned
+    HALT_NEW_ENTRIES, so risk() must not report 'ok' while the shared flag is set
+    — that false green is the 2026-07-15 silent-freeze shape (Rule 12). Scoped
+    takes precedence when both exist (it names the monitor's own trip)."""
+    import core.runner_common as rc
+    monkeypatch.setattr(rc, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(rc, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES")
+    orch = LoopOrchestrator(strategy="kt", state_root=tmp_path)   # no injected path
+
+    out_ok = orch.run_session(engine=_fake_engine(), today=date(2026, 7, 23))
+    assert out_ok.risk == "ok"
+
+    (tmp_path / "HALT_NEW_ENTRIES").touch()          # operator's fleet-wide halt
+    out_shared = orch.run_session(engine=_fake_engine(), today=date(2026, 7, 24))
+    assert out_shared.risk == "HALT_NEW_ENTRIES"
+
+    (tmp_path / "HALT_NEW_ENTRIES_kt").touch()       # monitor's scoped trip wins
+    out_scoped = orch.run_session(engine=_fake_engine(), today=date(2026, 7, 27))
+    assert out_scoped.risk == "HALT_NEW_ENTRIES_kt"
+
+
 def test_errored_session_still_writes_a_summary(tmp_path):
     """Fail-loud (Rule 12): a failed maker session is recorded, not swallowed."""
     orch = LoopOrchestrator(strategy="kt", state_root=tmp_path)

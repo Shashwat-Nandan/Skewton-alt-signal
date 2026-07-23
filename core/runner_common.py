@@ -50,6 +50,19 @@ HALT_ALL_PATH = DATA_CACHE / "HALT_ALL"
 HALT_NEW_ENTRIES_PATH = DATA_CACHE / "HALT_NEW_ENTRIES"
 
 
+def scoped_halt_new_entries_path(strategy: str) -> Path:
+    """Per-strategy entry-halt flag: HALT_NEW_ENTRIES_<strategy>.
+
+    Automated monitors must trip THIS, never the shared HALT_NEW_ENTRIES
+    above — the unsuffixed flag is operator-owned and freezes entries for
+    EVERY runner. On 2026-07-15 the kalman_trend paper risk monitor tripped
+    the shared flag on a ₹25,358 paper drawdown (breaching its ₹20k
+    threshold) and silently froze the LIVE pair runner's entries for ~6.5
+    sessions. Mirrors the halt_daily_loss_path namespacing in
+    runners/run_paper_pairs.py (PR #147)."""
+    return DATA_CACHE / f"HALT_NEW_ENTRIES_{strategy}"
+
+
 def taleb_state_suffix(underlying: str) -> str:
     """Underlying suffix for a Taleb instance's per-underlying files (state,
     lock, log, IV history). NIFTY keeps the LEGACY unsuffixed names (the

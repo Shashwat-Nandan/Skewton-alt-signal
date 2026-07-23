@@ -336,7 +336,12 @@ def main() -> int:  # pragma: no cover
     kite = KiteAuthManager("config.ini").get_kite()          # reuse cached session
     nfo = kite.instruments("NFO")
 
-    from core.runner_common import HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH
+    from core.runner_common import (HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH,
+                                    scoped_halt_new_entries_path)
+    # The isolated risk monitor trips the SCOPED flag (never the shared one —
+    # 2026-07-15 fleet-freeze incident); the shared flag stays operator-owned.
+    # Entries halt on either.
+    halt_scoped_path = scoped_halt_new_entries_path("kalman_trend")
 
     # Resolve front-month future per symbol + warmup-fit on recent 5-min history
     # OF THE FUTURE WE TRADE (not the spot index — the future carries a basis and
@@ -455,7 +460,8 @@ def main() -> int:  # pragma: no cover
             for b in books:
                 b.on_session_start()
             session_day = d_now
-        allow_entry = not HALT_NEW_ENTRIES_PATH.exists()
+        allow_entry = not (HALT_NEW_ENTRIES_PATH.exists()
+                           or halt_scoped_path.exists())
         now = time.time()
         ran = errored = 0
         for b in books:

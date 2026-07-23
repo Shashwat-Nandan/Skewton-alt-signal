@@ -730,6 +730,8 @@ Four escalation levels, gentlest first:
 
    A third file — `data_cache/HALT_DAILY_LOSS` — is touched **automatically** by the runner when the cumulative session ΔP&L breaches `--max-daily-loss-inr` (default ₹50,000). It has the same effect as `HALT_NEW_ENTRIES` (entries stop, exits continue) and persists across restarts so a session-end ≠ acknowledgement. Operator clears with `rm data_cache/HALT_DAILY_LOSS` after reviewing the journal for the breach details.
 
+   Automated monitors trip **per-strategy** flags — `data_cache/HALT_NEW_ENTRIES_<strategy>` (currently only `HALT_NEW_ENTRIES_kalman_trend`, tripped by `loop-kalman-trend-risk` on a drawdown breach) — never the shared flag above (2026-07-15 incident: the monitor tripping the shared flag froze the LIVE pair runner's entries for ~6.5 sessions). A scoped flag halts entries for **that strategy only**, and the `rm -f` line above does **not** clear it — resume that strategy with `rm data_cache/HALT_NEW_ENTRIES_<strategy>` after reviewing the breach in `journalctl -u loop-kalman-trend-risk.service`. Note the risk monitor re-trips the flag within 60 s while the breach condition persists (drawdown-from-peak does not reset), so clearing it mid-breach only sticks if the monitor is stopped — that latch is by design.
+
 1. **Soft halt — stop the timer; let the current session finish naturally.** The 15:25 flatten still runs, EOD report writes:
    ```bash
    sudo systemctl stop taleb-hedger-live.timer

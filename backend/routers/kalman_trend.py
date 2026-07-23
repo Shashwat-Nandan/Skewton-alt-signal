@@ -87,7 +87,7 @@ class LoopStatus(BaseModel):
     timestamp: Optional[str] = None
     status: Optional[str] = None
     checker: Optional[str] = None          # 'pass' | 'REJECT: …' | 'skipped:…' | 'deferred…'
-    risk: Optional[str] = None             # 'ok' | 'HALT_NEW_ENTRIES' | None (unknown)
+    risk: Optional[str] = None             # 'ok' | 'HALT_NEW_ENTRIES[_<strategy>]' | None (unknown)
 
 
 class KalmanTrendResponse(BaseModel):

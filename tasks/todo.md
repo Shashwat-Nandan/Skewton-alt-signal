@@ -1,3 +1,40 @@
+# Scope the kalman_trend risk-monitor kill switch — 2026-07-23
+
+**Incident:** `loop-kalman-trend-risk` tripped the SHARED `data_cache/HALT_NEW_ENTRIES`
+on 2026-07-15 12:57 IST (NIFTY:kalman paper drawdown ₹25,358 ≥ ₹20,000) and re-touches
+it every 60 s. Every runner reads that flag → the LIVE persistent pair runner and the
+baseline paper runner have entered **zero** new trades for ~6.5 sessions. Blast radius
+bug: monitor scope is the kalman paper book, switch scope is the whole fleet.
+
+Fix (approved by operator): namespace the monitor's flag, mirroring the
+`halt_daily_loss_path` pattern from PR #147. Shared `HALT_NEW_ENTRIES` becomes
+operator-owned only.
+
+- [x] `core/runner_common.py` — add `scoped_halt_new_entries_path(strategy)` →
+      `HALT_NEW_ENTRIES_<strategy>`
+- [x] `loop_engine/risk_monitor.py` — `poll_once` default halt path → scoped flag;
+      trip messages name the actual flag file
+- [x] `runners/run_paper_kalman_trend.py` — entry gate honours shared OR scoped flag
+- [x] `loop_engine/orchestrator.py` — `risk()` default reads the scoped flag,
+      reports the flag's name (`halt.name`; injected-path tests unchanged)
+- [x] Tests: `test_default_halt_flag_is_scoped_per_strategy_not_fleet_wide`
+      (monkeypatched DATA_CACHE; asserts scoped flag touched, fleet flag NOT)
+- [x] Docs: `state/kalman_trend/SKILL.md` risk-monitor rule line (rule-float
+      parser lines untouched); VPS runbook has no monitor-flag mention — skipped
+- [ ] Operator steps (post-merge, after 15:30 IST): `rm data_cache/HALT_NEW_ENTRIES`;
+      next session's risk monitor re-trips the scoped `HALT_NEW_ENTRIES_kalman_trend`
+      (kalman stays halted — correct, it is NO-GO); pair runners resume entries
+
+## Review — 2026-07-23
+
+`ruff` clean; full suite 1589 passed, 0 skips. Blast-radius fix only — no
+threshold, cadence, or pair-runner behaviour changed; the shared flag keeps its
+operator-owned semantics for every runner. The kalman book's dd-latch behaviour
+(drawdown-from-peak never resets) is unchanged and now correctly confines its
+freeze to kalman_trend itself.
+
+---
+
 # Delivery-percentage strategy (Varsity "who's holding") — 2026-07-22
 
 Plan approved via cloud Ultraplan; implemented on `delivery-accum-phase-abc`.

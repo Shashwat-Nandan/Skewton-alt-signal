@@ -107,8 +107,10 @@ function CheckerBadge({ kind }: { kind: string }) {
 /** Kill switch: green only when explicitly 'ok'; red on HALT; neutral 'unknown'
  *  when STATE.md has no risk yet — never assert healthy from absence (fail-loud). */
 function RiskBadge({ risk }: { risk: string | null | undefined }) {
-  if (risk === "HALT_NEW_ENTRIES")
-    return <Badge className="bg-rose-600/15 text-rose-700 hover:bg-rose-600/15">HALT_NEW_ENTRIES</Badge>;
+  // Prefix match: the risk seam reports the flag's file name — the shared
+  // "HALT_NEW_ENTRIES" or the scoped "HALT_NEW_ENTRIES_<strategy>" (PR #196).
+  if (risk?.startsWith("HALT_NEW_ENTRIES"))
+    return <Badge className="bg-rose-600/15 text-rose-700 hover:bg-rose-600/15">{risk}</Badge>;
   if (risk === "ok")
     return <Badge className="bg-emerald-600/15 text-emerald-700 hover:bg-emerald-600/15">ok</Badge>;
   return <Badge variant="outline" className="text-muted-foreground">unknown</Badge>;
@@ -146,7 +148,7 @@ export function KalmanTrendPage() {
   const lessons = data?.lessons ?? [];
   const hasData = data?.latest_date != null; // EOD sidecar present
   const loop = data?.loop ?? null;
-  const halted = loop?.risk === "HALT_NEW_ENTRIES";
+  const halted = !!loop?.risk?.startsWith("HALT_NEW_ENTRIES");
   const checker = parseChecker(loop?.checker);
   const RiskIcon = halted ? ShieldAlert : loop?.risk === "ok" ? ShieldCheck : Shield;
   const riskIconClass = halted ? "text-rose-600" : loop?.risk === "ok" ? "text-emerald-600" : "text-muted-foreground";

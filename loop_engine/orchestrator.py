@@ -124,7 +124,8 @@ class LoopOrchestrator:
         self._checker = checker
         # The kill-switch flag the isolated risk monitor trips. The orchestrator
         # only OBSERVES it (§VII-D: never run the monitor inline). None resolves to
-        # the shared runner_common flag at call time; tests inject a tmp path.
+        # the strategy's SCOPED flag (HALT_NEW_ENTRIES_<strategy>) at call time —
+        # matching what the monitor now trips; tests inject a tmp path.
         self._risk_halt_path = risk_halt_path
 
     # -- read-first (§II-B / §II-C): load the procedure manual + loop memory ----
@@ -168,13 +169,26 @@ class LoopOrchestrator:
 
         The monitor runs in a SEPARATE process (loop_engine.risk_monitor); running
         it here would be the §VII-D anti-pattern. We only read its effect — the
-        HALT_NEW_ENTRIES flag — so the kill is visible in STATE.md.
+        scoped HALT_NEW_ENTRIES_<strategy> flag — so the kill is visible in
+        STATE.md (reported by the flag's actual file name).
         """
         halt = self._risk_halt_path
         if halt is None:
-            from core.runner_common import HALT_NEW_ENTRIES_PATH
-            halt = HALT_NEW_ENTRIES_PATH
-        return "HALT_NEW_ENTRIES" if halt.exists() else "ok"
+            from core.runner_common import scoped_halt_new_entries_path
+            halt = scoped_halt_new_entries_path(self.strategy)
+        if halt.exists():
+            return halt.name
+        # The runner's entry gate ORs the scoped flag with the shared
+        # operator-owned HALT_NEW_ENTRIES, so reporting 'ok' while the shared
+        # flag is set would be a false green — the 2026-07-15 silent-freeze
+        # shape (Rule 12). Default mode only: an injected path stays the sole
+        # authority so tests remain hermetic. Module attribute lookup (not a
+        # from-import) so tests can monkeypatch the path.
+        if self._risk_halt_path is None:
+            import core.runner_common as _rc
+            if _rc.HALT_NEW_ENTRIES_PATH.exists():
+                return _rc.HALT_NEW_ENTRIES_PATH.name
+        return "ok"
 
     # -- stage 3.5: compounding retro (§IV) — append a lesson IFF notable -------
     def retro(self, prior: memory.LoopState, outcome: SessionOutcome) -> Optional[str]:
