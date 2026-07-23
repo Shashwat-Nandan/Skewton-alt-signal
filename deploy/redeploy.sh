@@ -50,11 +50,12 @@ echo "Syncing venv to lockfiles ..."
 
 # 5. Rebuild frontend only if frontend/ changed since last deploy marker
 #    (or always — the build is ~30s and idempotent, so we don't bother
-#    with a marker)
+#    with a marker). Delegates to build-frontend.sh, which also pins the
+#    Node runtime via nvm's default alias — an inherited stale PATH broke
+#    this step on 2026-07-23 (node 20.9.0 vs typescript 7's floor).
 echo "Rebuilding frontend ..."
+PROJECT_DIR="$PROJECT_DIR" bash "$PROJECT_DIR/deploy/build-frontend.sh"
 cd "$PROJECT_DIR/frontend"
-npm ci --no-audit --no-fund
-npm run build
 
 # 6. Restart backend so it picks up any code or .env changes
 echo "Restarting $BACKEND_UNIT ..."
