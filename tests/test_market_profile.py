@@ -12,13 +12,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from core.market_profile import (
     Bar,
+    DayIndicators,
     auto_tick_size,
     compute_composite,
     compute_day_profile,
+    hvn_lvn,
     indicators_to_dict,
     market_generated_indicators,
     period_letter,
     split_by_day,
+    value_migration,
 )
 
 
@@ -538,3 +541,152 @@ class TestIndicatorsSerialization:
 
     def test_empty_bars_returns_none(self):
         assert market_generated_indicators([]) is None
+
+
+# ──────────────────────────────────────────────────────────
+# hvn_lvn — volume-node peaks/troughs (reversal engine A1)
+# ──────────────────────────────────────────────────────────
+
+class TestHvnLvn:
+    def test_bimodal_histogram_finds_two_hvns_and_the_valley(self):
+        # Two clear volume shelves (bins 2 and 8) with a thin trough between —
+        # the canonical acceptance/rejection geometry the strategy trades.
+        mids = [100.0 + i for i in range(11)]
+        vols = [1, 2, 30, 5, 2, 1, 2, 5, 28, 2, 1]
+        hvns, lvns = hvn_lvn(mids, vols, smoothing_bins=1, min_prominence=0.2)
+        # Both peaks are recovered as HVNs...
+        assert 102.0 in hvns and 108.0 in hvns
+        # ...and the low-volume node sits strictly between them.
+        assert lvns, "a valley between two shelves must be an LVN"
+        assert any(102.0 < lvn < 108.0 for lvn in lvns)
+
+    def test_shoulder_below_a_single_peak_is_not_an_lvn(self):
+        # A monotone climb to one peak has local dips but no valley BETWEEN two
+        # HVNs — an LVN requires flanking shelves on both sides, else every
+        # pullback would mint a fake rejection level.
+        mids = [100.0 + i for i in range(7)]
+        vols = [1, 3, 2, 6, 10, 30, 1]   # one dominant peak, no second shelf
+        _, lvns = hvn_lvn(mids, vols, smoothing_bins=1, min_prominence=0.2)
+        assert lvns == []
+
+    def test_low_prominence_bumps_are_filtered(self):
+        # A dominant shelf plus noise well under the prominence floor: only the
+        # real shelf survives as an HVN.
+        mids = [100.0 + i for i in range(9)]
+        vols = [1, 2, 1, 2, 100, 2, 1, 2, 1]
+        hvns, _ = hvn_lvn(mids, vols, smoothing_bins=1, min_prominence=0.3)
+        assert hvns == [104.0]
+
+    def test_edge_bin_shelf_is_detected(self):
+        # The session's heaviest price sitting at the range extreme (VPOC at the
+        # last bin, e.g. a trend day closing on its highs) must still be an HVN —
+        # a peak finder that ignores endpoints would return the dominant node the
+        # reversal engine most needs. Regression for the 2026-07-24 review.
+        mids = [100.0 + i for i in range(9)]
+        vols = [2, 5, 10, 8, 6, 10, 15, 40, 90]   # tallest node at the edge
+        hvns, _ = hvn_lvn(mids, vols, smoothing_bins=1, min_prominence=0.3)
+        assert 108.0 in hvns
+
+    def test_secondary_shelf_survives_a_dominant_node(self):
+        # A skewed distribution (one dominant node + real secondary shelves with
+        # a valley between) must not collapse to a single level — prominence, not
+        # a global-peak height floor, is what keeps the secondary geometry.
+        mids = [100.0 + i for i in range(12)]
+        vols = [2, 100, 3, 2, 3, 12, 3, 2, 3, 12, 3, 2]
+        hvns, lvns = hvn_lvn(mids, vols, smoothing_bins=1, min_prominence=0.05)
+        assert 105.0 in hvns and 109.0 in hvns   # both secondary shelves kept
+        assert any(105.0 < lvn < 109.0 for lvn in lvns)
+
+    def test_flat_step_on_a_slope_is_not_a_node(self):
+        # A flat step mid-climb ([1,6,6,30,...]) is not a shelf — the volume is
+        # still rising to a taller node. The old strict/non-strict extrema rule
+        # flagged 101.0 as a phantom HVN; prominence rejects it.
+        mids = [100.0 + i for i in range(6)]
+        vols = [1, 6, 6, 30, 2, 1]
+        hvns, _ = hvn_lvn(mids, vols, smoothing_bins=0, min_prominence=0.2)
+        assert hvns == [103.0]
+
+    def test_degenerate_inputs_return_empty(self):
+        assert hvn_lvn([], []) == ([], [])
+        assert hvn_lvn([1.0, 2.0], [5.0, 5.0]) == ([], [])   # < 3 bins
+        assert hvn_lvn([1.0, 2.0, 3.0], [0.0, 0.0, 0.0]) == ([], [])  # flat/zero
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            hvn_lvn([1.0, 2.0, 3.0], [5.0, 5.0])
+
+
+# ──────────────────────────────────────────────────────────
+# value_migration — L1 directional bias (reversal engine A1)
+# ──────────────────────────────────────────────────────────
+
+def _ind(balance_state: str, poc: float,
+         day: datetime = datetime(2026, 4, 17)) -> DayIndicators:
+    """Minimal DayIndicators carrying only the fields value_migration reads."""
+    return DayIndicators(
+        day=day.date(), open_type="open_auction", day_shape="normal",
+        profile_skew="balanced", balance_state=balance_state, in_balance=True,
+        range_ext_up=False, range_ext_down=False, range_ext_first="none",
+        excess_high=False, excess_low=False, poor_high=False, poor_low=False,
+        single_print_count=0, single_print_levels=[],
+        one_timeframing="none", one_timeframing_run=0,
+        open=poc, close=poc, high=poc + 1, low=poc - 1,
+        poc=poc, vah=poc + 1, val=poc - 1, ib_high=None, ib_low=None,
+    )
+
+
+class TestValueMigration:
+    def test_rising_value_is_up_bias(self):
+        seq = [_ind("higher", 100.0), _ind("higher", 105.0),
+               _ind("overlapping_higher", 108.0)]
+        vm = value_migration(seq)
+        assert vm.bias == "up"
+        assert vm.score > 0
+        assert vm.n_days == 3
+
+    def test_falling_value_is_down_bias(self):
+        seq = [_ind("lower", 108.0), _ind("lower", 103.0),
+               _ind("overlapping_lower", 100.0)]
+        vm = value_migration(seq)
+        assert vm.bias == "down"
+        assert vm.score < 0
+
+    def test_balanced_days_are_neutral(self):
+        seq = [_ind("inside", 100.0), _ind("inside", 100.0),
+               _ind("overlapping_higher", 100.0)]
+        vm = value_migration(seq)
+        assert vm.bias == "neutral"
+
+    def test_recency_flips_a_stale_trend(self):
+        # Old down-days, fresh up-days: with a short half-life the recent side
+        # dominates — L1 must track the CURRENT auction, not the whole window.
+        seq = [_ind("lower", 110.0), _ind("lower", 105.0),
+               _ind("higher", 108.0), _ind("higher", 112.0)]
+        vm = value_migration(seq, half_life=1.0)
+        assert vm.bias == "up"
+
+    def test_unknown_prior_is_skipped_not_counted(self):
+        seq = [_ind("unknown", 100.0), _ind("higher", 104.0),
+               _ind("higher", 108.0)]
+        vm = value_migration(seq)
+        # Only the two days with a real balance_state contribute.
+        assert vm.n_days == 2
+        assert vm.bias == "up"
+
+    def test_empty_sequence_is_neutral_zero(self):
+        vm = value_migration([])
+        assert vm.bias == "neutral"
+        assert vm.score == 0.0
+        assert vm.n_days == 0
+
+    def test_all_unknown_never_emits_a_bias_from_poc_drift_alone(self):
+        # No usable balance_state anywhere, but POC drifts steadily up. POC drift
+        # is only a confirmer — on its own it must NOT call a trend off zero
+        # contributing sessions (regression for the 2026-07-24 review: it used to
+        # return bias='up', n_days=0).
+        seq = [_ind("unknown", 100.0), _ind("unknown", 105.0),
+               _ind("unknown", 110.0), _ind("unknown", 115.0)]
+        vm = value_migration(seq)
+        assert vm.bias == "neutral"
+        assert vm.score == 0.0
+        assert vm.n_days == 0

@@ -1,3 +1,94 @@
+# Reversal engine A1 — VAP tape reader + market_profile extensions — 2026-07-24
+
+**Issue #178** (label `reversal-engine`). Phase A1 of
+`docs/research/auction-orderflow-reversal-engine-2026-07-22.md` (§4.1, §4.3).
+A0 (depth retention) shipped c9561c9. This is pure new research/core code — no
+live path touched (strategy/runner are Phase D/E). `core/market_profile.py` is
+CODEOWNERS-guarded (owner: Shashwat-Nandan).
+
+**Data reality confirmed (07-13 parquet):** tape carries `NIFTY 50` (index spot,
+depth+volume NULL — it's a computed index) and `NIFTY26JULFUT` (front-month
+future, full depth + real `volume_traded`). So: volume-at-price is a *future*
+construct; TPO bars work for both. Depth cols present on 07-10/07-13 parquet +
+all forward JSONL; absent on 07-08/09 (pre-A0).
+
+**Plan**
+- [x] `research/tape_vap.py` (new): DuckDB reader over the session parquet/JSONL
+      (`union_by_name=true`), projecting `instrument_token, exchange_timestamp,
+      last_price, last_traded_quantity, volume_traded, tradingsymbol` (+ top-of-book
+      depth cols *when present* — detected via DESCRIBE, not assumed). Reuses the
+      epoch-zero/out-of-session drop from `load_captured_tape`.
+      - Volume-at-price per token: attribute `diff(volume_traded)` (first→0, clip
+        negatives, COUNT them = fail-loud) to the `last_price` bin; bins via
+        `market_profile.auto_tick_size`.
+      - `Bar` sequences (OHLCV) at 1/5-min → `compute_day_profile`.
+      - Token resolution helper: spot + front-month future by tradingsymbol.
+      - `TapeProfile` dataclass bundling both + provenance counters.
+- [x] `core/market_profile.py` extensions (surgical, stdlib-only to match the
+      module's "pure, no deps" design — smoothed-histogram, not scipy):
+      - `hvn_lvn(bin_mids, bin_volumes, ...) -> (hvns, lvns)`: smoothed-histogram
+        peaks/troughs with a prominence filter.
+      - `value_migration(Sequence[DayIndicators]) -> ValueMigration`: L1 bias from
+        the `balance_state` sequence + POC drift.
+- [x] Tests: `tests/test_tape_vap.py` (synthetic parquet round-trip; volume-delta
+      attribution; neg-delta counter; bar OHLC), `test_market_profile.py` additions
+      (hvn_lvn peak/trough on a known bimodal histogram; value_migration votes).
+- [x] **Gate:** validated (Review below). Manual chart-read of HVN/LVN levels =
+      operator step (flagged as follow-up; I can't eyeball a chart).
+
+## Review — 2026-07-24 (A1)
+
+**Shipped**
+- `research/tape_vap.py` (new): `read_tape_columns` (DuckDB, parquet + JSONL/zst,
+  `union_by_name=true`, depth cols passed through *only when DESCRIBE shows them*,
+  epoch-zero/out-of-session drop reused from `load_captured_tape`),
+  `resolve_profile_tokens` (spot by index symbol, front-month future by max tick
+  count — calendar-free), `build_tape_profile` / `session_profiles`, `TapeProfile`
+  dataclass (VAP histogram + Bars + provenance counters + `vpoc()`).
+- `core/market_profile.py` (+~150 lines, additive, stdlib-only): `hvn_lvn`
+  (triangular-smoothed histogram, HVN = prominent local max, LVN = valley between
+  two HVNs), `value_migration` (recency-weighted balance_state votes + POC drift →
+  L1 bias), `ValueMigration` dataclass.
+- Tests: `tests/test_tape_vap.py` (16) + `test_market_profile.py` additions (11).
+  Full new-file run green; ruff clean.
+
+**Two findings caught during build (Rule 12)**
+- Volume-at-price needs a *stable* tick sort: the default quicksort shuffled
+  within-second ties (exchange_timestamp is 1-sec) and manufactured 799 phantom
+  `volume_traded` decreases on 07-13 (2.4% of ticks). `kind="stable"` → **0**
+  negatives; total volume corrected 3.30M → 3.00M. The neg-delta counter that
+  surfaced it is retained as a real-glitch tripwire.
+- `_volume_at_price` boundary bug: a price sitting exactly on a tick multiple
+  (e.g. 24200.0 on a ₹10 grid) fell into the bin *below* it (numpy closes the last
+  bin), dropping the day's-high node. Fixed by anchoring `top` to the high's own
+  bin upper edge.
+
+**Gate evidence**
+- (a) Cross-source, tape-spot 5-min profile vs independent `NIFTY_5minute.parquet`
+  candles (the literal "match compute_day_profile from bars"), 5 overlapping
+  sessions (ref file stale after 07-14): **VAH exact 5/5, VAL ≤1 tick 5/5, POC
+  exact 4/5** (07-14 off 3 ticks — JSONL websocket-LTP vs official candle POC
+  tie-break).
+- (b) Cross-resolution consistency, tape-future 1-min vs 5-min TPO, **12 sessions
+  (both parquet & JSONL)**: all POC/VAH/VAL deltas within ±20 pt (mostly 1–2
+  ticks). Demonstrates reader stability across the full window the ref can't cover.
+
+**PR #201** (branch `feat/reversal-engine-a1`, signed cf2ec5b). High-effort
+`/code-review` run: 9 findings → 8 fixed (hvn_lvn rewritten to scipy find_peaks;
+value_migration neutral without balance evidence; .zst integrity guard;
+leading-NULL volume bfill; docstrings), 1 deliberately not fixed (reader shape
+overlaps `load_captured_tape` but projects different columns — shared helper
+would be a leaky abstraction, Rule 2). +5 regression tests. `core/` is
+CODEOWNERS-guarded → owner review required.
+
+**Follow-ups / not in A1**
+- Manual chart-read of HVN/LVN against a NIFTY-future volume profile = operator
+  eyeball step (part of the issue's gate I can't perform).
+- A full 10-session *independent* cross-source check needs a fresh NIFTY 5-min bar
+  pull (the ref parquet ends 07-14; refresh is Kite-auth-gated — do NOT auth while
+  the live pair runner is active).
+- Next: A2 = `core/level_registry.py` (issue TBD under `reversal-engine`).
+
 # Scope the kalman_trend risk-monitor kill switch — 2026-07-23
 
 **Incident:** `loop-kalman-trend-risk` tripped the SHARED `data_cache/HALT_NEW_ENTRIES`

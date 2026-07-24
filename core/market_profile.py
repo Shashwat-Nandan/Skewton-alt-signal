@@ -748,6 +748,209 @@ def indicators_to_dict(ind: DayIndicators) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────
+# Volume-node & value-migration extensions (reversal engine A1)
+# ──────────────────────────────────────────────────────────
+#
+# Two additions the profile levels above don't name, needed by the
+# auction/order-flow reversal engine (§4.3 of
+# docs/research/auction-orderflow-reversal-engine-2026-07-22.md):
+#
+#   hvn_lvn        — High/Low Volume Nodes: peaks and valleys of a
+#                    volume-at-price histogram. HVNs are acceptance
+#                    (fair-price shelves the auction defends); LVNs are
+#                    rejection (thin prices the auction moves through
+#                    fast) — the L2 location levels the strategy trades
+#                    around. Triangular-smoothed histogram + scipy's
+#                    topographic-prominence peak finder (find_peaks). A
+#                    hand-rolled height-vs-global-peak detector was tried
+#                    first and dropped: it excluded edge-bin shelves,
+#                    collapsed multi-node geometry on skewed real tape,
+#                    and minted phantom nodes on flat slope-steps (2026-
+#                    07-24 review). numpy/scipy are already hard repo
+#                    deps; correctness beats keeping this one function
+#                    stdlib-only. The imports are local so the module's
+#                    other (pure) functions stay import-light.
+#   value_migration — the L1 directional bias: which way value has been
+#                    migrating across recent sessions, from the
+#                    already-computed `balance_state` sequence plus POC
+#                    drift. Formalizes Dalton's "is value going up or
+#                    down day over day" into one signed score.
+#
+# Both are geometry over inputs the engine already produces (Rule 5).
+# Thresholds are stated as arguments — assumptions to MEASURE on tape
+# (Phase B), not trusted a priori.
+
+
+@dataclass
+class ValueMigration:
+    """Direction value has migrated across recent sessions (L1 bias)."""
+    bias: str           # "up" / "down" / "neutral"
+    score: float        # signed, ~[-1, 1]; sign = direction, |.| = conviction
+    n_days: int         # sessions that carried a usable balance_state
+
+
+# balance_state → directional vote. higher/lower are clean imbalance;
+# overlapping_* are weaker (value shifted but ranges still touch);
+# inside is balance (no migration); outside is TWO-sided imbalance, so it
+# carries no directional bias; unknown (no prior) is skipped, not zeroed.
+_BALANCE_VOTE = {
+    "higher": 1.0,
+    "overlapping_higher": 0.5,
+    "inside": 0.0,
+    "outside": 0.0,
+    "overlapping_lower": -0.5,
+    "lower": -1.0,
+}
+
+
+def value_migration(
+    indicators: Sequence["DayIndicators"],
+    *,
+    half_life: float = 3.0,
+    balance_weight: float = 0.7,
+    bias_threshold: float = 0.2,
+) -> ValueMigration:
+    """L1 bias from a chronological `DayIndicators` sequence.
+
+    Blends two already-computed signals, recency-weighted with a `half_life`
+    (in sessions, most-recent day = full weight):
+      - the `balance_state` votes (`_BALANCE_VOTE`), the primary signal — it
+        already encodes today's value area vs yesterday's;
+      - POC drift day-over-day, a coarse confirmer (`1 - balance_weight`).
+
+    Returns a `ValueMigration`; `bias` is "up"/"down" when |score| crosses
+    `bias_threshold`, else "neutral". Empty / all-unknown input → neutral, 0.
+    """
+    seq = list(indicators)
+    n = len(seq)
+    if n == 0:
+        return ValueMigration("neutral", 0.0, 0)
+
+    decay = 0.5 ** (1.0 / half_life) if half_life > 0 else 0.0
+
+    bal_acc = bal_w = 0.0
+    poc_acc = poc_w = 0.0
+    n_used = 0
+    for k, ind in enumerate(seq):
+        w = decay ** (n - 1 - k)          # 0 = oldest, n-1 = newest
+        vote = _BALANCE_VOTE.get(ind.balance_state)
+        if vote is not None:
+            bal_acc += w * vote
+            bal_w += w
+            n_used += 1
+        if k > 0:                          # POC drift needs a predecessor
+            prev = seq[k - 1].poc
+            if prev:
+                drift = ind.poc - prev
+                sign = 1.0 if drift > 0 else -1.0 if drift < 0 else 0.0
+                poc_acc += w * sign
+                poc_w += w
+
+    # No usable balance_state anywhere → neutral, whatever POC did. POC drift
+    # is only ever a *confirmer* of the balance-state signal (the docstring's
+    # contract); letting it emit a directional bias on its own would call a
+    # trend off zero contributing sessions (2026-07-24 review).
+    if n_used == 0:
+        return ValueMigration("neutral", 0.0, 0)
+
+    bal_score = bal_acc / bal_w if bal_w else 0.0
+    poc_score = poc_acc / poc_w if poc_w else 0.0
+    score = balance_weight * bal_score + (1.0 - balance_weight) * poc_score
+
+    bias = "up" if score >= bias_threshold else "down" if score <= -bias_threshold else "neutral"
+    return ValueMigration(bias=bias, score=score, n_days=n_used)
+
+
+def hvn_lvn(
+    bin_mids: Sequence[float],
+    bin_volumes: Sequence[float],
+    *,
+    smoothing_bins: int = 2,
+    min_prominence: float = 0.10,
+) -> tuple[List[float], List[float]]:
+    """High/Low Volume Nodes of a volume-at-price histogram.
+
+    `bin_mids`/`bin_volumes` are same-indexed and price-ascending (the
+    `research.tape_vap.TapeProfile` layout). Returns `(hvns, lvns)` as bin-mid
+    prices, price-ascending.
+
+    Method:
+      1. smooth volumes with a triangular kernel of half-width `smoothing_bins`
+         so single-bin noise doesn't mint a node;
+      2. HVN = a peak whose *topographic prominence* (rise above the higher of
+         the two valleys flanking it) ≥ `min_prominence` × the tallest node.
+         Prominence, not raw height, is what keeps a genuine secondary shelf on
+         a skewed one-dominant-node distribution — a height floor drops them.
+      3. LVN = a prominent valley that sits *between* two HVNs — a rejection
+         price is only meaningful flanked by acceptance on both sides.
+
+    The histogram is padded at both ends before the peak search so a shelf on
+    the first or last bin (the session's heaviest price sitting at the range
+    extreme, common on trend days) is detectable — scipy's find_peaks never
+    flags a raw endpoint. Prominence also makes a flat step mid-slope a
+    non-peak, so a rising/falling staircase doesn't manufacture nodes.
+
+    `min_prominence` is a fraction of peak volume — the one assumption to tune
+    on real tape (Phase B). Degenerate input (empty, flat, < 3 bins) → ([], []).
+    """
+    import numpy as np
+    from scipy.signal import find_peaks
+
+    vols = [float(v) for v in bin_volumes]
+    mids = list(bin_mids)
+    if len(vols) != len(mids):
+        raise ValueError(
+            f"bin_mids ({len(mids)}) and bin_volumes ({len(vols)}) "
+            "must be the same length")
+    if len(vols) < 3 or max(vols, default=0.0) <= 0.0:
+        return [], []
+
+    smoothed = np.asarray(_smooth_triangular(vols, smoothing_bins), dtype=float)
+    peak = float(smoothed.max())
+    if peak <= 0.0:
+        return [], []
+    prom = min_prominence * peak
+
+    # Pad both ends with a sentinel below the series floor so an edge shelf
+    # becomes an interior, detectable peak; its outward "valley" is the
+    # sentinel, so its prominence is measured against its one real (inward)
+    # side — exactly right for an edge node. Shift indices back past the pad.
+    pad = smoothed.min() - 1.0
+    padded = np.concatenate(([pad], smoothed, [pad]))
+    max_idx, _ = find_peaks(padded, prominence=prom)
+    hvn_idx = sorted(int(i) - 1 for i in max_idx)
+    hvns = [mids[i] for i in hvn_idx]
+
+    # Valleys = peaks of the negated series. No padding: an edge can't be
+    # "between" two shelves, and we only keep valleys that are.
+    min_idx, _ = find_peaks(-smoothed, prominence=prom)
+    lvns: List[float] = []
+    for t in (int(i) for i in min_idx):
+        if any(p < t for p in hvn_idx) and any(p > t for p in hvn_idx):
+            lvns.append(mids[t])
+
+    return hvns, lvns
+
+
+def _smooth_triangular(values: Sequence[float], radius: int) -> List[float]:
+    """Edge-aware triangular (weighted moving-average) smooth, pure Python."""
+    n = len(values)
+    if radius <= 0 or n <= 2:
+        return [float(v) for v in values]
+    out: List[float] = []
+    for i in range(n):
+        acc = wsum = 0.0
+        for k in range(-radius, radius + 1):
+            j = i + k
+            if 0 <= j < n:
+                w = radius + 1 - abs(k)   # triangular weights
+                acc += w * values[j]
+                wsum += w
+        out.append(acc / wsum if wsum else 0.0)
+    return out
+
+
+# ──────────────────────────────────────────────────────────
 # Serialization (router → JSON)
 # ──────────────────────────────────────────────────────────
 
