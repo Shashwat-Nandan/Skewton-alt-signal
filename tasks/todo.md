@@ -1,3 +1,96 @@
+# Reversal engine A2 — persistent level registry — 2026-07-24
+
+**Issue #179** (`reversal-engine`). Phase A2 of the plan §4.2. Depends on #178
+(MERGED). Pure new `core/` code — no live path. CODEOWNERS-guarded.
+
+The registry is what makes L4 (first-test / retest discipline) mechanical:
+`Level` objects that persist across sessions, accrue test outcomes, and age out.
+
+**Plan**
+- [x] `core/level_registry.py` (new):
+      - `TestOutcome` (ts, mfe, mae, absorbed) + `Level` (price, source,
+        instrument, created_at, test_count, tests[], last_tested_at) with
+        `register_test`, age/staleness, `to_dict`/`from_dict`.
+      - `LevelRegistry`: `upsert` (dedup by instrument+source within price_tol),
+        `levels_near`, `record_test` (zone touch → increments every level in
+        tol), `prune_stale`, `to_dict`/`from_dict`, `save`/`load` via
+        `runner_common.durable_write_text`.
+      - Derivation mapping existing fields 1:1 → sources: composite
+        (weekly_vah/val, composite_poc), day_profile (session_poc/vah/val,
+        ib_high/low), indicators (excess_/poor_ H/L, single_print), and
+        HVN/LVN from a **lunch-excluded** volume profile built off the session
+        bars (11:30–13:30 dropped, plan §2.5 — low participation must not mint a
+        fake level daily). `ingest_session(...)` mints + upserts all.
+- [x] Tests: `tests/test_level_registry.py` — dedup, test-count/zone semantics,
+      staleness/prune, lunch exclusion changes LVNs, JSON round-trip determinism.
+- [x] **Gate:** met (Review below).
+
+## Review — 2026-07-24 (A2)
+
+**Shipped** — `core/level_registry.py` (new):
+- `TestOutcome` (ts, mfe, mae, absorbed) + `Level` (price, source, instrument,
+  created_at, test_count, tests[], last_tested_at) with `register_test`,
+  age-from-last-activity, `staleness` (half-life decay a test resets),
+  `to_dict`/`from_dict`.
+- `LevelRegistry`: `upsert` (dedup by instrument+source within `price_tol`,
+  never resets a persisting level's age), `record_test` (a touch tests **every**
+  level in the price zone — L4 semantics), `levels_near`, `prune_stale`
+  (age from last activity, so a defended level survives), `to_dict`/`from_dict`
+  (levels emitted sorted → byte-stable JSON), `save`/`load` via
+  `runner_common.durable_write_text`.
+- Derivation `ingest_session(...)` mapping profile fields 1:1 to sources
+  (composite → weekly_vah/val + composite_poc; day_profile → session_poc/vah/val
+  + ib_high/low; indicators → excess/poor H-L + single_print; bars →
+  session_hvn/lvn). `session_nodes` builds a volume-at-price from bars with the
+  **11:30–13:30 lunch window excluded** before `hvn_lvn` (§2.5) — verified the
+  exclusion changes the derived LVNs on real 07-13 tape
+  (`[24095,24185]` → `[24092.5,24142.5,24192.5]`) and in a unit fixture.
+
+**Gate evidence**
+- 20-session synthetic replay is byte-identical across runs (sorted
+  serialization is insertion-order-independent); real 4-session parquet replay
+  (07-08..13) also deterministic across runs.
+- Test-count correctness pinned against hand annotation: a zone touch tests
+  exactly the levels within tol (100 & 102, not 110), and every day's POC touch
+  is booked (no silent loss). Real replay booked 8 tests from 4 POC touches
+  (coincident levels in a zone — the intended semantics).
+
+**Design choices surfaced**
+- LVN derivation uses a **bar-level** volume profile (not A1's tick-level VAP)
+  because bars carry the timestamps the lunch filter needs and make the replay
+  deterministic; the fine tick profile stays in `research.tape_vap`.
+- A touch tests **all** coincident levels, not the nearest — a value-area edge
+  and a volume node at the same price are both being probed. Documented on
+  `record_test`.
+
+**PR #202** (branch `feat/reversal-engine-a2`, signed 051f7d5). CODEOWNERS review
+required (core/).
+
+**High-effort /code-review — 9 findings, all fixed**
+- Cross-session node dedup (worst): `session_nodes` auto-sized the tick grid per
+  session, so the same physical node landed a tick apart on wide vs narrow days
+  and never deduped → `ingest_session` now derives on a **fixed** grid
+  (`node_tick_size`, default `price_tol`). The exact L4 error the registry exists
+  to prevent.
+- `_volume_profile_from_bars` binning: dropped the 1e-9 epsilon guard and spread
+  volume into a bin above the high (node ~0.5 tick high). Now mirrors
+  `compute_day_profile`'s `_floor_to_tick` + `//` + boundary-clamp exactly.
+- Lunch rule: hard-dropping all 11:30–13:30 bars could erase a real lunch shelf
+  and MINT a spurious LVN (§2.5 inversion) → switched to **deweight**
+  (`lunch_weight`, default 0.25). New tests show hard-exclude invents a 105 LVN
+  that include/deweight do not.
+- `upsert` now re-centers a matched level's price to the current edge (keeps
+  age/history); `Level.from_dict` enforces the `LEVEL_SOURCES` guard (Rule 12).
+- 3 test-quality fixes (Rule 9): full 1:1 source-mapping assertion, lunch test
+  asserts the specific artifact, replay asserts exact count (not `>=`). Fixed a
+  dead branch in the old fixture too.
+
+**Not in A2 / follow-ups**
+- Persistence is wired into the strategy's `serialize_state`/`restore_state` in
+  Phase D (the registry exposes `to_dict`/`from_dict`/`save`/`load`; no strategy
+  exists yet).
+- `record_test`'s MFE/MAE are caller-measured (Phase D computes excursions).
+
 # Reversal engine A1 — VAP tape reader + market_profile extensions — 2026-07-24
 
 **Issue #178** (label `reversal-engine`). Phase A1 of
