@@ -1,3 +1,83 @@
+# Reversal engine B — level-significance event study (kill-shot) — 2026-07-25
+
+**Issue #180** (`reversal-engine`). Phase B of the plan §7 (validation steps 2–3).
+Depends on #179 (merged). **This is a cheap kill-shot: if levels show no reaction
+asymmetry vs matched-random controls, L2 is decoration and the project STOPS
+before any strategy code.** Research only (`research/`), no live path.
+
+**Data reality:** `{NIFTY,BANKNIFTY}_5minute.parquet` = 134 sessions
+(2025-12-26 → 2026-07-14), **OHLC only, no volume**. So the study covers the
+TPO-derived levels (session_poc/vah/val, ib_high/low, excess/poor H-L,
+single_print, weekly composite) — NOT volume nodes (need tape, few sessions).
+Honest scope; volume-node significance is a tape-only follow-up.
+
+**Method (bias-guarded — this repo has a record of manufactured edges)**
+- **Point-in-time**: build the A2 registry rolling forward; a level created from
+  session i is only tested on sessions > i (no hindsight levels).
+- **Event study**: for each touch of an active registry level, forward reaction
+  over N bars — reversal excursion (away from level) vs continuation (through it),
+  in bps. Compare the distribution to **matched-random pseudo-levels** (random
+  in-range prices, same per-session count, seeded for reproducibility). The
+  random control is the primary evidence, not absolute numbers.
+- **First-test premium**: bucket registry touches by test_count-at-touch (1 / 2 /
+  3+) and compare reaction — the original spec asserts a large first-test edge.
+- Cluster-aware honesty: touches from one session/level aren't independent — flag
+  it; report per-session aggregation alongside raw counts.
+
+**Plan**
+- [x] `research/level_significance.py`: session loader (5-min parquet, IST
+      wall-clock), PIT registry+event builder, matched-random control, reaction
+      metrics, first-test buckets, printed report + JSON/TSV summary.
+- [x] `tests/test_level_significance.py`: deterministic touch-detection, forward
+      reaction (support vs resistance), first-test bucketing on synthetic bars.
+- [x] **Run on NIFTY + BANKNIFTY; record the empirical verdict.**
+
+## Review — 2026-07-25 (B) — VERDICT: STOP (profile-only engine)
+
+**PR #203** (branch `research/reversal-engine-phase-b`, signed 2ff4051).
+**Reminder set:** cloud routine `trig_01BgteRWDSHg2ehhGPyEhfzp` fires once
+2026-09-26 08:00 UTC → drafts a Gmail reminder to re-run the study on volume
+nodes ON THE HOST (cloud can't reach data_cache tape). Tape accrues ~5/wk;
+reopen when depth-bearing sessions ≳ 40–60 (was 11 on 07-25).
+
+**High-effort /code-review — 8 findings, all fixed; verdict re-derived and STANDS.**
+The review attacked the control (the crux of a kill-shot), rightly. The uniform
+random-price control was unfair; I first tried a random-TIME control which
+**flipped the verdict to PROCEED (+8 bp)** — but that was an artifact (it credits
+generic swing mean-reversion to levels). Correct design = **swing-split**: split
+real swing pivots by level-membership, both arms measured identically, so
+mean-reversion-after-a-pivot cancels. Result: STOP in all 18 cells — level swings
+(+16 bps NIFTY) react no more than non-level swings (+19.5); edge −1.6 [−4.3,+1.0].
+The corrected methodology confirms STOP far more strongly than the original.
+Fixes: swing-split control, `_active_as_of` (PIT, now unit-tested), min-sample
+verdict gate, per-session tol, first-test-index increment on skipped touches,
+loud half-session drops. Both swing arms hold ~85% / +16–24 bps = the reversal
+effect is REAL but generic (not a level edge); registry blankets ~70% of range.
+
+**Shipped** — `research/level_significance.py` + `tests/test_level_significance.py`
+(9 tests) + findings doc `docs/research/phase-b-level-significance-2026-07-25.md`
++ artifacts `docs/research/phase-b-results/*.json`.
+
+**Result — TPO-derived levels show NO reaction asymmetry vs matched random:**
+- NIFTY: registry net +7.48 bps vs random +9.70; per-session edge **−3.00 bps
+  [−7.23, +1.46]**. BANKNIFTY: +7.19 vs +8.81; **−4.07 [−12.07, +2.11]**.
+- Registry−random net-reversal edge is **negative in all 18 cells** (2 underlyings
+  × touch {3,5,8}bps × horizon {3,6,12}); several significantly negative. Registry
+  levels never beat random — they're slightly worse (acceptance prices = low
+  reaction; random catches more fast-move zones).
+- ~60–80% "hold" is a mean-reversion artifact (random holds at the same rate).
+- First-test premium **inverted**: 1st tests weaker than 3rd+ (spec claimed the
+  opposite).
+
+**Decision (per plan §8 kill criterion):** do NOT build Phase D on TPO levels.
+Honest scope: **volume nodes (HVN/LVN) are UNTESTED** — 5-min history has no
+volume; the rejection-type levels the engine most wanted need depth-bearing tape
+(too few sessions today). Reopen the study on LVN/HVN once tape ≳ 40–60 sessions.
+A0/A1/A2 infra remains correct and is reused by that future study.
+
+**Bias guards used (this repo's overfit history):** point-in-time levels, matched
+random control (primary evidence), per-session cluster bootstrap (not per-touch).
+
 # Reversal engine A2 — persistent level registry — 2026-07-24
 
 **Issue #179** (`reversal-engine`). Phase A2 of the plan §4.2. Depends on #178
