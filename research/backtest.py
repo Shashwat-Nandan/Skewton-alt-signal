@@ -45,6 +45,16 @@ from strategies.taleb_karpathy import (
 
 logger = logging.getLogger(__name__)
 
+# Basis for the synthetic futures series (see MockKite.quote). Synthetic
+# tapes carry no FUT rows, so without a quote for the placeholder contract
+# the strategy's hard delta hedge refuses on every tick and every synthetic
+# backtest silently scores an UNHEDGED book. 0.13% ~= 31 pts on NIFTY 24k,
+# the average basis measured on the 2026-07-10 tape. It is deliberately
+# non-zero: entry, mark and flatten all read this same series, so the basis
+# cancels in P&L, and any future regression that prices one of the three off
+# index spot shows up immediately as a synthetic-backtest artefact.
+_SYNTHETIC_FUT_BASIS_PCT = 0.0013
+
 
 class MockKite:
     """
@@ -116,6 +126,28 @@ class MockKite:
             # bid/ask and unusable as a liquidity proxy. Synthesize a
             # ~0.3% spread around last_price instead.
             row = tick_data[tick_data["symbol"] == tsym]
+            if row.empty and tsym == f"{self.underlying}FUTMOCK":
+                # Synthetic-data path: instruments() hands out the FUTMOCK
+                # placeholder but generate_synthetic_data emits no FUT
+                # rows, so this lookup can never hit. Serve a futures price
+                # derived from spot + basis instead of nothing — returning
+                # nothing makes the strategy refuse its delta hedge on
+                # every tick, which silently turns every synthetic backtest
+                # (including the autoresearch hold-out validation) into an
+                # unhedged book.
+                spot_rows = tick_data[tick_data["symbol"] == self.underlying]
+                if not spot_rows.empty:
+                    last = round(
+                        float(spot_rows.iloc[0]["last_price"])
+                        * (1 + _SYNTHETIC_FUT_BASIS_PCT), 2)
+                    result[sym] = {
+                        "last_price": last,
+                        "depth": {
+                            "buy": [{"price": last * 0.9985}],
+                            "sell": [{"price": last * 1.0015}],
+                        },
+                    }
+                continue
             if not row.empty:
                 r = row.iloc[0]
                 last = float(r["last_price"])

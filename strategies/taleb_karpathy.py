@@ -144,6 +144,15 @@ class HedgeState:
     futures_hedge_delta: float = 0.0  # Net delta from futures positions
     futures_entry_vwap: float = 0.0   # Volume-weighted average entry price for futures
     futures_lots: int = 0             # Net signed lot count (positive = long)
+    # The contract the hedge was actually entered on, and its last good
+    # LTP. Both are STATE, not caches: they must survive a restart and a
+    # monthly roll. _get_futures_symbol() resolves whatever is front-month
+    # *now*, so after settlement it returns the NEXT month — marking that
+    # against futures_entry_vwap would book the calendar spread as phantom
+    # P&L, i.e. re-introduce the exact bug this accounting fix exists to
+    # remove. Always mark the contract you hold.
+    futures_symbol: str = ""          # Tradingsymbol the hedge sits in
+    futures_last_mark: float = 0.0    # Last good LTP for futures_symbol
     # ── New: Bleed tracking ──
     bleed_history: List[BleedForecast] = field(default_factory=list)
     stability_history: List[StabilityReport] = field(default_factory=list)
@@ -349,6 +358,11 @@ class TalebKarpathyStrategy(BaseStrategy):
         # after 5 consecutive failures so a wrong symbol or session issue
         # surfaces clearly instead of being buried in unrelated stack traces.
         self._consecutive_spot_failures = 0
+        # Same ledger for the futures leg (H-6a). Without it a frozen
+        # futures mark or a repeatedly-refused hedge logs at the same
+        # severity forever, which is the silent-carry failure mode the
+        # option-leg ledger exists to prevent.
+        self._consecutive_futures_failures = 0
         self._clock = datetime.now  # Override for backtest replay
         # Persistent ATM IV history survives across runs so IV percentile is
         # computed against a real multi-session distribution. Backtests disable
@@ -1297,6 +1311,8 @@ class TalebKarpathyStrategy(BaseStrategy):
                 "futures_hedge_delta": self.state.futures_hedge_delta,
                 "futures_entry_vwap": self.state.futures_entry_vwap,
                 "futures_lots": self.state.futures_lots,
+                "futures_symbol": self.state.futures_symbol,
+                "futures_last_mark": self.state.futures_last_mark,
                 # Anchors for realized-theta and realized-gamma-scalp
                 # accounting. Re-anchored at the next tick if missing,
                 # so absence in an older blob is tolerated by restore.
@@ -1366,6 +1382,12 @@ class TalebKarpathyStrategy(BaseStrategy):
         self.state.futures_hedge_delta = float(s["futures_hedge_delta"])
         self.state.futures_entry_vwap = float(s["futures_entry_vwap"])
         self.state.futures_lots = int(s["futures_lots"])
+        # Tolerated absent: blobs written before the hedge carried its own
+        # contract identity. An empty futures_symbol degrades to "quote
+        # whatever is front-month", which is the pre-fix behaviour — loud
+        # via _futures_mark's log, not silently wrong.
+        self.state.futures_symbol = str(s.get("futures_symbol", "") or "")
+        self.state.futures_last_mark = float(s.get("futures_last_mark", 0.0) or 0.0)
         # Optional fields — older state files predate Phase 1.1
         # realized-accounting anchors; tolerate their absence.
         lta = s.get("_last_theta_anchor_time")
@@ -1484,13 +1506,27 @@ class TalebKarpathyStrategy(BaseStrategy):
             )
             return []
         fut_symbol = self._get_futures_symbol()
-        # Fetch live futures price
-        fut_price = spot
-        try:
-            q = self.kite.quote([f"NFO:{fut_symbol}"])
-            fut_price = q[f"NFO:{fut_symbol}"]["last_price"]
-        except Exception:
-            logger.warning("Could not fetch futures price for %s, using spot", fut_symbol)
+        # Entry price MUST come off the futures contract, not spot: the leg
+        # is marked and flattened off the same series, so a spot-priced
+        # entry VWAP injects the basis as phantom P&L (see
+        # _get_futures_price). Refusing the hedge for one tick is the
+        # smaller risk — drift re-proposes it on the next tick, whereas a
+        # corrupt VWAP follows the position to its grave and feeds the
+        # daily-loss breaker. Same "refuse rather than guess" stance as
+        # H-6c/H-6d above.
+        fut_price = self._get_futures_price(fut_symbol)
+        if not fut_price or fut_price <= 0:
+            # _get_futures_price already counted this failure and escalated
+            # WARNING -> ERROR at 5 consecutive, so a feed that stays down
+            # cannot sit at one severity for the whole session.
+            logger.error(
+                "Hard delta hedge: no usable futures price for %s — skipping "
+                "this hedge tick rather than opening it at spot (%.1f delta "
+                "left unhedged, %d consecutive failures).",
+                fut_symbol, delta_to_hedge,
+                getattr(self, "_consecutive_futures_failures", 0),
+            )
+            return []
 
         return [TradeProposal(
             tradingsymbol=fut_symbol, instrument_token=0,
@@ -1775,6 +1811,18 @@ class TalebKarpathyStrategy(BaseStrategy):
                     had_any_close = True
                     logger.info("Flipped futures hedge: realized P/L ₹%.0f", realized)
                 self.state.futures_lots = new_lots
+                # Bind the hedge to the contract it actually filled on, and
+                # seed its mark from the fill. Without the seed, a quote
+                # outage on the very next tick (or straight after a
+                # restart) has nothing to carry and the leg would mark
+                # flat — hiding the whole futures move from the
+                # daily-loss breaker.
+                if new_lots == 0:
+                    self.state.futures_symbol = ""
+                    self.state.futures_last_mark = 0.0
+                else:
+                    self.state.futures_symbol = prop.tradingsymbol
+                    self.state.futures_last_mark = fill_price
                 logger.info("Futures hedge delta now: %.1f (%d lots @ %.2f)",
                             self.state.futures_hedge_delta, self.state.futures_lots, self.state.futures_entry_vwap)
             elif prop.option_type in ("CE", "PE"):
@@ -2031,6 +2079,106 @@ class TalebKarpathyStrategy(BaseStrategy):
             f"No {self.underlying} FUT rows in kite.instruments('NFO') — "
             "cannot resolve futures symbol (H-6d); refusing the placeholder."
         )
+
+    def _get_futures_price(self, symbol: Optional[str] = None) -> Optional[float]:
+        """Fetch a futures LTP. Returns None on any failure.
+
+        `symbol` pins the contract to quote; without it the front-month is
+        resolved. Marking an OPEN hedge must always pass the contract the
+        hedge sits in (see _futures_mark) — front-month changes at the
+        monthly roll.
+
+        The futures hedge MUST be entered, marked AND flattened off this
+        one series. Mixing it with index spot books the basis as phantom
+        P&L: the hedge is opened at the futures price but was previously
+        marked (_update_positions_prices) and flattened
+        (_generate_close_all_proposals) at spot, so a long hedge showed an
+        instant unrealized loss of basis x lots x lot_size the moment it
+        went on. On 2026-07-10 the NIFTY basis averaged +31.8 pts, which
+        put ~Rs 7.7k of phantom loss on a 4-lot hedge, tripped the Rs 15k
+        daily-loss breaker at -Rs 15,297 (real: ~-Rs 7.6k), flattened the
+        book near the low and locked out entries for the rest of the
+        session. Same contract on both sides or the number is fiction.
+        """
+        if symbol:
+            fut_symbol = symbol
+        else:
+            try:
+                fut_symbol = self._get_futures_symbol()
+            except Exception as e:
+                self._note_futures_failure(
+                    "Futures price: cannot resolve symbol: %s", e)
+                return None
+        key = f"NFO:{fut_symbol}"
+        # Payload parsing stays INSIDE the try. _update_positions_prices
+        # calls this after it has already mutated pos.current_price for
+        # every option leg, so a raise here would leave a half-updated book
+        # with total_pnl unset and _should_exit never evaluated — worse
+        # than a skipped tick. (_get_spot_price parses outside its try; that
+        # is the older shape, not one to copy onto a money-affecting mark.)
+        try:
+            q = self.kite.quote([key])
+            if not q or key not in q or not q[key].get("last_price"):
+                self._note_futures_failure(
+                    "Futures quote returned no usable price for %s (got keys=%s).",
+                    fut_symbol, list(q.keys()) if q else [],
+                )
+                return None
+            price = float(q[key]["last_price"])
+        except Exception as e:
+            self._note_futures_failure("Futures quote raised for %s: %s: %s",
+                                       fut_symbol, type(e).__name__, e)
+            return None
+        # getattr default: many tests (and the backtest builders) construct
+        # the strategy via __new__, bypassing __init__ — same lazy-init
+        # convention as _consecutive_quote_failures / _stale_marks.
+        if getattr(self, "_consecutive_futures_failures", 0):
+            logger.info("Futures quote recovered after %d consecutive failure(s).",
+                        self._consecutive_futures_failures)
+        self._consecutive_futures_failures = 0
+        # Remember the last good mark for THIS contract so a quote outage
+        # carries it forward instead of marking the leg flat.
+        if self.state.futures_symbol == fut_symbol:
+            self.state.futures_last_mark = price
+        return price
+
+    def _note_futures_failure(self, msg: str, *args) -> int:
+        """H-6a ledger for the futures leg: count consecutive failures and
+        escalate WARNING -> ERROR at 5, exactly like _check_spot and the
+        option-leg carry. A frozen futures mark feeds _should_exit's
+        daily-loss breaker, so 'same severity forever' is the silent-carry
+        failure mode, not a cosmetic one."""
+        n = getattr(self, "_consecutive_futures_failures", 0) + 1
+        self._consecutive_futures_failures = n
+        (logger.error if n >= 5 else logger.warning)(
+            msg + " (consecutive futures-quote failures=%d)", *args, n)
+        return n
+
+    def _futures_mark(self) -> Optional[float]:
+        """Mark price for the futures hedge: live quote of the contract we
+        actually hold, else its last good mark. Returns None when neither
+        is available — callers decide how to degrade.
+
+        Quotes `state.futures_symbol`, NOT whatever `_get_futures_symbol()`
+        currently calls front-month. After a monthly settlement those
+        differ, and quoting the new contract against the old contract's
+        entry VWAP would book the roll spread as phantom P&L — the same
+        class of error as marking at index spot. Deliberately does NOT
+        fall back to entry VWAP: a VWAP is not a mark, and returning it
+        here silently books the leg flat.
+        """
+        symbol = self.state.futures_symbol or None
+        price = self._get_futures_price(symbol)
+        if price and price > 0:
+            return price
+        carried = self.state.futures_last_mark
+        if carried and carried > 0:
+            logger.warning(
+                "Futures quote unavailable for %s — carrying last good mark "
+                "%.2f (H-6a).", symbol or "front-month", carried,
+            )
+            return carried
+        return None
 
     def _spot_quote_key(self) -> str:
         return _INDEX_SPOT_SYMBOLS.get(self.underlying, f"NSE:{self.underlying}")
@@ -2645,24 +2793,27 @@ class TalebKarpathyStrategy(BaseStrategy):
                 return proposals
             fut_lots = abs(round(self.state.futures_hedge_delta / lot_size))
             if fut_lots > 0:
-                # H-6b: never price the flatten at `spot or 0.0` — a failed
-                # spot fetch booked the close at 0.0 in paper (realized P&L
-                # corrupted by ~entry_vwap × lots × lot_size). Fall back to
-                # the position's own entry VWAP: the leg books ~flat, and
-                # validate_order's price>0 gate can't reject the flatten.
-                spot = self._get_spot_price()
-                if not spot or spot <= 0:
-                    spot = self.state.futures_entry_vwap
-                    logger.error(
-                        "close-all: spot quote failed — pricing futures "
-                        "flatten at entry VWAP %.2f instead of 0.0 (H-6b).",
-                        spot,
+                # Price the flatten off the FUTURES contract, not spot: the
+                # leg was entered at the futures price, so closing it at
+                # spot books the basis as realized loss (2026-07-10:
+                # -Rs 12,979 booked where the futures level gave -Rs 5,322).
+                # _futures_mark keeps the H-6b guarantee — it never returns
+                # 0.0, so validate_order's price>0 gate cannot reject the
+                # flatten — and degrades quote -> last mark -> entry VWAP.
+                fut_price = self._futures_mark() or self.state.futures_entry_vwap
+                if not fut_price or fut_price <= 0:
+                    logger.critical(
+                        "close-all: no usable futures price AND no entry VWAP "
+                        "— futures hedge (net delta %.1f) NOT flattened; "
+                        "SQUARE IT MANUALLY before the next session.",
+                        self.state.futures_hedge_delta,
                     )
+                    return proposals
                 proposals.append(TradeProposal(
                     tradingsymbol=fut_symbol,
                     instrument_token=0, strike=0, expiry="", option_type="FUT",
                     lot_size=lot_size, quantity=fut_lots,
-                    price=spot,
+                    price=fut_price,
                     transaction_type="SELL" if self.state.futures_hedge_delta > 0 else "BUY",
                     iv=0, bid_ask_spread_pct=0.0, margin_required=0.0,
                     rationale="Close futures hedge (safety trigger)",
@@ -2724,10 +2875,29 @@ class TalebKarpathyStrategy(BaseStrategy):
                     pos.tradingsymbol, stale, consecutive, e, pos.current_price,
                 )
         unrealized = sum((p.current_price - p.entry_price) * p.quantity * p.lot_size for p in self.state.positions)
-        # Futures unrealized P/L: (current_spot - entry_vwap) * net_lots * lot_size
+        # Futures unrealized P/L: (futures LTP - entry_vwap) * net_lots * lot_size.
+        # NOT spot — the entry VWAP is a futures price, so marking against
+        # the index books the basis as a standing phantom loss on a long
+        # hedge. This feeds _should_exit's daily-loss breaker, so the error
+        # is not merely cosmetic: see _get_futures_price for the 2026-07-10
+        # session it cost.
         if self.state.futures_lots != 0 and self.state.futures_entry_vwap > 0:
             lot_size = self._get_lot_size()
-            unrealized += (spot - self.state.futures_entry_vwap) * self.state.futures_lots * lot_size
+            fut_price = self._futures_mark()
+            if not fut_price or fut_price <= 0:
+                # No quote and no carried mark (the mark is seeded at fill
+                # and persisted, so this is a genuinely broken feed). Book
+                # the leg flat at entry VWAP — omitting it entirely would
+                # understate exposure to the daily-loss breaker with no
+                # trace — and escalate, because a flat futures leg makes
+                # the loss gates blind to the whole hedge.
+                fut_price = self.state.futures_entry_vwap
+                self._note_futures_failure(
+                    "Marking futures hedge FLAT at entry VWAP %.2f — no quote "
+                    "and no carried mark, so the loss gates cannot see this "
+                    "leg. Check the futures feed.", fut_price,
+                )
+            unrealized += (fut_price - self.state.futures_entry_vwap) * self.state.futures_lots * lot_size
         self.state.unrealized_pnl = unrealized
         self.state.total_pnl = self.state.realized_pnl + unrealized
 

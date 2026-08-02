@@ -1,4 +1,5 @@
 """Tests for the Taleb-Karpathy strategy — position management, netting, costs, metrics."""
+import logging
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -266,10 +267,277 @@ class TestFuturesPnL:
         assert mock_hedger.state.futures_entry_vwap == 22000.0
         assert mock_hedger.state.futures_lots == 2
 
-        # Simulate spot moving to 22100 — futures P/L should be (22100-22000)*2*25 = 5000
-        mock_hedger.kite.quote.return_value = {}  # No option quotes
-        mock_hedger._update_positions_prices(22100.0)
+        # Futures moving to 22100 — P/L is (22100-22000)*2*25 = 5000.
+        # Spot is passed deliberately DIFFERENT from the futures LTP: the
+        # entry VWAP is a futures price, so the mark must come off the
+        # futures contract. Marking against spot here would give 2500 and
+        # silently book the 50-pt basis as P&L.
+        mock_hedger._cached_futures_symbol = "NIFTY26APRFUT"
+        mock_hedger.kite.quote.return_value = {
+            "NFO:NIFTY26APRFUT": {"last_price": 22100.0},
+        }
+        mock_hedger._update_positions_prices(22050.0)
         assert mock_hedger.state.unrealized_pnl == 5000.0
+
+
+class TestFuturesHedgeBasisPricing:
+    """The futures hedge is entered, marked and flattened off ONE series —
+    the futures contract. Mixing in index spot books the basis as phantom
+    P&L, which feeds the daily-loss breaker.
+
+    Regression for the 2026-07-10 session: a 4-lot long hedge (VWAP
+    24,220.47) was marked and flattened at spot while the basis ran ~+30
+    pts, showing ~Rs 7.7k of loss that did not exist. That tripped the
+    Rs 15k breaker at -Rs 15,297, flattened the book near the low and
+    locked out entries for the remaining four hours of a session that
+    closed higher.
+    """
+
+    LOT, LOTS = 65, 4
+    VWAP, FUT, SPOT = 24220.47, 24200.00, 24170.55   # basis ~ +30 pts
+
+    @pytest.fixture
+    def h(self):
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.kite = MagicMock()
+        hedger.state = HedgeState()
+        hedger.mode = "paper"
+        hedger.underlying = "NIFTY"
+        hedger.exchange = "NFO"
+        hedger._cached_lot_size = self.LOT
+        hedger._cached_futures_symbol = "NIFTY26JULFUT"
+        hedger._consecutive_losses = 0
+        hedger._circuit_breaker_until = None
+        hedger._daily_loss_stop_date = None
+        hedger._consecutive_futures_failures = 0
+        hedger._clock = lambda: datetime(2026, 7, 10, 11, 13)
+        hedger.immutable_params = {
+            "total_capital": 1_000_000, "max_daily_loss_pct": 1.5,
+            "gap_exit_threshold_pct": 100.0,
+        }
+        hedger.tunable_params = {"max_holding_period_hours": 22.0,
+                                 "vega_limit": 1e9}
+        hedger.state.futures_lots = self.LOTS
+        hedger.state.futures_hedge_delta = self.LOTS * self.LOT
+        hedger.state.futures_entry_vwap = self.VWAP
+        hedger.state.futures_symbol = "NIFTY26JULFUT"
+        hedger.state.futures_last_mark = self.VWAP
+        return hedger
+
+    def _quote_futures(self, h, price, symbol="NIFTY26JULFUT"):
+        h.kite.quote.return_value = {f"NFO:{symbol}": {"last_price": price}}
+
+    # ── marking ────────────────────────────────────────────────
+
+    def test_mark_uses_futures_not_spot(self, h):
+        """The mark must track the contract we actually hold. Spot is
+        passed 30 pts below the futures; using it would report -12,979
+        instead of the true -5,322."""
+        self._quote_futures(h, self.FUT)
+        h._update_positions_prices(self.SPOT)
+        assert h.state.unrealized_pnl == pytest.approx(
+            (self.FUT - self.VWAP) * self.LOTS * self.LOT
+        )
+        assert h.state.unrealized_pnl == pytest.approx(-5322.2)
+
+    def test_basis_alone_moves_no_pnl(self, h):
+        """Hedge opened at the futures price and the futures have not
+        moved: P&L is zero no matter how wide the basis is. This is the
+        property the 07-10 loss violated."""
+        h.state.futures_entry_vwap = self.FUT
+        self._quote_futures(h, self.FUT)
+        h._update_positions_prices(self.FUT - 30.0)
+        assert h.state.unrealized_pnl == 0.0
+
+    def test_daily_loss_breaker_not_tripped_by_basis(self, h):
+        """The money-affecting assertion. With Rs 2,300 of real costs and
+        the futures 20 pts against us, the day is -Rs 7,622 — inside the
+        Rs 15,000 floor. Marking at spot makes it -Rs 15,279 and fires the
+        breaker, which is exactly what happened on 2026-07-10."""
+        h.state.realized_pnl = -2300.0
+        self._quote_futures(h, self.FUT)
+        h._update_positions_prices(self.SPOT)
+
+        assert h.state._current_day_pnl == pytest.approx(-7622.2)
+        assert h._should_exit(None, self.SPOT) is False
+        assert h._daily_loss_stop_date is None
+
+        # Same book marked the old (spot) way would have breached.
+        spot_marked = -2300.0 + (self.SPOT - self.VWAP) * self.LOTS * self.LOT
+        assert spot_marked < -(1_000_000 * 1.5 / 100)
+
+    def test_mark_carries_last_good_futures_price_on_quote_failure(self, h):
+        """H-6a: a quote outage must carry the last good futures mark, not
+        fall back to spot and not silently mark the leg flat — the loss
+        gates read this number."""
+        self._quote_futures(h, self.FUT)
+        h._update_positions_prices(self.SPOT)
+        h.kite.quote.side_effect = Exception("feed down")
+        h._update_positions_prices(self.SPOT)
+        assert h.state.unrealized_pnl == pytest.approx(
+            (self.FUT - self.VWAP) * self.LOTS * self.LOT
+        )
+
+    # ── flattening ─────────────────────────────────────────────
+
+    def test_close_all_prices_flatten_at_futures(self, h):
+        self._quote_futures(h, self.FUT)
+        props = h._generate_close_all_proposals()
+        fut = [p for p in props if p.option_type == "FUT"]
+        assert len(fut) == 1
+        assert fut[0].price == pytest.approx(self.FUT)
+        assert fut[0].transaction_type == "SELL"   # long hedge -> sell to close
+
+    def test_flatten_falls_back_to_entry_vwap_never_zero(self, h):
+        """H-6b guarantee preserved: the flatten price is never 0.0, so
+        validate_order's price>0 gate cannot reject an emergency square-off
+        just because the feed died."""
+        h.kite.quote.side_effect = Exception("feed down")
+        props = h._generate_close_all_proposals()
+        fut = [p for p in props if p.option_type == "FUT"]
+        assert len(fut) == 1
+        assert fut[0].price == pytest.approx(self.VWAP)
+
+    # ── entry ──────────────────────────────────────────────────
+
+    def test_hard_hedge_skipped_when_no_futures_price(self, h):
+        """Refuse rather than guess (H-6c/H-6d): a spot-priced entry VWAP
+        would corrupt every later mark on the position. Drift re-proposes
+        the hedge on the next tick."""
+        h.kite.quote.side_effect = Exception("feed down")
+        greeks = MagicMock(net_discrete_delta=-260.0, net_delta=-260.0)
+        assert h._generate_hard_delta_proposals(greeks, self.SPOT) == []
+
+    def test_hard_hedge_prices_entry_at_futures(self, h):
+        self._quote_futures(h, self.FUT)
+        greeks = MagicMock(net_discrete_delta=-260.0, net_delta=-260.0)
+        props = h._generate_hard_delta_proposals(greeks, self.SPOT)
+        assert len(props) == 1
+        assert props[0].price == pytest.approx(self.FUT)
+        assert props[0].quantity == self.LOTS
+
+    # ── contract identity across the monthly roll ──────────────
+
+    def test_mark_quotes_the_contract_held_not_front_month(self, h):
+        """Review finding: after JUL settles, `_get_futures_symbol()`
+        resolves AUG. Quoting AUG against a JUL entry VWAP would book the
+        roll spread as phantom P&L — the same class of error as marking at
+        index spot. Mark the contract we actually hold."""
+        h._cached_futures_symbol = "NIFTY26AUGFUT"      # front-month rolled
+        h.kite.quote.return_value = {
+            "NFO:NIFTY26JULFUT": {"last_price": self.FUT},
+            "NFO:NIFTY26AUGFUT": {"last_price": self.FUT + 180.0},
+        }
+        h._update_positions_prices(self.SPOT)
+        assert h.state.futures_last_mark == pytest.approx(self.FUT)
+        assert h.state.unrealized_pnl == pytest.approx(
+            (self.FUT - self.VWAP) * self.LOTS * self.LOT
+        )
+        # The quote must have been asked for the HELD contract.
+        assert h.kite.quote.call_args[0][0] == ["NFO:NIFTY26JULFUT"]
+
+    def test_fill_binds_contract_and_seeds_mark_then_clears(self, h):
+        """The mark is seeded from the fill so a quote outage on the very
+        next tick has something to carry; both are cleared when flat so a
+        later hedge can never inherit a stale contract's price."""
+        h.state = HedgeState()
+        h.mode = "paper"
+        h.greeks = MagicMock()
+        h.greeks.compute_portfolio_greeks = MagicMock(
+            return_value=MagicMock(net_delta=0, net_shadow_theta=0))
+        open_prop = TradeProposal(
+            tradingsymbol="NIFTY26JULFUT", instrument_token=0, strike=0,
+            expiry="", option_type="FUT", lot_size=self.LOT, quantity=2,
+            price=self.FUT, transaction_type="BUY", iv=0,
+            bid_ask_spread_pct=0, margin_required=0,
+        )
+        h.execute_proposals([open_prop])
+        assert h.state.futures_symbol == "NIFTY26JULFUT"
+        assert h.state.futures_last_mark == pytest.approx(self.FUT)
+
+        close_prop = TradeProposal(
+            tradingsymbol="NIFTY26JULFUT", instrument_token=0, strike=0,
+            expiry="", option_type="FUT", lot_size=self.LOT, quantity=2,
+            price=self.FUT + 10, transaction_type="SELL", iv=0,
+            bid_ask_spread_pct=0, margin_required=0,
+        )
+        h.execute_proposals([close_prop])
+        assert h.state.futures_symbol == ""
+        assert h.state.futures_last_mark == 0.0
+
+    def test_mark_and_contract_survive_serialize_restore(self, h):
+        """Review finding: the mark used to be an un-persisted instance
+        attribute, so after a runner restart with a carried hedge the first
+        failing quote marked the leg FLAT and the daily-loss breaker went
+        blind to the whole futures move."""
+        h.state.futures_last_mark = self.FUT
+        blob = h.serialize_state()
+        h2 = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h2.state = HedgeState()
+        h2.restore_state(blob)
+        assert h2.state.futures_symbol == "NIFTY26JULFUT"
+        assert h2.state.futures_last_mark == pytest.approx(self.FUT)
+
+    def test_restore_tolerates_blob_without_futures_fields(self, h):
+        """Existing on-disk state files predate these fields."""
+        blob = h.serialize_state()
+        blob["state"].pop("futures_symbol", None)
+        blob["state"].pop("futures_last_mark", None)
+        h2 = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h2.state = HedgeState()
+        h2.restore_state(blob)
+        assert h2.state.futures_symbol == ""
+        assert h2.state.futures_last_mark == 0.0
+
+    def test_carried_mark_keeps_breaker_sighted_after_restart(self, h):
+        """The point of persisting the mark: a restored hedge whose quote
+        fails still marks against a real price, so a large adverse futures
+        move remains visible to `_should_exit`."""
+        h.state.futures_last_mark = self.VWAP - 100.0      # restored, adverse
+        h.kite.quote.side_effect = Exception("feed down")
+        h._update_positions_prices(self.SPOT)
+        assert h.state.unrealized_pnl == pytest.approx(-100.0 * self.LOTS * self.LOT)
+        assert h.state.unrealized_pnl != 0.0
+
+    # ── fail-loud ledger (H-6a) ────────────────────────────────
+
+    def test_futures_quote_failures_escalate_to_error(self, h, caplog):
+        """H-6a: a frozen futures mark feeds the daily-loss breaker, so it
+        must not sit at one severity forever."""
+        h.kite.quote.side_effect = Exception("feed down")
+        for _ in range(4):
+            h._futures_mark()
+        assert h._consecutive_futures_failures == 4
+        with caplog.at_level(logging.ERROR):
+            h._futures_mark()
+        assert h._consecutive_futures_failures == 5
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    @pytest.mark.parametrize("payload", [
+        {"NFO:NIFTY26JULFUT": None},                       # AttributeError
+        {"NFO:NIFTY26JULFUT": {"last_price": "n/a"}},      # ValueError
+        {"NFO:NIFTY26JULFUT": ["last_price"]},             # AttributeError
+    ])
+    def test_malformed_quote_payload_does_not_abort_the_pnl_update(self, h, payload):
+        """A shape-drifted payload must degrade to the carried mark, not
+        raise out of _update_positions_prices — which runs AFTER the option
+        legs have been re-marked, so a raise leaves a half-updated book with
+        total_pnl unset and _should_exit never evaluated."""
+        h.state.futures_last_mark = self.FUT
+        h.kite.quote.return_value = payload
+        h._update_positions_prices(self.SPOT)   # must not raise
+        assert h.state.unrealized_pnl == pytest.approx(
+            (self.FUT - self.VWAP) * self.LOTS * self.LOT
+        )
+
+    def test_futures_failure_counter_resets_on_recovery(self, h):
+        h.kite.quote.side_effect = Exception("feed down")
+        h._futures_mark()
+        assert h._consecutive_futures_failures == 1
+        h.kite.quote.side_effect = None
+        self._quote_futures(h, self.FUT)
+        assert h._futures_mark() == pytest.approx(self.FUT)
+        assert h._consecutive_futures_failures == 0
 
 
 class TestResetAndMetrics:

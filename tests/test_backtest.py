@@ -51,6 +51,53 @@ class TestMockKite:
         assert "CE" in types
         assert "PE" in types
 
+    def test_quote_serves_the_synthetic_futures_placeholder(self):
+        """instruments() hands out a FUTMOCK contract on synthetic data, so
+        quote() must price it. Returning nothing makes the strategy refuse
+        its hard delta hedge on every tick, which silently turns every
+        synthetic backtest — including the autoresearch hold-out validation
+        — into an unhedged book."""
+        data = generate_synthetic_data(days=1, ticks_per_day=2)
+        kite = MockKite(data, "NIFTY")
+        futs = [i for i in kite.instruments("NFO")
+                if i["instrument_type"] == "FUT"]
+        assert futs, "synthetic instruments must expose a FUT contract"
+        sym = futs[0]["tradingsymbol"]
+
+        q = kite.quote([f"NFO:{sym}"])
+        assert f"NFO:{sym}" in q
+        fut = q[f"NFO:{sym}"]["last_price"]
+        assert fut > 0
+
+        # Priced off spot + a real basis, not equal to spot: the hedge is
+        # entered, marked and flattened on this series, so a zero basis
+        # would hide exactly the regression class this models.
+        spot = kite.quote(["NSE:NIFTY"])["NSE:NIFTY"]["last_price"]
+        assert fut > spot
+        assert 0.0005 < (fut / spot - 1) < 0.003
+
+    def test_hard_delta_hedge_is_proposed_on_synthetic_data(self):
+        """End-to-end guard for the same regression: with a short delta the
+        strategy must actually emit a futures hedge on a synthetic tape,
+        priced off the futures series rather than spot."""
+        from unittest.mock import MagicMock
+        from strategies.taleb_karpathy import TalebKarpathyStrategy, HedgeState
+
+        data = generate_synthetic_data(days=1, ticks_per_day=3, lot_size=65)
+        kite = MockKite(data, "NIFTY")
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.kite, h.state = kite, HedgeState()
+        h.underlying, h.exchange = "NIFTY", "NFO"
+        h._cached_lot_size, h._cached_futures_symbol = 65, None
+        spot = kite.quote(["NSE:NIFTY"])["NSE:NIFTY"]["last_price"]
+
+        greeks = MagicMock(net_discrete_delta=-260.0, net_delta=-260.0)
+        props = h._generate_hard_delta_proposals(greeks, spot)
+        assert len(props) == 1, "synthetic backtests must still hedge delta"
+        assert props[0].option_type == "FUT"
+        assert props[0].transaction_type == "BUY"
+        assert props[0].price > spot   # futures level, not the index
+
 
 class TestBacktestIntegration:
     def test_smoke_test(self):

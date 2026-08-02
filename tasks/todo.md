@@ -1,3 +1,94 @@
+# Futures hedge priced off spot instead of the futures contract — 2026-08-02
+
+Found while investigating why the 2026-08-01 autoresearch sweep vetoed its
+candidate on the 2026-07-10 tail hold-out (`candidate_params_2026-08-01.json`,
+`tail_day_nonnegative = False`, −₹20,248).
+
+**Defect.** The futures delta hedge was entered at the futures LTP but *marked*
+and *flattened* at index spot:
+
+| site | before | after |
+|---|---|---|
+| `_generate_hard_delta_proposals` (entry) | futures LTP, silent spot fallback | futures LTP, **refuse** if unavailable |
+| `_update_positions_prices` (mark) | **index spot** | futures LTP → last good mark → entry VWAP |
+| `_generate_close_all_proposals` (flatten) | **index spot** | futures LTP → last good mark → entry VWAP |
+
+Basis becomes phantom P&L on a long hedge. On 2026-07-10 the NIFTY basis
+averaged +31.8 pts (range 16.55–47.50), putting ~₹7.7k of loss on a 4-lot hedge
+that did not exist. That is what tripped the ₹15,000 daily-loss breaker at
+−₹15,297 (true ≈ −₹7.6k), flattened the book at ~11:13 near the low of the only
+down-leg, and then locked out entries for the remaining four hours while NIFTY
+recovered to close +0.25% on the day.
+
+**Blast radius.** Realized P&L was wrong only in backtest/paper (`fill_price`
+falls back to `prop.price`; live uses the broker's `average_price`, and the live
+order price is re-derived by `_protective_limit_price`). **The unrealized mark
+was wrong in every mode, including live** — `_should_exit`'s daily-loss breaker
+and the `_pre_trade_checks` entry lockout both read it. That is the
+money-affecting part.
+
+**Plan**
+- [x] `_get_futures_price()` + `_futures_mark()` helpers — one series for entry,
+      mark and flatten; H-6a degradation (quote → last good mark → entry VWAP),
+      never spot, never 0.0 (preserves the H-6b `validate_order` guarantee).
+- [x] Entry refuses rather than guessing at spot (H-6c/H-6d stance); drift
+      re-proposes the hedge on the next tick.
+- [x] `TestFuturesHedgeBasisPricing` — 7 of 9 fail on pre-fix code; the other 2
+      pin behaviour that was already correct (H-6b fallback, entry pricing).
+- [x] Fixed `TestFuturesPnL::test_futures_unrealized_pnl_included`, which
+      asserted the spot mark and so passed while the accounting was wrong
+      (Rule 9: a test that cannot fail is worthless).
+**Review round 2 (`/code-review high`, 2026-08-02).** 10 findings survived
+verification; the top one was a regression introduced by the first commit, not a
+pre-existing defect.
+
+- [x] **Backtest hedging was silently disabled.** `MockKite.instruments()` hands
+      out a `NIFTYFUTMOCK` placeholder on synthetic tapes but
+      `generate_synthetic_data` emits no FUT rows, so `quote()` returned `{}`,
+      `_get_futures_price()` returned None every tick and the new refusal made
+      **every synthetic backtest score an unhedged book** — including the
+      autoresearch hold-out validation. Fixed in `research/backtest.py`:
+      `quote()` now prices the placeholder off spot + `_SYNTHETIC_FUT_BASIS_PCT`
+      (0.13% ≈ 31 pts, the basis measured on the 07-10 tape). Non-zero on
+      purpose — entry/mark/flatten all read that one series, so the basis
+      cancels in P&L and any future spot-pricing regression shows up as an
+      artefact.
+- [x] **Roll hazard.** `_futures_mark()` quoted whatever `_get_futures_symbol()`
+      called front-month; after a monthly settlement that is the NEXT contract,
+      marked against the previous contract's `futures_entry_vwap` — the roll
+      spread booked as phantom P&L, i.e. the same bug class in a new disguise.
+      Now `state.futures_symbol` pins the contract actually held and is what
+      gets quoted.
+- [x] **Mark did not survive a restart.** `_last_futures_mark` was an ad-hoc
+      instance attribute, absent from `__init__` and from the save/restore
+      schema, so after a restart the first failing quote marked the leg FLAT and
+      the ₹15k breaker went blind to the entire futures move. Promoted to
+      `HedgeState.futures_last_mark`, persisted, seeded from the fill, cleared
+      when flat. `restore_state` tolerates blobs predating both fields.
+- [x] **Refusal/staleness now fail loud.** `_note_futures_failure()` counts
+      consecutive failures and escalates WARNING → ERROR at 5, mirroring
+      `_check_spot` and the option-leg H-6a carry.
+- [x] Quote-payload parsing moved inside the try — a shape-drifted payload was
+      raising out of `_update_positions_prices` *after* the option legs had been
+      re-marked, leaving a half-updated book with `total_pnl` unset.
+- [x] Dead `if fut_price and fut_price > 0:` guard replaced with an explicit,
+      escalating flat-mark fallback.
+- [ ] NOT fixed (deliberate): close-all can still return options-only when the
+      futures leg cannot be priced at all, and `run_paper.force_flatten()` treats
+      that as success — the runner-side escalation is a separate change. The new
+      `or futures_entry_vwap` fallback makes it near-unreachable.
+- [ ] NOT fixed (Rule 3): `_get_futures_price` still duplicates `_get_spot_price`.
+      Extracting a shared `_quote_last_price()` means editing the live spot path,
+      which this PR should not touch.
+- [ ] Re-run the autoresearch sweep once merged — the 15-session fitness window
+      and both hold-outs were all scored with the corrupted futures accounting,
+      so every weekly candidate since the hedge was introduced is suspect.
+- [ ] Separate: the tail hold-out is picked on **close-to-close** move
+      (`load_daily_moves`), but the strategy is intraday and flat overnight. On
+      2026-07-10, +1.02% close-to-close was +0.78% overnight gap and only
+      +0.25% intraday — the veto graded a move the book cannot participate in.
+      Proposal: pick the tail hold-out on intraday range instead.
+
 # Reversal engine B — level-significance event study (kill-shot) — 2026-07-25
 
 **Issue #180** (`reversal-engine`). Phase B of the plan §7 (validation steps 2–3).
