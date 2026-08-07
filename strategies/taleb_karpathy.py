@@ -49,6 +49,13 @@ from core.regime_classifier import (
 
 from .base import BaseStrategy, ExecutionMode
 
+# Process-level memo for the daily ATM IV pool (see _load_daily_atm_iv).
+# Keyed by (underlying, min_dte, max_dates, archive fingerprint) so a
+# changed EOD archive can never be served from a stale entry. Module level
+# rather than per-instance because the point is to share it ACROSS the
+# hundreds of strategy constructions an autoresearch sweep performs.
+_DAILY_ATM_IV_CACHE: Dict[tuple, List[Tuple[date, float]]] = {}
+
 # Kite Connect's quote feed indexes the *spot* price under the index's
 # display name (with spaces), not the derivatives ticker. f"NSE:{u}"
 # works for stocks (NSE:RELIANCE) but Kite silently returns {} for
@@ -370,6 +377,15 @@ class TalebKarpathyStrategy(BaseStrategy):
         self._persist_iv_history = True
         self._iv_history_max_size = 500
         self._atm_iv_history: List[float] = []
+        # Daily ATM IV pool bounds (see _load_daily_atm_iv). Expiry-day IV
+        # back-solves are unstable — T → 0 inflates the implied vol that any
+        # pinning/settlement noise implies — so the pool skips the last
+        # _daily_iv_min_dte days of a cycle. Measured on the EOD snapshots:
+        # mean ATM IV 0.315 at DTE ≤ 3 vs 0.175 beyond it (BANKNIFTY), and a
+        # 0.70 outlier at DTE ≤ 3 (NIFTY). Without the filter every mid-cycle
+        # tick ranks against a pool inflated by those readings.
+        self._daily_iv_min_dte = 3
+        self._daily_iv_max_dates = 250
         # Rolling spot history is used to estimate realized vol for the
         # RV/IV entry gate. Live ticks are appended in-memory; backtests
         # rebuild it forward. Cron paper sessions are oneshot, so the
@@ -395,8 +411,38 @@ class TalebKarpathyStrategy(BaseStrategy):
         # Phase 1.3: rolling history of (25Δ put IV − 25Δ call IV) used to
         # rank current skew. Persisted alongside _atm_iv_history.
         self._skew_history: List[float] = []
+        # DATED daily ATM IV pool — the distribution _compute_iv_percentile
+        # ranks against. A SEPARATE list from _atm_iv_history for exactly the
+        # reason _daily_return_history is separate from _spot_history (#160).
+        #
+        # The defect is not "the tick series is too smooth" — it is that the
+        # tick series is tick-appended and capped at _iv_history_max_size, so
+        # the span of wall-clock it covers is ARBITRARY and depends on how
+        # often the runner reached the IV solve. Measured 2026-08-02 on the
+        # persisted series (500 obs each):
+        #
+        #            tick sd   tick sd/mean   daily sd   ratio d/t
+        #   BANKNIFTY  0.0037       2.9%       0.0318      8.5x
+        #   NIFTY      0.0920      45.8%       0.0539      0.59x
+        #
+        # BANKNIFTY's 500 obs span ~1.5 sessions (range 0.1177-0.1362), so
+        # its "percentile" ranked the tick against intraday micro-noise —
+        # readings of 100.0 → 5.4 → 81.4 within eight minutes on 2026-07-31,
+        # making the [8,43] band a per-tick coin flip. NIFTY's 500 obs span
+        # MONTHS (range 0.0656-0.3285) because its runner solves IV far less
+        # often per session, so there the same window is a stale multi-month
+        # mixture. Neither is a defined reference distribution, and the two
+        # fail in opposite directions — which is the point: one observation
+        # per session is the only construction that means the same thing on
+        # every underlying.
+        #
+        # Dates are kept so tape replay can exclude observations from the
+        # session under test and later (look-ahead guard) — the same reason
+        # #160 dated its bootstrap pool.
+        self._daily_atm_iv_history: List[Tuple[date, float]] = []
         self._load_iv_history()
         self._load_spot_history()
+        self._load_daily_atm_iv()
 
     # ══════════════════════════════════════════════════════════
     # PUBLIC API
@@ -2328,14 +2374,17 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     def _compute_iv_percentile(self, chain, spot):
         """
-        Compute IV percentile: where current ATM IV sits relative to
-        its own recent history (rolling window). This is the standard
-        approach — compare current vol regime against past observations,
-        not against the cross-sectional smile at the same tick.
+        Compute IV percentile: where current ATM IV sits relative to the
+        DAILY ATM IV distribution of prior sessions (`_daily_atm_iv_history`,
+        seeded from the EOD option-chain archive). This is the standard
+        approach — compare the current vol regime against past regimes, not
+        against the cross-sectional smile at the same tick, and not against
+        the last ~1.5 sessions of intraday ticks (which is what the
+        pre-2026-07-31 version did; see `_daily_atm_iv_history` in __init__).
 
         Returns None when the percentile cannot be computed this tick —
-        an ATM quote gap, an unsolvable IV, or a rolling window still in
-        warmup (<30 obs). The caller must treat None as "not ready" and
+        an ATM quote gap, an unsolvable IV, or a daily pool still in
+        warmup (<30 sessions). The caller must treat None as "not ready" and
         skip the scan; it must NOT be conflated with a genuine mid-range
         reading. Returning a neutral 50.0 for these cases (the pre-#75
         behaviour) made the IV-band tunables degenerate to a binary
@@ -2369,22 +2418,35 @@ class TalebKarpathyStrategy(BaseStrategy):
             logger.debug("IV percentile: back-solved IV %.4f out of (0.01,3.0) — not ready", atm_iv)
             return None
 
-        # Append to rolling history and compute percentile against it
+        # Append to the tick-level rolling history. This series is NOT what
+        # the percentile ranks against (see below) — it feeds the vol-of-vol
+        # regime feature and supplies the current-IV reading for the RV/IV
+        # gate, both of which legitimately want the intraday series.
         self._atm_iv_history.append(atm_iv)
         if len(self._atm_iv_history) > self._iv_history_max_size:
             self._atm_iv_history = self._atm_iv_history[-self._iv_history_max_size:]
         self._save_iv_history()
 
-        # Below ~30 observations the rolling window is too thin for a
-        # meaningful percentile. Return None (not ready) — a fabricated
-        # neutral 50.0 would either block (band excludes 50) or wave the
-        # trade through (band includes 50) on no real evidence.
-        if len(self._atm_iv_history) < 30:
-            logger.debug("IV percentile: warmup (%d/30 obs) — not ready", len(self._atm_iv_history))
+        # Rank against the DAILY pool, restricted to sessions strictly before
+        # the current one. Ranking against _atm_iv_history — what this did
+        # before — ranked the tick against ~1.5 sessions of its own intraday
+        # micro-noise, which is a coin flip, not a vol regime (see
+        # _daily_atm_iv_history in __init__). The date filter is a no-op live
+        # (the newest EOD snapshot is yesterday's) and is the look-ahead guard
+        # under tape replay, matching the #160 bootstrap pool.
+        today = self._clock().date()
+        pool = [v for d, v in self._daily_atm_iv_history if d < today]
+
+        # Below 30 observations the pool is too thin for a meaningful
+        # percentile. Return None (not ready) — a fabricated neutral 50.0
+        # would either block (band excludes 50) or wave the trade through
+        # (band includes 50) on no real evidence.
+        if len(pool) < 30:
+            logger.debug("IV percentile: warmup (%d/30 daily obs) — not ready", len(pool))
             return None
 
         from scipy.stats import percentileofscore
-        return percentileofscore(self._atm_iv_history, atm_iv)
+        return percentileofscore(pool, atm_iv)
 
     def _compute_skew_percentile(self, chain, spot):
         """Phase 1.3: percentile rank of IV(25Δ put) − IV(25Δ call).
@@ -2674,6 +2736,152 @@ class TalebKarpathyStrategy(BaseStrategy):
                 self._daily_return_history = list(zip(rdates, rets))
                 logger.info("MC bootstrap pool: %d daily returns from %s",
                             len(self._daily_return_history), path)
+
+    def _load_daily_atm_iv(self):
+        """Seed the dated daily ATM IV pool from the EOD option-chain
+        snapshots (`data_cache/<UNDERLYING>_*_eod.*`, written by
+        `market_data/fetch_bhavcopy.py --underlying <index>`; the same
+        archive `_load_spot_history` reads for spot).
+
+        One observation per session: the mean `iv` of the CE/PE rows at the
+        strike nearest that session's underlying price, on the nearest expiry
+        at least `_daily_iv_min_dte` days out.
+
+        Reads newest file first and stops at `_daily_iv_max_dates` distinct
+        sessions, holding ONE file in memory at a time. `_load_spot_history`
+        reads only `candidates[-1]` because a 5-day RV window fits in one
+        file; a percentile pool needs depth, and NIFTY's archive is 80 files
+        / 6.1M rows — not something to concatenate at strategy startup (cf.
+        the 2026-07-11 autoresearch OOM).
+
+        Failure is soft but LOUD: a missing/unreadable archive leaves the
+        pool empty, which makes `_compute_iv_percentile` return None and the
+        strategy inert. That must not be silent, so it warns here at startup
+        rather than only via the per-tick debug line.
+        """
+        cache_dir = Path("data_cache")
+        candidates = find_tables(cache_dir, f"{self.underlying}_*_eod") if cache_dir.exists() else []
+        if not candidates:
+            logger.warning(
+                "No %s_*_eod snapshot in data_cache — daily ATM IV pool is EMPTY, "
+                "so the IV-percentile entry gate cannot be computed and NO entry "
+                "will fire. Run: python -m market_data.fetch_bhavcopy --underlying %s",
+                self.underlying, self.underlying,
+            )
+            return
+
+        # Process-level memo. This runs in __init__ and takes ~10s against
+        # the NIFTY archive (80 files / 6.1M rows), but the archive is
+        # immutable for the life of a sweep: the 2026-08-01 autoresearch run
+        # built 393 strategies and so spent ~65 min of its 226 min wall clock
+        # re-reading the same parquet. Keyed on (path, size, mtime_ns) of
+        # every candidate, so ANY archive change — a new fetch_bhavcopy, a
+        # rewritten file — misses the cache rather than serving a stale pool.
+        try:
+            fingerprint = tuple(
+                (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in candidates
+            )
+        except OSError as e:      # racing fetch_bhavcopy — just don't cache
+            logger.debug("Daily ATM IV pool: cannot fingerprint archive (%s)", e)
+            fingerprint = None
+        key = (self.underlying, self._daily_iv_min_dte,
+               self._daily_iv_max_dates, fingerprint)
+        if fingerprint is not None and key in _DAILY_ATM_IV_CACHE:
+            self._daily_atm_iv_history = list(_DAILY_ATM_IV_CACHE[key])
+            logger.debug("Daily ATM IV pool: %d sessions (cached)",
+                         len(self._daily_atm_iv_history))
+            return
+
+        by_date: Dict[date, float] = {}
+        for path in reversed(candidates):  # filenames embed end-date; newest first
+            if len(by_date) >= self._daily_iv_max_dates:
+                break
+            try:
+                df = read_table(path, usecols=[
+                    "timestamp", "underlying_price", "strike",
+                    "option_type", "expiry", "iv",
+                ])
+                # Same sanity band _load_iv_history applies to the persisted
+                # series, so one corrupt snapshot cannot poison the ranking.
+                df = df[(df["iv"] > 0.01) & (df["iv"] < 3.0)]
+                if df.empty:
+                    continue
+                df = df.assign(
+                    _d=pd.to_datetime(df["timestamp"], utc=True)
+                        .dt.tz_convert("Asia/Kolkata").dt.date,
+                    _e=pd.to_datetime(df["expiry"]).dt.date,
+                )
+            except (OSError, ValueError, KeyError, TypeError, pd.errors.ParserError) as e:
+                logger.warning("Could not read daily ATM IV from %s: %s", path, e)
+                continue
+
+            skipped = 0
+            for d, g in df.groupby("_d", sort=False):
+                if d in by_date:
+                    continue  # newer file already supplied this session
+                # Per-SESSION guard, mirroring _load_spot_history's per-row
+                # guard above ("must degrade gracefully, not crash strategy
+                # startup"). read_table is called without a dtype map, so one
+                # non-numeric cell — NSE bhavcopy writes '-' for missing
+                # values — leaves the column as object dtype and the float()
+                # or the subtraction below raises. That used to propagate out
+                # of __init__, which is called unconditionally at line ~445:
+                # run_paper would die before its session loop and every
+                # autoresearch experiment would score -999999. One bad
+                # session must cost that session, not the trading day.
+                try:
+                    g = g[g["_e"] >= d + timedelta(days=self._daily_iv_min_dte)]
+                    if g.empty:
+                        continue
+                    g = g[g["_e"] == g["_e"].min()]
+                    spot = float(g["underlying_price"].iloc[0])
+                    if not (spot > 0):        # also rejects NaN
+                        skipped += 1
+                        continue
+                    atm = g["strike"].iloc[(g["strike"] - spot).abs().argsort().iloc[0]]
+                    atm_rows = g[g["strike"] == atm]
+                    if atm_rows.empty:
+                        # NaN strike (pandas parses 'n/a'/'-' as NaN, and
+                        # NaN == NaN is False) or no row at the chosen
+                        # strike. A data anomaly, not the expected
+                        # near-expiry filter above — count it.
+                        skipped += 1
+                        continue
+                    iv = float(atm_rows["iv"].mean())
+                except (TypeError, ValueError) as e:
+                    skipped += 1
+                    logger.debug("Daily ATM IV: skipping %s in %s: %s", d, path, e)
+                    continue
+                if iv != iv:                  # NaN mean — no usable ATM row
+                    skipped += 1
+                    continue
+                by_date[d] = iv
+            if skipped:
+                # Loud at file granularity: per-session would spam, silence
+                # would hide an archive quietly degrading the entry gate.
+                logger.warning(
+                    "Daily ATM IV: skipped %d unusable session(s) in %s — "
+                    "the IV-percentile pool is thinner than the archive.",
+                    skipped, path,
+                )
+
+        self._daily_atm_iv_history = sorted(by_date.items())[-self._daily_iv_max_dates:]
+        if fingerprint is not None:
+            _DAILY_ATM_IV_CACHE[key] = list(self._daily_atm_iv_history)
+        if len(self._daily_atm_iv_history) < 30:
+            logger.warning(
+                "Daily ATM IV pool for %s has only %d session(s) (need 30) — the "
+                "IV-percentile entry gate stays in warmup and NO entry will fire. "
+                "Widen the EOD archive (fetch_bhavcopy --days N).",
+                self.underlying, len(self._daily_atm_iv_history),
+            )
+        else:
+            ivs = [v for _, v in self._daily_atm_iv_history]
+            logger.info(
+                "Daily ATM IV pool: %d sessions %s→%s (min %.4f max %.4f) from %s_*_eod",
+                len(ivs), self._daily_atm_iv_history[0][0],
+                self._daily_atm_iv_history[-1][0], min(ivs), max(ivs), self.underlying,
+            )
 
     def _apply_risk_filters(self, proposals, spot):
         """

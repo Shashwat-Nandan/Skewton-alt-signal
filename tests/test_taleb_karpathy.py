@@ -5,7 +5,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 from strategies.taleb_karpathy import (
     TalebKarpathyStrategy, HedgeState, estimate_transaction_cost,
@@ -1895,7 +1895,16 @@ class TestIVPercentileNotReady:
         h._atm_iv_history = []
         h._iv_history_max_size = 500
         h._persist_iv_history = False  # _save_iv_history is a no-op
+        h._daily_atm_iv_history = []   # the pool the percentile ranks against
+        h._daily_iv_min_dte = 3
+        h._daily_iv_max_dates = 250
         return h
+
+    @staticmethod
+    def _pool(values, end=date(2026, 3, 28)):
+        """Dated daily pool ending the session BEFORE _bare()'s clock date."""
+        return [(end - timedelta(days=len(values) - 1 - i), v)
+                for i, v in enumerate(values)]
 
     def _chain(self):
         import pandas as pd
@@ -1927,23 +1936,67 @@ class TestIVPercentileNotReady:
         assert h._compute_iv_percentile(pe_only, 22000.0) is None
 
     def test_warmup_returns_none_not_neutral_50(self):
-        """<30 obs cannot rank a percentile — must be None, never 50."""
+        """<30 DAILY sessions cannot rank a percentile — None, never 50."""
         h = self._bare()
-        h._atm_iv_history = [0.15] * 5
+        h._daily_atm_iv_history = self._pool([0.15] * 5)
         h.kite.quote = MagicMock(side_effect=self._resolving_quote())
         assert h._compute_iv_percentile(self._chain(), 22000.0) is None
 
     def test_computes_real_percentile_when_ready(self):
-        """With ≥30 obs and a resolvable quote, returns a real float — and it
-        is a genuine rank, not the fabricated 50.0 sentinel. Seed the history
-        BELOW the current ATM IV so the true percentile is high (~100), which
-        would be indistinguishable from a bug only if it returned 50."""
+        """With ≥30 daily sessions and a resolvable quote, returns a real
+        float — and it is a genuine rank, not the fabricated 50.0 sentinel.
+        Seed the pool BELOW the current ATM IV so the true percentile is high
+        (~100), which would be indistinguishable from a bug only if it
+        returned 50."""
         h = self._bare()
-        h._atm_iv_history = [0.05] * 40  # all far below the ~ATM IV we'll solve
+        h._daily_atm_iv_history = self._pool([0.05] * 40)  # far below solved IV
         h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
         pct = h._compute_iv_percentile(self._chain(), 22000.0)
         assert pct is not None
         assert pct > 50.0  # current IV ranks above a low-vol history
+
+    def test_ranks_against_daily_pool_not_intraday_ticks(self):
+        """THE 2026-07-31 REGRESSION. _atm_iv_history is tick-appended and
+        capped at 500, so at ~340 IV solves/session it holds ~1.5 SESSIONS —
+        ranking against it ranks the tick against its own intraday noise
+        (observed on BANKNIFTY: 100.0 → 5.4 → 81.4 in eight minutes).
+
+        Here the intraday ticks all sit far BELOW the current ATM IV (old
+        code → percentile ~100 → 'expensive vol, do not buy') while the daily
+        regime pool sits far ABOVE it (true answer → percentile ~0 → 'vol is
+        cheap versus every prior session'). The two disagree maximally, so
+        this fails loudly if the ranking source ever reverts."""
+        h = self._bare()
+        h._atm_iv_history = [0.01] * 400          # what the OLD code ranked against
+        h._daily_atm_iv_history = self._pool([0.90] * 40)  # the real regime
+        h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
+        pct = h._compute_iv_percentile(self._chain(), 22000.0)
+        assert pct is not None
+        assert pct < 5.0, f"ranked against intraday ticks, not the daily pool (got {pct})"
+        # The tick series is still maintained — vol-of-vol and the RV/IV gate
+        # read it — it just no longer decides the percentile.
+        assert len(h._atm_iv_history) == 401
+
+    def test_excludes_current_and_future_sessions(self):
+        """Look-ahead guard (same contract as the #160 bootstrap pool): under
+        tape replay of session D the pool must contain only sessions < D.
+        Without the filter, replaying a past session ranks its IV against
+        snapshots taken after it — a manufactured edge. _bare()'s clock is
+        2026-03-29, so the 40 same-day/future rows must all be discarded,
+        dropping the pool under the 30-session floor → None."""
+        h = self._bare()
+        clock_date = h._clock().date()
+        h._daily_atm_iv_history = [
+            (clock_date + timedelta(days=i), 0.05) for i in range(40)
+        ]
+        h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
+        assert h._compute_iv_percentile(self._chain(), 22000.0) is None
+        # One session earlier and it is admitted, proving the boundary is
+        # "< today" and not something coarser that drops everything.
+        h._daily_atm_iv_history = [
+            (clock_date - timedelta(days=i + 1), 0.05) for i in range(40)
+        ]
+        assert h._compute_iv_percentile(self._chain(), 22000.0) is not None
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -3740,3 +3793,263 @@ class TestMcPathSource:
         assert h._mc_empirical_returns() is None
         h.immutable_params = {"mc_path_source": "bootstrap"}
         assert h._mc_empirical_returns() == [-0.021, 0.004]
+
+    def test_daily_atm_iv_pool_is_one_atm_obs_per_session_clear_of_expiry(
+            self, tmp_path, monkeypatch):
+        # WHY: the IV-percentile gate is only a REGIME filter if it ranks
+        # against one observation per SESSION. Two things can silently break
+        # that. (1) The snapshot holds a full chain, so taking anything but
+        # the ATM strike of the nearest live expiry mixes smile level into a
+        # time-series rank. (2) Expiry-day IV back-solves blow up as T → 0
+        # (measured: mean ATM IV 0.315 at DTE ≤ 3 vs 0.175 beyond it on
+        # BANKNIFTY), so a pool that keeps them biases every mid-cycle tick's
+        # percentile downward — the strategy would read "vol is cheap" purely
+        # because the pool is inflated.
+        import pandas as _pd
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        rows = []
+        for day, expiry, atm_iv in (
+            # DTE 9 — kept. Wrong-strike rows carry a very different IV so
+            # picking a non-ATM strike would show up as a wrong pool value.
+            ("2026-07-01", "2026-07-10", 0.20),
+            # DTE 1 — dropped by the min-DTE filter despite being the
+            # nearest expiry, and there is no other expiry that session, so
+            # the session yields nothing at all.
+            ("2026-07-02", "2026-07-03", 0.95),
+        ):
+            for strike, iv in ((24000.0, atm_iv), (26000.0, atm_iv + 0.40)):
+                for opt in ("CE", "PE"):
+                    rows.append({
+                        "timestamp": f"{day} 15:30:00+05:30",
+                        "underlying_price": 24010.0, "strike": strike,
+                        "option_type": opt, "expiry": expiry, "iv": iv,
+                    })
+        _pd.DataFrame(rows).to_csv(
+            dc / "NIFTY_20260701_20260702_eod.csv", index=False)
+
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.underlying = "NIFTY"
+        h._daily_atm_iv_history = []
+        h._daily_iv_min_dte = 3
+        h._daily_iv_max_dates = 250
+        h._load_daily_atm_iv()
+
+        assert h._daily_atm_iv_history == [(date(2026, 7, 1), 0.20)], (
+            "expected exactly one ATM observation for the DTE-9 session and "
+            "none for the DTE-1 session"
+        )
+
+    def test_daily_atm_iv_pool_missing_archive_is_empty_not_fabricated(
+            self, tmp_path, monkeypatch):
+        # WHY (Rule 12): with no EOD archive the honest answer is "no pool",
+        # which makes _compute_iv_percentile return None and the strategy sit
+        # out. Fabricating a pool — or silently falling back to the tick
+        # series — would resurrect the exact defect this replaced.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "data_cache").mkdir()
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.underlying = "NIFTY"
+        h._daily_atm_iv_history = []
+        h._daily_iv_min_dte = 3
+        h._daily_iv_max_dates = 250
+        h._load_daily_atm_iv()
+        assert h._daily_atm_iv_history == []
+
+
+class TestDailyAtmIvPoolMalformedSnapshot:
+    """`_load_daily_atm_iv` runs unconditionally from `__init__`, so ANY
+    exception it raises kills strategy construction: `runners/run_paper.py`
+    dies before its session loop (a lost trading day) and every autoresearch
+    experiment raises, which the sweep's per-cycle except scores as -999999
+    and flattens the generation.
+
+    Regression for a review finding: the per-session loop sat OUTSIDE the
+    try/except guarding the file read. `read_table` is called without a
+    dtype map, so one non-numeric cell — NSE bhavcopy writes '-' for missing
+    values — left the column object-dtype and `float(...)` raised straight
+    out of the constructor. The sibling `_load_spot_history` already had the
+    right convention ("must degrade gracefully, not crash strategy startup");
+    this class pins it for the new loader too.
+    """
+
+    @staticmethod
+    def _rows(day, price, strike=24000.0, iv=0.20, expiry="2026-07-20"):
+        return [{
+            "timestamp": f"{day} 15:30:00+05:30", "underlying_price": price,
+            "strike": strike, "option_type": opt, "expiry": expiry, "iv": iv,
+        } for opt in ("CE", "PE")]
+
+    def _load(self, tmp_path, monkeypatch, rows):
+        import pandas as _pd
+        from strategies.taleb_karpathy import _DAILY_ATM_IV_CACHE
+        _DAILY_ATM_IV_CACHE.clear()
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir(exist_ok=True)
+        _pd.DataFrame(rows).to_csv(
+            dc / "NIFTY_20260701_20260702_eod.csv", index=False)
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.underlying = "NIFTY"
+        h._daily_atm_iv_history = []
+        h._daily_iv_min_dte = 3
+        h._daily_iv_max_dates = 250
+        h._load_daily_atm_iv()          # must not raise
+        return h
+
+    @pytest.mark.parametrize("bad_price", ["-", "n/a", ""])
+    def test_non_numeric_underlying_price_does_not_crash_startup(
+            self, tmp_path, monkeypatch, bad_price):
+        h = self._load(tmp_path, monkeypatch,
+                       self._rows("2026-07-01", bad_price))
+        assert h._daily_atm_iv_history == []
+
+    def test_non_numeric_strike_does_not_crash_startup(
+            self, tmp_path, monkeypatch):
+        h = self._load(tmp_path, monkeypatch,
+                       self._rows("2026-07-01", 24010.0, strike="-"))
+        assert h._daily_atm_iv_history == []
+
+    def test_one_bad_session_does_not_discard_the_good_ones(
+            self, tmp_path, monkeypatch):
+        # WHY: the guard must be per-SESSION. Wrapping the whole loop instead
+        # would let a single corrupt session throw away every other session
+        # in the same snapshot, silently thinning the ranking pool.
+        h = self._load(tmp_path, monkeypatch,
+                       self._rows("2026-07-01", "-")
+                       + self._rows("2026-07-02", 24010.0)
+                       + self._rows("2026-07-03", 24020.0, iv=0.25))
+        assert h._daily_atm_iv_history == [
+            (date(2026, 7, 2), 0.20), (date(2026, 7, 3), 0.25),
+        ]
+
+    def test_skipped_sessions_are_surfaced_not_silent(
+            self, tmp_path, monkeypatch, caplog):
+        # WHY (Rule 12): a pool quietly thinner than its archive biases every
+        # percentile the entry gate reads. Dropping sessions must be visible.
+        with caplog.at_level(logging.WARNING):
+            self._load(tmp_path, monkeypatch,
+                       self._rows("2026-07-01", "-")
+                       + self._rows("2026-07-02", 24010.0))
+        assert "skipped 1 unusable session" in caplog.text
+
+    def test_expiry_only_session_is_filtered_not_counted_as_corrupt(
+            self, tmp_path, monkeypatch, caplog):
+        # A session whose only expiry is inside min_dte is an EXPECTED filter
+        # (that is the whole point of _daily_iv_min_dte), not a data anomaly,
+        # so it must not raise the corrupt-data alarm.
+        with caplog.at_level(logging.WARNING):
+            h = self._load(tmp_path, monkeypatch,
+                           self._rows("2026-07-01", 24010.0,
+                                      expiry="2026-07-02"))
+        assert h._daily_atm_iv_history == []
+        assert "unusable session" not in caplog.text
+
+
+class TestDailyAtmIvPoolCache:
+    """The pool load reads the whole EOD archive (~9s on NIFTY's 80 files)
+    and runs in __init__. An autoresearch sweep builds hundreds of
+    strategies — the 2026-08-01 run built 393 and burned ~58 min of its
+    226 min wall clock re-reading immutable parquet. Memoise it, but never
+    at the cost of serving a stale pool.
+    """
+
+    @staticmethod
+    def _archive(dc, name="NIFTY_20260701_20260702_eod.csv", iv=0.20):
+        import pandas as _pd
+        rows = [{
+            "timestamp": "2026-07-01 15:30:00+05:30",
+            "underlying_price": 24010.0, "strike": 24000.0,
+            "option_type": opt, "expiry": "2026-07-10", "iv": iv,
+        } for opt in ("CE", "PE")]
+        _pd.DataFrame(rows).to_csv(dc / name, index=False)
+
+    @staticmethod
+    def _build():
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.underlying = "NIFTY"
+        h._daily_atm_iv_history = []
+        h._daily_iv_min_dte = 3
+        h._daily_iv_max_dates = 250
+        h._load_daily_atm_iv()
+        return h
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        from strategies.taleb_karpathy import _DAILY_ATM_IV_CACHE
+        _DAILY_ATM_IV_CACHE.clear()
+        yield
+        _DAILY_ATM_IV_CACHE.clear()
+
+    def test_second_construction_does_not_reread_the_archive(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        self._archive(dc)
+
+        import strategies.taleb_karpathy as tk
+        calls = []
+        real = tk.read_table
+        monkeypatch.setattr(
+            tk, "read_table",
+            lambda *a, **k: (calls.append(a[0]), real(*a, **k))[1])
+
+        first = self._build()
+        assert len(calls) == 1
+        second = self._build()
+        assert len(calls) == 1, "second construction must hit the memo"
+        assert second._daily_atm_iv_history == first._daily_atm_iv_history
+        assert second._daily_atm_iv_history == [(date(2026, 7, 1), 0.20)]
+
+    def test_changed_archive_invalidates_the_memo(self, tmp_path, monkeypatch):
+        # WHY: the sweep is not the only caller. A live runner started after
+        # the nightly fetch_bhavcopy must rank against the NEW pool; serving
+        # a memo keyed only on the underlying would silently gate entries on
+        # yesterday's vol regime.
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        self._archive(dc, iv=0.20)
+        assert self._build()._daily_atm_iv_history == [(date(2026, 7, 1), 0.20)]
+
+        # Same filename, different contents -> different size/mtime.
+        self._archive(dc, iv=0.31)
+        assert self._build()._daily_atm_iv_history == [(date(2026, 7, 1), 0.31)]
+
+    def test_a_new_snapshot_file_invalidates_the_memo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        self._archive(dc, iv=0.20)
+        assert len(self._build()._daily_atm_iv_history) == 1
+
+        import pandas as _pd
+        _pd.DataFrame([{
+            "timestamp": "2026-07-03 15:30:00+05:30",
+            "underlying_price": 24010.0, "strike": 24000.0,
+            "option_type": opt, "expiry": "2026-07-20", "iv": 0.25,
+        } for opt in ("CE", "PE")]).to_csv(
+            dc / "NIFTY_20260703_20260703_eod.csv", index=False)
+        assert self._build()._daily_atm_iv_history == [
+            (date(2026, 7, 1), 0.20), (date(2026, 7, 3), 0.25),
+        ]
+
+    def test_underlying_is_part_of_the_key(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        dc = tmp_path / "data_cache"
+        dc.mkdir()
+        self._archive(dc, iv=0.20)
+        self._archive(dc, name="BANKNIFTY_20260701_20260702_eod.csv", iv=0.44)
+
+        nifty = self._build()
+        bn = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        bn.underlying = "BANKNIFTY"
+        bn._daily_atm_iv_history = []
+        bn._daily_iv_min_dte = 3
+        bn._daily_iv_max_dates = 250
+        bn._load_daily_atm_iv()
+
+        assert nifty._daily_atm_iv_history == [(date(2026, 7, 1), 0.20)]
+        assert bn._daily_atm_iv_history == [(date(2026, 7, 1), 0.44)]

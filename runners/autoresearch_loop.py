@@ -680,7 +680,7 @@ class HedgeResearchLoop:
         from research.backtest import (
             generate_synthetic_data, run_backtest,
             list_captured_sessions, load_captured_tape,
-            load_iv_skew_seed,
+            load_iv_skew_seed, load_daily_iv_seed,
         )
 
         underlying = getattr(self.hedger, "underlying", "NIFTY")
@@ -774,6 +774,18 @@ class HedgeResearchLoop:
                 len(self._iv_seed), len(self._skew_seed), drop,
             )
 
+        # The daily pool is what _compute_iv_percentile actually ranks
+        # against. A tape replay hands run_backtest ONE session, which cannot
+        # rank itself, so it must be supplied here — shared across every
+        # experiment, exactly like the seeds above, so it cannot bias the
+        # relative ranking the sweep is measuring. Its OWN hasattr guard:
+        # tying it to _iv_seed's would skip it on any path that pre-set that
+        # attribute, leaving _daily_iv_seed undefined at the call site.
+        if not hasattr(self, "_daily_iv_seed"):
+            self._daily_iv_seed = load_daily_iv_seed(underlying)
+            logger.info("Backtest daily ATM-IV pool: %d session(s)",
+                        len(self._daily_iv_seed))
+
         # Apply params to hedger so the backtest picks them up. Restore in
         # `finally`: the old restore sat after the cycle loop, so the
         # early -999999 return (and any propagating tape error) leaked the
@@ -822,6 +834,7 @@ class HedgeResearchLoop:
                         tunable_params=params,
                         seed_iv_history=self._iv_seed,
                         seed_skew_history=self._skew_seed,
+                        seed_daily_iv=getattr(self, "_daily_iv_seed", None),
                     )
                     metrics = results["metrics"]
                     if metrics.get("total_trades", 0) == 0:

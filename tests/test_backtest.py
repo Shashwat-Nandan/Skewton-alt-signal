@@ -4,6 +4,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
+from datetime import date, timedelta
 from research import backtest
 from research.backtest import (
     generate_synthetic_data, MockKite, run_backtest,
@@ -113,7 +114,10 @@ class TestBacktestIntegration:
 
     def test_backtest_produces_trades(self):
         """P1: Backtest must actually produce trades (clock injection works)."""
-        data = generate_synthetic_data(days=5, ticks_per_day=12)
+        # 40 days, not 5: the IV percentile ranks against one observation per
+        # SESSION and needs 30 prior sessions to leave warmup, so a 5-day
+        # tape can never fire an entry regardless of the band.
+        data = generate_synthetic_data(days=40, ticks_per_day=12)
         # Widen entry filters so synthetic data passes all pre-trade gates
         results = run_backtest(data, underlying="NIFTY", tunable_params={
             "entry_iv_percentile_min": 0,
@@ -171,7 +175,9 @@ class TestBacktestIntegration:
         """P1: Default config must produce trades with synthetic data (no param overrides)."""
         import numpy as np
         np.random.seed(42)
-        data = generate_synthetic_data(days=5, ticks_per_day=12)
+        # 40 days: see test_backtest_produces_trades — 30 prior sessions are
+        # needed before the IV-percentile gate can leave warmup.
+        data = generate_synthetic_data(days=40, ticks_per_day=12)
         results = run_backtest(data, underlying="NIFTY")
         assert results["metrics"]["total_trades"] > 0, (
             "Default backtest still produces 0 trades — not a meaningful validator"
@@ -185,7 +191,10 @@ class TestBacktestIntegration:
         """
         import numpy as np
         np.random.seed(7)
-        data = generate_synthetic_data(days=5, ticks_per_day=12)
+        # 40 days: see test_backtest_produces_trades — with fewer sessions the
+        # IV-percentile pool never leaves warmup, no trade fires, and the
+        # skip guard below silently stops exercising the flatten path.
+        data = generate_synthetic_data(days=40, ticks_per_day=12)
         results = run_backtest(data, underlying="NIFTY", tunable_params={
             "entry_iv_percentile_min": 0,
             "entry_iv_percentile_max": 100,
@@ -542,8 +551,23 @@ class TestLoadIVSkewSeed:
 
 class TestRunBacktestSeeding:
     """The seed must reach the hedger's rolling windows; default must wipe
-    BOTH (the prior code left _skew_history loaded from the live JSON — a
-    silent, asymmetric look-ahead leak)."""
+    them ALL (the prior code left _skew_history loaded from the live JSON —
+    a silent, asymmetric look-ahead leak, and later the daily ATM-IV pool
+    leaked from the on-disk EOD archive the same way).
+
+    Note which window does what: `_compute_iv_percentile` ranks against the
+    DAILY pool, so that is the seed which decides whether the IV gate opens
+    and the scan reaches `_compute_skew_percentile` at all. The tick-level
+    `_atm_iv_history` still feeds vol-of-vol and the current-IV reading, so
+    it is seeded and asserted separately.
+    """
+
+    @staticmethod
+    def _daily_pool(n=40, iv=0.15, end=date(2026, 2, 28)):
+        """Dated daily ATM-IV pool ending BEFORE generate_synthetic_data's
+        first session (2026-03-01), so the look-ahead guard keeps all of it."""
+        return [(end - timedelta(days=n - 1 - i), iv + 0.001 * i)
+                for i in range(n)]
 
     def _spy_first_call_lengths(self, monkeypatch):
         seen = {}
@@ -576,7 +600,8 @@ class TestRunBacktestSeeding:
                      tunable_params={"entry_iv_percentile_min": 0.0,
                                      "entry_iv_percentile_max": 100.0},
                      seed_iv_history=[0.15] * 40,
-                     seed_skew_history=[0.01] * 35)
+                     seed_skew_history=[0.01] * 35,
+                     seed_daily_iv=self._daily_pool())
         # The single entry scan saw the full seeded prefix → can leave the
         # 30-obs warmup, so the IV-percentile / regime tunables can bind.
         assert seen["iv"] == 40
@@ -587,23 +612,26 @@ class TestRunBacktestSeeding:
         band = {"entry_iv_percentile_min": 0.0, "entry_iv_percentile_max": 100.0}
 
         # (1) IV default-wipe: with no seed, _atm_iv_history must START empty
-        # even though __init__ loaded the live persisted history. The first
-        # _compute_iv_percentile call sees length 0 (recorded before its own
-        # append). Post-#75 that cold-start call returns None and the scan
-        # short-circuits BEFORE _compute_skew_percentile — so skew can't be
-        # observed here, which is why the skew-leak guard needs its own run.
+        # even though __init__ loaded the live persisted history, and the
+        # daily pool must fall back to this 2-session tape rather than the
+        # on-disk archive. The first _compute_iv_percentile call sees length
+        # 0 (recorded before its own append) and returns None — a 2-session
+        # pool cannot leave the 30-session warmup — so the scan short-circuits
+        # BEFORE _compute_skew_percentile, which is why the skew-leak guard
+        # below needs its own run.
         seen_iv = self._spy_first_call_lengths(monkeypatch)
         run_backtest(data, underlying="NIFTY", tunable_params=dict(band))
         assert seen_iv["iv"] == 0
         assert "skew" not in seen_iv  # None IV short-circuits before skew
 
-        # (2) Skew default-wipe (the leak this test is named for): seed only
-        # the IV window (≥30 obs) so the gate passes and the scan reaches
+        # (2) Skew default-wipe (the leak this test is named for): seed the
+        # DAILY pool (≥30 sessions) so the gate passes and the scan reaches
         # _compute_skew_percentile with NO skew seed. Pre-fix, _skew_history
         # started non-empty (leaked from the live JSON) — pin that it's empty.
         seen_skew = self._spy_first_call_lengths(monkeypatch)
         run_backtest(data, underlying="NIFTY", tunable_params=dict(band),
-                     seed_iv_history=[0.15] * 40)
+                     seed_iv_history=[0.15] * 40,
+                     seed_daily_iv=self._daily_pool())
         assert seen_skew["skew"] == 0
 
 

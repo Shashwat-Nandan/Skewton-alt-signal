@@ -879,6 +879,84 @@ def load_iv_skew_seed(
     return atm, skew
 
 
+def load_daily_iv_seed(underlying: str = "NIFTY") -> List[tuple]:
+    """Archive-derived daily ATM-IV pool for a captured-tape replay.
+
+    A tape replay hands ``run_backtest`` ONE session, which cannot rank
+    itself, so the sweep must supply the reference distribution explicitly.
+    Reuses ``TalebKarpathyStrategy._load_daily_atm_iv`` (and its process-level
+    memo) so there is one definition of the pool, not two — the sibling
+    ``load_iv_skew_seed`` predates that method and reads its JSON directly.
+
+    Unlike ``load_iv_skew_seed`` this IS look-ahead-clean at use time: the
+    entries are dated and ``_compute_iv_percentile`` keeps only sessions
+    strictly before the replayed one. Returns ``[]`` on any failure.
+    """
+    try:
+        shim = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        shim.underlying = underlying
+        shim._daily_atm_iv_history = []
+        shim._daily_iv_min_dte = 3
+        shim._daily_iv_max_dates = 250
+        shim._load_daily_atm_iv()
+        return list(shim._daily_atm_iv_history)
+    except Exception as e:                       # never break a sweep on this
+        logger.warning("load_daily_iv_seed(%s) failed: %s", underlying, e)
+        return []
+
+
+def daily_iv_from_frame(data: pd.DataFrame, min_dte: int = 3) -> List[tuple]:
+    """One ATM-IV observation per session, derived from the replay frame
+    itself, using the same definition as
+    ``TalebKarpathyStrategy._load_daily_atm_iv``: the mean IV of the rows at
+    the strike nearest that session's underlying price, on the nearest
+    expiry at least ``min_dte`` days out.
+
+    This exists so a SYNTHETIC tape ranks its IV against its own vol
+    distribution. The strategy seeds the pool from
+    ``data_cache/<UNDERLYING>_*_eod.*`` at construction, which is right for
+    a captured-tape replay and a category error for synthetic data —
+    ``generate_synthetic_data`` is not calibrated to real NIFTY vol, so
+    ranking a synthetic 0.15 IV against the real pool (mean 0.134) silently
+    parks every tick above the entry band. Returns ``[]`` if the frame has
+    no usable session.
+    """
+    need = {"timestamp", "underlying_price", "strike", "option_type", "expiry", "iv"}
+    if data.empty or not need.issubset(data.columns):
+        return []
+    df = data[data["option_type"].isin(["CE", "PE"])]
+    df = df[(df["iv"] > 0.01) & (df["iv"] < 3.0)]
+    if df.empty:
+        return []
+    try:
+        df = df.assign(
+            _d=pd.to_datetime(df["timestamp"]).dt.date,
+            _e=pd.to_datetime(df["expiry"]).dt.date,
+        )
+    except (TypeError, ValueError):
+        return []
+    out: Dict = {}
+    for d, g in df.groupby("_d", sort=False):
+        try:
+            g = g[g["_e"] >= d + timedelta(days=min_dte)]
+            if g.empty:
+                continue
+            g = g[g["_e"] == g["_e"].min()]
+            spot = float(g["underlying_price"].iloc[0])
+            if not (spot > 0):
+                continue
+            atm = g["strike"].iloc[(g["strike"] - spot).abs().argsort().iloc[0]]
+            rows = g[g["strike"] == atm]
+            if rows.empty:
+                continue
+            iv = float(rows["iv"].mean())
+        except (TypeError, ValueError):
+            continue
+        if iv == iv:
+            out[d] = iv
+    return sorted(out.items())
+
+
 def run_backtest(
     data: pd.DataFrame,
     underlying: str = "NIFTY",
@@ -886,6 +964,7 @@ def run_backtest(
     tunable_params: Optional[Dict] = None,
     seed_iv_history: Optional[List[float]] = None,
     seed_skew_history: Optional[List[float]] = None,
+    seed_daily_iv: Optional[List[tuple]] = None,
 ) -> Dict:
     """
     Run the full hedging engine over historical data.
@@ -929,6 +1008,20 @@ def run_backtest(
     # shared across all experiments in a sweep, so it cannot bias ranking.
     hedger._atm_iv_history = list(seed_iv_history) if seed_iv_history else []
     hedger._skew_history = list(seed_skew_history) if seed_skew_history else []
+    # The DAILY ATM-IV pool the percentile actually ranks against must be
+    # under the backtest's control for the same reason the two windows above
+    # are: __init__ seeds it from the live data_cache archive, so without
+    # this the replay silently ranks against whatever happens to be on disk.
+    # Precedence: explicit seed (autoresearch passes the archive pool, shared
+    # across experiments so it cannot bias ranking) > the replay frame's own
+    # sessions (synthetic tapes rank against synthetic vol) > empty.
+    # Empty means _compute_iv_percentile returns None and the scan sits out,
+    # which is the honest answer for a tape too short to define a regime —
+    # a single captured session cannot rank itself.
+    if seed_daily_iv:
+        hedger._daily_atm_iv_history = list(seed_daily_iv)
+    else:
+        hedger._daily_atm_iv_history = daily_iv_from_frame(data)
     hedger._cached_lot_size = int(data[data["option_type"].isin(["CE", "PE"])].iloc[0]["lot_size"])
 
     # Apply candidate tunable params if provided (autoresearch optimization)

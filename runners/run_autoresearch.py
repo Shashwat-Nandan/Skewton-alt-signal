@@ -455,7 +455,10 @@ def main():
             from runners.autoresearch_loop import (
                 build_validation_verdict, load_daily_moves, pick_holdout_sessions,
             )
-            from research.backtest import list_captured_sessions, load_captured_tape, load_iv_skew_seed
+            from research.backtest import (
+                list_captured_sessions, load_captured_tape, load_iv_skew_seed,
+                load_daily_iv_seed,
+            )
             captured = list_captured_sessions(args.underlying)
             window = set(loop._replay_sessions or captured[-loop.eval_cycles:])
             moves = load_daily_moves(args.underlying)
@@ -471,6 +474,14 @@ def main():
                 if val_seed_iv is None:
                     drop = loop.config.getint("autoresearch", "iv_seed_drop_recent", fallback=0)
                     val_seed_iv, val_seed_skew = load_iv_skew_seed(args.underlying, drop_recent=drop)
+                # A single hold-out session cannot rank itself, so the daily
+                # pool must be supplied or the whole hold-out goes inert.
+                # Dated, so _compute_iv_percentile drops the session under
+                # test and anything later — look-ahead-clean, unlike the two
+                # seeds above.
+                val_seed_daily = getattr(loop, "_daily_iv_seed", None)
+                if not val_seed_daily:
+                    val_seed_daily = load_daily_iv_seed(args.underlying)
                 if not moves:
                     print("\n  NOTE: daily-move data unavailable — hold-out "
                           "selection degraded to recency-only (no tail session).")
@@ -483,6 +494,7 @@ def main():
                         load_captured_tape(vd, args.underlying),
                         underlying=args.underlying, tunable_params=loop.best_params,
                         seed_iv_history=val_seed_iv, seed_skew_history=val_seed_skew,
+                        seed_daily_iv=val_seed_daily,
                     )["metrics"]
                     session_results.append({
                         "date": vd, "net_pnl": vr["net_pnl"],
@@ -568,8 +580,14 @@ def main():
                 val_label = None
             else:
                 np.random.seed(42)
-                val_data = generate_synthetic_data(days=10, ticks_per_day=12)
-                val_label = (f"synthetic (seed=42, 10 days) — all {len(captured)} "
+                # 40 days, not 10: the IV percentile now ranks against one
+                # observation per SESSION and needs 30 prior sessions to
+                # leave warmup, so a 10-day synthetic tape can never fire an
+                # entry. Deliberately NOT seeded from the EOD archive —
+                # synthetic vol is not calibrated to real NIFTY vol, so it
+                # must rank against its own distribution (daily_iv_from_frame).
+                val_data = generate_synthetic_data(days=40, ticks_per_day=12)
+                val_label = (f"synthetic (seed=42, 40 days) — all {len(captured)} "
                              f"tape session(s) are inside the fitness window, "
                              f"no hold-out exists")
 
