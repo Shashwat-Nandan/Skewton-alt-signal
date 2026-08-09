@@ -378,8 +378,16 @@ def main():
     print(f"  Experiments:    {args.experiments}")
     print(f"  Metric:         {args.metric}")
     print(f"  Data:           {data_desc}")
-    print(f"  Baseline:       {loop.baseline_metric:.6f}" if loop.baseline_metric > VETO_FITNESS
-          else f"  Baseline:       {loop.baseline_metric}")
+    # `seed_baseline`, NOT loop.baseline_metric: the latter is the hill-
+    # climber's *current* anchor and is overwritten on every acceptance
+    # (autoresearch_loop.run_single_experiment), so printing it always
+    # renders "Baseline == Best" — the 2026-08-08 run reported
+    # "Baseline -188.77 / Best -188.77" for a sweep that actually started
+    # at -2739.60, i.e. the report hid a 14x improvement and read as
+    # "the sweep found nothing". The JSON was always right
+    # (sweep_quality.seed_baseline); only this console line was wrong.
+    print(f"  Baseline:       {seed_baseline:.6f}" if seed_baseline > VETO_FITNESS
+          else f"  Baseline:       {seed_baseline}")
     print(f"  Best:           {loop.best_metric_value:.6f}")
     if VETO_FITNESS < loop.best_metric_value <= 0.0:
         # 2026-07-19 review: a negative best under a NON-vetoed seed is

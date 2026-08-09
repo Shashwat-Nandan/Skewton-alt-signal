@@ -603,7 +603,44 @@ class HedgeResearchLoop:
         params[param_name] = new_value
         return old_value, new_value
 
+    # A mutation that lands back on the value it started from costs a full
+    # replay (~5 min of a 25-experiment weekly budget) to re-measure a
+    # config we have already scored, and inflates the plateau_share that
+    # sweep_quality uses to judge whether the sweep was informative. Two
+    # mechanisms produce one: a param already sitting on a TUNABLE_RANGES
+    # bound (`entry_iv_percentile_min` = 5.0 = its low) clamps any outward
+    # step straight back, and the integer rounding applied to the
+    # percentile/vega params collapses any |step| < 0.5 to zero. The
+    # 2026-08-08 sweep burned experiment 20 on
+    # `entry_iv_percentile_min: 5.0000 -> 5.0000` exactly this way.
+    # Re-draw instead — a fresh draw also re-picks the parameter, so a knob
+    # pinned against a bound yields to one that can still move.
+    _MUTATION_ATTEMPTS = 8
+
     def _propose_mutation(self) -> Tuple[Dict, str, float, float]:
+        """Propose a mutation that actually changes the parameter set.
+
+        Delegates to `_propose_mutation_once` and re-draws while the
+        proposal is a no-op (see `_MUTATION_ATTEMPTS`). If every attempt
+        is a no-op the last one is returned anyway and the caller still
+        gets a well-formed experiment — but we log it, because a landscape
+        where nothing can move is a finding, not a detail (Rule 12).
+        """
+        for attempt in range(self._MUTATION_ATTEMPTS):
+            params, name, old_value, new_value = self._propose_mutation_once()
+            if params != self.baseline_params:
+                return params, name, old_value, new_value
+        logger.warning(
+            "Mutation proposer produced a no-op %d times in a row (last: %s "
+            "%.4f -> %.4f) — every sampled parameter is pinned at a range "
+            "bound or below its rounding granularity. Experiment %s will "
+            "re-measure the current config.",
+            self._MUTATION_ATTEMPTS, name, old_value, new_value,
+            getattr(self, "experiment_number", "?"),
+        )
+        return params, name, old_value, new_value
+
+    def _propose_mutation_once(self) -> Tuple[Dict, str, float, float]:
         """
         Propose a parameter mutation. Either single-param (default) or
         joint pair (Phase 2.5) with probability `joint_mutation_prob`.
@@ -615,6 +652,10 @@ class HedgeResearchLoop:
         Gaussian steps in the same experiment, exposing the hill-
         climber to ridges in the fitness landscape that univariate
         moves can't traverse.
+
+        May return a no-op (new == old) when the sampled parameter is
+        pinned at a bound; `_propose_mutation` is the caller that filters
+        those out.
         """
         params = copy.deepcopy(self.baseline_params)
         joint_prob = self.config.getfloat(

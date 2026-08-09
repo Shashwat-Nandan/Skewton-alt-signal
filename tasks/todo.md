@@ -1,3 +1,41 @@
+# Autoresearch 2026-08-08 review — report defects + why the sweep can't trade
+
+Review of the weekly `taleb-autoresearch` run of Sat 2026-08-08 (25 experiments,
+`convexity_edge`, 15-session tape 07-20→08-07). Verdict: **DO NOT PROMOTE** —
+seed −2,739.60 → best −188.77, `promote_ok: false`, and the improvement is the
+hill-climber learning not to trade (walk-forward window P&Ls `[0.0, −1441.94,
+0.0]`, `bootstrap_p_negative` 1.00, `shuffle_null_p` 1.000). `best_params.json`
+correctly untouched.
+
+**Two report/loop defects (fixed here).**
+
+| # | defect | effect |
+|---|---|---|
+| A | `run_autoresearch.py` printed `loop.baseline_metric` as "Baseline:" | that field is the hill-climber's *current* anchor, overwritten on every acceptance — so the console always shows `Baseline == Best`. 08-08 printed `−188.77 / −188.77` for a run that started at `−2739.60`, hiding a 14x move and reading as "found nothing". JSON (`sweep_quality.seed_baseline`) was always right. |
+| B | `_propose_mutation` could return a no-op | exp 20 was `entry_iv_percentile_min: 5.0000 -> 5.0000` — already on its `TUNABLE_RANGES` low, so the outward step clamped back. Burns a full replay (~6 min of 25) re-scoring a known config and inflates the `plateau_share` that `sweep_quality` reads as "landscape flat". |
+
+**Two root causes found underneath — these are why every sweep since 07-25
+reports no edge. Both are money-affecting; not yet implemented.**
+
+| # | finding | evidence |
+|---|---|---|
+| C | `propose_backspread` / `propose_risk_reversal_long_put` / `propose_asymmetric_strangle` pick each leg off the **two-expiry** chain independently, so legs land in *different* expiries | 15-session replay: every margin rejection is a mixed-expiry structure; `_structure_margin` can't expiry-scan it, and a net-credit backspread then falls through to `return gross` = full naked per-leg sum. Identical same-expiry structure margins **₹107k–₹123k**; mixed-expiry margins **₹717k–₹5.0M** against a ₹300k cap. 33 rejects vs 16 passes. |
+| D | `entry_iv_percentile_min/max` is still an unconditional hard block, running *before* the regime classifier | Under `enable_regime_dispatch` the skew and RV/IV gates were deliberately downgraded to *features* — the IV-level gate never was. At `entry_iv_percentile_max = 43`, **100%** of blocked ticks were blocked by the upper bound and **36.7%** of them had IV pct ≥ 70, which is `regime_calendar_iv_pct_min` — so `CALENDAR_SHORT_FRONT` is structurally unreachable. Median blocked IV pct 67.2, max 94.6. This is why the 07-08 hold-out (−2.12% move, a tail day) made **zero** trades. |
+
+**Plan**
+- [x] A — report reads the captured `seed_baseline`; AST guard in
+      `tests/test_autoresearch_loop.py` pins the call site, plus a behavioural
+      test that `baseline_metric` drifts on acceptance.
+- [x] B — `_propose_mutation` re-draws (bounded, `_MUTATION_ATTEMPTS = 8`) while
+      the proposal is a no-op; warns loudly if the whole space is pinned.
+      `_propose_mutation_once` keeps the old single/joint walk.
+- [ ] C — pin all legs of a single-expiry structure to one expiry slice.
+      **Not** "relax the margin cap": the cap is correctly sized (2.5x headroom
+      on well-formed structures) and only bites on malformed ones.
+- [ ] D — decide the entry-gate contract under regime dispatch (see review).
+
+---
+
 # Baseline pair runner — harness fidelity + stop-loop fixes — 2026-08-07
 
 Review of the `baseline` pair runner (`--top 8`). Realized peaked +₹102.6k on

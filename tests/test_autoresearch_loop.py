@@ -117,6 +117,143 @@ class TestMutateOne:
         assert new <= 40.0 - 5
 
 
+# ── _propose_mutation no-op guard (2026-08-08 sweep, experiment 20) ──
+
+class TestProposeMutationNoOp:
+    """The 2026-08-08 weekly sweep logged
+    `[20/25] rejected ... (mutated entry_iv_percentile_min: 5.0000 -> 5.0000)`.
+    `entry_iv_percentile_min` was already sitting on its TUNABLE_RANGES low
+    (5.0), so the outward Gaussian step clamped straight back to it. That
+    burned one of 25 replays (~6 min) re-measuring a config already scored,
+    and counted toward the plateau_share that sweep_quality reads as
+    'landscape is flat'. WHY it matters: the budget is the whole search — a
+    wasted experiment is a config never explored, and a fake plateau makes
+    an uninformative sweep look informative."""
+
+    @staticmethod
+    def _pinned_loop(**over):
+        cfg = configparser.ConfigParser()
+        cfg.add_section("autoresearch")
+        cfg.set("autoresearch", "joint_mutation_prob", "0.0")
+        attrs = dict(
+            config=cfg, mutation_step=0.1,
+            baseline_params={"entry_iv_percentile_min": 5.0,
+                             "entry_iv_percentile_max": 21.0},
+            experiment_number=20,
+        )
+        attrs.update(over)
+        return _loop(**attrs)
+
+    def test_pinned_param_does_not_produce_a_noop(self, monkeypatch):
+        # Only the two IV-band params are reachable; `min` is pinned at its
+        # low bound, so a downward step is a guaranteed no-op. The proposer
+        # must re-draw until something actually moves.
+        monkeypatch.setattr(HedgeResearchLoop, "TUNABLE_RANGES",
+                            {"entry_iv_percentile_min": (5.0, 30.0),
+                             "entry_iv_percentile_max": (20.0, 90.0)})
+        loop = self._pinned_loop()
+        # Always step downward — pins `min`, but `max` can still move down.
+        monkeypatch.setattr(np.random, "normal", lambda *a, **k: -8.0)
+        params, name, old, new = loop._propose_mutation()
+        assert params != loop.baseline_params, (
+            f"proposer returned an unchanged param set ({name}: {old} -> {new})"
+        )
+
+    def test_fully_pinned_space_warns_and_still_returns(self, monkeypatch, caplog):
+        # Degenerate range (low == high == current) — nothing can ever move.
+        # Rule 12: return a well-formed experiment but say so loudly rather
+        # than spin or crash.
+        monkeypatch.setattr(HedgeResearchLoop, "TUNABLE_RANGES",
+                            {"entry_iv_percentile_min": (5.0, 5.0)})
+        loop = self._pinned_loop(
+            baseline_params={"entry_iv_percentile_min": 5.0})
+        monkeypatch.setattr(np.random, "normal", lambda *a, **k: 3.0)
+        with caplog.at_level("WARNING"):
+            params, name, old, new = loop._propose_mutation()
+        assert old == new == 5.0
+        assert params == loop.baseline_params
+        assert "no-op" in caplog.text
+
+    def test_redraw_is_bounded(self, monkeypatch):
+        # The retry must not be unbounded: a fully-pinned space has to exit
+        # after _MUTATION_ATTEMPTS draws, not loop forever.
+        monkeypatch.setattr(HedgeResearchLoop, "TUNABLE_RANGES",
+                            {"entry_iv_percentile_min": (5.0, 5.0)})
+        loop = self._pinned_loop(
+            baseline_params={"entry_iv_percentile_min": 5.0})
+        monkeypatch.setattr(np.random, "normal", lambda *a, **k: 3.0)
+        calls = []
+        orig = HedgeResearchLoop._propose_mutation_once
+        monkeypatch.setattr(
+            HedgeResearchLoop, "_propose_mutation_once",
+            lambda self: (calls.append(1), orig(self))[1])
+        loop._propose_mutation()
+        assert len(calls) == HedgeResearchLoop._MUTATION_ATTEMPTS
+
+
+# ── the report's "Baseline:" line (2026-08-08 sweep) ──
+
+class TestReportBaselineIsTheSeed:
+    """The 2026-08-08 sweep printed `Baseline: -188.767916 / Best:
+    -188.767916` for a run whose seed actually scored -2739.60 — the
+    console report hid a 14x improvement and read as 'the sweep found
+    nothing'. Cause: `loop.baseline_metric` is the hill-climber's CURRENT
+    anchor, overwritten on every acceptance, not the seed's score. The
+    candidate JSON was always right (sweep_quality.seed_baseline); only
+    the human-facing summary was wrong, and the summary is what the
+    operator reads before deciding whether to look further."""
+
+    def test_baseline_metric_drifts_on_acceptance(self):
+        # The mechanism: pin that baseline_metric is NOT a stable seed
+        # score, so anything reporting "the baseline" must not read it.
+        loop = _loop(
+            baseline_metric=-2739.6, best_metric_value=-2739.6,
+            baseline_params={"vega_limit": 4000.0},
+            best_params={"vega_limit": 4000.0},
+            hedger=SimpleNamespace(tunable_params={}),
+            experiment_number=0, _experiment_records=[],
+            vetoed_baseline_abs_floor=0.0,
+            primary_metric="convexity_edge",
+        )
+        loop._propose_mutation = lambda: (
+            {"vega_limit": 1974.0}, "vega_limit", 4000.0, 1974.0)
+        loop._run_experiment = lambda params: -188.77
+        loop._log_experiment = lambda *a, **k: None
+
+        loop.run_single_experiment()
+
+        assert loop.baseline_metric == -188.77, "acceptance must move the anchor"
+        assert loop.baseline_metric != -2739.6, (
+            "baseline_metric no longer holds the seed score — a report that "
+            "prints it as 'Baseline' shows Baseline == Best on every sweep"
+        )
+
+    def test_report_prints_seed_baseline_not_the_drifting_anchor(self):
+        # Guard the call site itself: the "Baseline:" line in the report
+        # must read the captured seed, not loop.baseline_metric. A source
+        # check (cf. the AST sweep in test_arbitrage) because the report
+        # lives inline in main() and has no seam to assert on.
+        import ast
+        import inspect
+        from runners import run_autoresearch as _mod
+
+        tree = ast.parse(inspect.getsource(_mod))
+        offenders = [
+            ast.dump(n) for n in ast.walk(tree)
+            if isinstance(n, ast.JoinedStr)
+            and any(isinstance(v, ast.Constant)
+                    and isinstance(v.value, str) and "Baseline:" in v.value
+                    for v in n.values)
+            and any(isinstance(a, ast.Attribute) and a.attr == "baseline_metric"
+                    for v in n.values for a in ast.walk(v))
+        ]
+        assert not offenders, (
+            "the report's 'Baseline:' f-string reads loop.baseline_metric, "
+            "which drifts on every acceptance — use the captured "
+            "seed_baseline instead"
+        )
+
+
 # ── _evaluate_experiment (the accept/reject sign) ──────────
 
 class TestEvaluateExperiment:
