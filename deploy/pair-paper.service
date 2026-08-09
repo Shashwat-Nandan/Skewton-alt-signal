@@ -38,7 +38,33 @@ EnvironmentFile=/opt/taleb-karpathy-kite/.env
 # (no --mode live) until top-8 clears its own paper window (safety rule 3). The
 # host runs this via a systemd drop-in (pair-paper.service.d/10-top8.conf); see
 # tasks/todo.md (2026-07-18 baseline top-8) for the deferred live prerequisites.
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_pairs --top 8 --max-leg-notional 1000000 --max-daily-loss-inr 100000
+# --max-book-notional-inr 4000000 (2026-08-07): the runner had NO book-level
+# cap (the flag defaults to 0 = disabled), so open positions only ever left the
+# book by exiting. Between 07-23 and 08-07 the baseline went from 8 pairs to 13
+# (8 selected + 5 orphans) and its open notional reached ₹8.24M against ₹1M of
+# strategy capital — ~8× leverage, and cross-stock pairs get NO SPAN netting
+# (both legs margin in full), so that is not affordable. ₹4M ≈ 3 concurrent
+# pairs at the current ~₹1.37M/pair.
+#
+# NOTE: deploy/pair-paper.service.d/10-top8.conf resets and redefines
+# ExecStart, so the line below is NOT what runs wherever that drop-in is
+# installed. Both carry the same flags by design (see the drop-in's
+# "belt-and-suspenders" note) — change them together, or the drop-in wins
+# silently. The 2026-08-07 host had a base unit predating the top-8 template,
+# which is exactly the case the drop-in exists to cover.
+#
+# The cap is scoped to THIS runner's own state file
+# (data_cache/pair_paper_state_baseline.json), matching how
+# halt_daily_loss_path namespaces the daily-loss breaker per --system. It was
+# briefly a cross-runner sum, which would have let the LIVE persistent book
+# freeze this paper runner's entries — the HALT_NEW_ENTRIES failure shape
+# (PR #196). H17's leg-concentration counter still reads sibling runners; that
+# coupling is deliberate and separate.
+#
+# NOTE: the cap gates NEW ENTRIES ONLY; it never force-closes. With the
+# baseline book at ₹8.24M on 2026-08-07 no new entry fires until natural exits
+# bring it under ₹4M.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_pairs --top 8 --max-leg-notional 1000000 --max-daily-loss-inr 100000 --max-book-notional-inr 4000000
 # ------------------------------------
 
 # M-O5: auto-restart on segfault / non-zero exit. Successful exit (clean

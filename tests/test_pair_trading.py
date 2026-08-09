@@ -31,6 +31,7 @@ def _make_strategy(
     stop_z: float = 4.0,
     max_entry_z: float = 5.0,
     safety_buffer: float = 0.75,
+    entry_dte_buffer_days: int = 1,
     spread_history=None,
     max_leg_notional=None,
     lots_per_leg: int = 1,
@@ -58,6 +59,7 @@ def _make_strategy(
     s.lookback_days = 30
     s.lots_per_leg = lots_per_leg
     s.max_holding_days = 10
+    s.entry_dte_buffer_days = entry_dte_buffer_days
     s.max_leg_notional = max_leg_notional
     s.min_edge_multiplier = min_edge_multiplier
     s.total_capital = 500_000
@@ -95,11 +97,17 @@ def _make_strategy(
     s.paper_slippage_bps = 0.0
     s.state = PairState()
     s._spread_history = list(spread_history) if spread_history is not None else []
+    # Expiry sits well beyond max_holding_days (10) + entry_dte_buffer_days so
+    # the 2026-08-07 DTE gate stays inert for the entry/exit/sizing tests. A
+    # 2026-04-28 expiry against the 04-21 clock is only 5 trading days — less
+    # than the hold the same fixture claims — so those tests would have been
+    # asserting entries the live runner now (correctly) refuses. Tests that
+    # exercise expiry set their own _cached_futures or clock.
     s._cached_futures = {
         "AAA": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
-                "expiry": "2026-04-28", "instrument_token": 111},
+                "expiry": "2026-06-25", "instrument_token": 111},
         "BBB": {"tradingsymbol": "BBB26APRFUT", "lot_size": 200,
-                "expiry": "2026-04-28", "instrument_token": 222},
+                "expiry": "2026-06-25", "instrument_token": 222},
     }
     s._clock = lambda: datetime(2026, 4, 21, 10, 30)
     # session-start P&L baseline — normally set in __init__; tests bypass it.
@@ -844,12 +852,14 @@ class TestBrokerMediums:
                            max_leg_notional=2_000_000.0, lots_per_leg=1,
                            min_edge_multiplier=0.0)
         s._clock = lambda: dt(2026, 4, 21, 14, 0)
-        # Expiry next week
+        # Expiry comfortably past max_holding_days (10) + entry_dte_buffer_days
+        # (1), so this test isolates the expiry-day gate from the DTE gate
+        # added 2026-08-07 — TestEntryDteBuffer covers that one.
         s._cached_futures = {
-            "AAA": {"tradingsymbol": "AAA26APRFUT", "lot_size": 100,
-                    "expiry": "2026-04-28", "instrument_token": 111},
-            "BBB": {"tradingsymbol": "BBB26APRFUT", "lot_size": 200,
-                    "expiry": "2026-04-28", "instrument_token": 222},
+            "AAA": {"tradingsymbol": "AAA26JUNFUT", "lot_size": 100,
+                    "expiry": "2026-06-25", "instrument_token": 111},
+            "BBB": {"tradingsymbol": "BBB26JUNFUT", "lot_size": 200,
+                    "expiry": "2026-06-25", "instrument_token": 222},
         }
         s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
         s.kite.quote = lambda syms: (
@@ -1055,6 +1065,62 @@ class TestBookNotionalCap:
         # Should not raise; bad file is skipped.
         assert _aggregate_book_notional(tmp_path) == 0.0
 
+    def _two_runner_cache(self, tmp_path):
+        import json
+        (tmp_path / "pair_paper_state_baseline.json").write_text(json.dumps({
+            "pairs": [{"state": {"legs": [
+                {"entry_price": 1000.0, "quantity": 1, "lot_size": 100},
+            ]}}],
+        }))
+        (tmp_path / "pair_paper_state_persistent.json").write_text(json.dumps({
+            "pairs": [{"state": {"legs": [
+                {"entry_price": 2000.0, "quantity": 1, "lot_size": 500},
+            ]}}],
+        }))
+        return tmp_path
+
+    def test_scoped_sum_excludes_other_runners_books(self, tmp_path):
+        """2026-08-07: the cap is a per-book risk limit, so a runner must see
+        only its own notional.
+
+        Unscoped, the LIVE persistent book (₹1M here) counted against the
+        baseline PAPER runner's ceiling — a real-money position freezing a
+        simulation's entries. That is the HALT_NEW_ENTRIES failure shape
+        (PR #196): one runner's state silently halting another's.
+        """
+        from strategies.pair_trading import _aggregate_book_notional
+        cache = self._two_runner_cache(tmp_path)
+        own = cache / "pair_paper_state_baseline.json"
+        assert _aggregate_book_notional(cache, only_state_path=own) == 100_000.0
+
+    def test_unscoped_sum_still_spans_runners(self, tmp_path):
+        """The whole-cache sum is still available for callers that genuinely
+        want total deployed capital — scoping is opt-in, not a silent change
+        of meaning for existing callers."""
+        from strategies.pair_trading import _aggregate_book_notional
+        cache = self._two_runner_cache(tmp_path)
+        assert _aggregate_book_notional(cache) == 1_100_000.0
+
+    def test_scoped_sum_of_a_runner_with_no_state_file_is_zero(self, tmp_path):
+        """First run for a --system tag: no state file yet. Must read as an
+        empty book, not fall back to the cross-runner glob — a silent fallback
+        would reinstate exactly the coupling this removes."""
+        from strategies.pair_trading import _aggregate_book_notional
+        cache = self._two_runner_cache(tmp_path)
+        missing = cache / "pair_paper_state_brandnew.json"
+        assert _aggregate_book_notional(cache, only_state_path=missing) == 0.0
+
+    def test_runner_wires_the_cap_to_its_own_state_file(self):
+        """Pins the wiring, not just the helper: a correct helper called with
+        the default argument would silently restore the shared gate."""
+        import inspect
+        import runners.run_paper_pairs as rp
+        src = inspect.getsource(rp.main)
+        assert "only_state_path=own_state" in src, (
+            "run_paper_pairs.main must scope the book-notional cap to its own "
+            "--system state file (partial(..., only_state_path=own_state))"
+        )
+
 
 class TestStopCooldown:
     """A pair that stops out at z=4.2 must not re-enter on the very next
@@ -1101,21 +1167,223 @@ class TestStopCooldown:
         )
         assert s.scan_and_propose() == []
 
-    def test_reentry_allowed_after_cooldown_elapses(self):
+    def test_elapsed_cooldown_alone_does_not_readmit_a_diverged_spread(self):
+        """2026-08-07: elapsing the clock is NOT sufficient to re-enter.
+
+        This used to assert re-entry fires the moment 60 minutes pass. That is
+        exactly the loop HEROMOTOCO/TCS ran live: stopped at z=4.12 on 08-04
+        11:27, re-entered at z=4.08 at 12:28 (first tick past the gate),
+        stopped again, repeated on 08-05. The spread never came back — only
+        the clock moved. Re-entry now additionally requires |z| to be observed
+        back inside entry_z.
+        """
         s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
                            spread_history=[-1.0, 1.0] * 30)
         s.stop_cooldown_minutes = 60
         self._stage_long_spread(s)
         self._force_stop_then_close(s)
-        # Jump the clock past the cooldown window.
         original_clock = s._clock()
         s._clock = lambda: original_clock + timedelta(minutes=61)
+        # spread=3 → z=3.0: still well outside the ±2.0 entry band.
         s.kite.quote = lambda syms: (
             {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
             else {syms[0]: {"last_price": 1994.0}}
         )
-        proposals = s.scan_and_propose()
-        assert len(proposals) == 2, "Cooldown elapsed — re-entry should fire"
+        assert s._is_in_stop_cooldown() is False, "cooldown itself has elapsed"
+        assert s.state.stop_rearm_pending is True
+        assert s.scan_and_propose() == [], "spread never returned to the band"
+
+    def test_reentry_fires_once_the_spread_returns_to_the_band(self):
+        """The re-arm gate is a latch, not a ban: one in-band observation
+        clears it and the pair trades again on the next genuine signal."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 0
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+
+        # spread=1 → z=1.0, inside ±2.0: clears the latch, proposes nothing.
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1998.0}}
+        )
+        assert s.scan_and_propose() == []
+        assert s.state.stop_rearm_pending is False
+
+        # spread=3 → z=3.0: a fresh signal on a spread that proved it reverts.
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1994.0}}
+        )
+        assert len(s.scan_and_propose()) == 2
+
+    def test_rearm_latch_survives_a_state_roundtrip(self):
+        """The whole point of the latch is to outlive the session the stop
+        happened in — a flag that resets at 09:15 is the bug it replaces."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        s.stop_cooldown_minutes = 60
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        blob = s.serialize_state()
+
+        s2 = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                            spread_history=[-1.0, 1.0] * 30)
+        # Next session: hours later, so the wall-clock cooldown is long gone.
+        s2._clock = lambda: s._clock() + timedelta(hours=20)
+        s2.restore_state(blob)
+        assert s2.state.stop_rearm_pending is True
+        assert s2._is_in_stop_cooldown() is False
+        s2.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1994.0}}
+        )
+        assert s2.scan_and_propose() == []
+
+    def test_rearm_latch_inferred_for_pre_upgrade_state_files(self):
+        """State written before 2026-08-07 has no flag. A pair whose last
+        recorded exit was a STOP must still prove reversion — those files were
+        written while the re-entry loop was live."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        blob = s.serialize_state()
+        del blob["state"]["stop_rearm_pending"]
+
+        s2 = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                            spread_history=[-1.0, 1.0] * 30)
+        s2.restore_state(blob)
+        assert s2.state.stop_rearm_pending is True
+
+    def test_rearm_latch_survives_the_rolling_window_absorbing_the_break(self):
+        """2026-08-08: the latch must be cleared by the spread coming back,
+        not by the yardstick moving.
+
+        The runner re-seeds _spread_history from bhavcopy every session and
+        the window is only lookback_days long, so a permanent dislocation is
+        absorbed into the rolling mean within a few sessions. Judged against
+        the LIVE window, |z| then falls back inside entry_z with no reversion
+        whatsoever and the latch clears itself — re-admitting the pair at the
+        broken level, which is the loop the latch exists to stop, just on a
+        multi-session clock.
+        """
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        assert s.state.stop_rearm_pending is True
+        assert s.state.stop_rearm_mean == pytest.approx(0.0)
+        assert s.state.stop_rearm_std == pytest.approx(1.0)
+
+        # The spread has NOT reverted — it sat at ~10 and the 60-day window
+        # has now re-seeded around that new level, so the live z reads ~0.
+        s._spread_history = [9.0, 11.0] * 30
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1980.0}}   # spread = 10
+        )
+        assert s._z_score(10.0) == pytest.approx(0.0), "live window absorbed it"
+        assert s.scan_and_propose() == [], "latch must survive window drift"
+        assert s.state.stop_rearm_pending is True
+
+        # A genuine return toward the pre-stop level clears it.
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1999.0}}   # spread = 0.5 → frozen z=0.5
+        )
+        s.scan_and_propose()
+        assert s.state.stop_rearm_pending is False
+
+    def test_rearm_latch_releases_when_the_hedge_ratio_is_refitted(self):
+        """A frozen spread level is only meaningful under the β that defined
+        it. A materially refitted β is a different series the screener has
+        re-validated, so hold the latch there would strand the pair forever
+        on a stale yardstick."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        assert s.state.stop_rearm_beta == pytest.approx(0.5)
+
+        s.hedge_ratio = 0.75           # +50%, far past the 10% tolerance
+        s._spread_history = [-1.0, 1.0] * 30
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1330.0}}
+        )
+        s.scan_and_propose()
+        assert s.state.stop_rearm_pending is False
+
+    def test_small_beta_refit_does_not_release_the_latch(self):
+        """β drifts ~3% across a routine weekly re-screen. If that released
+        the latch, the gate would be bypassed every single week."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+
+        s.hedge_ratio = 0.515          # +3%, inside the 10% tolerance
+        s._spread_history = [9.0, 11.0] * 30    # window absorbed the break
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1922.0}}   # still far from µ=0
+        )
+        assert s.scan_and_propose() == []
+        assert s.state.stop_rearm_pending is True
+
+    def test_frozen_baseline_round_trips_through_state(self):
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        blob = s.serialize_state()
+
+        s2 = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                            spread_history=[-1.0, 1.0] * 30)
+        s2.restore_state(blob)
+        assert s2.state.stop_rearm_mean == pytest.approx(s.state.stop_rearm_mean)
+        assert s2.state.stop_rearm_std == pytest.approx(s.state.stop_rearm_std)
+        assert s2.state.stop_rearm_beta == pytest.approx(s.state.stop_rearm_beta)
+
+    def test_pre_upgrade_state_without_a_frozen_baseline_still_latches(self):
+        """State written before the frozen baseline existed must fall back to
+        the live-window test — weaker, but never a silent bypass."""
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        self._force_stop_then_close(s)
+        blob = s.serialize_state()
+        for k in ("stop_rearm_mean", "stop_rearm_std", "stop_rearm_beta"):
+            del blob["state"][k]
+
+        s2 = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
+                            spread_history=[-1.0, 1.0] * 30)
+        s2.restore_state(blob)
+        assert s2.state.stop_rearm_pending is True
+        assert s2.state.stop_rearm_mean is None
+        s2.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1994.0}}
+        )
+        assert s2.scan_and_propose() == []
+
+    def test_rearm_latch_not_inferred_for_a_mean_revert_exit(self):
+        s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0,
+                           spread_history=[-1.0, 1.0] * 30)
+        self._stage_long_spread(s)
+        s.execute_proposals(s._build_exit_proposals(
+            reason="MEAN_REVERT", z=0.0,
+            prices={"AAA": 1000.0, "BBB": 2000.0},
+        ))
+        blob = s.serialize_state()
+        assert blob["state"]["stop_rearm_pending"] is False
+        del blob["state"]["stop_rearm_pending"]
+
+        s2 = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0,
+                            spread_history=[-1.0, 1.0] * 30)
+        s2.restore_state(blob)
+        assert s2.state.stop_rearm_pending is False
 
     def test_mean_revert_exit_does_not_arm_cooldown(self):
         s = _make_strategy(hedge_ratio=0.5, exit_z=0.5, stop_z=4.0,
@@ -1131,7 +1399,9 @@ class TestStopCooldown:
         # _is_in_stop_cooldown gates only on reason=='STOP', so no block.
         assert s._is_in_stop_cooldown() is False
 
-    def test_zero_minutes_disables_cooldown(self):
+    def test_zero_minutes_disables_the_timer_but_not_the_rearm_latch(self):
+        """stop_cooldown_minutes=0 switches off the timer only. The re-arm
+        latch is independent and still demands the spread come back."""
         s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, stop_z=4.0,
                            spread_history=[-1.0, 1.0] * 30)
         s.stop_cooldown_minutes = 0
@@ -1141,7 +1411,8 @@ class TestStopCooldown:
             {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
             else {syms[0]: {"last_price": 1994.0}}
         )
-        assert len(s.scan_and_propose()) == 2
+        assert s._is_in_stop_cooldown() is False
+        assert s.scan_and_propose() == []
 
     def test_cooldown_persists_through_state_roundtrip(self):
         """STOP at 14:30 IST → state saved → restored next morning. The
@@ -1560,6 +1831,81 @@ class TestSerializeRestore:
 # ──────────────────────────────────────────────────────────
 # legs_expire_on (expiry-day force-flatten helper)
 # ──────────────────────────────────────────────────────────
+
+class TestEntryDteBuffer:
+    """2026-08-07: refuse entries the time stop cannot outlive.
+
+    A position opened with fewer than max_holding_days of contract left is
+    flattened at expiry wherever the spread happens to sit — a bet on
+    reverting inside a window the strategy never chose. Live 2026-05→08 paid
+    -₹72,548 across 7 such trades (avg -₹10,364), the second-largest loss
+    bucket after stops.
+    """
+
+    @staticmethod
+    def _entry_ready(expiry: str, *, buffer_days: int = 1, max_hold: int = 10):
+        from datetime import datetime as dt
+        s = _make_strategy(hedge_ratio=0.5, entry_z=2.0, exit_z=0.5,
+                           max_leg_notional=2_000_000.0, lots_per_leg=1,
+                           entry_dte_buffer_days=buffer_days)
+        s.max_holding_days = max_hold
+        s._clock = lambda: dt(2026, 4, 21, 14, 0)
+        s._cached_futures = {
+            "AAA": {"tradingsymbol": "AAAFUT", "lot_size": 100,
+                    "expiry": expiry, "instrument_token": 111},
+            "BBB": {"tradingsymbol": "BBBFUT", "lot_size": 200,
+                    "expiry": expiry, "instrument_token": 222},
+        }
+        s._spread_history = [-1.0, 1.0] * 30 + [-5.0]
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 1000.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 2010.0}}
+        )
+        return s
+
+    def test_refuses_entry_inside_the_hold_window(self):
+        # 2026-04-28 is 5 trading days from the 04-21 clock; the trade wants
+        # 10 + 1. Without this gate the runner opens it anyway and expiry
+        # decides the P&L.
+        s = self._entry_ready("2026-04-28")
+        assert s._trading_days_to_expiry() == 5
+        assert s.scan_and_propose() == []
+
+    def test_allows_entry_with_room_for_the_full_hold(self):
+        s = self._entry_ready("2026-06-25")
+        assert s._trading_days_to_expiry() >= 11
+        assert len(s.scan_and_propose()) == 2
+
+    def test_boundary_is_max_hold_plus_buffer(self):
+        """Exactly max_holding_days + buffer passes; one fewer does not —
+        pins the arithmetic, not just the direction."""
+        s = self._entry_ready("2026-04-28", max_hold=4, buffer_days=1)
+        assert s._trading_days_to_expiry() == 5
+        assert len(s.scan_and_propose()) == 2
+
+        s = self._entry_ready("2026-04-28", max_hold=5, buffer_days=1)
+        assert s.scan_and_propose() == []
+
+    def test_binds_on_the_nearer_of_the_two_legs(self):
+        """The pair is flattened when EITHER leg expires, so the earlier
+        contract is the binding one even if the other has months left."""
+        s = self._entry_ready("2026-06-25")
+        s._cached_futures["BBB"]["expiry"] = "2026-04-28"
+        assert s._trading_days_to_expiry() == 5
+        assert s.scan_and_propose() == []
+
+    def test_fails_open_when_the_contract_cannot_be_resolved(self):
+        """A missing NFO dump must not silently halt the book — the entry
+        path already fails open on _resolve_futures, and a data outage is not
+        a reason to stop trading a pair whose legs are already known."""
+        s = self._entry_ready("2026-06-25")
+        s._cached_futures = {}
+        s.kite.instruments = lambda exch: []
+        assert s._trading_days_to_expiry() is None
+        # Entry is blocked here only because _build_entry_proposals itself
+        # needs the contract — not by the DTE gate returning a false positive.
+        assert s.scan_and_propose() == []
+
 
 class TestLegsExpireOn:
     def _strategy_with_legs(self, leg_tradingsymbol: str = "AAA26MAYFUT"):
@@ -2597,6 +2943,33 @@ class TestRealConstructor:
         assert s.hedge_ratio == 0.5
         # seed = AAA - 0.5*BBB over the 80-row panel
         assert len(s._spread_history) == 80
+
+    def test_entry_ceiling_leaves_stop_room_by_default(self):
+        """2026-08-07: max_entry_z must sit at or below stop_z - safety_buffer.
+
+        Above that the runner can open a position already past its own stop
+        band: effective_stop_z = |entry_z| + safety_buffer, so a z=4.08 entry
+        under the old 5.0 ceiling had 0.75 sigma of room against a 3.3 sigma
+        target and stopped out the next session. This asserts the identity,
+        not the literal — a future stop_z change must keep the invariant.
+        """
+        s = PairTradingStrategy(
+            kite=MagicMock(), config_path=self.CONFIG, mode="signals",
+            symbol_a="AAA", symbol_b="BBB", hedge_ratio=0.5,
+            spread_panel=self._panel(),
+        )
+        assert s.max_entry_z <= s.stop_z - s.safety_buffer
+        assert s.max_entry_z == 3.25
+        # And an entry may never be admitted at or beyond the stop band.
+        assert s.max_entry_z < s.stop_z
+
+    def test_entry_dte_buffer_defaults_to_one_trading_day(self):
+        s = PairTradingStrategy(
+            kite=MagicMock(), config_path=self.CONFIG, mode="signals",
+            symbol_a="AAA", symbol_b="BBB", hedge_ratio=0.5,
+            spread_panel=self._panel(),
+        )
+        assert s.entry_dte_buffer_days == 1
 
     def test_non_signals_mode_requires_notional_cap(self):
         # config_template has no [pair_trading] max_leg_notional, so paper/

@@ -37,6 +37,7 @@ import signal
 import sys
 import time
 from datetime import date, datetime
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
@@ -640,8 +641,69 @@ def load_prior_state(system: str, log: logging.Logger) -> Dict[str, Dict]:
     return out
 
 
+# A post-STOP re-arm latch must outlive deselection, not just the session.
+# `strategies` only ever contains today's picks plus orphans, and
+# build_orphan_strategies skips prior-state pairs that are FLAT ("closed
+# before this session — nothing to manage"). A pair that stopped out and is
+# therefore FLAT is neither, so if it drops out of today's top-N its whole
+# blob — including stop_rearm_pending — was erased by the next tick's write,
+# and the pair re-entered its diverged spread the day it was re-admitted.
+# Deselection is routine: select_pairs is seeded with the sibling runner's
+# open legs, so the leg-concentration cap re-orders admits day to day.
+#
+# Bounded so a latch for a pair that never returns cannot accumulate forever.
+LATCH_CARRY_MAX_AGE_DAYS = 30
+
+
+def latch_carry_forward_blobs(prior_state: Dict[str, Dict],
+                              represented_keys: set,
+                              log: logging.Logger,
+                              *, now: Optional[datetime] = None,
+                              max_age_days: int = LATCH_CARRY_MAX_AGE_DAYS,
+                              ) -> List[Dict]:
+    """Prior-state blobs to re-persist verbatim because they still carry a
+    pending post-STOP re-arm latch, even though no strategy represents them
+    this session.
+
+    Only FLAT, latch-pending pairs qualify: open positions are already
+    carried as orphans, and a pair with no latch has nothing to preserve.
+    """
+    now = now or datetime.now()
+    carried: List[Dict] = []
+    for key, blob in sorted(prior_state.items()):
+        if key in represented_keys:
+            continue
+        state_blob = blob.get("state") or {}
+        if state_blob.get("position", "FLAT") != "FLAT":
+            continue          # open → build_orphan_strategies owns it
+        if not state_blob.get("stop_rearm_pending"):
+            continue          # nothing worth preserving
+        last_exit = state_blob.get("last_exit_time")
+        if last_exit:
+            try:
+                age_days = (now - datetime.fromisoformat(last_exit)).days
+            except (TypeError, ValueError):
+                age_days = 0
+            if age_days > max_age_days:
+                log.info(
+                    "[%s] dropping post-STOP re-arm latch: stopped %dd ago "
+                    "(> %dd). The pair has not been selected since; a latch "
+                    "this old is stale state, not live risk.",
+                    key, age_days, max_age_days,
+                )
+                continue
+        carried.append(blob)
+        log.info(
+            "[%s] not selected today but post-STOP re-arm is still pending — "
+            "carrying its state forward so re-admission cannot silently "
+            "re-enter the spread that stopped it.", key,
+        )
+    return carried
+
+
 def write_state_file(strategies, system: str, log: logging.Logger,
-                     archive: bool = True, mode: str = "paper"):
+                     archive: bool = True, mode: str = "paper",
+                     carry_forward: Optional[List[Dict]] = None):
     """Atomically and durably persist current strategy state. Each strategy
     emits its own serialize_state() blob; runner adds a system/timestamp
     header. Crash/power-loss safety is runner_common.durable_write_text
@@ -669,6 +731,10 @@ def write_state_file(strategies, system: str, log: logging.Logger,
         except Exception as e:
             log.exception("serialize_state failed for %s/%s: %s",
                           s.symbol_a, s.symbol_b, e)
+    # Latch-only blobs for pairs no strategy represents this session. They
+    # carry no legs, so they contribute nothing to the notional or
+    # leg-concentration readers of this file — only the re-arm flag.
+    payload["pairs"].extend(carry_forward or [])
     # durable_write_text owns the tmp→fsync→replace→dir-fsync steps
     # (extracted to runner_common in the PR #96 review; identical
     # behaviour, one shared copy). Default mode = 0o666 & ~umask, so
@@ -1287,11 +1353,23 @@ def main():
         fresh = auth.get_kite()
         return throttle_kite(fresh, kite_limiter)
 
-    # H13: closure that scans data_cache/ for all paper-state JSONs and sums
-    # open-leg notional across every runner. Each strategy calls this before
-    # generating entry proposals.
+    # H13: closure summing open-leg notional, called by each strategy before
+    # it generates entry proposals.
+    #
+    # Scoped to THIS runner's own state file (2026-08-07). It used to sum every
+    # data_cache/*paper_state*.json, which made the cap a shared gate: the LIVE
+    # persistent runner's open notional counted against the baseline PAPER
+    # runner's ceiling, so a real-money position could freeze a simulation's
+    # entries. That is the HALT_NEW_ENTRIES failure shape (PR #196) — one
+    # runner's state silently halting another's. The daily-loss breaker is
+    # already namespaced per --system via halt_daily_loss_path; the notional
+    # cap now matches. Cross-runner coupling that IS wanted stays explicit and
+    # separate: H17's leg-concentration counter above still reads siblings.
     from strategies.pair_trading import _aggregate_book_notional
-    book_notional_fn = _aggregate_book_notional if args.max_book_notional_inr > 0 else None
+    book_notional_fn = (
+        partial(_aggregate_book_notional, only_state_path=own_state)
+        if args.max_book_notional_inr > 0 else None
+    )
 
     # Audit 2026-06-10 task 1.1: preload the bhavcopy front-month panel ONCE
     # for every symbol any strategy will need — today's candidates plus any
@@ -1385,6 +1463,12 @@ def main():
     )
     strategies = strategies + orphans
 
+    # Must be computed AFTER orphans are folded in: a pair represented by any
+    # strategy serialises its own blob and needs no carry-forward.
+    latch_carry = latch_carry_forward_blobs(
+        prior_state, {f"{s.symbol_a}/{s.symbol_b}" for s in strategies}, log,
+    )
+
     reconcile_with_broker(strategies, kite, log)
 
     now = datetime.now()
@@ -1445,7 +1529,8 @@ def main():
                     # here; that's harmless and the safer side to err on.
                     try:
                         write_state_file(strategies, args.system, log,
-                                         archive=False, mode=args.mode)
+                                         archive=False, mode=args.mode,
+                                         carry_forward=latch_carry)
                     except Exception as e:
                         log.exception("Per-fill state persist failed: %s "
                                       "— continuing", e)
@@ -1459,7 +1544,7 @@ def main():
                                    halt_loss_path)
             try:
                 write_state_file(strategies, args.system, log, archive=False,
-                                 mode=args.mode)
+                                 mode=args.mode, carry_forward=latch_carry)
             except Exception as e:
                 log.exception("Intraday state persist failed: %s — continuing", e)
             remaining = (session_end_ts - datetime.now()).total_seconds()
@@ -1474,7 +1559,8 @@ def main():
         # sentinel + CRITICAL log have already fired by this point.
         if silent_fail:
             try:
-                end_of_session(strategies, today, args, log, holidays=holidays)
+                end_of_session(strategies, today, args, log, holidays=holidays,
+                               carry_forward=latch_carry)
             except Exception as e:
                 log.exception(
                     "end_of_session failed during silent-fail teardown: "
@@ -1483,7 +1569,8 @@ def main():
                 )
         else:
             log.info("Session-end window reached.")
-            end_of_session(strategies, today, args, log, holidays=holidays)
+            end_of_session(strategies, today, args, log, holidays=holidays,
+                           carry_forward=latch_carry)
 
     except KeyboardInterrupt:
         # If a second SIGTERM arrives while end_of_session is writing the
@@ -1493,7 +1580,8 @@ def main():
         # *after* this teardown completes, rather than interrupting it.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         log.info("Interrupted — persisting state and exiting.")
-        end_of_session(strategies, today, args, log, holidays=holidays)
+        end_of_session(strategies, today, args, log, holidays=holidays,
+                       carry_forward=latch_carry)
         return 130
 
     if silent_fail:
@@ -1520,7 +1608,8 @@ def _calendar_days_until_next_trading_day(today: date, holidays: set) -> int:
 
 
 def end_of_session(strategies, today: date, args, log: logging.Logger,
-                    *, holidays: Optional[set[date]] = None):
+                    *, holidays: Optional[set[date]] = None,
+                    carry_forward: Optional[List[Dict]] = None):
     """At session end: (1) force-flatten any leg whose contract expires today;
     (2) honour --force-flatten-on-exit if set; (3) persist state for the
     next session; (4) write the EOD sidecar for the verifier/dashboard.
@@ -1573,7 +1662,8 @@ def end_of_session(strategies, today: date, args, log: logging.Logger,
             log.exception("[%s] expiry check failed after retries: %s",
                           pair_label, e)
             unverified_expiry.append(pair_label)
-    write_state_file(strategies, args.system, log, mode=args.mode)
+    write_state_file(strategies, args.system, log, mode=args.mode,
+                     carry_forward=carry_forward)
     write_eod_sidecar(strategies, today, log, args.system)
     if unverified_expiry:
         log.critical(

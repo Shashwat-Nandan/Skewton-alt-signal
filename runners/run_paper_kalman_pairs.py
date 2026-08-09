@@ -89,6 +89,11 @@ SYSTEM = "kalman"
 # against the live runner's notional cap NOR its per-symbol concentration
 # limiter. (The EOD sidecar keeps the pair_paper_kalman_eod_<date> name so the
 # dashboard compare tab still picks it up; only the STATE file needs hiding.)
+#
+# 2026-08-07: run_paper_pairs now scopes its notional cap to its own --system
+# state file, so that half of the isolation no longer depends on this name.
+# The H17 concentration counter still globs, and _aggregate_book_notional's
+# unscoped path still exists, so the naming choice stands.
 STATE_PATH = DATA_CACHE / "kalman_pairs_runner_state.json"
 CANDIDATES_PATH = DATA_CACHE / "pair_candidates.csv"
 LOCK_PATH = DATA_CACHE / "kalman_pairs.lock"

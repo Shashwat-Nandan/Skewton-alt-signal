@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -34,7 +34,12 @@ import pandas as pd
 from core.data_cache_io import find_tables, read_table
 
 
-from core.screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
+from core.screen_pairs import (
+    NIFTY_50,
+    classify_pair_candidates,
+    load_front_month_panel,
+    screen_pairs,
+)
 from research.engine import MockBroker
 from strategies.pair_trading import (
     DEFAULT_MARGIN_HEADROOM,
@@ -73,13 +78,71 @@ def load_lot_sizes(symbols: List[str], raw_dir: Path = RAW_DIR) -> Dict[str, int
     return df.drop_duplicates("TckrSymb").set_index("TckrSymb")["NewBrdLotQty"].astype(int).to_dict()
 
 
-def load_top_pairs(n: int, path: Path = CANDIDATES_PATH) -> pd.DataFrame:
+def load_stf_expiries(raw_dir: Path = RAW_DIR) -> List[date]:
+    """Every distinct single-stock-futures expiry date on the bhavcopy tape.
+
+    Feeds MockBroker so replays force-flatten on real expiry days instead of
+    holding a contract that, in the mock, never expired. ~8s over a 2-year
+    cache; called once per backtest run, not per pair.
+    """
+    files = find_tables(raw_dir, "bhavcopy_fo_*")
+    if not files:
+        raise RuntimeError(f"No bhavcopy tables in {raw_dir}")
+    out: set = set()
+    for f in files:
+        df = read_table(
+            f,
+            usecols=["FinInstrmTp", "XpryDt"],
+            dtype={"FinInstrmTp": str},
+        )
+        df = df[df["FinInstrmTp"] == "STF"]
+        if df.empty:
+            continue
+        out |= set(pd.to_datetime(df["XpryDt"], errors="coerce").dropna().dt.date)
+    if not out:
+        raise RuntimeError(f"No STF expiry dates found in {raw_dir}")
+    return sorted(out)
+
+
+def select_top_pairs(df: pd.DataFrame, n: int,
+                     max_pvalue: Optional[float] = None) -> pd.DataFrame:
+    """Pick the `n` pairs the live runner would trade, in its admit order.
+
+    2026-08-07: this harness used to `sort_values("rank_score").head(n)`,
+    which is NOT what runners/run_paper_pairs.select_pairs does — it skipped
+    the |β| band, the corr/half-life/p-value quality floor and the
+    leg-concentration cap. The gap is not cosmetic: on the same OOS split and
+    identical strategy params, the raw-rank universe reported ₹-5.63M against
+    ₹+213k for the live-selected one, because raw rank admits |β|≈0.1 pairs
+    and stacks six of eight legs on one symbol. A backtest that trades a
+    universe the runner would refuse cannot validate the runner (Rule 9).
+
+    Selection is delegated to core.screen_pairs.classify_pair_candidates so
+    there is exactly one implementation of the rules (Rule 7); `select_pairs`
+    layers only the runner's stale-CSV age check on top, which is meaningless
+    on a replay.
+
+    `max_pvalue` mirrors the runner's --quality-max-pvalue. It must be
+    threaded, not defaulted: the persistent (real-money) system passes 0.05
+    because its CSV already cleared the persistence screen, and re-testing at
+    QUALITY_MAX_PVALUE=0.025 is double jeopardy. Hardcoding 0.025 here made
+    the harness *refuse pairs the live runner trades* — the same
+    universe-mismatch defect this function exists to fix, inverted.
+    """
+    annotated = classify_pair_candidates(df, n, logger, max_pvalue=max_pvalue)
+    admitted = annotated[annotated["skip_reason"] == ""]
+    if "processing_rank" in admitted.columns:
+        admitted = admitted.sort_values("processing_rank")
+    return admitted.head(n).reset_index(drop=True)
+
+
+def load_top_pairs(n: int, path: Path = CANDIDATES_PATH,
+                   max_pvalue: Optional[float] = None) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found — run `python -m core.screen_pairs` first."
         )
-    df = pd.read_csv(path).sort_values("rank_score").head(n).reset_index(drop=True)
-    return df
+    return select_top_pairs(pd.read_csv(path), n, max_pvalue)
 
 
 # ──────────────────────────────────────────────────────────
@@ -92,8 +155,9 @@ def make_strategy(
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
     min_edge_multiplier: float = 1.5,
-    max_entry_z: float = 5.0,
+    max_entry_z: float = 3.25,
     safety_buffer: float = 0.75,
+    entry_dte_buffer_days: int = 1,
     seed_spreads: Optional[List[float]] = None,
 ) -> PairTradingStrategy:
     s = PairTradingStrategy.__new__(PairTradingStrategy)
@@ -113,6 +177,7 @@ def make_strategy(
     s.lookback_days = lookback_days
     s.lots_per_leg = lots_per_leg
     s.max_holding_days = max_holding_days
+    s.entry_dte_buffer_days = entry_dte_buffer_days
     s.max_leg_notional = max_leg_notional
     s.total_capital = 500_000
     # __init__ establishes these but this __new__ bootstrap bypasses it; the
@@ -172,15 +237,37 @@ def make_strategy(
 # Single-pair backtest
 # ──────────────────────────────────────────────────────────
 
+def _legs_expired_by(s: PairTradingStrategy, today: date) -> bool:
+    """True once any held leg's contract has reached or passed its expiry.
+
+    The `>=` is the point — see the call site. Legs restored from a
+    pre-expiry-field state file carry expiry="" and are skipped; in a replay
+    every leg is stamped at entry from _resolve_futures, so that only affects
+    hand-built fixtures.
+    """
+    for leg in s.state.legs:
+        if not leg.expiry:
+            continue
+        try:
+            exp = datetime.strptime(str(leg.expiry)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if today >= exp:
+            return True
+    return False
+
+
 def backtest_one(
     pair_row: pd.Series, replay_panel: pd.DataFrame, lot_sizes: Dict[str, int],
     *, entry_z: float, exit_z: float, stop_z: float,
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
     min_edge_multiplier: float = 1.5,
-    max_entry_z: float = 5.0,
+    max_entry_z: float = 3.25,
     safety_buffer: float = 0.75,
+    entry_dte_buffer_days: int = 1,
     seed_panel: Optional[pd.DataFrame] = None,
+    expiries: Optional[List[date]] = None,
 ) -> Optional[dict]:
     a, b = pair_row["symbol_a"], pair_row["symbol_b"]
     hedge = float(pair_row["hedge_ratio"])
@@ -206,7 +293,7 @@ def backtest_one(
         # Cap to lookback_days * 3 so the buffer doesn't grow unbounded.
         seed_spreads = seed_spreads[-(lookback_days * 3):]
 
-    mock = MockBroker(pair_panel, lot_sizes)
+    mock = MockBroker(pair_panel, lot_sizes, expiries=expiries)
     s = make_strategy(
         a, b, hedge, mock,
         entry_z=entry_z, exit_z=exit_z, stop_z=stop_z,
@@ -215,11 +302,20 @@ def backtest_one(
         min_edge_multiplier=min_edge_multiplier,
         max_entry_z=max_entry_z,
         safety_buffer=safety_buffer,
+        entry_dte_buffer_days=entry_dte_buffer_days,
         seed_spreads=seed_spreads,
     )
 
     pnl_curve: List[dict] = []
     while True:
+        # Both instrument caches are sticky for a strategy's lifetime, which
+        # live is one session. Here one instance spans months, so unless they
+        # are dropped per bar every expiry lookup — the EXPIRY flatten below
+        # and the entry DTE gate in scan_and_propose — answers with bar 1's
+        # contract and silently never fires.
+        if expiries is not None:
+            s._nfo_instruments_cache = None
+            s._cached_futures = {}
         try:
             entries = s.scan_and_propose()
             if entries:
@@ -229,6 +325,29 @@ def backtest_one(
                 s.execute_proposals(rehedges)
         except Exception as e:
             logger.warning("%s/%s tick %s failed: %s", a, b, mock.current_date.date(), e)
+
+        # Contract expiry, mirroring run_paper_pairs' session-end check
+        # (it flattens at 15:25 on expiry day, so the flatten belongs after
+        # the bar's scan/rehedge, not before).
+        #
+        # Deliberately `today >= expiry`, not legs_expire_on's `== today`.
+        # The runner ticks every calendar trading day so equality always
+        # lands; a replay does not. pair_panel is `replay_panel[[a, b]]
+        # .dropna()` over a panel built with min_coverage=0.50, so either leg
+        # missing on the expiry date removes that bar, equality never holds,
+        # and by the next bar the front month has already rolled — the
+        # position then carries across the roll on a continuous price series,
+        # free of charge. That is latent on today's gap-free NIFTY-50 cache
+        # and live for exactly the thin symbols min_coverage=0.50 admits.
+        if expiries is not None and s.state.position != "FLAT":
+            today = mock.current_date.date()
+            if _legs_expired_by(s, today):
+                _, prices = s._observe_spread()
+                if prices:
+                    s._update_unrealized(prices)
+                    exp_props = s._build_exit_proposals("EXPIRY", 0.0, prices)
+                    if exp_props:
+                        s.execute_proposals(exp_props)
 
         pnl_curve.append({
             "date": mock.current_date,
@@ -364,7 +483,7 @@ def main():
     p.add_argument("--entry-z", type=float, default=2.0)
     p.add_argument("--exit-z", type=float, default=0.75)
     p.add_argument("--stop-z", type=float, default=4.0)
-    p.add_argument("--max-entry-z", type=float, default=5.0, dest="max_entry_z",
+    p.add_argument("--max-entry-z", type=float, default=3.25, dest="max_entry_z",
                    help="Hard ceiling for entries; past |z|>=max_entry_z the "
                         "spread is treated as a regime break and refused.")
     p.add_argument("--safety-buffer", type=float, default=0.75, dest="safety_buffer",
@@ -396,6 +515,17 @@ def main():
                         "(newline-separated symbol file). Default: NIFTY 50.")
     p.add_argument("--save-curves", type=str, default=None,
                    help="Optional: write per-pair P&L curves to this CSV")
+    p.add_argument("--quality-max-pvalue", type=float, default=None,
+                   help="Override the cointegration p-value ceiling used by "
+                        "pair selection (core.screen_pairs.QUALITY_MAX_PVALUE "
+                        "= 0.025). Mirror the runner: the persistent system "
+                        "runs --quality-max-pvalue 0.05, so validating that "
+                        "book requires passing 0.05 here too.")
+    p.add_argument("--no-expiry", action="store_true",
+                   help="Disable contract-expiry force-flatten (pre-2026-08-07 "
+                        "behaviour). Diagnostic only: it makes held positions "
+                        "free to carry across expiry, which the live runner "
+                        "cannot do.")
     args = p.parse_args()
 
     if args.train_fraction is not None and not (0.1 < args.train_fraction < 0.95):
@@ -427,7 +557,11 @@ def main():
         if screened.empty:
             logger.error("No pairs passed cointegration on train slice; aborting")
             return 1
-        pairs = screened.head(args.top).reset_index(drop=True)
+        pairs = select_top_pairs(screened, args.top, args.quality_max_pvalue)
+        if pairs.empty:
+            logger.error("No train-screened pair cleared the live selection "
+                         "filters (|β| band / corr / half-life / p-value); aborting")
+            return 1
         logger.info("Top %d train-screened pairs (these are NEW selections, not from "
                     "cached pair_candidates.csv):", args.top)
         for _, r in pairs.iterrows():
@@ -442,7 +576,22 @@ def main():
                        "This has lookahead bias (the screener saw all the data "
                        "we're now testing on). Use --train-fraction for honest "
                        "out-of-sample results.")
-        pairs = load_top_pairs(args.top, Path(args.candidates))
+        pairs = load_top_pairs(args.top, Path(args.candidates),
+                               args.quality_max_pvalue)
+        if pairs.empty:
+            # load_top_pairs could not return empty before it applied the
+            # selection filters. Without this guard `universe` is [] and
+            # load_front_month_panel dies with "No STF rows for the requested
+            # universe" — an error that blames the bhavcopy cache for what is
+            # actually a filter outcome, sending the operator to re-fetch
+            # market data. run_paper_pairs.select_pairs raises here too.
+            logger.error(
+                "No candidate in %s cleared the live selection filters "
+                "(|β| band / corr / half-life / p-value ≤ %s). Nothing to "
+                "backtest — loosen --quality-max-pvalue or re-screen.",
+                args.candidates, args.quality_max_pvalue or "default 0.025",
+            )
+            return 1
         universe = sorted(set(pairs["symbol_a"]) | set(pairs["symbol_b"]))
         logger.info("Loading bhavcopy panel for %d unique symbols", len(universe))
         replay_panel = load_front_month_panel(universe, min_coverage=0.50)
@@ -452,6 +601,15 @@ def main():
     missing_lots = [s for s in universe if s not in lot_sizes]
     if missing_lots:
         logger.warning("Missing lot sizes for: %s", missing_lots)
+
+    expiries = None if args.no_expiry else load_stf_expiries()
+    if expiries is None:
+        logger.warning("--no-expiry: contracts never expire in this replay, so "
+                       "held positions are never force-flattened. P&L will be "
+                       "optimistic against the live runner (Rule 12).")
+    else:
+        logger.info("Modelling %d STF expiry dates (%s → %s)",
+                    len(expiries), expiries[0], expiries[-1])
 
     results = []
     for _, row in pairs.iterrows():
@@ -466,6 +624,7 @@ def main():
             max_entry_z=args.max_entry_z,
             safety_buffer=args.safety_buffer,
             seed_panel=seed_panel,
+            expiries=expiries,
         )
         if r is not None:
             results.append(r)

@@ -10,9 +10,12 @@ strategy code then runs unmodified in backtest, paper, and live.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from datetime import date
+from typing import Dict, List, Optional
 
 import pandas as pd
+
+NON_EXPIRING = "2099-12-31"
 
 
 class MockBroker:
@@ -31,6 +34,12 @@ class MockBroker:
         depth_spread: one-way synthetic book half-spread as a fraction
             (default 0.15%, the value the pairs harness has always used).
         exchange: the only exchange `instruments()` answers for.
+        expiries: optional sorted contract expiry dates. When given,
+            `instruments()` reports the front-month expiry relative to the
+            current bar (smallest expiry >= today), so a strategy's
+            `legs_expire_on(today)` fires on real expiry days. When omitted
+            the rows stay non-expiring, which is the historical behaviour
+            every existing caller and tests/test_mock_broker.py rely on.
     """
 
     VARIETY_REGULAR = "regular"
@@ -48,12 +57,32 @@ class MockBroker:
         symbol_suffix: str = "-BTFUT",
         depth_spread: float = 0.0015,
         exchange: str = "NFO",
+        expiries: Optional[List[date]] = None,
     ):
         self.panel = panel
         self.lot_sizes = lot_sizes
         self.symbol_suffix = symbol_suffix
         self.depth_spread = depth_spread
         self.exchange = exchange
+        self.expiries = sorted(expiries) if expiries else None
+        if self.expiries is not None and len(panel.index):
+            last_bar = panel.index[-1]
+            last_bar = last_bar.date() if hasattr(last_bar, "date") else last_bar
+            if self.expiries[-1] < last_bar:
+                # Refuse now rather than degrade at the tail. Reporting a
+                # past expiry makes _resolve_futures find no contract with
+                # expiry >= today, so it returns None, _observe_spread
+                # returns (None, {}), and every remaining bar silently
+                # no-ops: no entries, no exits, no EXPIRY flatten, and any
+                # open position carried unmanaged to the final force-close —
+                # the exact free-carry this calendar exists to prevent,
+                # showing up as a plausible-looking flat tail.
+                raise ValueError(
+                    f"expiry calendar ends {self.expiries[-1]} but the panel "
+                    f"runs to {last_bar}: the replay would outrun its "
+                    f"contracts and silently stop trading. Extend the "
+                    f"calendar or truncate the panel."
+                )
         self._date_idx = 0
         self._orders: List[dict] = []
 
@@ -90,9 +119,36 @@ class MockBroker:
                 }
         return out
 
+    def front_month_expiry(self) -> str:
+        """Expiry reported for the current bar, ISO-formatted.
+
+        Without an `expiries` calendar every row is non-expiring, which is
+        what this mock did unconditionally until 2026-08-07. That made
+        contract expiry invisible to replays: positions were never
+        force-flattened, so the EXIT_EXPIRY bucket the live pair runner pays
+        (-₹72.5k over 7 trades, 2026-05→08) simply did not exist in backtest,
+        and any `max_holding_days` long enough to straddle an expiry scored
+        as if the hold had been free.
+        """
+        if not self.expiries:
+            return NON_EXPIRING
+        today = self.current_date.date()
+        for exp in self.expiries:
+            if exp >= today:
+                return exp.isoformat()
+        # Unreachable: __init__ refuses a calendar that ends before the last
+        # panel bar, so every bar has an expiry at or after it. Kept as a
+        # loud tripwire rather than a silent fallback — returning a past
+        # expiry here blinds _resolve_futures instead of flattening.
+        raise AssertionError(
+            f"no expiry >= {self.current_date.date()} despite the __init__ "
+            f"guard (calendar ends {self.expiries[-1]})"
+        )
+
     def instruments(self, exchange: str) -> List[dict]:
         if exchange != self.exchange:
             return []
+        expiry = self.front_month_expiry()
         rows = []
         for sym in self.panel.columns:
             rows.append({
@@ -100,7 +156,7 @@ class MockBroker:
                 "tradingsymbol": f"{sym}{self.symbol_suffix}",
                 "instrument_type": "FUT",
                 "lot_size": int(self.lot_sizes.get(sym, 1)),
-                "expiry": "2099-12-31",   # never rolls during a backtest
+                "expiry": expiry,
                 "instrument_token": abs(hash(sym)) % 1_000_000,
             })
         return rows

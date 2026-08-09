@@ -38,7 +38,9 @@ from research.backtest_pairs import (
     CANDIDATES_PATH,
     backtest_one,
     load_lot_sizes,
+    load_stf_expiries,
     load_top_pairs,
+    select_top_pairs,
 )
 from core.screen_pairs import NIFTY_50, load_front_month_panel, screen_pairs
 
@@ -56,6 +58,9 @@ def main() -> int:
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--top", type=int, default=5)
+    p.add_argument("--quality-max-pvalue", type=float, default=None,
+                   help="Override the selection p-value ceiling (0.025). "
+                        "The persistent system runs 0.05.")
     p.add_argument("--candidates", type=str, default=str(CANDIDATES_PATH))
     # Fixed knobs (not swept here — sweep these in a separate script if needed)
     p.add_argument("--entry-z", type=float, default=2.0)
@@ -109,7 +114,10 @@ def main() -> int:
         if screened.empty:
             logger.error("No pairs passed cointegration on train slice")
             return 1
-        pairs = screened.head(args.top).reset_index(drop=True)
+        pairs = select_top_pairs(screened, args.top, args.quality_max_pvalue)
+        if pairs.empty:
+            logger.error("No train-screened pair cleared the live selection filters")
+            return 1
         replay_panel = test_panel
         seed_panel = train_panel
         mode_label = (
@@ -118,12 +126,22 @@ def main() -> int:
             f"test {test_panel.index[0].date()}→{test_panel.index[-1].date()})"
         )
     else:
-        pairs = load_top_pairs(args.top, Path(args.candidates))
+        pairs = load_top_pairs(args.top, Path(args.candidates),
+                               args.quality_max_pvalue)
+        if pairs.empty:
+            logger.error(
+                "No candidate in %s cleared the live selection filters. "
+                "Nothing to sweep — loosen --quality-max-pvalue or re-screen.",
+                args.candidates,
+            )
+            return 1
         universe = sorted(set(pairs["symbol_a"]) | set(pairs["symbol_b"]))
         replay_panel = load_front_month_panel(universe, min_coverage=0.50)
         lot_sizes = load_lot_sizes(universe)
         seed_panel = None
         mode_label = "IN-SAMPLE (lookahead bias — use --train-fraction for honest results)"
+
+    expiries = load_stf_expiries()
 
     print("\nPair-trading risk-knob sweep")
     print(f"  mode: {mode_label}")
@@ -158,6 +176,7 @@ def main() -> int:
                 max_entry_z=mez,
                 safety_buffer=sb,
                 seed_panel=seed_panel,
+                expiries=expiries,
             )
             if r is None:
                 continue

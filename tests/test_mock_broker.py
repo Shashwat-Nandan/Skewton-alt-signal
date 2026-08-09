@@ -85,7 +85,57 @@ class TestInstruments:
         assert b.instruments("NSE") == []
         rows = b.instruments("NFO")
         assert {r["tradingsymbol"] for r in rows} == {"AAA-BTFUT", "BBB-BTFUT"}
-        assert all(r["expiry"] == "2099-12-31" for r in rows)  # never rolls mid-replay
+        # No expiry calendar supplied → non-expiring, the historical default
+        # every other harness still relies on.
+        assert all(r["expiry"] == "2099-12-31" for r in rows)
+
+
+class TestExpiryCalendar:
+    """2026-08-07: without a calendar the mock reported a 2099 expiry
+    unconditionally, so contract expiry was invisible to every replay —
+    positions were never force-flattened and any max_holding_days long enough
+    to straddle an expiry scored as if the carry were free. Live, the pair
+    runner paid -₹72,548 over 7 expiry-flattened trades in 2026-05→08.
+    """
+
+    def test_reports_the_front_month_relative_to_the_current_bar(self):
+        from datetime import date
+        b = _broker(expiries=[date(2025, 1, 2), date(2025, 2, 27)])
+        assert b.instruments("NFO")[0]["expiry"] == "2025-01-02"
+        b.advance()  # 2025-01-02 — expiry day itself is still front month
+        assert b.instruments("NFO")[0]["expiry"] == "2025-01-02"
+        b.advance()  # 2025-01-03 — rolled
+        assert b.instruments("NFO")[0]["expiry"] == "2025-02-27"
+
+    def test_calendar_ending_before_the_panel_is_refused_at_construction(self):
+        """2026-08-08: this used to return the last (past) expiry, which does
+        NOT keep flattening — it blinds the strategy.
+
+        _resolve_futures keeps only contracts with expiry >= today, so a past
+        expiry leaves it with none: it returns None, _observe_spread returns
+        (None, {}), and every remaining bar silently no-ops — no entries, no
+        exits, no EXPIRY flatten — while any open position rides to the final
+        force-close. That reads as a plausible flat tail, so refuse up front
+        instead of degrading where nobody looks.
+        """
+        import pytest
+        from datetime import date
+        with pytest.raises(ValueError, match="expiry calendar ends"):
+            _broker(expiries=[date(2024, 12, 31)])   # panel runs into 2025
+
+    def test_calendar_reaching_the_last_bar_is_accepted(self):
+        from datetime import date
+        b = _broker(expiries=[date(2025, 1, 3)])
+        assert b.instruments("NFO")[0]["expiry"] == "2025-01-03"
+
+    def test_unsorted_input_is_ordered(self):
+        from datetime import date
+        b = _broker(expiries=[date(2025, 2, 27), date(2025, 1, 2)])
+        assert b.instruments("NFO")[0]["expiry"] == "2025-01-02"
+
+    def test_empty_calendar_is_treated_as_no_calendar(self):
+        b = _broker(expiries=[])
+        assert b.instruments("NFO")[0]["expiry"] == "2099-12-31"
 
     def test_lot_sizes_flow_through(self):
         """Lot size drives sizing and cost turnover; defaulting silently to 1

@@ -94,20 +94,49 @@ def _load_holidays(path: Path = HOLIDAYS_PATH) -> set:
     return days
 
 
-def _aggregate_book_notional(data_cache: Optional[Path] = None) -> float:
-    # H13: read all paper/live state JSONs in data_cache/ and sum |entry_px *
-    # qty * lot_size| across every open leg, regardless of which runner owns
-    # it. The pair-runner shape (pairs[].state.legs[]) and the taleb-runner
-    # shape (positions[].legs[]) are both covered. Best-effort: a malformed
-    # file is skipped (logged at debug), and tick concurrency means the read
-    # is eventually consistent — fine for an approximate ceiling, not for
-    # margin accounting.
+def _aggregate_book_notional(data_cache: Optional[Path] = None, *,
+                             only_state_path: Optional[Path] = None) -> float:
+    # H13: read paper/live state JSONs in data_cache/ and sum |entry_px * qty *
+    # lot_size| across every open leg. The pair-runner shape
+    # (pairs[].state.legs[]) and the taleb-runner shape (positions[].legs[])
+    # are both covered. Best-effort: a malformed file is skipped (logged at
+    # debug), and tick concurrency means the read is eventually consistent —
+    # fine for an approximate ceiling, not for margin accounting.
+    #
+    # `only_state_path` scopes the sum to ONE runner's own state file
+    # (2026-08-07). The original cross-runner glob is a shared gate: the LIVE
+    # persistent book's open notional counted against the baseline PAPER
+    # runner's cap, so a real-money position could freeze a simulation's
+    # entries — the same shape as the HALT_NEW_ENTRIES flag that froze all
+    # entries for 6.5 sessions (PR #196). A cap is a per-book risk limit; make
+    # it per-book, exactly as halt_daily_loss_path namespaces the daily-loss
+    # breaker per --system. Omitting the argument keeps the whole-cache sum
+    # for callers that genuinely want total deployed capital.
     import json
     cache = data_cache or (Path(__file__).resolve().parent.parent / "data_cache")
     if not cache.exists():
         return 0.0
+    if only_state_path is not None:
+        if only_state_path.exists():
+            paths = [only_state_path]
+        else:
+            # Legitimate on a runner's first session for a --system tag, but
+            # indistinguishable from a mis-typed tag or a failed state write —
+            # in which case the book this cap is meant to bound lives in a
+            # file we are not reading, and the ceiling silently reads ₹0.
+            # Warn rather than return a quiet zero (Rule 12).
+            logger.warning(
+                "book-notional cap is scoped to %s, which does not exist — "
+                "reporting ₹0. Expected only on this --system tag's first "
+                "session; otherwise the tag is wrong or the last state write "
+                "failed, and the cap is not bounding anything.",
+                only_state_path,
+            )
+            paths = []
+    else:
+        paths = sorted(cache.glob("*paper_state*.json"))
     total = 0.0
-    for jp in cache.glob("*paper_state*.json"):
+    for jp in paths:
         try:
             blob = json.loads(jp.read_text())
         except Exception as e:
@@ -182,6 +211,26 @@ class PairState:
     # diagnostics but allow immediate re-entry.
     last_exit_time: Optional[datetime] = None
     last_exit_reason: Optional[str] = None
+    # 2026-08-07: True from a STOP exit until |z| is next observed back inside
+    # entry_z. `last_exit_time` alone cannot express this — the cooldown is
+    # wall-clock, so it always lapses overnight and re-arms the pair into a
+    # spread that never came back. HEROMOTOCO/TCS stopped at z=4.12 on
+    # 2026-08-04 11:27 and re-entered at z=4.08 at 12:28 — the first tick past
+    # the 60-minute gate — stopped again, then ran the same loop on 08-05.
+    # Three entries, three stops, one monotonically diverging spread.
+    stop_rearm_pending: bool = False
+    # Baseline frozen at the moment of the stop, so the latch is cleared by the
+    # spread actually coming back — not by the yardstick moving. The runner
+    # re-seeds _spread_history from bhavcopy every session and the window is
+    # only lookback_days long, so a permanent dislocation is absorbed into the
+    # rolling mean/std within a handful of sessions: |z| then falls back inside
+    # entry_z with no reversion whatsoever, and the latch clears itself. These
+    # pin the pre-stop distribution instead. stop_rearm_beta guards the
+    # comparison: the frozen level is in spread units, so it is only
+    # meaningful while the hedge ratio that defined that spread still holds.
+    stop_rearm_mean: Optional[float] = None
+    stop_rearm_std: Optional[float] = None
+    stop_rearm_beta: Optional[float] = None
     # M-S3: consecutive-tick count for the mean-revert exit debounce.
     # Single noisy tick at |z| <= exit_z used to fire MEAN_REVERT
     # immediately. Counter increments per qualifying tick, fires the
@@ -290,7 +339,20 @@ class PairTradingStrategy(BaseStrategy):
         #     |entry_z| + safety_buffer). A z=-3.8 entry therefore stops at
         #     4.55, not 4.0, so it isn't insta-stopped by sub-σ jitter.
         # Both are per-pair config-overridable.
-        self.max_entry_z = float(cfg.get("max_entry_z", 5.0))
+        #
+        # 2026-08-07: default lowered 5.0 → 3.25 = stop_z - safety_buffer.
+        # At 5.0 the ceiling sat ABOVE stop_z, so the runner would open a
+        # position already past its own stop band and then stop out almost
+        # immediately: effective_stop_z = |entry_z| + safety_buffer leaves a
+        # z=4.08 entry only 0.75σ of room against a 3.3σ target. That is what
+        # HEROMOTOCO/TCS did on 2026-08-04 (entered 4.08, stopped 4.81 next
+        # session, -₹21,351), and 4 of the 6 positions open on 08-07 were
+        # entered at |z| >= 3.4 — they held -₹75.9k of the -₹88.6k unrealized.
+        # 3.25 restores the invariant that stop_z is reachable only by an
+        # adverse move, never by the entry itself. Chosen from that identity,
+        # NOT fitted: per-trade sigma is ₹38k, so fold totals in this
+        # universe cannot resolve a ceiling (pooled t = -0.95, n=437).
+        self.max_entry_z = float(cfg.get("max_entry_z", 3.25))
         self.safety_buffer = float(cfg.get("safety_buffer", 0.75))
         self.lookback_days = int(cfg.get("lookback_days", 60))
         self.lots_per_leg = int(cfg.get("lots_per_leg", 1))
@@ -322,6 +384,15 @@ class PairTradingStrategy(BaseStrategy):
         # "let-winners-run" optimum. Roughly aligns with Varsity Method 1's
         # ~5-day time-stop guidance.
         self.max_holding_days = int(cfg.get("max_holding_days", 7))
+        # 2026-08-07: refuse entries the time stop cannot outlive. A position
+        # opened with fewer than max_holding_days of contract left is flattened
+        # at expiry regardless of where the spread sits, so it is a bet on
+        # reverting inside a window the strategy never chose. Live 2026-05→08:
+        # 7 such trades, -₹72,548, avg -₹10,364 — the second-largest loss
+        # bucket after stops, and invisible to backtests until the mock stopped
+        # reporting a 2099 expiry (research/engine/mock_broker.py).
+        # Buffer of 1 trading day covers the flatten itself.
+        self.entry_dte_buffer_days = int(cfg.get("entry_dte_buffer_days", 1))
 
         # H5: post-STOP re-entry cooldown. Without this, a pair that stops
         # out at z=4.2 will re-enter on the very next tick (z still > entry_z)
@@ -480,11 +551,45 @@ class PairTradingStrategy(BaseStrategy):
             logger.debug("Spread history too thin (%d obs) for z-score", len(self._spread_history))
             return []
 
+        # Post-STOP re-arm. The wall-clock cooldown above cannot survive a
+        # session boundary, so it re-admits a pair the very next morning with
+        # the spread still outside the band. Require proof of mean reversion
+        # before trusting the pair again — it is the spread's behaviour, not
+        # elapsed time, that says the relationship still holds.
+        if self.state.stop_rearm_pending:
+            cleared, detail = self._stop_rearm_cleared_by(spread, z)
+            if not cleared:
+                logger.info(
+                    "[%s/%s] post-STOP re-arm pending: %s — no re-entry until "
+                    "the spread returns to the band.",
+                    self.symbol_a, self.symbol_b, detail,
+                )
+                return []
+            logger.info("[%s/%s] post-STOP re-arm cleared: %s.",
+                        self.symbol_a, self.symbol_b, detail)
+            self.state.stop_rearm_pending = False
+            self.state.stop_rearm_mean = None
+            self.state.stop_rearm_std = None
+            self.state.stop_rearm_beta = None
+
         # Hard ceiling: past max_entry_z is a regime break, not a deep
         # mean-reversion signal. Refuse rather than enter with an ever-wider
         # stop. Below the ceiling, _set_position_from_legs widens the per-
         # trade stop by safety_buffer to avoid same-tick stop-out.
         if abs(z) >= self.max_entry_z:
+            return []
+
+        # Don't open a trade the time stop cannot outlive — expiry would
+        # flatten it wherever the spread happens to be.
+        min_dte = self.max_holding_days + self.entry_dte_buffer_days
+        dte = self._trading_days_to_expiry()
+        if dte is not None and dte < min_dte:
+            logger.info(
+                "[%s/%s] %d trading day(s) to expiry < %d (max_hold %d + "
+                "buffer %d) — refusing entry at z=%.2f.",
+                self.symbol_a, self.symbol_b, dte, min_dte,
+                self.max_holding_days, self.entry_dte_buffer_days, z,
+            )
             return []
 
         if z <= -self.entry_z:
@@ -688,6 +793,22 @@ class PairTradingStrategy(BaseStrategy):
             # ticks (and sessions, via state serialization).
             self.state.last_exit_time = self._clock()
             self.state.last_exit_reason = self._pending_exit_reason
+            # A stop means the spread left the band the wrong way. Arm the
+            # re-entry gate and freeze the baseline it will be judged against.
+            if self._pending_exit_reason == "STOP":
+                self.state.stop_rearm_pending = True
+                stats = self._rolling_window_stats()
+                if stats is not None:
+                    self.state.stop_rearm_mean, self.state.stop_rearm_std = stats
+                    self.state.stop_rearm_beta = self.hedge_ratio
+                else:
+                    # No computable window (thin history). Leave the frozen
+                    # baseline unset — _stop_rearm_cleared_by falls back to the
+                    # live window, which is the pre-2026-08-08 behaviour and
+                    # still strictly better than no latch.
+                    self.state.stop_rearm_mean = None
+                    self.state.stop_rearm_std = None
+                    self.state.stop_rearm_beta = None
             self._pending_exit_reason = None
             # Issue #90: the position this group identified no longer
             # exists; the EXIT signal (published at decision time above)
@@ -860,6 +981,16 @@ class PairTradingStrategy(BaseStrategy):
                     if self.state.last_exit_time else None
                 ),
                 "last_exit_reason": self.state.last_exit_reason,
+                # 2026-08-07: the re-arm gate exists precisely to outlive a
+                # session, so it MUST round-trip through the state file — a
+                # flag that resets at 09:15 is the bug it replaces.
+                "stop_rearm_pending": self.state.stop_rearm_pending,
+                # The frozen pre-stop baseline the latch is judged against.
+                # Without it the latch survives the session but its yardstick
+                # does not, and tomorrow's re-seeded window clears it.
+                "stop_rearm_mean": self.state.stop_rearm_mean,
+                "stop_rearm_std": self.state.stop_rearm_std,
+                "stop_rearm_beta": self.state.stop_rearm_beta,
                 # Issue #90: signal correlation id for the open position.
                 # Older state files restore this as None (bootstrap path).
                 "position_group_id": self.state.position_group_id,
@@ -917,6 +1048,25 @@ class PairTradingStrategy(BaseStrategy):
             datetime.fromisoformat(last_exit_time) if last_exit_time else None
         )
         self.state.last_exit_reason = state_blob.get("last_exit_reason")
+        # Backwards-compat: state files written before 2026-08-07 have no
+        # flag. Derive it from the recorded exit reason so a pair stopped out
+        # on the last pre-upgrade session still has to prove reversion — the
+        # loop this closes was live at the time those files were written.
+        self.state.stop_rearm_pending = bool(state_blob.get(
+            "stop_rearm_pending",
+            self.state.last_exit_reason == "STOP" and not state_blob["legs"],
+        ))
+
+        def _opt_float(key):
+            v = state_blob.get(key)
+            return None if v is None else float(v)
+
+        # Absent in pre-2026-08-08 state files; _stop_rearm_cleared_by then
+        # falls back to the live rolling window (the weaker test, but still a
+        # latch — never a silent bypass).
+        self.state.stop_rearm_mean = _opt_float("stop_rearm_mean")
+        self.state.stop_rearm_std = _opt_float("stop_rearm_std")
+        self.state.stop_rearm_beta = _opt_float("stop_rearm_beta")
         # M-S3: backwards-compat — older state files don't carry the streak.
         self.state.mean_revert_streak = int(state_blob.get("mean_revert_streak") or 0)
         # M-S4: backwards-compat — older state files don't carry per-trade
@@ -1296,6 +1446,61 @@ class PairTradingStrategy(BaseStrategy):
             self._make_fut_proposal(fut_a, qty_a, prices[self.symbol_a], side_a, rationale),
             self._make_fut_proposal(fut_b, qty_b, prices[self.symbol_b], side_b, rationale),
         ]
+
+    # Hedge-ratio drift past this fraction means the weekly re-screen refitted
+    # the relationship materially, so a spread level frozen under the old β no
+    # longer describes the same series and the latch cannot be evaluated
+    # against it. Observed drift across a normal re-screen is ~3%.
+    STOP_REARM_BETA_TOLERANCE = 0.10
+
+    def _stop_rearm_cleared_by(self, spread: float,
+                               live_z: float) -> Tuple[bool, str]:
+        """Has the spread proved it still reverts since the stop?
+
+        Judged against the mean/std frozen when the stop fired, NOT the live
+        rolling window. The runner re-seeds `_spread_history` from bhavcopy
+        every session and the window is only `lookback_days` long, so a
+        permanent dislocation is absorbed into the rolling mean within a few
+        sessions — the live |z| then drops back inside `entry_z` with no
+        reversion at all, clearing the latch and re-admitting the pair at the
+        new, broken level. Freezing the baseline makes the test require an
+        actual price move back toward where the spread used to trade.
+
+        Falls back to the live window when no frozen baseline exists (state
+        written before 2026-08-08, or a stop taken on history too thin to
+        compute stats). That is the weaker pre-existing test, but it is still
+        a latch, so the fallback never silently disables the gate.
+        """
+        mean = self.state.stop_rearm_mean
+        std = self.state.stop_rearm_std
+        beta = self.state.stop_rearm_beta
+
+        if mean is None or not std:
+            inside = abs(live_z) < self.entry_z
+            return inside, (
+                f"z={live_z:.2f} vs ±{self.entry_z:.2f} (live window; no "
+                f"frozen stop baseline)"
+            )
+
+        if beta is not None and abs(beta) > 1e-9:
+            drift = abs(self.hedge_ratio - beta) / abs(beta)
+            if drift > self.STOP_REARM_BETA_TOLERANCE:
+                # A materially refitted β is a different spread series, and
+                # the screener re-validated cointegration to produce it. The
+                # frozen level is meaningless now; release rather than latch
+                # the pair forever on a stale yardstick.
+                return True, (
+                    f"hedge ratio refitted {beta:.4f}→{self.hedge_ratio:.4f} "
+                    f"({drift:.0%} > {self.STOP_REARM_BETA_TOLERANCE:.0%}); "
+                    f"frozen stop baseline no longer describes this spread"
+                )
+
+        frozen_z = (spread - mean) / std
+        return abs(frozen_z) < self.entry_z, (
+            f"z={frozen_z:.2f} against the frozen pre-stop baseline "
+            f"(µ={mean:.2f} σ={std:.2f}) vs ±{self.entry_z:.2f}; "
+            f"live-window z={live_z:.2f}"
+        )
 
     def _is_in_stop_cooldown(self) -> bool:
         """H5: True if the last exit was a STOP and the cooldown window has
@@ -1876,6 +2081,36 @@ class PairTradingStrategy(BaseStrategy):
         if self._holidays_cache is None:
             self._holidays_cache = _load_holidays()
         return self._holidays_cache
+
+    def _trading_days_to_expiry(self) -> Optional[int]:
+        """Trading days from today to the nearer leg's front-month expiry.
+
+        The pair is flattened when EITHER leg expires, so the binding contract
+        is the earlier of the two. Returns None when the contract can't be
+        resolved (no NFO dump / unknown symbol), which the caller treats as
+        "don't gate" — the same fail-open stance _resolve_futures already
+        takes in the entry path, since a hard failure there would take the
+        book offline for a data problem.
+        """
+        today = self._clock().date()
+        holidays = self._holidays()
+        remaining = []
+        for sym in (self.symbol_a, self.symbol_b):
+            fut = self._resolve_futures(sym)
+            if not fut:
+                return None
+            exp = fut.get("expiry")
+            if isinstance(exp, str):
+                try:
+                    exp = datetime.strptime(exp[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    return None
+            elif hasattr(exp, "date"):
+                exp = exp.date()
+            if exp is None:
+                return None
+            remaining.append(_trading_days_between(today, exp, holidays))
+        return min(remaining) if remaining else None
 
     def _seed_spread_history(self) -> None:
         """

@@ -45,7 +45,7 @@ import pandas as pd
 
 # Re-use existing building blocks — Rule 7: don't fork the selection logic
 # and don't reimplement screening.
-from research.backtest_pairs import backtest_one, load_lot_sizes
+from research.backtest_pairs import backtest_one, load_lot_sizes, load_stf_expiries
 from core.screen_pairs import classify_pair_candidates
 from core.screen_pairs import (
     NIFTY_50, load_front_month_panel, screen_pairs, screen_pairs_persistent,
@@ -202,6 +202,11 @@ def run(args) -> int:
                 panel.index[0].date(), panel.index[-1].date())
 
     lot_sizes = load_lot_sizes(panel.columns.tolist(), raw_dir=RAW_DIR)
+    # Contract expiries: without these MockBroker reports 2099-12-31, the
+    # EXPIRY force-flatten never fires and the entry DTE gate never binds, so
+    # this harness scores a strategy that carries positions across expiry for
+    # free while research.backtest_pairs (and the live runner) do not.
+    expiries = load_stf_expiries(raw_dir=RAW_DIR)
 
     checkpoints = weekly_checkpoints(
         panel,
@@ -293,6 +298,7 @@ def run(args) -> int:
                 max_entry_z=args.max_entry_z,
                 safety_buffer=args.safety_buffer,
                 seed_panel=train,
+                expiries=expiries,
             )
             if res is None:
                 continue
@@ -400,7 +406,11 @@ def main():
     p.add_argument("--entry-z", type=float, default=2.0)
     p.add_argument("--exit-z", type=float, default=0.75)
     p.add_argument("--stop-z", type=float, default=4.0)
-    p.add_argument("--max-entry-z", type=float, default=5.0)
+    p.add_argument("--max-entry-z", type=float, default=3.25,
+                   help="Entry ceiling. Default tracks the live runner's "
+                        "config.ini max_entry_z (= stop_z - safety_buffer); "
+                        "it was 5.0 until 2026-08-07, which admitted entries "
+                        "already past the stop band that the runner refuses.")
     p.add_argument("--safety-buffer", type=float, default=0.75)
     p.add_argument("--min-edge-multiplier", type=float, default=1.5)
     p.add_argument("--lookback-days", type=int, default=60)

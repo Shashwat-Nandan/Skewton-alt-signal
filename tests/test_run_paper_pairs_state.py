@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from runners import run_paper_pairs
 from runners.run_paper_pairs import (
     acquire_runner_lock,
+    latch_carry_forward_blobs,
     build_orphan_strategies,
     end_of_session,
     load_prior_state,
@@ -238,6 +240,87 @@ class TestWriteStateFile:
 # ──────────────────────────────────────────────────────────
 # restore_matching_strategies
 # ──────────────────────────────────────────────────────────
+
+class TestLatchCarryForward:
+    """A post-STOP re-arm latch must outlive DESELECTION, not just the session.
+
+    write_state_file only persists today's picks plus orphans, and
+    build_orphan_strategies skips prior-state pairs that are FLAT. A pair that
+    stopped out is FLAT, so if it drops out of today's top-N it is neither —
+    and its whole blob, latch included, was erased by the next tick's write.
+    Deselection is routine: select_pairs is seeded with the sibling runner's
+    open legs, so the leg-concentration cap re-orders admits day to day. The
+    pair then re-entered its still-diverged spread the day it came back.
+    """
+
+    def _stopped_flat_blob(self, key="AAA/BBB", **state):
+        base = {
+            "position": "FLAT", "legs": [], "last_exit_reason": "STOP",
+            "stop_rearm_pending": True,
+            "last_exit_time": datetime.now().isoformat(),
+        }
+        base.update(state)
+        return {key: {"pair": key.split("/"), "hedge_ratio": 1.0, "state": base}}
+
+    def test_latched_pair_not_selected_today_is_carried(self, log):
+        prior = self._stopped_flat_blob()
+        carried = latch_carry_forward_blobs(prior, set(), log)
+        assert [b["pair"] for b in carried] == [["AAA", "BBB"]]
+
+    def test_represented_pair_is_not_duplicated(self, log):
+        """A pair a strategy owns serialises its own blob; carrying it too
+        would write the same pair twice into the state file."""
+        prior = self._stopped_flat_blob()
+        assert latch_carry_forward_blobs(prior, {"AAA/BBB"}, log) == []
+
+    def test_open_position_is_left_to_the_orphan_path(self, log):
+        prior = self._stopped_flat_blob(position="SHORT_SPREAD")
+        assert latch_carry_forward_blobs(prior, set(), log) == []
+
+    def test_pair_without_a_pending_latch_is_not_carried(self, log):
+        prior = self._stopped_flat_blob(stop_rearm_pending=False)
+        assert latch_carry_forward_blobs(prior, set(), log) == []
+
+    def test_stale_latch_is_dropped_so_it_cannot_accumulate(self, log):
+        old = (datetime.now() - timedelta(days=45)).isoformat()
+        prior = self._stopped_flat_blob(last_exit_time=old)
+        assert latch_carry_forward_blobs(prior, set(), log) == []
+
+    def test_latch_just_inside_the_age_bound_is_kept(self, log):
+        recent = (datetime.now() - timedelta(days=29)).isoformat()
+        prior = self._stopped_flat_blob(last_exit_time=recent)
+        assert len(latch_carry_forward_blobs(prior, set(), log)) == 1
+
+    def test_unparseable_exit_time_is_kept_not_silently_dropped(self, log):
+        """Losing a real latch to a bad timestamp is the failure mode that
+        matters; keeping a spurious one only costs a state-file row."""
+        prior = self._stopped_flat_blob(last_exit_time="not-a-timestamp")
+        assert len(latch_carry_forward_blobs(prior, set(), log)) == 1
+
+    def test_carried_blob_reaches_the_state_file(self, isolated_data_cache, log):
+        """End-to-end: the whole point is that the next session can restore it."""
+        s = MagicMock()
+        s.symbol_a, s.symbol_b = "CCC", "DDD"
+        s.serialize_state.return_value = {
+            "pair": ["CCC", "DDD"], "hedge_ratio": 1.0,
+            "state": {"position": "FLAT"},
+        }
+        carried = list(self._stopped_flat_blob().values())
+        write_state_file([s], "baseline", log, carry_forward=carried)
+        payload = json.loads(state_file_path("baseline").read_text())
+        by_pair = {tuple(p["pair"]): p for p in payload["pairs"]}
+        assert ("AAA", "BBB") in by_pair
+        assert by_pair[("AAA", "BBB")]["state"]["stop_rearm_pending"] is True
+        assert ("CCC", "DDD") in by_pair
+
+    def test_carried_blobs_add_no_legs(self, isolated_data_cache, log):
+        """The state file is also read for book notional and leg
+        concentration; a carried latch must not register as exposure."""
+        carried = list(self._stopped_flat_blob().values())
+        write_state_file([], "baseline", log, carry_forward=carried)
+        payload = json.loads(state_file_path("baseline").read_text())
+        assert all(not p["state"].get("legs") for p in payload["pairs"])
+
 
 class TestRestoreMatchingStrategies:
     def _make_strategy_mock(self, sa: str, sb: str, beta: float = 1.0):

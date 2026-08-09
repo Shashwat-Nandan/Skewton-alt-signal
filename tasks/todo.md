@@ -1,3 +1,147 @@
+# Baseline pair runner — harness fidelity + stop-loop fixes — 2026-08-07
+
+Review of the `baseline` pair runner (`--top 8`). Realized peaked +₹102.6k on
+07-17, fell to −₹18.1k by 08-07, plus −₹88.6k open unrealized.
+
+**What the review established.** Per-trade σ is ₹38k, so a 40-trade fold total
+carries ±₹472k at 95%. Fold-total comparisons therefore cannot resolve
+`entry_z`/`max_entry_z`/`top`: identical params flip sign between a 3-fold/120d
+and a 5-fold/80d geometry, and a pooled 437-trade test of an `|entry_z|` ceiling
+gives t = −0.95. **entry_z 2.25 is not promoted** — the sweep that liked it sat
+inside the noise band. What *is* significant (t = +7.49, live n=36): EXIT_STOP
+averages −₹31,942 (0% win, 7 trades, −₹223.6k) against +₹9,468 for every other
+exit. The cause is structural, so the fixes below are structural.
+
+**Two harness defects found first — no sweep through them means anything.**
+
+| # | defect | effect |
+|---|---|---|
+| A | `backtest_pairs.py` OOS uses `screened.head(top)`, skipping `classify_pair_candidates` | benchmarks a universe live would never trade: −₹5.6M vs +₹213k at identical params |
+| B | `research/engine/mock_broker.py` pins expiry to `2099-12-31` | EXIT_EXPIRY force-flatten invisible; live cost −₹72.5k / 7 trades; long-`max_hold` results biased up |
+
+**Plan**
+- [x] A — `load_top_pairs` + both OOS branches (`backtest_pairs`, `sweep_pair_params`)
+      select through `classify_pair_candidates` via a shared `select_top_pairs`,
+      matching `run_paper_pairs.select_pairs` (β band, corr/HL/p floors, leg cap).
+- [x] B — `MockBroker(expiries=…)` reports a rolling front-month expiry;
+      `backtest_one` calls `legs_expire_on` each bar and force-flattens (EXPIRY),
+      mirroring the runner's 15:25 check. Default stays non-expiring so other
+      harnesses are unchanged. `--no-expiry` restores the old behaviour, loudly.
+      Both instrument caches are dropped per bar — they are sticky for a
+      strategy's lifetime, which is one session live but months in a replay.
+- [x] 1 — `max_entry_z` default 5.0 → 3.25 (= `stop_z - safety_buffer`), plus
+      `config.ini`. Test asserts the *identity*, not the literal.
+- [x] 2 — `PairState.stop_rearm_pending`: a STOP latches it, only an observation
+      of |z| back inside `entry_z` clears it. Serialised (that is the point) and
+      inferred for pre-upgrade state files whose last exit was a STOP.
+- [x] 3 — `entry_dte_buffer_days` (default 1): entries need
+      `max_holding_days + buffer` trading days on the *nearer* leg's contract.
+      Fails open when the contract can't be resolved.
+- [x] 4 — `--max-book-notional-inr 4000000` on `deploy/pair-paper.service` **and**
+      on the host drop-in `pair-paper.service.d/10-top8.conf`, which overrides
+      ExecStart and would otherwise have silently discarded the change.
+- [x] 4b — namespaced the cap per `--system`. `_aggregate_book_notional` gained
+      `only_state_path`; the runner passes its own `state_file_path(args.system)`.
+      Unscoped, the LIVE persistent book (₹1.56M) counted against the baseline
+      PAPER runner's ceiling — a real-money position freezing a simulation, the
+      HALT_NEW_ENTRIES shape (PR #196). Now: unscoped ₹9.80M, baseline ₹8.24M,
+      persistent ₹1.56M. H17's leg-concentration counter still reads siblings —
+      that coupling is deliberate and stays. A test pins the *wiring*, not just
+      the helper, since a correct helper called with the default argument would
+      silently restore the shared gate.
+- [x] Tests: 4 new suites/classes (`TestEntryDteBuffer`, `TestExpiryCalendar`,
+      `test_backtest_pairs_selection.py`, re-arm coverage in `TestStopCooldown`).
+      `ruff check .` clean; `pytest tests/ -q` = **1712 passed, 0 skips**.
+
+**Review**
+
+Three tests had to be rewritten rather than merely fixed, because they pinned
+the behaviour being removed (Rule 9): `test_reentry_allowed_after_cooldown_elapses`
+asserted re-entry fires the instant 60 minutes pass — the literal HEROMOTOCO/TCS
+loop. It is now `test_elapsed_cooldown_alone_does_not_readmit_a_diverged_spread`.
+The `_make_strategy` fixture also claimed a 10-day max hold against a contract
+5 trading days out, so its entry tests were asserting entries the runner now
+refuses; its default expiry moved to 2026-06-25.
+
+Sanity check on the *corrected* harness (walk-forward, live-parity selection,
+expiry modelled), reported honestly rather than as a promotion:
+
+| change | 3-fold/120d | 5-fold/80d | verdict |
+|---|---|---|---|
+| DTE gate on vs off | +₹106k, 62→49 trips, 2/3→3/3 folds | +₹207k, 126→92 trips | **same sign in both** |
+| `max_entry_z` 3.25 vs 5.0 | −₹83k (win% 63.0→67.3) | −₹214k | inside noise; leans against |
+
+The DTE gate is the one change the backtest supports consistently, which is
+expected — defect B is exactly what used to hide it. The `max_entry_z` cap is
+*not* supported by backtest P&L: both point estimates lean slightly against it,
+though at ~0.5 SE (per-trade σ ₹38k) neither is a real result. It ships on the
+structural argument (never open a position already inside its own stop band)
+and on the live tape (entries at |z| ≥ 3.4 hold −₹75.9k of the −₹88.6k
+unrealized), not on a fitted curve. Flagged so a future reader does not mistake
+it for a validated win.
+
+Two pre-existing issues found and NOT fixed (out of scope, surfaced instead):
+- `config_template.ini` has no `[pair_trading]` section at all, so none of these
+  knobs are documented in the checked-in template.
+- The installed `/etc/systemd/system/pair-paper.service` is a stale *copy* of
+  `deploy/pair-paper.service` (`--top 12`, `--max-daily-loss-inr 100000000`,
+  `/root` vs `/opt` paths). The drop-in masks it, but the base unit has drifted.
+
+**Code-review round 2 (2026-08-08).** A multi-agent review at high effort
+returned 10 verified findings; all applied. Two of them said the headline fix
+did not actually hold:
+
+- [x] R1 — the re-arm latch was erased by **deselection**, not just by a
+      restart. `write_state_file` persists today's picks plus orphans, and
+      `build_orphan_strategies` skips prior-state pairs that are FLAT — a
+      stopped-out pair is exactly that, so dropping out of the top-N wiped its
+      latch on the next tick's write. Deselection is routine: `select_pairs` is
+      seeded with the sibling runner's open legs, so the leg-concentration cap
+      re-orders admits day to day. Added `latch_carry_forward_blobs`, bounded
+      at 30 days so a latch for a pair that never returns cannot accumulate.
+- [x] R2 — the latch cleared itself on **baseline drift**. `_spread_history` is
+      re-seeded from bhavcopy each session over a `lookback_days` window, so a
+      permanent dislocation is absorbed into the rolling mean within a few
+      sessions: live |z| falls back inside `entry_z` with no reversion at all.
+      The latch now freezes the pre-stop mean/std/β and judges against those,
+      releasing only on a material (>10%) β refit, where the frozen level no
+      longer describes the series. The old live-window test remains as the
+      fallback for pre-upgrade state — weaker, never a silent bypass.
+- [x] R3 — scoped book cap returned a silent ₹0 when its own state file was
+      missing (wrong `--system` tag, failed write). Now warns loudly.
+- [x] R4 — `select_top_pairs` hardcoded p ≤ 0.025, so the harness could not
+      reproduce the **persistent** runner's universe (it runs 0.05). Threaded
+      `max_pvalue` + `--quality-max-pvalue` on both harnesses. This is the same
+      universe-mismatch defect the function was added to fix, inverted.
+- [x] R5 — `MockBroker`'s past-the-calendar fallback returned a **past** expiry,
+      which blinds `_resolve_futures` (no contract with expiry ≥ today) rather
+      than flattening: every remaining bar silently no-ops and the position
+      rides to the final force-close. Now refused at construction.
+- [x] R6 — the EXPIRY flatten required `expiry == bar date`. `pair_panel` is
+      `dropna()`'d over a `min_coverage=0.50` panel, so a missing expiry-day bar
+      skipped it and the position carried across the roll for free. Now `>=`.
+- [x] R7/R8 — `backtest_pairs_rule.py` and `sweep_top.py` still defaulted
+      `--max-entry-z` to 5.0 and never passed `expiries`. `backtest_pairs_rule`
+      is the walk-forward validator of the very selection rule this PR adopts,
+      so it was scoring a configuration that no longer exists.
+- [x] R9 — in-sample branch had no `pairs.empty` guard, so a fully-filtered
+      universe died with "No STF rows for the requested universe", blaming the
+      bhavcopy cache for a filter outcome.
+- [x] R10 — the drop-in gets the flag too. **The finding's premise was wrong**
+      — `deploy/pair-paper.service.d/10-top8.conf` has been tracked since #167,
+      not host-only; I confirmed that before acting and restored the tracked
+      file after briefly overwriting it with the host's drifted copy. Its
+      conclusion still held: the drop-in resets and redefines `ExecStart`, so
+      editing only the base unit was inert wherever the drop-in is installed.
+      Both now carry `--max-book-notional-inr`, and the host copy was verified
+      flag-identical to the tracked one.
+
+**Not changed** (evidence does not support it): `entry_z`, `exit_z`, `stop_z`,
+`--top`. `--top` is largely inert anyway — the quality filter admitted only 3/4/11
+pairs across the three folds, so top-12→8 changed nothing in two of three.
+
+---
+
 # Futures hedge priced off spot instead of the futures contract — 2026-08-02
 
 Found while investigating why the 2026-08-01 autoresearch sweep vetoed its

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from research.backtest_pairs import backtest_one, load_lot_sizes
+from research.backtest_pairs import backtest_one, load_lot_sizes, load_stf_expiries
 from research.backtest_pairs_rule import (
     aggregate_per_pair,
     portfolio_metrics,
@@ -70,6 +70,11 @@ def collect_admissions_at_max_top(args) -> list[dict]:
                 len(panel), panel.shape[1],
                 panel.index[0].date(), panel.index[-1].date())
     lot_sizes = load_lot_sizes(panel.columns.tolist(), raw_dir=RAW_DIR)
+    # Contract expiries: without these MockBroker reports 2099-12-31, the
+    # EXPIRY force-flatten never fires and the entry DTE gate never binds, so
+    # this harness scores a strategy that carries positions across expiry for
+    # free while research.backtest_pairs (and the live runner) do not.
+    expiries = load_stf_expiries(raw_dir=RAW_DIR)
     checkpoints = weekly_checkpoints(
         panel, screen_window=args.screen_window,
         test_horizon=args.test_horizon, stride=args.checkpoint_stride,
@@ -114,6 +119,7 @@ def collect_admissions_at_max_top(args) -> list[dict]:
                 max_entry_z=args.max_entry_z,
                 safety_buffer=args.safety_buffer,
                 seed_panel=train,
+                expiries=expiries,
             )
             if res is None:
                 continue
@@ -169,7 +175,11 @@ def main() -> int:
     p.add_argument("--entry-z", type=float, default=2.0)
     p.add_argument("--exit-z", type=float, default=0.75)
     p.add_argument("--stop-z", type=float, default=4.0)
-    p.add_argument("--max-entry-z", type=float, default=5.0)
+    p.add_argument("--max-entry-z", type=float, default=3.25,
+                   help="Entry ceiling. Default tracks the live runner's "
+                        "config.ini max_entry_z (= stop_z - safety_buffer); "
+                        "it was 5.0 until 2026-08-07, which admitted entries "
+                        "already past the stop band that the runner refuses.")
     p.add_argument("--safety-buffer", type=float, default=0.75)
     p.add_argument("--min-edge-multiplier", type=float, default=1.5)
     p.add_argument("--lookback-days", type=int, default=60)
