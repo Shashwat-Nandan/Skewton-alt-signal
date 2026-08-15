@@ -529,9 +529,29 @@ class TalebKarpathyStrategy(BaseStrategy):
             # mid-range "outside band" log below so the two are separable.
             logger.info("IV percentile not computable this tick — waiting.")
             return []
+        regime_enabled = self.tunable_params.get(
+            "enable_regime_dispatch", False,
+        )
+        # IV-percentile band: a HARD BLOCK on the legacy path, a FEATURE
+        # under regime dispatch — the same demotion `skew_pct_max` and
+        # `min_rv_iv_ratio` already got (2026-06-07), which this gate was
+        # simply missed by.
+        #
+        # WHY (2026-08-09 review): the band gates the one feature that is
+        # guaranteed to be HIGH on exactly the sessions a long-convexity
+        # book exists for. Left as a hard block it ran BEFORE the classifier
+        # and silently shadowed it: at the tuned `entry_iv_percentile_max`
+        # of 43, 100% of blocked ticks on the 15-session window were blocked
+        # by the upper bound (median blocked IV pct 67.2, max 94.6), and
+        # 36.7% of them sat at IV pct >= 70 — which is
+        # `regime_calendar_iv_pct_min`, making CALENDAR_SHORT_FRONT
+        # unreachable code. It is also why the 2026-07-08 hold-out, a -2.12%
+        # tail session, took ZERO trades. Under dispatch the per-structure
+        # cutoffs (`regime_straddle_iv_pct_max`, `regime_calendar_iv_pct_min`)
+        # are the IV policy, and they are the tunables autoresearch sweeps.
         iv_min = self.tunable_params["entry_iv_percentile_min"]
         iv_max = self.tunable_params["entry_iv_percentile_max"]
-        if not (iv_min <= iv_percentile <= iv_max):
+        if not regime_enabled and not (iv_min <= iv_percentile <= iv_max):
             logger.info("IV percentile %.1f outside [%.0f, %.0f]. Waiting.", iv_percentile, iv_min, iv_max)
             return []
 
@@ -543,9 +563,6 @@ class TalebKarpathyStrategy(BaseStrategy):
         # to RISK_REVERSAL_LONG_PUT.
         skew_pct = self._compute_skew_percentile(primary, spot)
         skew_max = self.tunable_params.get("skew_pct_max", 100.0)
-        regime_enabled = self.tunable_params.get(
-            "enable_regime_dispatch", False,
-        )
         if skew_max < 100.0 and not regime_enabled and skew_pct > skew_max:
             logger.info(
                 "Skew percentile %.1f > max %.1f — ATM straddle would "

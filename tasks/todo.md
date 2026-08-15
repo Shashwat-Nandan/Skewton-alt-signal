@@ -29,10 +29,32 @@ reports no edge. Both are money-affecting; not yet implemented.**
 - [x] B — `_propose_mutation` re-draws (bounded, `_MUTATION_ATTEMPTS = 8`) while
       the proposal is a no-op; warns loudly if the whole space is pinned.
       `_propose_mutation_once` keeps the old single/joint walk.
-- [ ] C — pin all legs of a single-expiry structure to one expiry slice.
-      **Not** "relax the margin cap": the cap is correctly sized (2.5x headroom
-      on well-formed structures) and only bites on malformed ones.
-- [ ] D — decide the entry-gate contract under regime dispatch (see review).
+- [x] C — `propose_for_structure` pins every structure except
+      `calendar_short_front` to the nearest expiry that still has time on it
+      (`_single_expiry_slice`). "Nearest LIVE", not `primary_expiry`, so the
+      expiry-day fallthrough in `_pick_strike_by_delta` still works.
+      The margin cap was **not** relaxed — operator decision 2026-08-09, and
+      the measurement supports it: on the 15-session replay every one of the
+      33 rejections was mixed-expiry (same-expiry: 0), mixed-expiry structures
+      were charged **100.0%** of gross in all 35 cases, and single-expiry ones
+      averaged 42.6% of gross. The cap was never the binding constraint on a
+      well-formed structure.
+- [x] D — the IV-percentile band is a hard gate on the LEGACY path only;
+      under `enable_regime_dispatch` it is a feature and the classifier's
+      per-structure cutoffs are the IV policy. Dropped from `TUNABLE_RANGES`
+      and `JOINT_PAIRS`, matching the 2026-06-07 `min_rv_iv_ratio` /
+      `skew_pct_max` precedent. `docs/strategies/taleb_framework.md` §5
+      records both C and D.
+
+**Operator follow-ups (not done here)**
+- The next weekly sweep is the first that can reach `CALENDAR_SHORT_FRONT`
+  and the backspread regime. Treat its seed baseline as a NEW baseline —
+  it is not comparable to the 07-25…08-08 series, which was measured
+  against a strategy that could not enter those regimes.
+- `best_params.json` still carries `entry_iv_percentile_min/max` 8/43. Those
+  values are now inert under dispatch; leave them (they still govern the
+  legacy path) but do not read them as live entry policy.
+- Promotion remains an operator decision. Nothing here promotes anything.
 
 ---
 

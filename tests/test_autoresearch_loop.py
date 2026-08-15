@@ -110,11 +110,34 @@ class TestMutateOne:
     def test_iv_min_invariant_stays_below_max(self, monkeypatch):
         # entry_iv_percentile_min must remain <= max - 5 even if the step
         # would push it above. Force a big upward step.
+        #
+        # The band left TUNABLE_RANGES on 2026-08-09 (demoted to a feature
+        # under regime dispatch), so the range is injected here: _mutate_one
+        # still carries the invariant, and this pins that it survives — the
+        # band stays config-settable on the legacy path, and if the range is
+        # ever restored the guard must still hold.
+        monkeypatch.setattr(HedgeResearchLoop, "TUNABLE_RANGES",
+                            {**HedgeResearchLoop.TUNABLE_RANGES,
+                             "entry_iv_percentile_min": (5.0, 30.0),
+                             "entry_iv_percentile_max": (20.0, 90.0)})
         monkeypatch.setattr(np.random, "normal", lambda *a, **k: 1e9)
         loop = _loop(mutation_step=0.5)
         params = {"entry_iv_percentile_min": 10.0, "entry_iv_percentile_max": 40.0}
         _, new = loop._mutate_one(params, "entry_iv_percentile_min")
         assert new <= 40.0 - 5
+
+    def test_iv_band_is_not_swept_under_regime_dispatch(self):
+        # WHY (2026-08-09): while the band was BOTH a hard entry gate and a
+        # swept tunable, the sweep spent experiments pulling
+        # entry_iv_percentile_max down — which is how it reached 43, blocking
+        # 100% of out-of-band ticks by the upper bound and making
+        # CALENDAR_SHORT_FRONT (regime_calendar_iv_pct_min = 70) unreachable.
+        # Now that the gate is a feature under dispatch, sweeping it moves
+        # nothing; re-adding it would resurrect the wasted experiments the
+        # 2026-06-07 min_rv_iv_ratio/skew_pct_max drop already ruled out.
+        for key in ("entry_iv_percentile_min", "entry_iv_percentile_max"):
+            assert key not in HedgeResearchLoop.TUNABLE_RANGES
+            assert not any(key in pair for pair in HedgeResearchLoop.JOINT_PAIRS)
 
 
 # ── _propose_mutation no-op guard (2026-08-08 sweep, experiment 20) ──

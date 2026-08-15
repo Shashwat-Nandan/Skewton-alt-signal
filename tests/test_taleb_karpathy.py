@@ -830,10 +830,13 @@ class TestOptimizerRangeCoverage:
         # hard gates min_rv_iv_ratio / skew_pct_max are bypassed under dispatch
         # (their regime equivalents ARE the regime_* thresholds) and are
         # intentionally config-only, not swept — so they are not required here.
+        # entry_iv_percentile_min/max joined that category on 2026-08-09 when
+        # the band was demoted to a feature under dispatch; its live
+        # equivalents are regime_straddle_iv_pct_max / regime_calendar_iv_pct_min,
+        # both required below.
         runtime_tunables = {
             "rehedge_delta_threshold", "gamma_scalp_band_pct",
             "position_size_pct", "vega_limit", "max_holding_period_hours",
-            "entry_iv_percentile_min", "entry_iv_percentile_max",
             "max_entry_alpha", "mc_worst_path_loss_pct", "rv_window_days",
             "regime_straddle_iv_pct_max", "regime_straddle_rv_iv_ratio_min",
             "regime_straddle_skew_pct_max", "regime_calendar_iv_pct_min",
@@ -4053,3 +4056,100 @@ class TestDailyAtmIvPoolCache:
 
         assert nifty._daily_atm_iv_history == [(date(2026, 7, 1), 0.20)]
         assert bn._daily_atm_iv_history == [(date(2026, 7, 1), 0.44)]
+
+
+class TestIVPercentileGateUnderRegimeDispatch:
+    """2026-08-09 review. Under `enable_regime_dispatch` the legacy hard
+    gates were deliberately demoted to features — `min_rv_iv_ratio` and
+    `skew_pct_max` both carry `not regime_enabled` guards. The
+    entry_iv_percentile band was missed, and stayed an unconditional block
+    running BEFORE the classifier.
+
+    WHY that is the expensive one: it gates the single feature guaranteed
+    to be HIGH on exactly the sessions a long-convexity book exists for. On
+    the 15-session replay at the tuned max of 43, 100% of blocked ticks hit
+    the UPPER bound (median blocked IV pct 67.2, max 94.6) and 36.7% sat at
+    IV pct >= 70 — which is `regime_calendar_iv_pct_min`, so
+    CALENDAR_SHORT_FRONT was unreachable code. It is also why the 07-08
+    hold-out, a -2.12% tail session, took zero trades: the strategy sat out
+    the day its thesis is built to be paid on."""
+
+    def _hedger(self, regime_enabled, iv_percentile=85.0):
+        import datetime as _dt
+        import pandas as pd
+        hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        hedger.state = HedgeState()
+        hedger.mode = "paper"
+        hedger.underlying = "NIFTY"
+        hedger._clock = lambda: _dt.datetime(2026, 3, 29, 10, 0)
+        hedger.immutable_params = {"total_capital": 1000000,
+                                   "max_position_margin_pct": 30.0}
+        hedger.tunable_params = {
+            "enable_regime_dispatch": regime_enabled,
+            "max_layered_structures": 1,
+            "entry_iv_percentile_min": 8.0,
+            "entry_iv_percentile_max": 43.0,   # the tuned value that blocked
+            "position_size_pct": 12.0,
+            "skew_pct_max": 100.0,
+            "min_rv_iv_ratio": 1.0,
+            "rv_window_days": 5.0,
+            "regime_straddle_iv_pct_max": 60.0,
+            "regime_straddle_rv_iv_ratio_min": 1.0,
+            "regime_straddle_skew_pct_max": 70.0,
+            "regime_calendar_iv_pct_min": 70.0,
+            "regime_calendar_skew_pct_max": 60.0,
+            "regime_risk_reversal_skew_pct_min": 80.0,
+            "regime_backspread_vvol_min": 0.15,
+            "regime_asymmetric_strangle_rv_iv_min": 1.30,
+            "regime_asymmetric_strangle_skew_pct_min": 70.0,
+        }
+        chain = pd.DataFrame([{
+            "tradingsymbol": "NIFTY2640322000CE", "instrument_token": 1,
+            "strike": 22000.0, "expiry": "2026-04-03",
+            "instrument_type": "CE", "lot_size": 25, "name": "NIFTY",
+        }])
+        hedger._pre_trade_checks = lambda: True
+        hedger._get_spot_price = lambda: 22000.0
+        hedger._check_spot = lambda s: True
+        hedger._record_spot_sample = lambda *a: None
+        hedger._get_options_chain = lambda: chain
+        hedger._primary_expiry_slice = lambda c: c
+        hedger._compute_iv_percentile = lambda c, s: iv_percentile
+        hedger._compute_skew_percentile = lambda c, s: 55.0
+        hedger._compute_realized_vol = lambda w: 0.18
+        hedger._atm_iv_history = [0.15] * 25
+        hedger.greeks = MagicMock()
+        hedger.proposer = MagicMock()
+        hedger.proposer.propose_for_structure = MagicMock(return_value=[])
+        hedger.proposer.propose_delta_neutral = MagicMock(return_value=[])
+        return hedger
+
+    def test_high_iv_reaches_the_classifier_under_dispatch(self):
+        # IV pct 85 is far above entry_iv_percentile_max = 43. Under
+        # dispatch the band must NOT short-circuit — the classifier has to
+        # get the chance to route (this reading is above
+        # regime_calendar_iv_pct_min = 70).
+        hedger = self._hedger(regime_enabled=True, iv_percentile=85.0)
+        hedger.scan_and_propose()
+        assert hedger.proposer.propose_for_structure.called, (
+            "IV percentile 85 was swallowed by the legacy band before the "
+            "regime classifier ran — CALENDAR_SHORT_FRONT stays unreachable"
+        )
+
+    def test_legacy_path_still_hard_blocks_out_of_band_iv(self):
+        # With dispatch OFF the band is still the entry gate. Demoting it
+        # unconditionally would have removed the only IV guard the legacy
+        # straddle path has.
+        hedger = self._hedger(regime_enabled=False, iv_percentile=85.0)
+        assert hedger.scan_and_propose() == []
+        assert not hedger.proposer.propose_delta_neutral.called
+
+    def test_in_band_iv_unaffected_on_either_path(self):
+        for regime_enabled in (True, False):
+            hedger = self._hedger(regime_enabled=regime_enabled, iv_percentile=30.0)
+            hedger.scan_and_propose()
+            builder = (hedger.proposer.propose_for_structure if regime_enabled
+                       else hedger.proposer.propose_delta_neutral)
+            assert builder.called, (
+                f"in-band IV 30 must still enter (regime_enabled={regime_enabled})"
+            )

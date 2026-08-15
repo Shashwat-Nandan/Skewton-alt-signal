@@ -321,12 +321,6 @@ class HedgeResearchLoop:
         "position_size_pct": (5.0, 25.0),
         "vega_limit": (1000.0, 8000.0),  # per-lot; scales with position size
         "max_holding_period_hours": (4.0, 168.0),  # 4 hours to 1 week
-        # Re-centred 2026-06-07: captured NIFTY tape sits at iv_pct 14-22, so
-        # the old max floor of 50 could never bind (data was always < floor) and
-        # min never needed to move off 10. Ranges now bracket that low-vol regime
-        # from both sides so the gate can actually flip an entry.
-        "entry_iv_percentile_min": (5.0, 30.0),
-        "entry_iv_percentile_max": (20.0, 90.0),
         "max_entry_alpha": (5000.0, 150000.0),
         "mc_worst_path_loss_pct": (1.0, 10.0),
         "cost_hurdle_factor": (1.0, 8.0),  # raised: cube-root scaling in
@@ -338,6 +332,14 @@ class HedgeResearchLoop:
         # under regime dispatch wasted experiments on no-op params. They remain
         # config-settable for the non-regime path; their regime-path equivalents
         # are the regime_* thresholds below.
+        # Dropped 2026-08-09 for the same reason, once the same demotion was
+        # applied to it: entry_iv_percentile_min / entry_iv_percentile_max.
+        # Until then the band was the ONE surviving hard gate under dispatch,
+        # and it shadowed the classifier — 100% of blocked ticks on the
+        # 15-session window hit the upper bound and 36.7% sat at IV pct >= 70,
+        # i.e. above regime_calendar_iv_pct_min, so CALENDAR_SHORT_FRONT could
+        # never be reached. Sweeping the band now moves nothing under dispatch;
+        # the regime_* IV cutoffs below are its live equivalents.
         # Phase 5: T-0 (expiry day) band tightening factor. 1.0 = disabled,
         # 0.33 = aggressive sticky-strike harvest. Tighter values produce
         # more rehedges on expiry day; the cost gate still filters sub-EV.
@@ -570,7 +572,9 @@ class HedgeResearchLoop:
     JOINT_PAIRS = [
         ("rehedge_delta_threshold", "gamma_scalp_band_pct"),
         ("cost_hurdle_factor", "gamma_scalp_band_pct"),
-        ("entry_iv_percentile_min", "entry_iv_percentile_max"),
+        # (entry_iv_percentile_min, entry_iv_percentile_max) removed
+        # 2026-08-09 alongside their TUNABLE_RANGES entries — leaving a pair
+        # behind after dropping its range is precisely the 2026-06-13 crash.
     ]
 
     def _mutate_one(self, params: Dict, param_name: str) -> Tuple[float, float]:

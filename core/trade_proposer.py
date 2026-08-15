@@ -59,6 +59,28 @@ class TradeProposer:
         "asymmetric_strangle",
     ]
 
+    # Structures whose legs MUST share one expiry. Everything except the
+    # calendar, whose entire thesis is the term-structure spread between two.
+    # Phase 3.2 widened the chain handed to `propose_for_structure` to span
+    # two expiries so the calendar builder could work — but the delta-based
+    # builders below pick each leg independently off that chain via
+    # `_pick_strike_by_delta`, with nothing pinning them to the same expiry.
+    # They routinely straddled two (2026-08-09 review: a "backspread" of
+    # short NIFTY2680424300CE against long NIFTY2681124850CE is a diagonal
+    # ratio spread, not a backspread). Two consequences, both bad:
+    #   * risk — the short leg carries near-expiry gamma/theta the long legs
+    #     don't offset, so the structure the classifier picked is not the
+    #     structure the book holds;
+    #   * margin — `_structure_margin` can only expiry-scan a single-expiry
+    #     book. A mixed-expiry, net-CREDIT structure (which a properly built
+    #     backspread always is) misses both the scan and the net-debit
+    #     branch, falls through to `return gross` = the naked per-leg sum,
+    #     and gets rejected by the 30%-of-capital cap. On the 15-session
+    #     replay window that killed EVERY backspread entry: same-expiry
+    #     structures margin Rs 107k-123k, the mixed-expiry ones Rs 717k-5.0M
+    #     against a Rs 300k cap.
+    _MULTI_EXPIRY_STRUCTURES = frozenset({"calendar_short_front"})
+
     def __init__(self, kite, config_path: str = "config.ini"):
         self.kite = kite
         self.config = configparser.ConfigParser()
@@ -561,6 +583,17 @@ class TradeProposer:
         builder = builders.get(structure)
         if builder is None:
             return []
+        # Pin every single-expiry structure to ONE expiry before the builder
+        # sees the chain (see _MULTI_EXPIRY_STRUCTURES). Done here rather than
+        # in each builder so a future builder cannot forget it.
+        if structure not in self._MULTI_EXPIRY_STRUCTURES:
+            chain = self._single_expiry_slice(chain)
+            if chain.empty:
+                logger.warning(
+                    "%s: no expiry with time remaining in the chain — "
+                    "skipping (structure needs one live expiry)", structure,
+                )
+                return []
         # propose_delta_neutral (the straddle builder) doesn't take
         # greeks_engine positionally — it has its own signature. Branch.
         if structure == "straddle":
@@ -574,6 +607,39 @@ class TradeProposer:
             position_size_pct=position_size_pct,
             greeks_engine=greeks_engine,
         )
+
+    def _single_expiry_slice(self, chain: pd.DataFrame) -> pd.DataFrame:
+        """Restrict `chain` to the NEAREST expiry that still has time on it.
+
+        Deliberately "nearest LIVE", not "chain.attrs['primary_expiry']":
+        on expiry day the primary's `time_to_expiry` is 0 (day-resolution),
+        and `_pick_strike_by_delta` already skips those rows so the picker
+        falls through to the next live expiry rather than nulling the whole
+        structure. Selecting the primary blindly would re-break exactly that
+        case; selecting the nearest live expiry keeps the fallthrough AND
+        guarantees both legs land in the same one.
+
+        Returns an empty frame when no expiry has time remaining — the
+        caller skips, it must not silently trade the expiring series.
+        """
+        from core.greeks_engine import time_to_expiry
+
+        if chain.empty or "expiry" not in chain:
+            return chain
+        clock = getattr(self, "_clock", None)
+        ref = clock() if clock is not None else None
+        # Rank by remaining time, not by string sort: expiry formatting has
+        # varied (date objects vs 'YYYY-MM-DD') and 26JUL-style trading
+        # symbols do not sort chronologically either.
+        live = sorted(
+            ((time_to_expiry(str(e), ref), str(e))
+             for e in chain["expiry"].unique()),
+            key=lambda t: t[0],
+        )
+        live = [e for T, e in live if T > 0]
+        if not live:
+            return chain.iloc[0:0]
+        return chain[chain["expiry"].astype(str) == live[0]]
 
     # ══════════════════════════════════════════════════════════════
 

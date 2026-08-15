@@ -304,3 +304,150 @@ class TestBackspreadSizing:
         assert short_leg.quantity >= 1
         cumulative = sum(p.price * p.lot_size * p.quantity for p in proposals)
         assert cumulative < 0.30 * 500000
+
+
+# ── single-expiry pinning (2026-08-09 review) ──────────────
+
+@pytest.fixture
+def wide_two_expiry_chain():
+    """Two expiries shaped like a real NIFTY chain: a fine-stepped weekly
+    front clustered around ATM, and a coarse-stepped monthly back that runs
+    much further out.
+
+    That asymmetry is the point. `_pick_strike_by_delta` scans the WHOLE
+    frame and keeps the single closest delta match, so the ~0.5Δ ATM target
+    lands on the finely-stepped front while the ~0.10Δ / ~0.15Δ tail targets
+    land on the back — which is exactly how the live chain produced
+    "backspreads" with one leg in each expiry. A uniform ladder lets both
+    picks land in the same expiry by luck and hides the defect."""
+    rows = []
+    ladders = {
+        "2026-04-03": range(21600, 22401, 50),     # weekly: fine, near ATM only
+        "2026-05-29": range(17000, 27001, 250),    # monthly: coarse, wide tails
+    }
+    for expiry, strikes in ladders.items():
+        for s in strikes:
+            for otype in ("CE", "PE"):
+                rows.append({
+                    "tradingsymbol": f"NIFTY{expiry.replace('-', '')}{s}{otype}",
+                    "instrument_token": hash((expiry, s, otype)) % 100000,
+                    "strike": float(s),
+                    "expiry": expiry,
+                    "instrument_type": otype,
+                    "lot_size": 25,
+                    "name": "NIFTY",
+                })
+    return pd.DataFrame(rows)
+
+
+class TestSingleExpiryPinning:
+    """2026-08-09 review: Phase 3.2 widened the chain handed to
+    `propose_for_structure` to two expiries so the CALENDAR builder could
+    construct front-vs-back legs. The delta-based builders pick each leg
+    independently off that same chain, and nothing pinned them to one
+    expiry — so a "backspread" routinely came out as short near-expiry ATM
+    against long far-expiry OTM: a diagonal ratio spread, not a backspread.
+
+    WHY it matters beyond naming: `_structure_margin` can only expiry-scan
+    a single-expiry book. A mixed-expiry, net-CREDIT structure (which a
+    properly built backspread always is) misses the scan AND the net-debit
+    branch and falls through to `return gross` — the naked per-leg sum. On
+    the 15-session tape replay that rejected EVERY backspread entry at the
+    30%-of-capital cap: same-expiry structures margined ~Rs 110k, the
+    mixed-expiry ones Rs 717k-5.0M against a Rs 300k cap. The strategy was
+    silently unable to enter its own vol-of-vol regime."""
+
+    VOL = {"2026-04-03": 0.16, "2026-05-29": 0.18}
+
+    def _proposer(self, mock_kite, chain, now):
+        """Quotes priced with Black-Scholes at a per-expiry vol, so
+        `_pick_strike_by_delta`'s IV bisect solves and the delta targets
+        resolve to real strikes on either expiry."""
+        from core.greeks_engine import GreeksEngine, time_to_expiry
+
+        engine = GreeksEngine()
+        by_symbol = {
+            r["tradingsymbol"]: (float(r["strike"]), str(r["expiry"]),
+                                 r["instrument_type"])
+            for _, r in chain.iterrows()
+        }
+
+        def quote(symbol):
+            strike, expiry, otype = by_symbol[symbol]
+            T = time_to_expiry(expiry, now)
+            if T <= 0:
+                return None
+            px = engine.bs_price(22000.0, strike, T, self.VOL[expiry], otype)
+            px = max(px, 0.05)
+            return {"last_price": px,
+                    "depth": {"buy": [{"price": px * 0.995}],
+                              "sell": [{"price": px * 1.005}]}}
+
+        proposer = TradeProposer.__new__(TradeProposer)
+        proposer.kite = mock_kite
+        proposer.underlying = "NIFTY"
+        proposer.config = MagicMock()
+        proposer._clock = lambda: now
+        proposer._get_quote = quote
+        return proposer
+
+    def _propose(self, mock_kite, chain, structure, now=None):
+        from datetime import datetime
+        from core.greeks_engine import GreeksEngine
+        now = now or datetime(2026, 3, 20, 10, 30)
+        return self._proposer(mock_kite, chain, now).propose_for_structure(
+            structure=structure, chain=chain, spot=22000.0,
+            capital=1000000, position_size_pct=12.0,
+            greeks_engine=GreeksEngine(),
+        )
+
+    @pytest.mark.parametrize("structure", [
+        "backspread", "risk_reversal_long_put", "asymmetric_strangle", "straddle",
+    ])
+    def test_single_expiry_structures_never_straddle_two_expiries(
+            self, mock_kite, wide_two_expiry_chain, structure):
+        # The three delta-based builders each fail this without the pinning
+        # in propose_for_structure. `straddle` passes either way — it reads
+        # `atm_ce.iloc[0]` / `atm_pe.iloc[0]`, which happen to land in the
+        # same expiry — so it is here as a forward guard on the invariant,
+        # not as a reproduction of the 2026-08-09 defect.
+        proposals = self._propose(mock_kite, wide_two_expiry_chain, structure)
+        assert proposals, f"{structure} produced no legs — fixture is wrong"
+        expiries = {str(p.expiry) for p in proposals}
+        assert len(expiries) == 1, (
+            f"{structure} spans {expiries} — a single-expiry structure whose "
+            f"legs sit in different expiries is a diagonal, and "
+            f"_structure_margin degrades it to the naked per-leg sum"
+        )
+
+    def test_calendar_still_gets_both_expiries(self, mock_kite, wide_two_expiry_chain):
+        # The exemption must stay exact: pinning the calendar to one expiry
+        # would silently disable the structure Phase 3.2 widened the chain for.
+        proposals = self._propose(
+            mock_kite, wide_two_expiry_chain, "calendar_short_front")
+        assert proposals, "calendar produced no legs"
+        assert len({str(p.expiry) for p in proposals}) == 2, (
+            "calendar_short_front IS the term-structure spread — it must "
+            "keep both expiries"
+        )
+
+    def test_expiry_day_falls_through_to_next_live_expiry(
+            self, mock_kite, wide_two_expiry_chain):
+        # `_pick_strike_by_delta` skips rows whose T <= 0 so builders don't
+        # null out on expiry day. Pinning must preserve that: with the front
+        # expiry already expired, the structure builds on the BACK month
+        # rather than returning [].
+        from datetime import datetime
+        proposals = self._propose(
+            mock_kite, wide_two_expiry_chain, "backspread",
+            now=datetime(2026, 4, 3, 10, 30))
+        assert proposals, "expiry day must fall through to the back month"
+        assert {str(p.expiry) for p in proposals} == {"2026-05-29"}
+
+    def test_no_live_expiry_returns_no_proposals(self, mock_kite, wide_two_expiry_chain):
+        # Rule 12: past every expiry there is nothing tradable. Skip, never
+        # fall back to an expired series.
+        from datetime import datetime
+        assert self._propose(
+            mock_kite, wide_two_expiry_chain, "backspread",
+            now=datetime(2026, 6, 30, 10, 30)) == []

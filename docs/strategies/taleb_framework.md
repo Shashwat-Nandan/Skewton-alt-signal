@@ -204,13 +204,78 @@ For a gamma scalping strategy, vega exposure is a side effect:
 Our system:
 1. Monitors portfolio vega continuously
 2. Hard limit prevents excessive vega concentration
-3. Entry timing filtered by IV percentile (avoid buying expensive vol)
+3. Entry timing filtered by IV percentile (avoid buying expensive vol) —
+   **legacy path only.** See "The IV-percentile band is a feature, not a
+   gate" below.
 4. Entry timing filtered by **put-skew percentile** (Phase 1.3) —
    reject ATM straddle when IV(25Δ put) − IV(25Δ call) sits in the top
    quintile of its history; rich skew is premium an ATM body cannot
    recover via delta-hedged gamma, per Ch 15 path-dependence rule.
    Default `skew_pct_max = 80`; 100 disables.
 5. Calendar spreads can isolate gamma from vega if needed (Phase 3+)
+
+### The IV-percentile band is a feature, not a gate (2026-08-09)
+
+"Don't buy expensive vol" is sound for a single-structure book that only
+ever buys the ATM straddle. It is wrong as an unconditional *pre-filter*
+for a regime-routed book, and the distinction cost the strategy its best
+sessions.
+
+`entry_iv_percentile_min/max` used to hard-block entry *before* the regime
+classifier ran, while `min_rv_iv_ratio` and `skew_pct_max` had already been
+demoted to features under `enable_regime_dispatch` (2026-06-07). That left
+the IV band as the only surviving hard gate — keyed on the one feature
+guaranteed to be HIGH on exactly the sessions a long-convexity book exists
+for. Measured over the 15-session window 2026-07-20 → 08-07 at the tuned
+`entry_iv_percentile_max = 43`:
+
+- **100%** of blocked ticks were blocked by the UPPER bound; the lower
+  bound never bound once.
+- Median blocked IV percentile **67.2**, max **94.6**.
+- **36.7%** of blocked ticks sat at IV pct ≥ 70 — which *is*
+  `regime_calendar_iv_pct_min`, so `CALENDAR_SHORT_FRONT` could never be
+  reached. The branch was unreachable code.
+- The 2026-07-08 hold-out session (−2.12% spot move — a tail day, the
+  product) took **zero** trades.
+
+The band is now a hard gate only on the legacy (non-dispatch) path. Under
+dispatch, IV policy is the classifier's per-structure cutoffs
+(`regime_straddle_iv_pct_max`, `regime_calendar_iv_pct_min`), which is what
+autoresearch sweeps; `entry_iv_percentile_min/max` left `TUNABLE_RANGES`
+for the same reason `min_rv_iv_ratio` / `skew_pct_max` did.
+
+Note this is not a licence to buy rich vol indiscriminately — it moves the
+decision from "is IV high?" to "which structure does *this* vol regime
+call for?", which is the Ch 15 question. A high-IV, flat-skew tape routes
+to a calendar (long gamma / short vega) rather than an outright straddle,
+precisely so the book isn't paying the rich front-month premium the old
+gate was trying to avoid.
+
+### Structure legs must share an expiry (2026-08-09)
+
+Phase 3.2 widened the chain handed to `propose_for_structure` to span two
+expiries so the calendar builder could construct front-vs-back legs. The
+delta-based builders (`backspread`, `risk_reversal_long_put`,
+`asymmetric_strangle`) pick each leg independently off that chain via
+`_pick_strike_by_delta`, and nothing pinned them to the same expiry — so a
+"backspread" was frequently short near-expiry ATM against long far-expiry
+OTM: a diagonal ratio spread, with the short leg carrying gamma and theta
+the longs do not offset.
+
+The margin consequence was what surfaced it. `_structure_margin` can only
+expiry-scan a single-expiry book; a mixed-expiry, net-**credit** structure
+(which a properly built backspread always is) misses both the scan and the
+net-debit branch and falls through to the naked per-leg sum. Same-expiry
+structures margined ₹107k–₹123k; the mixed-expiry ones ₹717k–₹5.0M against
+the ₹300k cap (30% of ₹1M). Every backspread entry on the replay window
+was rejected — the strategy could not enter its own vol-of-vol regime.
+
+`propose_for_structure` now pins every structure except
+`calendar_short_front` to the nearest expiry that still has time on it
+("nearest live", not "primary", so the expiry-day fallthrough in
+`_pick_strike_by_delta` still works). The 30%-of-capital margin cap was
+**not** relaxed — it was never the binding constraint on a well-formed
+structure.
 
 ## 6. Theta — The Cost of Carry
 
