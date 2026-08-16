@@ -1,3 +1,24 @@
+# Autoresearch — code-review follow-ups on PR #208 — 2026-08-10
+
+High-effort multi-agent review of the merged #208 commit (`a68e436`) returned 7
+verified findings, 5 CONFIRMED and 2 PLAUSIBLE. Two were regressions introduced
+by #208 itself. All fixed here.
+
+| # | finding | fix |
+|---|---|---|
+| 0 | Joint-mutation branch reported the PRIMARY leg unconditionally, so a pinned primary + moving secondary still logged `mutated a+b: 5.0000 -> 5.0000` — the exact signature #208 set out to remove — and hid which knob an accepted fitness came from | report whichever leg actually moved |
+| 1 | `test_pinned_param_does_not_produce_a_noop` rode unseeded stdlib `random.choice`: ~1 CI failure in 190 on the definition-of-done gate, and only ~50% effective at catching a revert | drive `random.choice` explicitly; measured 0/20,000 no-ops vs the reviewer's 105/20,000 |
+| 2 | `--seed` seeded numpy only, while knob selection and joint-vs-single use stdlib `random` — a `--seed` re-run could not reproduce the candidate it was auditing | seed both; help text no longer overclaims for the synthetic path |
+| 3 | The all-pinned fallback returned a params dict equal to the seed and the caller re-scored it; on a stochastic eval that books resampling noise as an ACCEPTED improvement, inflating `best_metric` and `informative` for an unchanged config | skip the replay, record the plateau, never accept |
+| 4 | The re-draw silently discarded pinned proposals — deleting the `x: 5.0000 -> 5.0000` signal that *is* how the 08-08 diagnosis was made. The existing warning needed the WHOLE space pinned, so the common single-knob case went silent | count discards per param, log each, surface as `sweep_quality.pinned_draws` + a warning when one knob dominates |
+| 5 | The AST guard filtered `ast.JoinedStr` only, so the same defect reintroduced with `%`-format or `.format()` passed | check whole statements, any formatting style |
+| 6 | Driver hand-rolled the baseline/veto/seed_baseline block that `run()` already had — the duplication that caused the #208 defect in the first place | `HedgeResearchLoop.establish_baseline()`, called by both entrypoints; a test asserts neither re-grows its own copy |
+
+Findings 0, 1, 3, 4 are #208's own regressions; 2, 5, 6 predate it.
+Red-green verified for 0, 1, 5. Suite 1750 passed (1740 + 10), ruff clean.
+
+---
+
 # Autoresearch 2026-08-08 review — report defects + why the sweep can't trade
 
 Review of the weekly `taleb-autoresearch` run of Sat 2026-08-08 (25 experiments,

@@ -423,22 +423,7 @@ class HedgeResearchLoop:
         logger.info("=" * 60)
 
         # ── Step 0: Establish baseline ──
-        logger.info("[Experiment 0] Running baseline with current parameters...")
-        self.baseline_metric = self._run_experiment(self.baseline_params)
-        self.best_metric_value = self.baseline_metric
-        self._log_experiment(
-            experiment_id=0,
-            mutated_param="BASELINE",
-            old_value=0,
-            new_value=0,
-            metric_value=self.baseline_metric,
-            accepted=True,
-            params=self.baseline_params,
-        )
-        logger.info("[Experiment 0] Baseline %s: %.4f", self.primary_metric, self.baseline_metric)
-        # baseline_metric drifts upward as mutations are accepted; keep the
-        # seed's score for the sweep-quality verdict at save time.
-        seed_baseline = self.baseline_metric
+        seed_baseline = self.establish_baseline()
 
         # ── Main loop ──
         try:
@@ -512,6 +497,48 @@ class HedgeResearchLoop:
                 sweep_quality=self.sweep_quality(seed_baseline),
             )
 
+    def establish_baseline(self) -> float:
+        """Score the seed config as experiment 0 and return the SEED score.
+
+        One definition shared by both entrypoints — `run()`'s LOOP-FOREVER
+        mode and the weekly `runners/run_autoresearch.py` driver — the way
+        `sweep_quality()` already is. They previously kept byte-identical
+        copies of this block (down to a duplicated comment), and that is
+        exactly what produced the 2026-08-08 reporting defect: the loop's
+        copy kept `seed_baseline` correctly while the driver's report drifted
+        onto `self.baseline_metric`, which every acceptance overwrites. A
+        divergence that costs an operator a 14x-improvement readout should
+        not be reachable by editing one file and not the other.
+
+        The returned value is the SEED's score and never changes;
+        `self.baseline_metric` is the hill-climber's moving anchor. Callers
+        wanting "what did the status quo score" want this return value.
+        """
+        logger.info("[Experiment 0] Running baseline with current parameters...")
+        self.baseline_metric = self._run_experiment(self.baseline_params)
+        self.best_metric_value = self.baseline_metric
+        self._log_experiment(
+            experiment_id=0,
+            mutated_param="BASELINE",
+            old_value=0,
+            new_value=0,
+            metric_value=self.baseline_metric,
+            accepted=True,
+            params=self.baseline_params,
+        )
+        logger.info("[Experiment 0] Baseline %s: %.6f",
+                    self.primary_metric, self.baseline_metric)
+        if self.baseline_metric <= VETO_FITNESS:
+            # Issue #159: a vetoed status quo is a headline finding, and it
+            # flips the acceptance rule to the absolute floor
+            # (_evaluate_experiment).
+            logger.warning(
+                "SEED VETOED: the current config is disqualified on this "
+                "replay window. 'Beats seed' is meaningless this run — "
+                "mutations are accepted only with fitness > %g.",
+                self.vetoed_baseline_abs_floor)
+        return self.baseline_metric
+
     def run_single_experiment(self) -> dict:
         """
         Run a single experiment cycle. Useful for testing or
@@ -521,6 +548,37 @@ class HedgeResearchLoop:
         """
         self.experiment_number += 1
         mutated_params, param_name, old_val, new_val = self._propose_mutation()
+
+        # Every re-draw was a no-op (whole space pinned). Do NOT spend a
+        # replay on it (2026-08-10 review): on a stochastic eval path
+        # — synthetic GBM regenerated per cycle — re-scoring a config
+        # byte-identical to the seed returns a DIFFERENT fitness, and
+        # `_evaluate_experiment` accepts anything strictly better. That
+        # books pure resampling noise as an ACCEPTED improvement, raising
+        # best_metric_value and lowering plateau_share, so the run is
+        # stamped `informative` and the candidate JSON carries an inflated
+        # best_metric for a parameter set identical to the seed. Record it
+        # as the plateau it is and move on.
+        if mutated_params == self.baseline_params:
+            self._experiment_records.append(
+                {"accepted": False, "metric_value": self.baseline_metric},
+            )
+            self._log_experiment(
+                self.experiment_number, param_name, old_val, new_val,
+                self.baseline_metric, False, mutated_params,
+            )
+            return {
+                "experiment_id": self.experiment_number,
+                "param_mutated": param_name,
+                "old_value": old_val,
+                "new_value": new_val,
+                "metric": self.primary_metric,
+                "metric_value": self.baseline_metric,
+                "accepted": False,
+                "skipped_noop": True,
+                "best_so_far": self.best_metric_value,
+            }
+
         metric_value = self._run_experiment(mutated_params)
         accepted = self._evaluate_experiment(metric_value)
         self._experiment_records.append(
@@ -625,20 +683,38 @@ class HedgeResearchLoop:
         """Propose a mutation that actually changes the parameter set.
 
         Delegates to `_propose_mutation_once` and re-draws while the
-        proposal is a no-op (see `_MUTATION_ATTEMPTS`). If every attempt
-        is a no-op the last one is returned anyway and the caller still
-        gets a well-formed experiment — but we log it, because a landscape
-        where nothing can move is a finding, not a detail (Rule 12).
+        proposal is a no-op (see `_MUTATION_ATTEMPTS`). Returns
+        `(params, name, old, new)`; `params == self.baseline_params`
+        signals "every attempt was a no-op" and the CALLER must not spend a
+        replay re-scoring it (`run_single_experiment`).
+
+        Every discarded draw is counted in `self._pinned_draws`, keyed by
+        parameter (2026-08-10 review): a knob stuck against a
+        TUNABLE_RANGES bound used to announce itself in the sweep log as
+        `mutated x: 5.0000 -> 5.0000`, and that line is literally how the
+        2026-08-08 diagnosis was made. Silently re-rolling would delete the
+        only evidence that a range is mis-specified — the fix for wasted
+        experiments must not cost the signal that found them. The counts
+        reach the operator through `sweep_quality()`.
         """
-        for attempt in range(self._MUTATION_ATTEMPTS):
+        pinned = getattr(self, "_pinned_draws", None)
+        if pinned is None:
+            pinned = self._pinned_draws = {}
+        for _ in range(self._MUTATION_ATTEMPTS):
             params, name, old_value, new_value = self._propose_mutation_once()
             if params != self.baseline_params:
                 return params, name, old_value, new_value
+            pinned[name] = pinned.get(name, 0) + 1
+            logger.info(
+                "Discarded no-op mutation (%s %.4f -> %.4f): parameter is "
+                "pinned at a TUNABLE_RANGES bound or below its rounding "
+                "granularity — re-drawing.", name, old_value, new_value,
+            )
         logger.warning(
             "Mutation proposer produced a no-op %d times in a row (last: %s "
             "%.4f -> %.4f) — every sampled parameter is pinned at a range "
-            "bound or below its rounding granularity. Experiment %s will "
-            "re-measure the current config.",
+            "bound or below its rounding granularity. Experiment %s is "
+            "SKIPPED rather than re-measuring the current config.",
             self._MUTATION_ATTEMPTS, name, old_value, new_value,
             getattr(self, "experiment_number", "?"),
         )
@@ -682,9 +758,17 @@ class HedgeResearchLoop:
             primary, secondary = pair
             old_v1, new_v1 = self._mutate_one(params, primary)
             old_v2, new_v2 = self._mutate_one(params, secondary)
-            # We log the primary in the canonical fields; the secondary
-            # is appended to the descriptor so the TSV row reflects the
-            # joint move.
+            # The descriptor names both legs; the canonical old/new fields
+            # can carry only one. Report a leg that ACTUALLY MOVED (2026-08-10
+            # review): reporting the primary unconditionally printed
+            # `mutated a+b: 5.0000 -> 5.0000` whenever the primary was pinned
+            # and the secondary moved — the exact signature the no-op guard
+            # exists to eliminate, so the log claimed a defect that wasn't
+            # there while hiding which knob the accepted fitness came from.
+            # Both legs' resulting VALUES are still written to their own
+            # results.tsv columns either way; this only fixes old -> new.
+            if new_v1 == old_v1 and new_v2 != old_v2:
+                return (params, f"{primary}+{secondary}", old_v2, new_v2)
             return (params, f"{primary}+{secondary}",
                     old_v1, new_v1)
 
@@ -1132,11 +1216,30 @@ class HedgeResearchLoop:
                 f"fitness ({plateau_value:.6f}) — landscape flat on this "
                 f"replay window"
             )
+        # Pinned knobs (2026-08-10 review). `_propose_mutation` silently
+        # re-draws no-op proposals, which is right for the experiment budget
+        # but would otherwise delete the evidence that a TUNABLE_RANGES bound
+        # is mis-specified — before the re-draw existed, a pinned knob was
+        # visible as `mutated x: 5.0000 -> 5.0000` in the sweep log, and that
+        # line is how the 2026-08-08 diagnosis was made. Surface the counts
+        # here so the candidate file still carries the signal, and warn when
+        # one knob dominates the discards.
+        pinned_draws = dict(getattr(self, "_pinned_draws", {}) or {})
+        if pinned_draws:
+            worst, worst_n = max(pinned_draws.items(), key=lambda kv: kv[1])
+            if worst_n >= max(3, len(records) // 4):
+                warnings.append(
+                    f"'{worst}' was pinned on {worst_n} discarded draw(s) — "
+                    f"it sits on a TUNABLE_RANGES bound (or below its "
+                    f"rounding granularity) and never moved; the range is "
+                    f"likely mis-specified"
+                )
         return {
             "experiments": len(records),
             "accepted": n_accepted,
             "distinct_fitness": len(fitness_counts),
             "plateau_share": round(plateau_share, 3),
+            "pinned_draws": pinned_draws,
             "seed_baseline": seed_baseline,
             "seed_vetoed": seed_vetoed,
             "best": self.best_metric_value,

@@ -171,9 +171,21 @@ class TestProposeMutationNoOp:
         # Only the two IV-band params are reachable; `min` is pinned at its
         # low bound, so a downward step is a guaranteed no-op. The proposer
         # must re-draw until something actually moves.
+        #
+        # `random.choice` is driven explicitly (2026-08-10 review). Left to
+        # the unseeded stdlib RNG this test was BOTH randomly red — 105
+        # no-op returns per 20,000 constructions, ~1 CI failure in 190, on
+        # the repo's definition-of-done gate — and only ~50% effective at
+        # catching a reverted fix, since a lucky first pick passes without
+        # the retry. Forcing the pinned param for the first three draws
+        # makes it deterministic AND makes a revert fail every time.
         monkeypatch.setattr(HedgeResearchLoop, "TUNABLE_RANGES",
                             {"entry_iv_percentile_min": (5.0, 30.0),
                              "entry_iv_percentile_max": (20.0, 90.0)})
+        picks = iter(["entry_iv_percentile_min"] * 3
+                     + ["entry_iv_percentile_max"] * 8)
+        monkeypatch.setattr("runners.autoresearch_loop.random.choice",
+                            lambda seq: next(picks))
         loop = self._pinned_loop()
         # Always step downward — pins `min`, but `max` can still move down.
         monkeypatch.setattr(np.random, "normal", lambda *a, **k: -8.0)
@@ -181,6 +193,45 @@ class TestProposeMutationNoOp:
         assert params != loop.baseline_params, (
             f"proposer returned an unchanged param set ({name}: {old} -> {new})"
         )
+        assert name == "entry_iv_percentile_max"
+        # The discarded draws must be COUNTED, not silently dropped: that
+        # count is the only remaining evidence a range is mis-specified.
+        assert loop._pinned_draws == {"entry_iv_percentile_min": 3}
+
+    def test_joint_mutation_reports_the_leg_that_moved(self, monkeypatch):
+        # WHY (2026-08-10 review): `_propose_mutation_once` reports the
+        # PRIMARY leg in the canonical old/new fields, but the no-op guard
+        # tests the whole dict. With joint_mutation_prob = 0.20 live, a pair
+        # whose primary is pinned and whose secondary moves is a legitimate
+        # mutation — and it used to log `mutated a+b: 5.0000 -> 5.0000`, the
+        # exact signature the guard exists to eliminate, while hiding which
+        # knob the accepted fitness actually came from.
+        cfg = configparser.ConfigParser()
+        cfg.add_section("autoresearch")
+        cfg.set("autoresearch", "joint_mutation_prob", "1.0")
+        monkeypatch.setattr(HedgeResearchLoop, "TUNABLE_RANGES",
+                            {"entry_iv_percentile_min": (5.0, 30.0),
+                             "entry_iv_percentile_max": (20.0, 90.0)})
+        monkeypatch.setattr(HedgeResearchLoop, "JOINT_PAIRS",
+                            [("entry_iv_percentile_min",
+                              "entry_iv_percentile_max")])
+        monkeypatch.setattr("runners.autoresearch_loop.random.random", lambda: 0.0)
+        monkeypatch.setattr("runners.autoresearch_loop.random.choice",
+                            lambda seq: seq[0])
+        loop = self._pinned_loop(config=cfg)
+        # Downward step: `min` clamps back to its 5.0 low (no-op), `max`
+        # moves 21 -> 20 (its own low clamps the -8 step). The report must
+        # name the leg that moved.
+        monkeypatch.setattr(np.random, "normal", lambda *a, **k: -8.0)
+        params, name, old, new = loop._propose_mutation()
+        assert params != loop.baseline_params
+        assert name == "entry_iv_percentile_min+entry_iv_percentile_max"
+        assert old != new, (
+            f"joint mutation reported an unchanged leg ({name}: {old} -> {new}) "
+            f"— the '5.0000 -> 5.0000' signature the guard exists to remove"
+        )
+        assert (old, new) == (21.0, 20.0)
+        assert params["entry_iv_percentile_min"] == 5.0   # primary pinned
 
     def test_fully_pinned_space_warns_and_still_returns(self, monkeypatch, caplog):
         # Degenerate range (low == high == current) — nothing can ever move.
@@ -215,6 +266,151 @@ class TestProposeMutationNoOp:
 
 
 # ── the report's "Baseline:" line (2026-08-08 sweep) ──
+
+class TestNoOpExperimentIsSkipped:
+    """2026-08-10 review. When every re-draw is a no-op `_propose_mutation`
+    hands back a params dict equal to the seed. Re-scoring it is not
+    harmless: on a stochastic eval path (synthetic GBM regenerated per
+    cycle) the identical config returns a DIFFERENT fitness, and
+    `_evaluate_experiment` accepts anything strictly better — so pure
+    resampling noise gets booked as an ACCEPTED improvement, raising
+    best_metric_value and lowering plateau_share. The candidate JSON then
+    reports an inflated best_metric, and `informative: true`, for a
+    parameter set byte-identical to the seed."""
+
+    def _loop_returning_noop(self, eval_values):
+        it = iter(eval_values)
+        loop = _loop(
+            baseline_metric=-1000.0, best_metric_value=-1000.0,
+            baseline_params={"vega_limit": 4000.0},
+            best_params={"vega_limit": 4000.0},
+            hedger=SimpleNamespace(tunable_params={}),
+            experiment_number=0, _experiment_records=[],
+            vetoed_baseline_abs_floor=0.0, primary_metric="convexity_edge",
+        )
+        loop._propose_mutation = lambda: (
+            {"vega_limit": 4000.0}, "vega_limit", 4000.0, 4000.0)
+        loop._run_experiment = lambda p: next(it)
+        loop._log_experiment = lambda *a, **k: None
+        return loop
+
+    def test_noop_does_not_spend_a_replay(self):
+        # A replay is ~5 min of a 25-experiment weekly budget.
+        loop = self._loop_returning_noop([])   # StopIteration if called
+        result = loop.run_single_experiment()
+        assert result["skipped_noop"] is True
+        assert result["accepted"] is False
+
+    def test_noop_cannot_be_accepted_on_eval_noise(self):
+        # The eval would return a "better" score for the identical config.
+        loop = self._loop_returning_noop([-900.0])
+        result = loop.run_single_experiment()
+        assert result["accepted"] is False, (
+            "a no-op proposal was booked as an improvement — best_metric_value "
+            "now reflects resampling noise, not a parameter change"
+        )
+        assert loop.best_metric_value == -1000.0
+        assert loop.baseline_params == {"vega_limit": 4000.0}
+
+    def test_noop_is_recorded_as_a_plateau(self):
+        # It must still count as an experiment at the SEED's fitness, so
+        # sweep_quality's plateau_share reflects the wasted draw.
+        loop = self._loop_returning_noop([])
+        loop.run_single_experiment()
+        assert loop._experiment_records == [
+            {"accepted": False, "metric_value": -1000.0}]
+
+
+class TestSweepQualitySurfacesPinnedKnobs:
+    """2026-08-10 review: the no-op re-draw is right for the experiment
+    budget but must not cost the SIGNAL. Before it existed, a knob stuck on
+    a TUNABLE_RANGES bound announced itself in the sweep log as
+    `mutated x: 5.0000 -> 5.0000` — that line is how the 2026-08-08
+    diagnosis was made. Silently re-rolling would leave a mis-specified
+    range invisible in both the log and the candidate file."""
+
+    def _loop(self, pinned, n_records=8):
+        return _loop(
+            _experiment_records=[{"accepted": True, "metric_value": float(i)}
+                                 for i in range(n_records)],
+            best_metric_value=7.0, vetoed_baseline_abs_floor=0.0,
+            _pinned_draws=dict(pinned),
+        )
+
+    def test_pinned_counts_reach_the_candidate_file(self):
+        q = self._loop({"entry_iv_percentile_min": 3}).sweep_quality(-100.0)
+        assert q["pinned_draws"] == {"entry_iv_percentile_min": 3}
+
+    def test_dominant_pinned_knob_warns(self):
+        q = self._loop({"vega_limit": 5}).sweep_quality(-100.0)
+        assert any("vega_limit" in w and "pinned" in w for w in q["warnings"]), (
+            f"a knob pinned on 5 of 8 draws produced no warning: {q['warnings']}"
+        )
+        assert q["informative"] is False
+
+    def test_no_pinned_draws_is_silent(self):
+        q = self._loop({}).sweep_quality(-100.0)
+        assert q["pinned_draws"] == {}
+        assert not any("pinned" in w for w in q["warnings"])
+
+
+class TestEstablishBaselineIsShared:
+    """2026-08-10 review. The driver and `HedgeResearchLoop.run()` kept
+    byte-identical copies of the baseline/veto/seed_baseline block, and that
+    duplication IS what produced the 2026-08-08 defect: the loop's copy kept
+    `seed_baseline` correctly while the driver's report drifted onto
+    `self.baseline_metric`. One definition, called by both."""
+
+    def test_returns_the_seed_score_and_seeds_the_anchors(self):
+        loop = _loop(
+            baseline_params={"vega_limit": 4000.0}, primary_metric="net_pnl",
+            vetoed_baseline_abs_floor=0.0,
+        )
+        loop._run_experiment = lambda p: -2739.596064
+        logged = []
+        loop._log_experiment = lambda **kw: logged.append(kw)
+
+        seed = loop.establish_baseline()
+
+        assert seed == -2739.596064
+        assert loop.baseline_metric == seed
+        assert loop.best_metric_value == seed
+        assert logged and logged[0]["mutated_param"] == "BASELINE"
+        assert logged[0]["experiment_id"] == 0
+
+    def test_vetoed_seed_warns(self, caplog):
+        loop = _loop(
+            baseline_params={"vega_limit": 4000.0}, primary_metric="net_pnl",
+            vetoed_baseline_abs_floor=0.0,
+        )
+        loop._run_experiment = lambda p: -999999.0
+        loop._log_experiment = lambda **kw: None
+        with caplog.at_level("WARNING"):
+            loop.establish_baseline()
+        assert "SEED VETOED" in caplog.text
+
+    def test_both_entrypoints_call_it(self):
+        # The point of the extraction: neither caller may re-grow its own
+        # copy of the block. Both must route through the one definition.
+        import ast
+        import inspect
+        from runners import run_autoresearch as _driver
+
+        for mod, fn in ((_driver, "main"),
+                        (HedgeResearchLoop, "run")):
+            src = inspect.getsource(getattr(mod, fn))
+            tree = ast.parse(src.lstrip() if fn == "run" else src)
+            calls = {n.func.attr for n in ast.walk(tree)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)}
+            assert "establish_baseline" in calls, (
+                f"{fn} does not call establish_baseline — it has re-grown its "
+                f"own baseline block, the duplication that caused the defect"
+            )
+            assert "_run_experiment" not in calls or fn == "run", (
+                f"{fn} scores the baseline itself instead of delegating"
+            )
+
 
 class TestReportBaselineIsTheSeed:
     """The 2026-08-08 sweep printed `Baseline: -188.767916 / Best:
@@ -256,24 +452,38 @@ class TestReportBaselineIsTheSeed:
         # must read the captured seed, not loop.baseline_metric. A source
         # check (cf. the AST sweep in test_arbitrage) because the report
         # lives inline in main() and has no seam to assert on.
+        #
+        # Checks whole STATEMENTS, not f-string nodes (2026-08-10 review).
+        # The original filtered `ast.JoinedStr` only, so rewriting the line
+        # as `"  Baseline: %.6f" % loop.baseline_metric` or
+        # `"...".format(loop.baseline_metric)` — both idiomatic here, the
+        # adjacent logger.info calls already use %-style — reintroduced the
+        # defect with the test still green. Any statement mentioning
+        # "Baseline:" must not touch `.baseline_metric`, whatever the
+        # formatting style.
         import ast
         import inspect
         from runners import run_autoresearch as _mod
 
-        tree = ast.parse(inspect.getsource(_mod))
-        offenders = [
-            ast.dump(n) for n in ast.walk(tree)
-            if isinstance(n, ast.JoinedStr)
-            and any(isinstance(v, ast.Constant)
-                    and isinstance(v.value, str) and "Baseline:" in v.value
-                    for v in n.values)
-            and any(isinstance(a, ast.Attribute) and a.attr == "baseline_metric"
-                    for v in n.values for a in ast.walk(v))
-        ]
+        src = inspect.getsource(_mod)
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.stmt):
+                continue
+            segment = ast.get_source_segment(src, node) or ""
+            if "Baseline:" not in segment:
+                continue
+            # Only the statement's OWN text, not a nested block's.
+            if any(isinstance(c, ast.stmt) for c in ast.iter_child_nodes(node)):
+                continue
+            if any(isinstance(a, ast.Attribute) and a.attr == "baseline_metric"
+                   for a in ast.walk(node)):
+                offenders.append(segment.strip()[:160])
         assert not offenders, (
-            "the report's 'Baseline:' f-string reads loop.baseline_metric, "
-            "which drifts on every acceptance — use the captured "
-            "seed_baseline instead"
+            "a 'Baseline:' report statement reads loop.baseline_metric, which "
+            "drifts on every acceptance — use the captured seed_baseline "
+            f"instead. Offending statement(s): {offenders}"
         )
 
 

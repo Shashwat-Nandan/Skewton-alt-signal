@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import random
 from pathlib import Path
 
 import numpy as np
@@ -110,7 +111,11 @@ def main():
     parser.add_argument("--days", type=int, default=5,
                         help="Days per synthetic replay (default: 5)")
     parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducibility")
+                        help="Seed BOTH numpy and stdlib random. Reproduces "
+                             "the mutation path (which knob, joint-vs-single, "
+                             "step size) for a captured-tape sweep; a "
+                             "synthetic-data run also regenerates its tape "
+                             "per cycle, so only the tape path is bit-stable.")
     parser.add_argument("--data", type=str, default=None,
                         help="Path to historical data CSV (from market_data/fetch_historical_data.py). "
                              "If omitted, uses synthetic data.")
@@ -128,7 +133,16 @@ def main():
     args = parser.parse_args()
 
     if args.seed is not None:
+        # BOTH generators (2026-08-10 review). numpy alone is not
+        # reproducibility: `_propose_mutation_once` picks WHICH knob to move
+        # with stdlib `random.choice` and decides joint-vs-single with
+        # `random.random()`, so an unseeded stdlib stream gives a different
+        # mutation path — and, because the no-op re-draw consumes a variable
+        # number of `np.random.normal` draws per experiment, it desynchronizes
+        # the numpy stream too. An operator re-running --seed to reproduce a
+        # weekly candidate before promoting it must get that candidate back.
         np.random.seed(args.seed)
+        random.seed(args.seed)
 
     # Load historical data if provided
     historical_data = None
@@ -338,23 +352,13 @@ def main():
     logger.info("Starting params: %s", json.dumps(hedger.tunable_params, indent=2))
     logger.info("=" * 60)
 
-    # Baseline
+    # Baseline. `establish_baseline` is the ONE definition, shared with
+    # HedgeResearchLoop.run() — this driver used to keep a byte-identical
+    # copy, and that duplication is what let the report drift onto the
+    # moving `loop.baseline_metric` while the loop kept the seed correctly.
+    # The return value is the SEED's score and never moves.
     logger.info("[0/%d] Baseline...", args.experiments)
-    loop.baseline_metric = loop._run_experiment(loop.baseline_params)
-    loop.best_metric_value = loop.baseline_metric
-    loop._log_experiment(0, "BASELINE", 0, 0, loop.baseline_metric, True, loop.baseline_params)
-    logger.info("[0/%d] Baseline %s = %.6f", args.experiments, args.metric, loop.baseline_metric)
-    if loop.baseline_metric <= VETO_FITNESS:
-        # Issue #159: a vetoed status quo is a headline finding, and it flips
-        # the acceptance rule to the absolute floor (_evaluate_experiment).
-        logger.warning(
-            "SEED VETOED: the current config is disqualified on this replay "
-            "window. 'Beats seed' is meaningless this run — mutations are "
-            "accepted only with fitness > %g.",
-            loop.vetoed_baseline_abs_floor)
-    # loop.baseline_metric drifts upward as mutations are accepted; keep
-    # the seed's score for the sweep-quality verdict below.
-    seed_baseline = loop.baseline_metric
+    seed_baseline = loop.establish_baseline()
     # Phase-3: per-session P&Ls of the CURRENT BEST config, refreshed on every
     # acceptance — feeds the validation bootstrap. Starts as the baseline's.
     best_cycle_pnls = list(getattr(loop, "_last_cycle_pnls", []) or [])
