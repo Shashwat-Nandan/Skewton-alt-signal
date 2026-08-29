@@ -1,5 +1,36 @@
 # Lessons
 
+## A ranked universe must not be allowed to forget an open position
+
+- 2026-08-28: the kalman pair runner rebuilt its universe mid-session; three
+  pairs that still held open AUG legs had dropped out of the ranked top-N, and
+  their state entries were simply discarded — **−₹77,989** left the book with no
+  trace. Two of the three were never touched by the fill bug being investigated
+  that day, so this was an independent defect that only surfaced because the
+  book was being audited line by line for another reason.
+- Cause: `build_strategies` builds from today's top-N candidates and
+  `write_state_file` serializes exactly those. Nothing anywhere asked whether a
+  dropped pair still held a position.
+- The bias is one-directional and therefore worse than it looks: a pair that has
+  been *losing* is precisely the one that falls out of a rank-ordered universe,
+  so the book silently sheds its losers and flatters itself.
+- Fix: `carry_open_positions()` rebuilds and restores any prior pair holding a
+  position, and the caller adds it to `entry_block` — managed to an EXIT only,
+  never a new entry, since it is not in today's universe on merit. Chose that
+  over force-flattening at the rebuild: closing a position because its pair
+  slipped in a ranking is a trade the strategy never asked for.
+- Two secondary changes are what make it real rather than nominal: the bhavcopy
+  panel now spans carried symbols (without their columns `build_strategies`
+  skips them and every carry-over orphans — the fix would have been *inert in
+  production*), and `write_state_file(extra_blobs=)` preserves the blob of a
+  pair that cannot be rebuilt, logged CRITICAL.
+- Takeaway: **whenever a working set is derived from a ranking, a filter, or a
+  top-N cut, ask what happens to the members that fall out while still holding
+  state.** The dangerous case is never the entry into the set, it is the exit.
+  And when a fix depends on a *derived* input (a panel, a symbol list, a cache
+  key) also containing the new case, check that input — a fix that silently
+  no-ops in production still passes all its unit tests.
+
 ## Resolve a fill's leg by the contract it was OPENED in, not the current front month
 
 - 2026-08-28: `BHARTIARTL/COALINDIA` in the kalman paper book reported

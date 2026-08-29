@@ -190,11 +190,17 @@ def build_strategies(pairs: pd.DataFrame, panel: pd.DataFrame, nfo: List[dict],
 # ──────────────────────────────────────────────────────────────────
 # State persistence + EOD (mirror run_paper_pairs)
 # ──────────────────────────────────────────────────────────────────
-def write_state_file(strategies, log: logging.Logger, *, archive: bool = True) -> None:
+def write_state_file(strategies, log: logging.Logger, *, archive: bool = True,
+                     extra_blobs: Optional[List[Dict]] = None) -> None:
     """Atomic, power-loss-safe persist (write tmp → fsync → rename → fsync dir),
     then a timestamped backup ring so a corrupted file is recoverable (parity
     with run_paper_pairs). `archive=False` for the per-tick intraday persist so
-    the 30-slot ring isn't churned every minute."""
+    the 30-slot ring isn't churned every minute.
+
+    `extra_blobs` are prior-session state blobs carried through verbatim: pairs
+    that hold an OPEN position but could not be rebuilt this session. Persisting
+    only `strategies` is what silently erased three open books on 2026-08-28
+    when the universe was rebuilt (tasks/todo.md 2026-08-29)."""
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
     payload = {
         "system": SYSTEM, "mode": "paper",
@@ -206,6 +212,10 @@ def write_state_file(strategies, log: logging.Logger, *, archive: bool = True) -
         except Exception as e:
             log.exception("serialize_state failed for %s/%s: %s",
                           s.symbol_a, s.symbol_b, e)
+    live = {tuple(b.get("pair", ())) for b in payload["pairs"]}
+    for blob in extra_blobs or []:
+        if tuple(blob.get("pair", ())) not in live:
+            payload["pairs"].append(blob)
     durable_write_text(STATE_PATH, json.dumps(payload, default=str, indent=2))
     if archive:
         archive_state_backup(STATE_PATH, log)
@@ -227,6 +237,78 @@ def load_prior_state(log: logging.Logger) -> Dict[str, Dict]:
         return {}
     return {f"{b['pair'][0]}/{b['pair'][1]}": b
             for b in payload.get("pairs", []) if len(b.get("pair", [])) == 2}
+
+
+def open_position_symbols(prior: Dict[str, Dict]) -> set:
+    """Underlyings named by prior state blobs that hold an OPEN position."""
+    out = set()
+    for blob in prior.values():
+        st = blob.get("state") or {}
+        if st.get("position", "FLAT") != "FLAT" and st.get("legs"):
+            out.update(blob.get("pair", ()))
+    return out
+
+
+def carry_open_positions(strategies, prior: Dict[str, Dict], panel: pd.DataFrame,
+                         nfo: List[dict], kite, config_path: str, today: date,
+                         log: logging.Logger):
+    """Keep managing any prior pair that holds an OPEN position but has dropped
+    out of today's ranked universe.
+
+    The runner rebuilds `strategies` from the top-N candidates every morning and
+    persists only those, so a pair that falls out while still holding legs was
+    simply erased — on 2026-08-28 that removed three open books and −₹77,989
+    from the record. The bias is one-directional: a pair that has been losing is
+    exactly the one that drops out of a rank-ordered universe.
+
+    Carried pairs are rebuilt and restored so they can be managed to an exit;
+    NEW entries are blocked for them by the caller (they are not in today's
+    universe on merit). A pair that cannot be rebuilt — gone from the panel, no
+    front-month contract — is returned as an orphan blob to be persisted
+    verbatim and surfaced CRITICAL, never dropped (Rule 12).
+
+    Returns (carried_strategies, orphan_blobs).
+    """
+    live = {f"{s.symbol_a}/{s.symbol_b}" for s in strategies}
+    stale_open = {
+        k: b for k, b in prior.items()
+        if k not in live
+        and (b.get("state") or {}).get("position", "FLAT") != "FLAT"
+        and (b.get("state") or {}).get("legs")
+    }
+    if not stale_open:
+        return [], []
+
+    carried, orphans = [], []
+    for key, blob in sorted(stale_open.items()):
+        a, b = blob["pair"]
+        one = pd.DataFrame({"symbol_a": [a], "symbol_b": [b]})
+        try:
+            built = build_strategies(one, panel, nfo, kite, config_path, today, log)
+        except Exception as e:
+            log.warning("[%s] carry-over rebuild failed: %s", key, e)
+            built = []
+        if not built:
+            log.critical(
+                "[%s] holds an OPEN position but dropped out of the universe and "
+                "could NOT be rebuilt (not in the panel, or no front-month "
+                "contract). Its state is preserved as-is and it will NOT be "
+                "managed this session. OPERATOR: square off manually.", key)
+            orphans.append(blob)
+            continue
+        s = built[0]
+        try:
+            s.restore_state(blob)
+        except Exception as e:
+            log.exception("[%s] carry-over restore failed: %s — preserving blob",
+                          key, e)
+            orphans.append(blob)
+            continue
+        log.warning(
+            "[%s] carried over: holds %s but is no longer in the top-N universe. "
+            "Managed to EXIT only; new entries blocked.", key, s.state.position)
+        carried.append(s)
+    return carried, orphans
 
 
 def restore_matching(strategies, prior: Dict[str, Dict],
@@ -699,10 +781,23 @@ def main() -> int:
     nfo = kite.instruments("NFO") or []
     log.info("Prefetched %d NFO rows", len(nfo))
 
-    panel_symbols = sorted(set(pairs["symbol_a"]) | set(pairs["symbol_b"]))
+    prior = load_prior_state(log)
+    # The panel must also span pairs that hold an OPEN position but have fallen
+    # out of today's universe — without their columns carry_open_positions can't
+    # rebuild them and they'd all orphan. load_front_month_panel drops symbols
+    # under min_coverage before its dropna, so a genuinely gappy carry-over is
+    # excluded rather than truncating the panel for everyone.
+    panel_symbols = sorted(set(pairs["symbol_a"]) | set(pairs["symbol_b"])
+                           | open_position_symbols(prior))
     panel = load_front_month_panel(panel_symbols, min_coverage=0.5)
     strategies = build_strategies(pairs, panel, nfo, kite, config_path, today, log)
-    restore_matching(strategies, load_prior_state(log), log)
+    restore_matching(strategies, prior, log)
+    # A pair that dropped out of today's ranked universe while still holding a
+    # position must keep being managed to an exit — persisting only the top-N is
+    # what erased three open books on 2026-08-28. Carried pairs are exit-only.
+    carried, orphan_blobs = carry_open_positions(
+        strategies, prior, panel, nfo, kite, config_path, today, log)
+    strategies.extend(carried)
     catch_up_filters(strategies, panel, today, log)
     warn_if_gate_stale(strategies, log)   # #65: loud once-per-restart stale signal
 
@@ -720,6 +815,9 @@ def main() -> int:
     # Entry suppression near front-month expiry (issue #70). Expiries are static
     # for the session, so resolve the suppressed set once. Held pairs still exit.
     entry_block = entry_suppressed(strategies, nfo, today, args.entry_cutoff_days)
+    # Carried-over pairs are managed to EXIT only: they are not in today's
+    # universe on merit, so they must never open a NEW position.
+    entry_block |= set(carried)
     if args.entry_cutoff_days > 0:
         log.info("Entry cutoff armed: %dd before front-month expiry; suppressed "
                  "today: %s", args.entry_cutoff_days,
@@ -740,7 +838,8 @@ def main() -> int:
         if heartbeat.record_tick(ran, errored):
             log.critical("Silent-fail threshold hit — exiting non-zero.")
             return 1
-        write_state_file(strategies, log, archive=False)  # crash-safe intraday persist
+        write_state_file(strategies, log, archive=False,
+                         extra_blobs=orphan_blobs)  # crash-safe intraday persist
         sleep_until(min(datetime.now() + timedelta(seconds=TICK_SECONDS), end_ts), log)
 
     # Session close: flatten any expiring/expired leg first (so state + EOD
@@ -758,7 +857,7 @@ def main() -> int:
                       "before exiting non-zero so the operator is alerted")
     warn_if_long_break(strategies, today, holidays, log)
     step_filters_on_close(strategies, today, log)
-    write_state_file(strategies, log)
+    write_state_file(strategies, log, extra_blobs=orphan_blobs)
     write_eod_sidecar(strategies, today, log)
     if expiry_error is not None:
         raise expiry_error

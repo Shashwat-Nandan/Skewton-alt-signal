@@ -95,11 +95,26 @@ from the book:
 
 This is independent of the fill bug (M&M/EICHERMOT and INFY/ADANIPORTS were
 never corrupted) and it biases the book optimistic, since a pair that has been
-losing is exactly the one that falls out of a rank-ordered universe. Fixing it
-means either retaining state for out-of-universe pairs that hold a position, or
-force-flattening them at the rebuild. Both change runner behaviour on a
-money-affecting path, so it is left for an explicit decision rather than folded
-into this repair.
+losing is exactly the one that falls out of a rank-ordered universe.
+
+**Fixed** (PR #214). Retaining and managing beat force-flattening: closing a
+position because its pair slipped in a ranking is a trade the strategy never
+asked for. `carry_open_positions()` rebuilds and restores any prior pair that
+holds an open position but is no longer in the top-N, and the caller adds it to
+`entry_block` — it is managed to an EXIT only, never to a new entry, since it is
+not in today's universe on merit. Two supporting changes are what make that real
+rather than nominal:
+
+- `panel_symbols` now unions in `open_position_symbols(prior)`. Without the
+  carried pair's columns `build_strategies` skips it ("not in bhavcopy panel")
+  and every carry-over would orphan — the fix would have been inert in
+  production, which is exactly how the 08-28 loss went unnoticed.
+- `write_state_file(..., extra_blobs=)` persists the blob of a pair that cannot
+  be rebuilt (gone from the panel, no front-month contract) verbatim, logged
+  CRITICAL for manual square-off. Serializing only the live strategies is the
+  same silent truncation one layer down.
+
+Red-green verified on all five tests.
 
 ## Reconciliation basis
 AUG futures cash-settle at the underlying spot close on expiry day (2026-08-27):

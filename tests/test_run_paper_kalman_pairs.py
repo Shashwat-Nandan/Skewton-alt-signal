@@ -522,3 +522,126 @@ def test_tick_one_halt_new_suppresses_entry_but_allows_exit():
     calls.clear()
     R.tick_one(s, R.logger, halt_new=False)
     assert "scan" in calls and "rehedge" in calls        # both run when not halted
+
+
+# ──────────────────────────────────────────────────────────────────
+# Universe churn must never silently drop an open position
+# ──────────────────────────────────────────────────────────────────
+def _prior_blob_with_open_position(tmp_path, today):
+    """A serialized state blob for CCC/DDD holding an open LONG_SPREAD."""
+    s, _ = _entered_strategy(tmp_path, today)
+    blob = s.serialize_state()
+    blob["pair"] = ["CCC", "DDD"]
+    return blob
+
+
+def test_open_position_survives_falling_out_of_the_universe(tmp_path):
+    """A pair that drops out of the ranked top-N while still holding a position
+    must keep being managed, not vanish.
+
+    The runner rebuilds `strategies` from the top-N candidates each morning and
+    `write_state_file` persists ONLY those, so on 2026-08-28 three pairs holding
+    open AUG legs were silently discarded when the universe was rebuilt at 15:26
+    — erasing −₹77,989 from the book. It biases the book optimistic in exactly
+    one direction, because a pair that has been losing is precisely the one that
+    falls out of a rank-ordered universe.
+    """
+    today = date(2026, 1, 1)
+    prior = {"CCC/DDD": _prior_blob_with_open_position(tmp_path, today)}
+    pairs = pd.DataFrame({"symbol_a": ["AAA"], "symbol_b": ["BBB"]})
+    kite = FakeKite({"NFO:AAA26JANFUT": 178.0, "NFO:BBB26JANFUT": 100.0})
+    built = R.build_strategies(pairs, _panel(), _nfo(), kite, _config(tmp_path),
+                               today, R.logger)
+    panel = _panel().rename(columns={"AAA": "CCC", "BBB": "DDD"})
+    panel = pd.concat([_panel(), panel], axis=1)
+    nfo = _nfo() + [
+        {"name": "CCC", "instrument_type": "FUT", "tradingsymbol": "CCC26JANFUT",
+         "expiry": "2026-01-29", "lot_size": 50, "instrument_token": 4},
+        {"name": "DDD", "instrument_type": "FUT", "tradingsymbol": "DDD26JANFUT",
+         "expiry": "2026-01-29", "lot_size": 40, "instrument_token": 5},
+    ]
+    kite.prices.update({"NFO:CCC26JANFUT": 178.0, "NFO:DDD26JANFUT": 100.0})
+
+    carried, orphans = R.carry_open_positions(
+        built, prior, panel, nfo, kite, _config(tmp_path), today, R.logger)
+
+    assert not orphans, "CCC/DDD is rebuildable, so it must be managed, not orphaned"
+    assert [f"{s.symbol_a}/{s.symbol_b}" for s in carried] == ["CCC/DDD"]
+    assert carried[0].state.position == "LONG_SPREAD", \
+        "the carried pair must come back holding its position, not flat"
+
+
+def test_flat_pair_leaving_the_universe_is_not_carried(tmp_path):
+    """Control side: only OPEN positions are carried. A pair that left the
+    universe holding nothing is correctly forgotten — otherwise the universe
+    would only ever grow."""
+    today = date(2026, 1, 1)
+    flat = _prior_blob_with_open_position(tmp_path, today)
+    flat["state"]["position"] = "FLAT"
+    flat["state"]["legs"] = []
+    pairs = pd.DataFrame({"symbol_a": ["AAA"], "symbol_b": ["BBB"]})
+    kite = FakeKite({"NFO:AAA26JANFUT": 178.0, "NFO:BBB26JANFUT": 100.0})
+    built = R.build_strategies(pairs, _panel(), _nfo(), kite, _config(tmp_path),
+                               today, R.logger)
+    carried, orphans = R.carry_open_positions(
+        built, {"CCC/DDD": flat}, _panel(), _nfo(), kite, _config(tmp_path),
+        today, R.logger)
+    assert carried == [] and orphans == []
+
+
+def test_unrebuildable_open_position_is_preserved_not_erased(tmp_path, caplog):
+    """If a carried pair cannot be rebuilt (gone from the panel, no front-month
+    contract), its state must still be PRESERVED verbatim and surfaced — never
+    dropped. Losing the record is how the loss goes unnoticed; the operator has
+    to be told a position exists that the runner cannot manage."""
+    import logging
+    today = date(2026, 1, 1)
+    prior = {"CCC/DDD": _prior_blob_with_open_position(tmp_path, today)}
+    pairs = pd.DataFrame({"symbol_a": ["AAA"], "symbol_b": ["BBB"]})
+    kite = FakeKite({"NFO:AAA26JANFUT": 178.0, "NFO:BBB26JANFUT": 100.0})
+    built = R.build_strategies(pairs, _panel(), _nfo(), kite, _config(tmp_path),
+                               today, R.logger)
+    # CCC/DDD is NOT in the panel and has no NFO rows → unrebuildable.
+    with caplog.at_level(logging.CRITICAL):
+        carried, orphans = R.carry_open_positions(
+            built, prior, _panel(), _nfo(), kite, _config(tmp_path), today,
+            R.logger)
+    assert carried == []
+    assert [o["pair"] for o in orphans] == [["CCC", "DDD"]], \
+        "an unmanageable open position must be preserved, not erased"
+    assert any("CCC/DDD" in r.message for r in caplog.records
+               if r.levelno >= logging.CRITICAL)
+
+
+def test_write_state_file_persists_orphaned_open_positions(tmp_path, monkeypatch):
+    """The preserved blob must actually reach disk. write_state_file serializes
+    only the live strategies, so without this an orphan is still erased on the
+    next persist — the same silent truncation, one layer down."""
+    today = date(2026, 1, 1)
+    monkeypatch.setattr(R, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(R, "STATE_PATH", tmp_path / "state.json")
+    orphan = _prior_blob_with_open_position(tmp_path, today)
+    s, _ = _entered_strategy(tmp_path, today)
+    R.write_state_file([s], R.logger, archive=False, extra_blobs=[orphan])
+
+    import json
+    payload = json.loads((tmp_path / "state.json").read_text())
+    pairs = [tuple(b["pair"]) for b in payload["pairs"]]
+    assert ("CCC", "DDD") in pairs, "orphaned open position was not persisted"
+    assert ("AAA", "BBB") in pairs
+
+
+def test_panel_symbols_span_carried_open_positions(tmp_path):
+    """The bhavcopy panel is built from today's top-N symbols. It must also span
+    pairs holding an open position that fell out of the universe — without their
+    columns build_strategies skips them ("not in bhavcopy panel"), so every
+    carry-over would orphan and the fix would be inert in production."""
+    today = date(2026, 1, 1)
+    open_blob = _prior_blob_with_open_position(tmp_path, today)
+    flat = _prior_blob_with_open_position(tmp_path, today)
+    flat["pair"] = ["EEE", "FFF"]
+    flat["state"]["position"] = "FLAT"
+    flat["state"]["legs"] = []
+    prior = {"CCC/DDD": open_blob, "EEE/FFF": flat}
+    # Only the pair that still holds legs pulls its symbols into the panel.
+    assert R.open_position_symbols(prior) == {"CCC", "DDD"}
