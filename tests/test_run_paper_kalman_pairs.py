@@ -645,3 +645,28 @@ def test_panel_symbols_span_carried_open_positions(tmp_path):
     prior = {"CCC/DDD": open_blob, "EEE/FFF": flat}
     # Only the pair that still holds legs pulls its symbols into the panel.
     assert R.open_position_symbols(prior) == {"CCC", "DDD"}
+
+
+def test_exposure_cap_knob_reaches_the_derived_config(tmp_path, monkeypatch):
+    """`_write_config` REPLACES the whole [kalman_pair_trading] section, so any
+    knob it does not write is silently dropped for the live paper runner even if
+    the operator set it in config.ini. A cap that cannot be armed is worse than
+    no cap — it reads as protection that isn't there.
+
+    Pins that the knob is (a) exposed on the CLI, (b) written into the derived
+    config, and (c) defaulted OFF so arming it stays an operator decision.
+    """
+    import configparser
+    monkeypatch.setattr(R, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(R, "CONFIG_PATH", str(tmp_path / "absent.ini"))
+
+    args = R.build_parser().parse_args([])
+    assert args.max_net_exposure_pct == 1.0, "cap must default to OFF"
+    cfg = configparser.ConfigParser()
+    cfg.read(R._write_config(args))
+    assert cfg.getfloat("kalman_pair_trading", "max_net_exposure_pct") == 1.0
+
+    armed = R.build_parser().parse_args(["--max-net-exposure-pct", "0.5"])
+    cfg2 = configparser.ConfigParser()
+    cfg2.read(R._write_config(armed))
+    assert cfg2.getfloat("kalman_pair_trading", "max_net_exposure_pct") == 0.5

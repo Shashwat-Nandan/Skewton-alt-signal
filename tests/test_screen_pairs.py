@@ -148,3 +148,94 @@ class TestHalfLife:
 
     def test_too_short_returns_inf(self):
         assert _half_life(np.array([1.0])) == float("inf")
+
+
+class TestBetaSignStability:
+    """A pair whose hedge ratio changes DIRECTION across the sample is not
+    cointegrated in any usable sense — the fit is re-estimating a relationship
+    that isn't there, and the "hedge" it produces points the wrong way for part
+    of the holding period.
+
+    Motivation (2026-08-29): of 28 pairs the three pair systems actually traded,
+    26 had a γ whose sign flipped across rolling windows — including 8/8 of the
+    pairs that were traded with both legs on the SAME side. `DRREDDY/HCLTECH`
+    ranged −10.01 to +1.69. The existing |β| ∈ [0.1, 10] guard passes all of
+    them, because it only ever looks at one full-sample fit.
+    """
+
+    def _panel(self, n=400, seed=3):
+        """STABLE: B tracks A with a fixed positive slope throughout.
+        FLIPPY: F's relationship to A reverses direction halfway through, so a
+        full-sample fit reports one slope the pair never actually held."""
+        rng = np.random.default_rng(seed)
+        a = np.cumsum(rng.normal(0, 1, n)) + 300.0
+        half = n // 2
+        flip = np.concatenate([0.8 * a[:half], -0.8 * a[half:] + 1.6 * a[half]])
+        return pd.DataFrame({
+            "A": a,
+            "STABLE": 0.8 * a + 25.0 + rng.normal(0, 0.4, n),
+            "FLIPPY": flip + 200.0 + rng.normal(0, 0.4, n),
+        }, index=pd.date_range("2025-01-01", periods=n, freq="D"))
+
+    def test_agreement_is_one_for_a_stable_hedge(self):
+        """Every rolling window agrees with the full-sample sign → 1.0."""
+        from core.screen_pairs import _beta_sign_agreement
+        p = self._panel()
+        assert _beta_sign_agreement(p, "STABLE", "A", window=120, step=10) == 1.0
+
+    def test_agreement_falls_when_the_hedge_reverses(self):
+        """The metric must actually detect a direction reversal, not just noise."""
+        from core.screen_pairs import _beta_sign_agreement
+        p = self._panel()
+        agree = _beta_sign_agreement(p, "FLIPPY", "A", window=120, step=10)
+        assert agree < 0.9, f"a reversing hedge scored {agree}, gate would not bite"
+
+    def test_agreement_is_nan_when_the_window_does_not_fit(self):
+        """Too little history to judge must read as NOT EVALUATED (nan), never as
+        a passing score — the persistent screener runs on ~130-day sub-windows."""
+        from core.screen_pairs import _beta_sign_agreement
+        import math
+        p = self._panel(n=60)
+        assert math.isnan(_beta_sign_agreement(p, "STABLE", "A", window=120, step=10))
+
+    def test_screeners_emit_the_diagnostic_column(self):
+        """The column must always be present even when the gate is off, so the
+        operator can pick a threshold from real data rather than guessing."""
+        p = _cointegrated_panel()
+        for df in (screen_pairs(p), screen_pairs_book(p)):
+            if df.empty:
+                continue
+            assert "beta_sign_agreement" in df.columns
+
+    def test_gate_is_inert_by_default(self):
+        """Default must not change the tradeable universe: this gate would drop
+        every one of the 59 live candidates at a zero-flip threshold, and the
+        static system's candidates feed a LIVE money runner. Arming it is an
+        operator decision."""
+        p = _cointegrated_panel()
+        assert len(screen_pairs(p)) == len(screen_pairs(p, min_beta_sign_agreement=0.0))
+
+    def test_gate_drops_pairs_below_the_threshold(self):
+        """With the gate armed and enough history to judge, a pair scoring below
+        the threshold is excluded."""
+        p = _cointegrated_panel(n=600)     # long enough for the 250d window
+        base = screen_pairs(p)
+        if base.empty:
+            pytest.skip("no cointegrated pairs in the synthetic panel")
+        assert base["beta_sign_agreement"].notna().any(), \
+            "panel must be long enough for the gate to be evaluated at all"
+        strict = screen_pairs(p, min_beta_sign_agreement=1.01)   # unreachable
+        assert len(strict) < len(base), "an armed gate must actually exclude pairs"
+
+    def test_unevaluable_pair_is_kept_but_counted(self, caplog):
+        """A pair whose stability window does not fit must be KEPT (a filter that
+        could not run must not masquerade as one that passed) — and said out
+        loud, so "0 dropped" is never mistaken for "all pairs are stable"."""
+        import logging
+        p = _cointegrated_panel(n=260)     # shorter than the 250d window + step
+        with caplog.at_level(logging.INFO):
+            df = screen_pairs(p, min_beta_sign_agreement=0.9)
+        if df.empty:
+            pytest.skip("no cointegrated pairs in the synthetic panel")
+        assert df["beta_sign_agreement"].isna().all()
+        assert any("could not be evaluated" in r.message for r in caplog.records)

@@ -376,6 +376,15 @@ class PairTradingStrategy(BaseStrategy):
         # smaller than the round-trip cost. Default 1.5× chosen to cut
         # marginal entries; set to 0.0 to disable the hurdle entirely.
         self.min_edge_multiplier = float(cfg.get("min_edge_multiplier", 1.5))
+        # Net-directional-exposure cap: |net notional| / gross notional at entry.
+        # Bounds the case where β<0 puts both legs on the same side, leaving the
+        # "pair" a leveraged directional basket with no offsetting leg — the
+        # z-score stop bounds spread divergence, not market drawdown. Across 31
+        # real open positions (2026-08-29) every same-side position scored 1.00
+        # while opposed ranged 0.03–0.31. Default 1.0 = OFF: this path carries
+        # LIVE money and the threshold is an operator decision. Net exposure is
+        # logged on every entry regardless, so it is visible before arming.
+        self.max_net_exposure_pct = float(cfg.get("max_net_exposure_pct", 1.0))
         # max_holding_days=7 emerged as the win-rate peak (82.6%) in both
         # in-sample and OOS sweeps — see data_cache/backtest_2026-05-08/
         # sweep_maxhold_*.csv. Tighter time stop (7d) frees the book to
@@ -1433,6 +1442,39 @@ class PairTradingStrategy(BaseStrategy):
             side_a, side_b = "BUY", ("SELL" if beta_sign > 0 else "BUY")
         else:
             side_a, side_b = "SELL", ("BUY" if beta_sign > 0 else "SELL")
+
+        # Net directional exposure of the structure we are about to open. With
+        # both legs on the same side (β<0) there is NO offsetting leg: the
+        # position is a leveraged directional basket, and the z-score stop bounds
+        # SPREAD divergence, not market drawdown. Across 31 real open positions
+        # from the baseline/persistent books (2026-08-29) every same-side
+        # position scored 1.00 while opposed positions ranged 0.03–0.31, so a cap
+        # between those separates them without naming leg direction.
+        # NOTE this system sizes by share-count β (raw-price spread A − βB), not
+        # dollar-weighted, so its opposed pairs do NOT net to ~0 the way the
+        # kalman system's do — pick the threshold from the logged values here,
+        # not from that system's.
+        sign_a = 1 if side_a == "BUY" else -1
+        sign_b = 1 if side_b == "BUY" else -1
+        # Recompute from the FINAL lots: the max_leg_notional clamp above rounds
+        # each leg to a whole lot with a floor of 1, which can shift the realized
+        # ratio away from the pre-clamp notionals.
+        final_a = qty_a * fut_a["lot_size"] * prices[self.symbol_a]
+        final_b = qty_b * fut_b["lot_size"] * prices[self.symbol_b]
+        gross = final_a + final_b
+        net = sign_a * final_a + sign_b * final_b
+        net_pct = abs(net) / gross if gross > 0 else 0.0
+        if net_pct > self.max_net_exposure_pct:
+            logger.info(
+                "%s/%s: entry skipped — net directional exposure ₹%.0f is %.0f%% "
+                "of ₹%.0f gross, over the %.0f%% cap (β=%.4f): this structure is "
+                "a directional basket, not a hedge",
+                self.symbol_a, self.symbol_b, net, 100 * net_pct, gross,
+                100 * self.max_net_exposure_pct, self.hedge_ratio,
+            )
+            return []
+        logger.info("%s/%s: entry net exposure ₹%.0f (%.0f%% of ₹%.0f gross)",
+                    self.symbol_a, self.symbol_b, net, 100 * net_pct, gross)
 
         rationale = (
             f"{direction} on {self.symbol_a}/{self.symbol_b} "

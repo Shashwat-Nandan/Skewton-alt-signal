@@ -1,5 +1,32 @@
 # Lessons
 
+## Answer a "should we ban X" question with the split, not the anecdote
+
+- 2026-08-29: asked whether to stop trading pairs whose legs are both long or
+  both short, on the observation that they all lost. Splitting every closed trade
+  across the three pair systems by the sign of its γ: same-side n=15 **+₹10,787**
+  (53% win), opposed n=43 **−₹232,464** (49% win), permutation p=**0.49**. The
+  pattern was not there; the ban would have forgone ₹10,787 and left the actual
+  losses — which sit in the *opposed* trades — untouched.
+- Where the impression came from: the two most VISIBLE same-side positions were
+  both bad (the ₹52.9cr-corrupted `BHARTIARTL/COALINDIA`, and the persistent
+  book's 0/2). Salience, not frequency.
+- But the instinct was still worth chasing, and the chase found two real defects
+  the P&L split could never have shown: same-side positions carry net/gross =
+  **1.00** directional exposure (opposed: 0.03–0.31), and **26 of 28** traded
+  pairs have a γ whose sign FLIPS across rolling windows (8/8 of same-side ones).
+- Takeaway: **when someone proposes banning a category, compute the category's
+  full P&L split before agreeing or disagreeing — and if the split is null, keep
+  looking, because the observation usually came from somewhere.** The useful
+  finding was structural (unhedged beta, unstable β), not statistical, and a
+  structural argument does not need the sample to be significant. Ship the
+  mechanism, let the operator pick the threshold, and say plainly which is which.
+- Corollary that nearly bit twice in one day: a gate is only real if it can be
+  reached in production. The kalman runner's `_write_config` REPLACES its whole
+  config section, so a knob not written there is silently dropped no matter what
+  config.ini says — the same shape as the panel-columns bug in [[the universe
+  carry-over fix]]. Both are now pinned by tests.
+
 ## A ranked universe must not be allowed to forget an open position
 
 - 2026-08-28: the kalman pair runner rebuilt its universe mid-session; three

@@ -1,3 +1,96 @@
+# Pair systems — hedge-direction stability gate + net-exposure cap — 2026-08-29
+
+Follow-up to the ₹52.9 crore reconciliation below. The question asked was whether
+to **stop trading pairs whose legs are both long or both short**. The evidence
+says no — but it pointed at two real defects, which are what got built.
+
+## Why the same-side ban was NOT implemented
+
+Same-side is the negative-γ branch (`beta_sign = -1`). Every closed trade across
+all three pair systems, split by the γ it was traded on:
+
+| | n | total | mean | win |
+|---|---|---|---|---|
+| SAME-side (γ<0) | 15 | **+₹10,787** | +719 | 8/15 (53%) |
+| OPPOSED (γ>0) | 43 | **−₹232,464** | −5,406 | 21/43 (49%) |
+
+Permutation test, 200k shuffles: **p = 0.49**. No effect — and same-side is
+marginally the *better* half, so the ban would have forgone +₹10,787. The
+impression most likely came from the two most visible same-side positions: the
+corrupted `BHARTIARTL/COALINDIA` (γ=−0.60), reconciled to −₹25,936, and the
+persistent book's 0/2 same-side record (−₹52,303). A rule fitted to 15 trades
+that fails its own significance test is exactly what this repo has been burned
+by before — see `feedback_no_promote_if_zero_trade_holdout`.
+
+## What IS wrong, and is now addressed
+
+**1. Same-side positions carry undisclosed market beta.** Across 31 real open
+positions, every same-side one scored net/gross = **1.00** while opposed ranged
+**0.03–0.31**. The live baseline `BHARTIARTL/COALINDIA` was ₹1,437,420 gross and
+₹1,437,420 **net long** — a leveraged directional basket, not a market-neutral
+pair. The z-score stop bounds *spread* divergence and does nothing about market
+drawdown.
+
+**2. The hedge ratio is not stable.** Of 28 pairs the systems actually traded,
+**26 had a γ whose sign flips** across rolling windows — including **8/8** of the
+same-side ones. `DRREDDY/HCLTECH` ranged −10.01 to +1.69. The |β| ∈ [0.1, 10]
+guard cannot see this: it reads one full-sample fit, which averages both regimes.
+
+## Shipped (PR #215)
+
+- `core/screen_pairs._beta_sign_agreement()` — fraction of rolling windows whose
+  β agrees in sign with the full-sample β. Emitted as the `beta_sign_agreement`
+  column by **both** screeners (shared `_pair_metrics_row`, so schema parity
+  holds), and gated by `min_beta_sign_agreement`. Returns nan when the window
+  does not fit; nan pairs are kept but counted and logged — a filter that could
+  not run must never pass as one that did.
+- Net-directional-exposure cap in **both** strategies: refuses an entry whose
+  |net notional| / gross notional exceeds `max_net_exposure_pct`, and logs net
+  exposure on **every** entry regardless, so the number is visible before anyone
+  arms anything.
+
+**Both default to OFF** (0.0 and 1.0). These paths feed a LIVE money runner and
+threshold selection is an operator decision — the mechanism is mine to build, the
+number is not. See `feedback_mc_floor_is_operator_decision`.
+
+## Operator steps to arm (not taken here)
+
+Re-screening the 2026-08-29 panel — 30 pairs pass the existing gates, median
+agreement 1.00, min 0.44:
+
+| `min_beta_sign_agreement` | pairs kept | same-side kept |
+|---|---|---|
+| 0.70 | 27 / 30 | 1 of 4 |
+| 0.80 | 25 / 30 | 1 of 4 |
+| **0.90** | **22 / 30** | **0 of 4** |
+
+**0.90 is the recommended starting point**: it removes every same-side pair for a
+structural reason rather than a P&L pattern, and still leaves 22 tradeable pairs.
+
+For the cap, any value in **(0.31, 1.0)** separates the two populations on real
+data; **0.50** gives headroom over the worst opposed position (0.31). Note the
+static system sizes by share-count β, so its opposed pairs do NOT net to ~0 the
+way the kalman system's do — pick per system from the logged values.
+
+Arming, per path:
+- kalman paper runner: `--max-net-exposure-pct 0.5` (its `_write_config`
+  REPLACES the whole `[kalman_pair_trading]` section, so a config.ini value is
+  silently dropped — a test now pins that the knob reaches the derived config).
+- static pair runners: `max_net_exposure_pct` under `[pair_trading]` in
+  config.ini (that section is absent from the template by existing convention).
+- screeners: pass `min_beta_sign_agreement` where the candidate CSVs are built.
+
+## Still open — deliberately not shipped
+
+The realised loss concentrates at the **extremes of |γ|**, not its sign: 13
+trades at |γ|<0.25 (leg B barely hedges) lost ₹88,564; 16 at |γ|>1.5 (leg B
+dominates) lost ₹173,094; the 21 in between made +₹75,648. The current guard
+admits [0.1, 10.0], which is very wide. But that came from slicing 58 trades
+several ways — it needs out-of-sample validation before it becomes a gate, not a
+promotion on the strength of one in-sample table.
+
+---
+
 # Kalman pairs — ₹52.9 crore phantom P&L on BHARTIARTL/COALINDIA — 2026-08-29
 
 **There was no COALINDIA share split.** The apparent "profit from Coal India

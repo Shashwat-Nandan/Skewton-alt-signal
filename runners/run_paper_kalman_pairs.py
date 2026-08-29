@@ -691,6 +691,7 @@ def _write_config(args) -> str:
         "min_edge_multiplier": str(args.min_edge_multiplier),
         "adf_gate_p": str(args.adf_gate_p),
         "adf_gate_window": str(args.adf_gate_window),
+        "max_net_exposure_pct": str(args.max_net_exposure_pct),
     }
     out = DATA_CACHE / "config_kalman_derived.ini"
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
@@ -732,6 +733,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="suppress NEW entries when the front-month future is "
                         "within this many calendar days of expiry (issue #70); "
                         "0 disables. Held positions still exit/flatten normally.")
+    p.add_argument("--max-net-exposure-pct", type=float, default=1.0,
+                   help="Refuse an entry whose |net notional| / gross notional "
+                        "exceeds this. A same-side (γ<0) structure scores 1.0 — "
+                        "it is a directional basket, not a hedge — while opposed "
+                        "pairs measured 0.03-0.31 on the real book. Default 1.0 "
+                        "= OFF; net exposure is logged on every entry either way.")
     p.add_argument("--candidates", default=str(CANDIDATES_PATH))
     p.add_argument("--force", action="store_true",
                    help="run even on a weekend/holiday (testing)")

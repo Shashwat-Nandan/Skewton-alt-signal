@@ -158,6 +158,17 @@ class KalmanPairStrategy(BaseStrategy):
         # min_edge_multiplier × round-trip cost. Without it the strategy churns
         # on cost-unworthy z-crossings (the 2026-05-13 bleed). 0 disables.
         self.min_edge_multiplier = float(cfg.get("min_edge_multiplier", 1.5))
+        # Net-directional-exposure cap: |net notional| / gross notional, where
+        # net signs each leg by its side. An opposed (γ>0) dollar-weighted pair
+        # nets to ~0; a SAME-side (γ<0) pair nets to 1.0 — it is a leveraged
+        # directional basket, not a hedge, and the z-score stop bounds spread
+        # divergence, not market drawdown. Measured on the live book 2026-08-29:
+        # baseline BHARTIARTL/COALINDIA held ₹1,437,420 gross and ₹1,437,420 NET
+        # long. Default 1.0 = OFF (admits even a fully directional pair) — the
+        # threshold is an operator decision, and the static twin of this book
+        # runs LIVE money. Net exposure is logged on every entry regardless, so
+        # it is visible before anyone arms it.
+        self.max_net_exposure_pct = float(cfg.get("max_net_exposure_pct", 1.0))
         mln = str(cfg.get("max_leg_notional", "")).strip()
         self.max_leg_notional: Optional[float] = float(mln) if mln else None
         if self.mode != "signals" and self.max_leg_notional is None:
@@ -648,6 +659,25 @@ class KalmanPairStrategy(BaseStrategy):
             txn_a, txn_b = "BUY", ("SELL" if beta_sign > 0 else "BUY")
         else:
             txn_a, txn_b = "SELL", ("BUY" if beta_sign > 0 else "SELL")
+        # Net directional exposure of the structure we are about to open.
+        sign_a = 1 if txn_a == "BUY" else -1
+        sign_b = 1 if txn_b == "BUY" else -1
+        notional_a = pa * self.lot_size_a * lots_a
+        notional_b = pb * self.lot_size_b * lots_b
+        gross = notional_a + notional_b
+        net = sign_a * notional_a + sign_b * notional_b
+        net_pct = abs(net) / gross if gross > 0 else 0.0
+        if net_pct > self.max_net_exposure_pct:
+            logger.info(
+                "[%s/%s] entry skipped: net directional exposure ₹%.0f is %.0f%% "
+                "of ₹%.0f gross, over the %.0f%% cap — this structure is a "
+                "directional basket, not a hedge (γ=%.4f)",
+                self.symbol_a, self.symbol_b, net, 100 * net_pct, gross,
+                100 * self.max_net_exposure_pct, self.hedge_ratio,
+            )
+            return []
+        logger.info("[%s/%s] entry net exposure ₹%.0f (%.0f%% of ₹%.0f gross)",
+                    self.symbol_a, self.symbol_b, net, 100 * net_pct, gross)
         self._last_risk_band = self._structure_risk_band(z, lots_a, pa)
         rationale = (f"{direction} z={z:.2f} γ={self.hedge_ratio:.4f} "
                      f"({self.model} Kalman)")

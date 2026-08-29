@@ -213,6 +213,43 @@ def _choose_direction(panel: pd.DataFrame, raw_a: str, raw_b: str):
     return raw_b, raw_a, fit_ba, er_ba
 
 
+BETA_SIGN_WINDOW_DAYS = 250
+BETA_SIGN_STEP_DAYS = 5
+
+
+def _beta_sign_agreement(panel: pd.DataFrame, a: str, b: str, *,
+                         window: int = BETA_SIGN_WINDOW_DAYS,
+                         step: int = BETA_SIGN_STEP_DAYS) -> float:
+    """Fraction of rolling windows whose OLS slope has the SAME SIGN as the
+    full-sample slope. 1.0 = the hedge never changes direction.
+
+    A pair whose β flips sign is not cointegrated in any usable sense: the fit is
+    re-estimating a relationship that isn't there, and the "hedge" points the
+    wrong way for part of any holding period. The |β| guard cannot see this — it
+    reads a single full-sample fit, which is an average over both regimes.
+
+    Measured 2026-08-29: of 28 pairs the three pair systems actually traded, 26
+    flipped sign across rolling windows (8/8 of those traded with both legs on
+    the same side); `DRREDDY/HCLTECH` ranged −10.01 to +1.69. All passed |β|.
+
+    Returns nan when the window does not fit the panel — NOT EVALUATED, never a
+    passing score. `screen_pairs_persistent` screens ~130-day sub-windows, so a
+    250-day stability window cannot be judged there; arming the gate for that
+    path means lowering `beta_sign_window_days` too.
+    """
+    if a not in panel.columns or b not in panel.columns:
+        return float("nan")
+    y, x = panel[a].values, panel[b].values
+    if len(x) < window + step:
+        return float("nan")
+    betas = [_hedge_ratio(y[i:i + window], x[i:i + window])
+             for i in range(0, len(x) - window, step)]
+    if len(betas) < 5:
+        return float("nan")
+    full = _hedge_ratio(y, x)
+    return float(np.mean(np.sign(betas) == np.sign(full)))
+
+
 def _pair_metrics_row(panel: pd.DataFrame, a: str, b: str, *, beta: float,
                       intercept: float, error_ratio: float, p_value: float,
                       correlation: float):
@@ -242,6 +279,10 @@ def _pair_metrics_row(panel: pd.DataFrame, a: str, b: str, *, beta: float,
         "symbol_b": b,
         "correlation": correlation,
         "hedge_ratio": beta,
+        # Direction-stability of the hedge across rolling windows (see
+        # _beta_sign_agreement). Always emitted so a threshold can be chosen
+        # from real data; the gate itself is off unless armed.
+        "beta_sign_agreement": _beta_sign_agreement(panel, a, b),
         "intercept": intercept,
         "error_ratio": error_ratio,
         "coint_pvalue": float(p_value),
@@ -277,6 +318,7 @@ def screen_pairs(
     min_correlation: float = 0.5,
     min_hedge_ratio: float = 0.1,
     max_hedge_ratio: float = 10.0,
+    min_beta_sign_agreement: float = 0.0,
 ) -> pd.DataFrame:
     """
     Run pairwise Engle-Granger cointegration and return one row per
@@ -291,6 +333,25 @@ def screen_pairs(
     `strategies.pair_trading.HEDGE_RATIO_MIN`/`HEDGE_RATIO_MAX` so the
     output CSV is always consumable by that strategy without further
     filtering on the consumer side.
+
+    Hedge-direction-stability filter: skip pairs whose `beta_sign_agreement`
+    (fraction of rolling windows agreeing in sign with the full-sample β) is
+    below `min_beta_sign_agreement`. **Default 0.0 = OFF**, so the tradeable
+    universe is unchanged unless the operator arms it — the static system's
+    candidates feed a LIVE money runner. The diagnostic column is emitted
+    regardless, so a threshold can be chosen from real data rather than guessed.
+
+    Reference points, re-screening the 2026-08-29 panel (30 pairs pass the
+    existing coint/|β| gates; median agreement 1.00, min 0.44):
+        ≥0.70 → 27 pairs, 1 of 4 same-side survives
+        ≥0.80 → 25 pairs, 1 of 4 same-side survives
+        ≥0.90 → 22 pairs, 0 same-side survive
+    Note a *stricter* zero-flip criterion on a shorter 120-day window dropped
+    every pair, so the window and threshold have to be chosen together — this is
+    a graded score, not a binary "is cointegrated".
+    Pairs whose window does not fit (nan) are NOT dropped, but are counted and
+    logged — a filter that cannot be evaluated must not silently pass as one
+    that was.
     """
     symbols = panel.columns.tolist()
     n_pairs = len(symbols) * (len(symbols) - 1) // 2
@@ -300,6 +361,8 @@ def screen_pairs(
     corr = panel.corr().abs()
 
     skipped_beta = 0
+    skipped_sign = 0
+    unjudged = 0
     results = []
     for raw_a, raw_b in combinations(symbols, 2):
         if corr.loc[raw_a, raw_b] < min_correlation:
@@ -333,8 +396,20 @@ def screen_pairs(
         )
         if row is None:      # degenerate avg leg price
             continue
+        agree = row["beta_sign_agreement"]
+        if min_beta_sign_agreement > 0 and not (agree != agree):  # nan = not evaluated
+            if agree < min_beta_sign_agreement:
+                skipped_sign += 1
+                continue
+        elif min_beta_sign_agreement > 0:
+            unjudged += 1
         results.append(row)
 
+    if skipped_sign or unjudged:
+        logger.info(
+            "Hedge-direction gate (min_beta_sign_agreement=%.2f): dropped %d "
+            "pair(s); %d could not be evaluated (window did not fit) and were "
+            "kept", min_beta_sign_agreement, skipped_sign, unjudged)
     if skipped_beta:
         logger.info("Skipped %d pair(s) with |β| outside [%.2f, %.2f]",
                     skipped_beta, min_hedge_ratio, max_hedge_ratio)
@@ -366,6 +441,7 @@ def screen_pairs_book(
     min_hedge_ratio: float = 0.1,
     max_hedge_ratio: float = 10.0,
     rank_by: str = "npd",
+    min_beta_sign_agreement: float = 0.0,
 ) -> pd.DataFrame:
     """Pair selection per Palomar Ch.15 §15.4 — the KALMAN system's selection,
     deliberately distinct from `screen_pairs`' composite ranking (which the static
@@ -379,6 +455,11 @@ def screen_pairs_book(
          (the static system's p-value/half-life/vol score). The A/B showed pure
          NPD ranking over-trades low-vol pairs on NIFTY, so "composite" keeps the
          book's NPD DISCOVERY but the vol-aware ranking that beats costs.
+    `min_beta_sign_agreement` gates on hedge-direction stability exactly as in
+    `screen_pairs` (default 0.0 = OFF; see that docstring). The kalman system
+    fits γ on LOG prices while this screen fits raw, but the sign-agreement
+    measured either way was identical across the 2026-08-29 universe.
+
     Output columns match `screen_pairs` (downstream unchanged) plus `npd`;
     rank_score follows `rank_by` so existing `.sort_values('rank_score')`
     consumers get the chosen order. See tasks/kalman-pairs-rebase-plan.md."""
@@ -396,6 +477,8 @@ def screen_pairs_book(
                 len(candidates), len(npds))
 
     results = []
+    skipped_sign = 0
+    unjudged = 0
     for a0, b0, npd in candidates:
         # Same Error-Ratio direction choice + per-pair metrics as screen_pairs
         # (shared helpers — parity guaranteed). Book differs only in the NPD
@@ -420,8 +503,21 @@ def screen_pairs_book(
         )
         if row is None:      # degenerate avg leg price
             continue
+        agree = row["beta_sign_agreement"]
+        if min_beta_sign_agreement > 0:
+            if agree != agree:                     # nan = not evaluated
+                unjudged += 1
+            elif agree < min_beta_sign_agreement:
+                skipped_sign += 1
+                continue
         row["npd"] = npd
         results.append(row)
+    if skipped_sign or unjudged:
+        logger.info(
+            "screen_pairs_book: hedge-direction gate "
+            "(min_beta_sign_agreement=%.2f) dropped %d pair(s); %d could not be "
+            "evaluated (window did not fit) and were kept",
+            min_beta_sign_agreement, skipped_sign, unjudged)
     if not results:
         logger.warning("screen_pairs_book: no pairs passed NPD prescreen + "
                        "coint p<%.3f", p_threshold)

@@ -155,6 +155,7 @@ def make_strategy(
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
     min_edge_multiplier: float = 1.5,
+    max_net_exposure_pct: float = 1.0,
     max_entry_z: float = 3.25,
     safety_buffer: float = 0.75,
     entry_dte_buffer_days: int = 1,
@@ -174,6 +175,7 @@ def make_strategy(
     s.max_entry_z = max_entry_z
     s.safety_buffer = safety_buffer
     s.min_edge_multiplier = min_edge_multiplier
+    s.max_net_exposure_pct = max_net_exposure_pct
     s.lookback_days = lookback_days
     s.lots_per_leg = lots_per_leg
     s.max_holding_days = max_holding_days
@@ -263,6 +265,7 @@ def backtest_one(
     lookback_days: int, max_holding_days: int, lots_per_leg: int,
     max_leg_notional: Optional[float] = None,
     min_edge_multiplier: float = 1.5,
+    max_net_exposure_pct: float = 1.0,
     max_entry_z: float = 3.25,
     safety_buffer: float = 0.75,
     entry_dte_buffer_days: int = 1,
@@ -300,6 +303,7 @@ def backtest_one(
         lookback_days=lookback_days, max_holding_days=max_holding_days,
         lots_per_leg=lots_per_leg, max_leg_notional=max_leg_notional,
         min_edge_multiplier=min_edge_multiplier,
+        max_net_exposure_pct=max_net_exposure_pct,
         max_entry_z=max_entry_z,
         safety_buffer=safety_buffer,
         entry_dte_buffer_days=entry_dte_buffer_days,

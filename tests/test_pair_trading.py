@@ -36,6 +36,7 @@ def _make_strategy(
     max_leg_notional=None,
     lots_per_leg: int = 1,
     min_edge_multiplier: float = 0.0,
+    max_net_exposure_pct: float = 1.0,
 ) -> PairTradingStrategy:
     """Build a PairTradingStrategy with __init__ bypassed — fully controllable for unit tests.
 
@@ -62,6 +63,7 @@ def _make_strategy(
     s.entry_dte_buffer_days = entry_dte_buffer_days
     s.max_leg_notional = max_leg_notional
     s.min_edge_multiplier = min_edge_multiplier
+    s.max_net_exposure_pct = max_net_exposure_pct
     s.total_capital = 500_000
     # H5: default cooldown disabled in unit tests so existing entry/exit
     # tests keep their pre-H5 behaviour. Cooldown-specific tests opt in by
@@ -319,6 +321,55 @@ class TestEntry:
         b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")
         assert a_leg.transaction_type == "SELL"
         assert b_leg.transaction_type == "BUY"
+
+    # ── Net-directional-exposure cap ────────────────────────────────
+    # Same-side legs (β<0) give a position with NO offset at all: measured
+    # across 31 real open positions from the baseline/persistent books
+    # (2026-08-29), every same-side position scored net/gross = 1.00 while
+    # opposed positions ranged 0.03–0.31. A cap in between separates them
+    # cleanly without naming leg direction as the criterion.
+
+    def _negative_beta_long_entry(self, s):
+        """The β<0 setup from test_negative_hedge_ratio_flips_leg_b_side."""
+        s._spread_history = [995.0, 1005.0] * 30      # mean 1000, std 5
+        s.kite.quote = lambda syms: (
+            {syms[0]: {"last_price": 80.0}} if "AAA" in syms[0]
+            else {syms[0]: {"last_price": 1800.0}}
+        )
+
+    def test_same_side_entry_has_no_offsetting_leg(self):
+        """Pins what the cap exists to bound: with both legs the same way the
+        position is a leveraged directional basket, not a hedge. The z-score stop
+        bounds SPREAD divergence and does nothing about market drawdown."""
+        s = _make_strategy(hedge_ratio=-0.5)
+        self._negative_beta_long_entry(s)
+        props = s.scan_and_propose()
+        assert len(props) == 2
+        assert all(p.transaction_type == "BUY" for p in props)
+        gross = sum(p.price * p.lot_size * p.quantity for p in props)
+        net = sum((1 if p.transaction_type == "BUY" else -1)
+                  * p.price * p.lot_size * p.quantity for p in props)
+        assert abs(net) / gross == pytest.approx(1.0)
+
+    def test_exposure_cap_blocks_a_fully_directional_entry(self):
+        """Armed, the cap refuses the same-side structure."""
+        s = _make_strategy(hedge_ratio=-0.5, max_net_exposure_pct=0.5)
+        self._negative_beta_long_entry(s)
+        assert s.scan_and_propose() == []
+
+    def test_exposure_cap_leaves_a_hedged_entry_alone(self):
+        """The same armed cap must still admit a genuinely opposed pair, or it is
+        just a global off-switch. Real opposed positions topped out at 0.31."""
+        s = _make_strategy(hedge_ratio=0.5, max_net_exposure_pct=0.5)
+        self._seed_priced_quotes(s, price_a=1000.0, price_b=2010.0)
+        assert len(s.scan_and_propose()) == 2
+
+    def test_exposure_cap_is_inert_by_default(self):
+        """Default must not change the tradeable book — this runner path carries
+        LIVE money. Arming the cap is an operator decision."""
+        s = _make_strategy(hedge_ratio=-0.5)
+        self._negative_beta_long_entry(s)
+        assert len(s.scan_and_propose()) == 2
 
     def test_negative_hedge_ratio_flips_leg_b_side(self):
         # With β<0, LONG_SPREAD wants both legs BUY (since "−β·B" with β<0 means +|β|·B)

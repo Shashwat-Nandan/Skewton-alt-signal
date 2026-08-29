@@ -650,3 +650,75 @@ def test_exit_that_leaves_legs_open_is_surfaced(caplog):
         strat.execute_proposals([half])
     assert any("did not reach FLAT" in r.message for r in caplog.records), \
         "a half-closed exit must be surfaced, not silently retried next tick"
+
+
+def _same_side_strategy(z, gamma=-0.5, cap=None):
+    """A γ<0 pair driven to a signal — both legs end up on the SAME side, so the
+    position carries net directional exposure equal to its GROSS notional."""
+    strat, quotes = _make()
+    if cap is not None:
+        strat.max_net_exposure_pct = cap
+    strat._gamma_today, strat._mu_today = gamma, 0.0
+    pa, pb = _push_z(strat, z)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    return strat, quotes, pa, pb
+
+
+def _net_and_gross(props, pa, pb):
+    px = {"PA_FUT": pa, "PB_FUT": pb}
+    net = sum((1 if p.transaction_type == "BUY" else -1)
+              * px[p.tradingsymbol] * p.lot_size * p.quantity for p in props)
+    gross = sum(px[p.tradingsymbol] * p.lot_size * p.quantity for p in props)
+    return net, gross
+
+
+def test_same_side_entry_carries_full_directional_exposure():
+    """Pins the risk the cap exists to bound: when γ<0 both legs go the same way,
+    so the 'pair' is a leveraged directional basket, not a hedge — its net
+    exposure equals 100% of gross. The z-score stop bounds SPREAD divergence and
+    does nothing about market drawdown. Measured on the live book 2026-08-29:
+    baseline BHARTIARTL/COALINDIA was ₹1,437,420 gross and ₹1,437,420 net long.
+    """
+    strat, _, pa, pb = _same_side_strategy(-3.0)
+    props = strat.scan_and_propose()
+    assert len(props) == 2
+    net, gross = _net_and_gross(props, pa, pb)
+    assert abs(net) / gross == pytest.approx(1.0), \
+        "a same-side pair should be fully directional — if not, the fixture is wrong"
+
+
+def test_opposed_entry_is_near_market_neutral():
+    """Control: γ>0 legs are opposed and dollar-weighted, so net exposure is a
+    small fraction of gross. The cap must not touch these."""
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    props = strat.scan_and_propose()
+    assert len(props) == 2
+    net, gross = _net_and_gross(props, pa, pb)
+    assert abs(net) / gross < 0.35, f"opposed pair netted {abs(net)/gross:.2f} of gross"
+
+
+def test_exposure_cap_blocks_a_fully_directional_entry():
+    """Armed, the cap refuses an entry whose net directional exposure exceeds the
+    limit — the same-side case, without banning same-side by name."""
+    strat, _, _, _ = _same_side_strategy(-3.0, cap=0.5)
+    assert strat.scan_and_propose() == []
+
+
+def test_exposure_cap_leaves_a_hedged_entry_alone():
+    """The same armed cap must still admit a genuinely hedged pair, or it is just
+    a global off-switch."""
+    strat, quotes = _make()
+    strat.max_net_exposure_pct = 0.5
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    assert len(strat.scan_and_propose()) == 2
+
+
+def test_exposure_cap_is_inert_by_default():
+    """Default must not change behaviour: this cap would block every same-side
+    entry, and the static system's twin feeds a LIVE money runner. Arming it is
+    an operator decision."""
+    strat, _, _, _ = _same_side_strategy(-3.0)
+    assert len(strat.scan_and_propose()) == 2
