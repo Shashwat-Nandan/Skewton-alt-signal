@@ -540,3 +540,113 @@ def test_paper_mode_requires_notional_cap(monkeypatch):
             lot_size_a=50, lot_size_b=50, training_a=pa, training_b=pb,
             quote_fn=lambda ts: None,
         )
+
+
+def test_rolled_leg_fill_is_booked_on_its_own_leg():
+    """A fill carrying the contract a leg was OPENED in must be booked on THAT
+    leg, even after the strategy has been re-seeded on the next front month.
+
+    Why this matters: exit proposals are built from `leg.tradingsymbol`, but the
+    runner re-seeds strategies on the current front month every morning. The old
+    `symbol_a if prop.tradingsymbol == self.tradingsymbol_a else symbol_b`
+    resolution missed for every leg-A fill after a roll and dumped it onto leg B.
+    On 2026-08-28 that applied ~₹1,892 BHARTIARTL fills against a ₹399 COALINDIA
+    leg and manufactured ₹528,705,886 of realized P&L on a pair that never closed
+    a trade. The tell is asymmetric: leg A is never touched while leg B's
+    entry_price drifts toward leg A's price.
+    """
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.scan_and_propose())
+    leg_a = next(l for l in strat.state.legs if l.symbol == "PA")
+    leg_b = next(l for l in strat.state.legs if l.symbol == "PB")
+    b_entry_before, b_qty_before = leg_b.entry_price, leg_b.quantity
+
+    # The overnight roll: the strategy is re-seeded on the NEXT month while the
+    # legs still hold the contracts they were opened in.
+    strat.tradingsymbol_a, strat.tradingsymbol_b = "PA_FUT_NEXT", "PB_FUT_NEXT"
+
+    # A fill for leg A's OWN (now off-front-month) contract.
+    close_a = strat._make_proposal(leg_a.tradingsymbol, leg_a.lot_size,
+                                   abs(leg_a.quantity), pa,
+                                   "SELL" if leg_a.quantity > 0 else "BUY", "exit A")
+    strat._apply_fill(close_a, pa)
+
+    # Leg A closed; leg B untouched — not the reverse.
+    assert not [l for l in strat.state.legs if l.symbol == "PA"], \
+        "leg A's own fill did not close leg A"
+    leg_b = next(l for l in strat.state.legs if l.symbol == "PB")
+    assert leg_b.quantity == b_qty_before
+    assert leg_b.entry_price == pytest.approx(b_entry_before), \
+        "leg B absorbed a leg-A fill — fills are misattributed across legs"
+
+
+def test_exit_is_refused_for_rolled_legs_rather_than_mispriced(caplog):
+    """When the held legs are no longer the contracts the strategy is seeded on,
+    an exit must be REFUSED, not booked at the front month's quote.
+
+    Closing a JAN leg at the FEB price books the calendar basis as P&L, so
+    run_paper_kalman_pairs deliberately strands rolled legs for manual square-off
+    (its `test_flatten_strands_rolled_leg_it_cannot_square`). Refusing at the
+    proposal layer keeps that policy AND stops the churn: check_and_rehedge
+    re-proposes the same exit every tick, which on 2026-08-28 ran ~263 times in a
+    single session.
+    """
+    import logging
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.scan_and_propose())
+    assert strat.state.position == "SHORT_SPREAD"
+
+    strat.tradingsymbol_a, strat.tradingsymbol_b = "PA_FUT_NEXT", "PB_FUT_NEXT"
+    quotes["PA_FUT_NEXT"], quotes["PB_FUT_NEXT"] = quotes["PA_FUT"], quotes["PB_FUT"]
+    pa, pb = _push_z(strat, -0.2)       # would otherwise MEAN_REVERT-exit
+    for k in ("PA_FUT", "PA_FUT_NEXT"):
+        quotes[k] = pa
+    for k in ("PB_FUT", "PB_FUT_NEXT"):
+        quotes[k] = pb
+
+    with caplog.at_level(logging.WARNING):
+        assert strat.check_and_rehedge() == []
+        # Second tick: still refused, but not re-logged (263 identical warnings
+        # is how the real incident buried itself).
+        assert strat.check_and_rehedge() == []
+    assert strat.state.position == "SHORT_SPREAD"   # left open for the operator
+    warns = [r for r in caplog.records if "exit refused" in r.message]
+    assert len(warns) == 1, f"expected exactly one refusal warning, got {len(warns)}"
+
+
+def test_unmappable_fill_raises_instead_of_defaulting_to_leg_b():
+    """A proposal whose tradingsymbol matches neither a held leg nor either
+    configured contract must RAISE, not silently land on leg B (Rule 12). The
+    old `if a else b` resolution had no failure mode at all, which is why the
+    roll bug booked ₹52.9 crore in silence."""
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.scan_and_propose())
+    stray = strat._make_proposal("WHO_KNOWS_FUT", 50, 1, 100.0, "SELL", "stray")
+    with pytest.raises(ValueError, match="cannot be mapped"):
+        strat._apply_fill(stray, 100.0)
+
+
+def test_exit_that_leaves_legs_open_is_surfaced(caplog):
+    """An exit that does not reach FLAT must be logged loudly. Without this the
+    strategy silently re-proposes the same exit on the next tick, forever: on
+    2026-08-28 a single mis-booked exit repeated ~263 times between 10:02 and
+    15:25, compounding a one-tick error into ₹52.9 crore."""
+    import logging
+    strat, quotes = _make()
+    pa, pb = _push_z(strat, 2.5)
+    quotes["PA_FUT"], quotes["PB_FUT"] = pa, pb
+    strat.execute_proposals(strat.scan_and_propose())
+    # Exit only leg A, leaving leg B open — a half-closed book.
+    leg_a = next(l for l in strat.state.legs if l.symbol == "PA")
+    half = strat._make_proposal(leg_a.tradingsymbol, leg_a.lot_size,
+                                abs(leg_a.quantity), pa, "BUY", "half exit")
+    with caplog.at_level(logging.WARNING):
+        strat.execute_proposals([half])
+    assert any("did not reach FLAT" in r.message for r in caplog.records), \
+        "a half-closed exit must be surfaced, not silently retried next tick"

@@ -216,6 +216,9 @@ class KalmanPairStrategy(BaseStrategy):
         self._session_start_realized = 0.0
         self._session_start_unrealized = 0.0
         self._pending_exit_reason: Optional[str] = None
+        # One-shot latch so a rolled-contract exit refusal is logged once,
+        # not on every tick of the session.
+        self._rolled_exit_warned = False
         self._last_risk_band: Optional[dict] = None
 
     # ──────────────────────────────────────────────────────────────────
@@ -572,6 +575,19 @@ class KalmanPairStrategy(BaseStrategy):
         elif not self.state.legs:
             self._record_close()
             self._reset_after_close()
+        else:
+            # A non-entry execution that left legs open is a HALF-CLOSED book.
+            # check_and_rehedge will re-propose the same exit on the next tick,
+            # so a silent one is a loop: on 2026-08-28 a mis-booked MAX_HOLD exit
+            # repeated ~263 times between 10:02 and 15:25 and compounded a
+            # one-tick error into ₹52.9 crore of phantom P&L. Surface it.
+            logger.warning(
+                "[%s/%s] exit did not reach FLAT — %d leg(s) still open (%s); "
+                "the same exit will be re-proposed next tick",
+                self.symbol_a, self.symbol_b, len(self.state.legs),
+                ", ".join(f"{l.tradingsymbol}:{l.quantity:+d}"
+                          for l in self.state.legs),
+            )
         return results
 
     def generate_eod_report(self) -> Dict:
@@ -642,8 +658,41 @@ class KalmanPairStrategy(BaseStrategy):
                                 pb, txn_b, rationale),
         ]
 
+    def _rolled_legs(self) -> List[str]:
+        """Held legs whose contract is no longer one this strategy is seeded on.
+
+        The runner re-seeds strategies on the current front month every morning
+        while restoring the legs held at entry, so after a contract roll the two
+        disagree."""
+        current = {self.tradingsymbol_a, self.tradingsymbol_b}
+        return [l.tradingsymbol for l in self.state.legs
+                if l.tradingsymbol not in current]
+
     def _build_exit_proposals(self, reason: str, z: float,
                               prices: Dict[str, float]) -> List[TradeProposal]:
+        # A rolled leg is priced from _observe_spread(), which quotes the CURRENT
+        # front month — closing a JAN leg at the FEB price books the calendar
+        # basis as P&L. Refuse; the runner's expiry re-check then strands the
+        # pair for manual square-off (run_paper_kalman_pairs finding 3).
+        #
+        # Refusing HERE, rather than letting the exit "execute" and not reach
+        # FLAT, is also what stops the churn: check_and_rehedge re-proposes the
+        # same exit every tick, and on 2026-08-28 that ran ~263 times in one
+        # session (tasks/todo.md 2026-08-29).
+        rolled = self._rolled_legs()
+        if rolled:
+            if not self._rolled_exit_warned:
+                logger.warning(
+                    "[%s/%s] %s exit refused: held leg(s) %s are not the "
+                    "contracts this strategy is seeded on (%s/%s) — closing them "
+                    "at the front month's quote would book the calendar basis. "
+                    "Position left open; OPERATOR must square off manually.",
+                    self.symbol_a, self.symbol_b, reason, ", ".join(rolled),
+                    self.tradingsymbol_a, self.tradingsymbol_b,
+                )
+                self._rolled_exit_warned = True
+            return []
+        self._rolled_exit_warned = False
         self._pending_exit_reason = reason
         rationale = f"EXIT ({reason}) z={z:.2f}"
         proposals = []
@@ -771,9 +820,39 @@ class KalmanPairStrategy(BaseStrategy):
         return prop.price * (1 + slip) if prop.transaction_type == "BUY" \
             else prop.price * (1 - slip)
 
+    def _leg_symbol_for(self, tradingsymbol: str) -> str:
+        """Map a proposal's tradingsymbol back to the underlying it belongs to.
+
+        HELD legs are consulted first, and that ordering is the whole point.
+        Exit proposals are built from `leg.tradingsymbol` — the contract that was
+        open at ENTRY — while the runner re-seeds the strategy on the current
+        front month every morning. After a roll the two disagree, and the old
+        `symbol_a if prop.tradingsymbol == self.tradingsymbol_a else symbol_b`
+        test failed for every leg-A fill and booked it onto leg B. On 2026-08-28
+        that applied ~₹1,892 BHARTIARTL fills against a ₹399 COALINDIA leg,
+        manufacturing ₹528,705,886 of realized P&L on a pair that never closed a
+        trade (tasks/todo.md 2026-08-29).
+
+        A tradingsymbol matching neither a held leg nor either configured
+        contract RAISES rather than defaulting to leg B: silently guessing the
+        leg is exactly the failure mode above (Rule 12).
+        """
+        for leg in self.state.legs:
+            if leg.tradingsymbol == tradingsymbol:
+                return leg.symbol
+        if tradingsymbol == self.tradingsymbol_a:
+            return self.symbol_a
+        if tradingsymbol == self.tradingsymbol_b:
+            return self.symbol_b
+        raise ValueError(
+            f"[{self.symbol_a}/{self.symbol_b}] fill for {tradingsymbol!r} "
+            f"cannot be mapped to a leg: held "
+            f"{[l.tradingsymbol for l in self.state.legs]}, configured "
+            f"{self.tradingsymbol_a!r}/{self.tradingsymbol_b!r}"
+        )
+
     def _apply_fill(self, prop: TradeProposal, fill_price: float) -> None:
-        symbol = self.symbol_a if prop.tradingsymbol == self.tradingsymbol_a \
-            else self.symbol_b
+        symbol = self._leg_symbol_for(prop.tradingsymbol)
         signed = prop.quantity if prop.transaction_type == "BUY" else -prop.quantity
 
         from strategies.taleb_karpathy import estimate_transaction_cost

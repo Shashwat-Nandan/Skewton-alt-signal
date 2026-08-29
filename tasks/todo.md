@@ -1,3 +1,113 @@
+# Kalman pairs — ₹52.9 crore phantom P&L on BHARTIARTL/COALINDIA — 2026-08-29
+
+**There was no COALINDIA share split.** The apparent "profit from Coal India
+price reduction" is one accounting bug that produced ₹528,705,886 of realized
+P&L on a pair that never closed a trade.
+
+## Evidence that rules out a corporate action
+- Equity bhavcopy, 611 sessions 2024-03-04 → 2026-08-28: ISIN `INE522F01014`
+  unchanged throughout; price continuously ₹350–530.
+- Exactly one close-over-close move > 12%: 2026-06-04 (−13.75%, election-result
+  day). NSE's own `PrvsClsgPric` matches the prior raw close on every session,
+  so NSE applied **no** adjustment factor — no split, bonus, or consolidation.
+- Zero open-vs-prev-close gaps > 12%. The STF front-month panel the strategy
+  actually trades is likewise continuous (₹397–430 through August).
+
+## Root cause — leg-symbol misattribution across a front-month roll
+`KalmanPairStrategy._apply_fill` resolved a fill's leg with
+
+```python
+symbol = self.symbol_a if prop.tradingsymbol == self.tradingsymbol_a else self.symbol_b
+```
+
+`_build_exit_proposals` builds proposals from **`leg.tradingsymbol`** — the
+contract held at entry. The runner rebuilds strategies on the **current front
+month** every morning. So on 2026-08-28 the strategy carried
+`tradingsymbol_a = BHARTIARTL26SEPFUT` while the restored legs were
+`BHARTIARTL26AUGFUT` / `COALINDIA26AUGFUT`. The equality test failed for **every**
+leg-A fill, and the `else` branch booked all of them onto **leg B (COALINDIA)** —
+a ₹1,892 BHARTIARTL fill applied against a ₹399 COALINDIA leg.
+
+Fingerprints, all confirmed in `data_cache/state_backups/`:
+- BHARTIARTL leg untouched the whole session (`entry_price` 1931.1651 identical
+  on 08-19 and 08-28) — no fill ever reached it.
+- COALINDIA `entry_price` 399.49965 → **1891.4046** — a running average
+  converging on BHARTIARTL's fill price.
+- COALINDIA `quantity` +1 → −1; `n_closed_trades` stuck at 1.
+
+The position entered 2026-08-19 hit `max_holding_days = 7` on 08-28, so
+`MAX_HOLD` fired **every tick**. Because both fills landed on leg B,
+`self.state.legs` was never empty, `_record_close()` never ran, the position
+never reached FLAT — and the exit re-fired ~263 times over 10:02→15:25.
+A standalone replay of the buggy arithmetic from the 08-19 state reproduces
+realized ₹5.29e8, costs ₹222k and `entry_price` 1891.4 at n≈263. Confirmed.
+
+The 2026-08-20→28 host outage is what set this up: it stranded an open AUG
+position across the 08-27 expiry, so the 08-28 restart was the first time the
+runner ran with a rolled front month over a live book.
+
+## Blast radius
+- `BHARTIARTL/COALINDIA`: realized ₹19,879 → **₹528,705,886**, costs ₹1,954 → ₹222,123.
+- `BHARTIARTL/EICHERMOT`: same bug, opposite sign — realized **−₹163,232,203**,
+  leg-B `entry_price` 1891.41 (also BHARTIARTL's fill price). Only ever written
+  to the 15:25 EOD sidecar, which the 15:26 rebuild overwrote; its state entry
+  was then dropped when the pair left the top-N universe.
+- Not contaminated: `state/strategy_decay.json` (reported_through 2026-06),
+  `dashboard.db` (holds no kalman-pair tables).
+
+## Honest book, with the phantom removed
+Kalman paper book 2026-06-29 → 08-28 is **−₹109,557**, not profitable.
+COALINDIA pairs net **+₹25,074** across five other runs — no Coal India edge exists.
+
+## Tasks
+- [x] Rule out a corporate action from raw bhavcopy (ISIN + adjustment factor).
+- [x] Reproduce the corruption arithmetic from the 08-19 state backup.
+- [x] Fix `_apply_fill` to resolve the leg from the **held** leg's tradingsymbol
+      (`_leg_symbol_for`), falling back to the configured front month, and
+      **raise** when neither matches instead of silently defaulting to leg B.
+- [x] Refuse an exit whose held legs are off-contract (`_rolled_legs`) instead of
+      pricing a JAN leg at the FEB quote. This preserves the existing strand
+      policy (`test_flatten_strands_rolled_leg_it_cannot_square`, finding 3) —
+      which the symbol fix alone would have silently overridden by letting the
+      flatten "succeed" — and it is what stops the per-tick churn at source.
+      Warning is latched so it logs once per session, not 263 times.
+- [x] Fail loud when a non-entry execution leaves legs open (the silent
+      263×-repeat that let a one-tick error compound into ₹52.9 crore).
+- [x] Regression tests: red-green verified on all four (4 failed on `main`'s
+      strategy file, 4 pass with the fix).
+- [x] Reconcile `kalman_pairs_runner_state.json` + `pair_paper_kalman_eod_2026-08-28.json`
+      by cash-settling the stranded AUG legs at the 2026-08-27 expiry
+      settlement (spot close), which is what should have happened on expiry day.
+
+## Open finding — NOT fixed here (needs an operator decision)
+
+When the pair universe was rebuilt at 15:26 on 08-28, three pairs that still
+held **open** AUG legs dropped out of the top-N and their state entries were
+simply discarded — the runner keeps state only for pairs currently in the
+universe. Settled at the 2026-08-27 close, that silently removed **−₹77,989**
+from the book:
+
+| pair | realized | settle-to-expiry | total |
+|---|---|---|---|
+| BHARTIARTL/EICHERMOT | −876.61 | −49,267.84 | **−50,144.45** |
+| M&M/EICHERMOT | −799.51 | −29,782.42 | **−30,581.93** |
+| INFY/ADANIPORTS | −365.56 | +3,102.63 | **+2,737.07** |
+
+This is independent of the fill bug (M&M/EICHERMOT and INFY/ADANIPORTS were
+never corrupted) and it biases the book optimistic, since a pair that has been
+losing is exactly the one that falls out of a rank-ordered universe. Fixing it
+means either retaining state for out-of-universe pairs that hold a position, or
+force-flattening them at the rebuild. Both change runner behaviour on a
+money-affecting path, so it is left for an explicit decision rather than folded
+into this repair.
+
+## Reconciliation basis
+AUG futures cash-settle at the underlying spot close on expiry day (2026-08-27):
+BHARTIARTL ₹1,878.30, COALINDIA ₹400.00. Applied to the position as it stood in
+the last uncorrupted snapshot, `state_backups/kalman_pairs_runner_state.20260819T152503.json`.
+
+---
+
 # Autoresearch — code-review follow-ups on PR #208 — 2026-08-10
 
 High-effort multi-agent review of the merged #208 commit (`a68e436`) returned 7

@@ -1,5 +1,38 @@
 # Lessons
 
+## Resolve a fill's leg by the contract it was OPENED in, not the current front month
+
+- 2026-08-28: `BHARTIARTL/COALINDIA` in the kalman paper book reported
+  **₹528,705,886** of realized P&L with `n_closed_trades` stuck at 1 — and it
+  read as a Coal India edge, because COALINDIA was the leg the phantom profit
+  accrued on. It was not a share split, a bonus, or a bad tick: COALINDIA's ISIN
+  and adjustment factor are unchanged across all 611 sessions on tape.
+- Cause: `KalmanPairStrategy._apply_fill` resolved a fill's leg with
+  `symbol_a if prop.tradingsymbol == self.tradingsymbol_a else symbol_b`, while
+  `_build_exit_proposals` builds proposals from `leg.tradingsymbol` — the
+  contract held at ENTRY. The runner re-seeds strategies on the current front
+  month every morning, so after the 08-27 AUG expiry the strategy carried
+  `BHARTIARTL26SEPFUT` and the restored legs were `...26AUGFUT`. The equality
+  test missed on every leg-A fill and the `else` branch booked all of them onto
+  **leg B**, applying ₹1,892 BHARTIARTL fills against a ₹399 COALINDIA leg.
+- What made it 5 orders of magnitude instead of one bad tick: because both fills
+  landed on leg B, `state.legs` never emptied, so the position never reached
+  FLAT and `MAX_HOLD` re-proposed the same exit **every tick** — ~263 times
+  between 10:02 and 15:25. A one-tick error compounded all session, in silence.
+- The 2026-08-20→28 host outage was the setup, not the cause: it stranded an
+  open AUG position across expiry, which was the first time the runner ever ran
+  with a rolled front month over a live book.
+- Fix: `_leg_symbol_for()` consults **held legs first**, falls back to the
+  configured contracts, and **raises** when neither matches; plus a warning
+  whenever a non-entry execution leaves legs open.
+- Takeaways: **a two-way `if a else b` on an identifier is a silent
+  misattribution waiting to happen — the `else` is an unchecked assumption, so
+  make the no-match case raise.** And **when a strategy's identifiers can be
+  re-seeded underneath persisted state (contract rolls, symbol changes,
+  re-listings), the persisted record is the authority, not the freshly-built
+  config.** Anything that re-proposes an action until a state flips needs a loud
+  failure when the state does not flip.
+
 ## A heavier autoresearch config must be re-fit to its systemd TimeoutStartSec
 
 - 2026-06-06: `taleb-autoresearch.service` (Sat 10:00 IST timer) failed with
