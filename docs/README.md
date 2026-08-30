@@ -67,6 +67,15 @@ Crons that produce the inputs the strategies consume.
 - [research/hmm_market_regime_detection.md](./research/hmm_market_regime_detection.md) —
   Hidden Markov Model regime detection: mechanics, what maps onto this
   codebase vs. what doesn't, and a scoped implementation path.
+- [research/pre-earnings-iv-crush-2026-08-29.md](./research/pre-earnings-iv-crush-2026-08-29.md) —
+  Pre-earnings IV crush: 1,236 single-stock results events built from the
+  UDiFF bhavcopy cache + NSE board meetings. The crush is real (−5.3 vol
+  points) but the event is **fairly priced** — implied E|jump| 3.43 % vs
+  realised 3.38 %, breach 41.3 % vs a 42.4 % benchmark; the "over-priced
+  fear" reading is a horizon artefact. Short straddle, iron fly and long
+  vol-ramp all ≤ 0. Verdict NO-GO, earnings calendar retained as a blackout
+  gate proposal. Documents two look-ahead traps (t = 3.94 and t = 6.25) and
+  a ranker that ran t = 4.50 in 2025 and t = −0.13 in 2026.
 
 ## Cross-reference: cron timer ↔ doc
 

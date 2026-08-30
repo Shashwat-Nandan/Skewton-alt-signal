@@ -1,0 +1,55 @@
+[Unit]
+Description=Short-Call-Into-Earnings Paper Runner — PAPER ONLY, no live mode
+Documentation=https://github.com/anthropics/claude-code
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+#
+# ⚠ THIS STRATEGY HAS NO MEASURED EDGE. See
+# docs/research/pre-earnings-iv-crush-2026-08-29.md. The event is fairly priced
+# (implied E|jump| 3.43% vs realised 3.38%; breach 41.3% vs a 42.4% benchmark),
+# and this structure's backtest result is 100% directional and statistically
+# indistinguishable from zero (356 trades, +₹92,091, t=0.33; a zero-edge
+# process beats that 37% of the time). It is deployed on PAPER to be measured,
+# not because it is believed. ShortCallEarningsStrategy raises for mode=live.
+#
+# The number this run exists to produce is gap_through_stop_count /
+# gap_through_worst_R in the EOD sidecar.
+#
+# --max-daily-loss-inr 40000 = 2x the 1R budget (risk_per_trade_pct 2.0 of
+# ₹1M). A breach touches HALT_SHORT_CALL_DAILY_LOSS and suspends ENTRIES only;
+# open positions still exit. Scoped so it never freezes the other runners.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_short_call --max-daily-loss-inr 40000
+# -------------------------------
+
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches buy-on-gap-paper.service)
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+# NOTE: do NOT set ProtectHome=true if WorkingDirectory is under /root or /home
+# (the unit fails at status=200/CHDIR before ExecStart). See tasks/lessons.md.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

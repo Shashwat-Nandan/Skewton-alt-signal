@@ -1,0 +1,27 @@
+[Unit]
+Description=Fire short-call-paper.service Mon–Fri at 14:55 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 14:55 IST — deliberately in the AFTERNOON, unlike every other runner.
+#
+# Two reasons. (1) The strategy enters in a 15:00–15:20 window because the
+# research entered at the T-1 CLOSE; starting five minutes early lets the panel
+# build and the calendar refresh finish before the window opens. (2) It keeps
+# this runner away from the 09:10–09:14 TOTP stampede entirely — by 14:55 the
+# shared .kite_session.json is already warm, so this unit reuses the cached
+# token and never triggers a fresh login. That matters: a fresh login
+# invalidates the token the LIVE pair runner is holding (2026-06-17 incident).
+OnCalendar=Mon..Fri *-*-* 14:55:00 Asia/Kolkata
+
+# Persistent is SAFE here but nearly useless: the runner refuses to start after
+# 15:30 and the entry window is 15:00–15:20, so a catch-up run outside that
+# window manages open positions and takes no new entries. That is the intent.
+Persistent=true
+
+RandomizedDelaySec=60
+
+Unit=short-call-paper.service
+
+[Install]
+WantedBy=timers.target

@@ -1,3 +1,238 @@
+# Short-call-into-earnings — paper runner with a 1R target/stop — 2026-08-29
+
+Operator asked to paper-trade the single short-call structure from the
+pre-earnings IV study, with a defined target and stop at a minimum 1R.
+
+**Built and green. Deployed nowhere yet — no systemd unit installed.** Paper
+mode only; `mode="live"` raises in `__init__` and will keep raising.
+
+## The standing caveat, restated so nobody has to re-derive it
+
+`docs/research/pre-earnings-iv-crush-2026-08-29.md` says this has NO measured
+edge. The earnings event is fairly priced (implied E|jump| 3.43 % vs realised
+3.38 %; breach 41.3 % against a 42.4 % fair-value benchmark, §3). This
+structure's headline — short ATM call at IVP ≥ 90, +₹2,029/event, t = 2.24 — is
+**100 % directional**: the same vol exposure harvested delta-neutrally returns
+−₹116 on the same 417 events, and it fades out of sample (t = 2.06 in 2025 →
+1.29 in 2026, §5.3). The runner exists to measure it forward, not because it is
+believed.
+
+## What got built
+
+- [x] `market_data/fetch_board_meetings.py` — NSE `corporate-board-meetings`
+      fetcher (the earnings calendar). Same Akamai homepage-warm as
+      `fetch_fii_dii`. Month-chunked cache under `data_cache/board_meetings/`.
+      `load_results_calendar()` filters to results meetings and dedupes to one
+      row per symbol per quarter, keeping `announced_at` so a caller can prove
+      the date was public before it acted. Backfilled 2026-01 → 2026-10:
+      **6,912 symbol-quarters, 2,363 symbols.**
+- [x] `strategies/_atm_iv.py` — daily ATM-IV panel for every F&O stock, built
+      from the bhavcopy cache; `iv_percentile()` ranks against the trailing 252
+      sessions STRICTLY BEFORE `asof`, returns None below 120 obs (never a
+      fabricated 50). Panel: **118,148 rows / 278 symbols, 2024-05-02 →
+      2026-08-27.** Vectorised IV solve is parity-pinned to
+      `core.greeks_engine.implied_volatility_bisect` (< 1e-5) by a test.
+- [x] `strategies/short_call_earnings.py` — the strategy. Entry: results next
+      session, date already public, IVP ≥ 90, DTE in [7, 45]. Sized so the stop
+      equals exactly 1R; **a lot that exceeds the budget is SKIPPED, never
+      truncated.** Exit priority gap-stop > stop > target > time.
+- [x] `runners/run_paper_short_call.py` — paper runner on the `buy_on_gap`
+      scaffolding (TZ/disk/holiday gates, own lock, own scoped halt flags,
+      heartbeat, durable state). Entry window 15:00–15:20 IST (the study
+      entered at the T-1 close). Positions carry across sessions.
+- [x] `tests/test_short_call_earnings.py` — 21 tests, all green.
+- [x] `[short_call_earnings]` section in `config_template.ini`.
+
+## Two decisions worth knowing about
+
+**`risk_per_trade_pct` defaults to 2.0, not 1.0.** Not risk appetite — the floor
+at which it can trade. 1R per lot is a median ₹12,502 across the 417 tested
+events, so at 1.0 % of ₹1M only **26.9 %** of events clear a single lot; at
+2.0 % it is **85.4 %**. A lower value gives a runner that looks live and takes
+nothing (cf. the 2026-05-31 autoresearch inert-gate incident).
+
+**Target/stop default to 60 %/60 % of credit.** Calibrated on option daily bars
+across the 417 events — tighter management is actively worse:
+
+| target/stop | target hit | stop hit | gap through | time | mean R | gross P&L |
+|---|---|---|---|---|---|---|
+| 30/30 | 47.2 % | 46.3 % | 5.8 % | 0.7 % | −0.099 | −₹410 |
+| 50/50 | 47.0 % | 36.2 % | 5.5 % | 11.3 % | +0.053 | +₹761 |
+| **60/60** | 40.8 % | 30.5 % | 5.3 % | 23.5 % | **+0.092** | **+₹1,374** |
+| 75/75 | 29.5 % | 24.9 % | 3.6 % | 42.0 % | +0.141 | +₹2,453 |
+
+75/75 scores better but is most of the way back to unmanaged. 60/60 is the
+middle that still manages the position at exactly 1R.
+
+## What the run is actually for
+
+`gap_through_stop_count` / `gap_through_worst_R` in the EOD sidecar. On daily
+bars the stop is honoured ~95 % of the time; on the ~5 % that gap through it the
+realised loss averaged **−1.55R and reached −3.13R**. Every position records
+`realised_R`, so the paper book measures slippage-past-stop rather than assuming
+1R. A naked short call's loss is unbounded.
+
+## Two bugs the tests caught during the build
+
+1. `last_mtm_dt` was refreshed BEFORE `_exit_decision` read it, so
+   `fresh_session` was always False — the gap-stop branch was dead code and
+   `sessions_held` never advanced (the time-stop never fired). Fixed by
+   deciding first and adding `_ref_dt`, which falls back to `entry_dt`.
+2. Chain lookups via `.loc[(date, symbol, expiry, opt)]` + `idxmin` on a fully
+   specified MultiIndex select an ARBITRARY row, not the nearest strike. Found
+   in the research scripts (§5.1 of the doc carries the correction); the
+   production code uses positional `iloc[argmin]`.
+
+## Code review 2026-08-29 — 8 findings, all real, all fixed
+
+Reviewed on PR #216. Every finding held up against the code; two would have
+silently produced the wrong answer for the one thing the runner exists to
+measure.
+
+- [x] **(HIGH) Open positions were marked against a re-struck ATM call.** The
+      runner called `_atm_call_snapshot` for *every* symbol each tick, including
+      held ones, re-deriving strike from the *current* spot and rolling expiry
+      once DTE fell under 7. On the results gap — the exact session this
+      measures — the freshly-struck call has barely moved, so the stop never
+      fires and `gap_through_stop_count` reads zero while the real position
+      bleeds. Fixed with `_held_snapshot`, which quotes `pos.tradingsymbol`
+      directly; the strategy now also REFUSES a snapshot whose tradingsymbol
+      differs from the open position rather than marking against it.
+- [x] **(HIGH) Empty results calendar crashed the runner**, including
+      `--dry-run`. `load_results_calendar` documented an empty-frame degraded
+      mode, but the frame had object dtype so `.dt.normalize()` raised — on the
+      first run of any host without the cache, and after any NSE block. Fixed
+      at source (typed empty frame) and guarded at the call site.
+- [x] **(MED) A partial-range fetch overwrote the whole month's cache.** The
+      runner's daily `sync(today, today+45d)` would rewrite the current month
+      with only its tail, progressively shredding the record the 1,236-event
+      study depends on. `write_cached` now merges and dedupes.
+- [x] **(MED) Dedupe spliced columns across rows.** `groupby(...).last()` takes
+      the last non-null value per column *independently*, so a revised meeting
+      with an unparseable timestamp could contribute `event_date` while
+      `announced_at` came from an older intimation. Now `drop_duplicates` keeps
+      whole rows, and a high NaT rate is logged loudly.
+- [x] **Found while fixing the above: the publicity check was FAILING OPEN.**
+      `if pd.notna(ann) and ...` meant an unparseable timestamp skipped the
+      comparison entirely and the event was traded — reintroducing the exact
+      look-ahead the research doc records as a t=6.25 phantom edge. Now fails
+      closed: no provable announcement time, no trade.
+- [x] **(MED) `day_high_at_entry` never expired.** Captured once and applied for
+      the position's whole multi-session life, so a pre-entry spike suppressed
+      legitimate stops on later sessions. Now applies only inside the entry
+      session. (`buy_on_gap`, the model for this guard, is flat by its own
+      close, so it never crossed a day boundary there.)
+- [x] **(LOW/MED) The target had no pre-entry guard** while the stop did — the
+      entry session's own low could book a phantom +1R win. Added
+      `day_low_at_entry`; the asymmetry biased the book in the strategy's
+      favour, which is the one thing this run cannot afford.
+- [x] **(LOW) Per-day EOD sidecar reported cumulative-since-inception figures.**
+      Now `today` and `cumulative` blocks, so diffing sidecars cannot
+      double-count.
+- [x] **(LOW) `--force` silently opened the entry window** as well as the
+      market-hours gate, allowing entries at a time the study never tested.
+      Split out `--ignore-entry-window`.
+
+12 regression tests added (35 in the two files, 1,822 in the suite).
+
+## Holding-period backstops — 2026-08-30
+
+Operator asked what the maximum holding period actually is. Tracing it found a
+defect the code review had missed.
+
+Designed hold is **2 sessions**: enter at the T-1 close, flat by T+1. But
+`max_hold_sessions` counts sessions the runner *observed*, so the ceiling was
+not what the config implied:
+
+- runner down for a week → a nominally 2-session position lived **6 calendar
+  days** (traced).
+- **a position could still be OPEN on expiry day.** Indian stock options are
+  PHYSICALLY SETTLED, so an ITM short call at expiry is a delivery obligation
+  and NSE ramps margin through expiry week. The exit logic referenced the
+  expiry date **nowhere at all** — `EXPIRY_FLATTEN` was declared in
+  `ExitReason` and never emitted. Same defect the kalman-pairs runner shipped
+  with (PR #69, 2026-06-30).
+
+- [x] `expiry_flatten_dte = 2` — never carry into physical settlement.
+- [x] `max_hold_calendar_days = 5` — wall-clock bound, immune to downtime.
+- [x] Exit priority is now gap-stop → stop → target → **expiry-flatten** →
+      time → calendar-time → force-close, so a stop that genuinely filled still
+      books at the stop rather than at the mark.
+- [x] `TIME_CALENDAR` is a distinct exit reason from `TIME`, so the sidecar
+      shows when *downtime* ended a trade rather than the strategy's clock.
+
+4 tests added (1,826 in the suite). Verified against the original traces:
+downtime case now closes `TIME_CALENDAR` at the bound; expiry case closes
+`EXPIRY_FLATTEN` the day before expiry.
+
+## Second code review 2026-08-30 — 8 more findings, all real, all fixed
+
+- [x] **(HIGH) An intraday jump through the stop booked at the nominal
+      `stop_px`.** `GAP_STOP` only fired on a fresh session's OPEN, so a results
+      announcement made *during* market hours — routine for Indian single
+      stocks — was classified as an ordinary STOP and filled at a price nobody
+      could have got. Reproduced: credit ₹20, stop ₹32, market at ₹96 → booked
+      `STOP @ 32, realised_R -1.05, gap_through_stop_count 0`; the true fill is
+      ≈ −4.9R. This silently zeroed the one statistic the run exists to produce,
+      on exactly the events it exists to count. Now fills at the market and
+      labels it `GAP_STOP` beyond a 2 % tolerance; the resting-SL case (session
+      high through, LTP back below) still books at the level. Same fix on the
+      target side.
+- [x] **(MED) No `except KeyboardInterrupt` teardown.** `install_signal_handlers`
+      maps SIGTERM → KeyboardInterrupt so `systemctl stop` runs an orderly
+      shutdown; without the handler the EOD sidecar was skipped and `main()`
+      raised out of the process. Every sibling runner has this.
+- [x] **(MED) `--force` collapsed the session to a single tick**, leaving naked
+      short calls carried in from T-1 unmanaged all day. `--force` now only
+      bypasses the hours/holiday gate; `--once` is the single-pass flag.
+- [x] **(MED) A stopped-out event could be re-sold minutes later.** Only open
+      positions were skipped, so a 15:07 stop-out made the name eligible at
+      15:08 and the entry window could re-sell the same event ~20 times, booking
+      full costs each round trip. Added a `(symbol, event_date)` lock that
+      survives `restore_state`.
+- [x] **(MED) The daily-loss breaker was read but never written.** The flag
+      gated entries from the first commit and nothing computed a session ΔP&L —
+      an unbounded-loss naked short with a guard that only *looked* present.
+      Added `_check_daily_loss_limit` + `--max-daily-loss-inr` (default ₹40k).
+- [x] **(LOW) The "panel through yesterday" invariant was not enforced.** The
+      runner passes a wall-clock `asof` and panel dates are midnight, so today's
+      own EOD row entered its own percentile history once the bhavcopy landed.
+      Normalised in `iv_percentile` and `latest_rows`.
+- [x] **(LOW) The cost import escaped the documented monkeypatch target**
+      (Rule 7) — bound at module level rather than inside the function, so
+      patching `strategies.taleb_karpathy.estimate_transaction_cost` had no
+      effect on this strategy's P&L.
+- [x] **(LOW) Two ATM rows on an exact strike tie.** Not theoretical: the cached
+      panel held **895 duplicated symbol-days**. Tie now breaks on the lower
+      strike; panel rebuilt 118,148 → 117,246 rows, 0 duplicates. Research doc
+      row count corrected with a note (the verdicts are unaffected).
+
+9 regression tests added.
+
+### Stop/target levels, for the record
+
+`target_px = 0.40 x credit`, `stop_px = 1.60 x credit` — fractions of the
+premium received, not of spot. Median event: sell at ₹37.20 on a 550 lot
+(₹20,460 credit), target ₹14.88, stop ₹59.52, 1R = ₹12,276/lot. In spot terms
+the credit is 3.27% and the stop 5.23%. Measured, the stop trips on a **3.5–6%
+adverse move** — i.e. it sits *inside* the 3.43% implied jump, which is why
+30.5% of trades stop out. That is structural on a 1R symmetric rule, not a
+tuning miss.
+
+## Not done — operator decisions
+
+- [ ] **No systemd unit.** Nothing is scheduled; the runner only runs by hand.
+      `deploy/` is CODEOWNERS-gated.
+- [ ] **Money-affecting review.** `strategies/`, `runners/` — needs a
+      CODEOWNERS owner (safety rule 5). Nothing committed.
+- [ ] **The runner will idle until ~mid-October.** Q2 FY27 results intimations
+      are not filed yet: at 2026-08-29 the forward calendar holds 7 results
+      meetings and **none** are in the F&O universe. Expect zero trades until
+      the season opens — that is correct behaviour, not a fault.
+- [ ] A daily `fetch_board_meetings` timer, if this is kept.
+
+---
+
 # Pair systems — hedge-direction stability gate + net-exposure cap — 2026-08-29
 
 Follow-up to the ₹52.9 crore reconciliation below. The question asked was whether
