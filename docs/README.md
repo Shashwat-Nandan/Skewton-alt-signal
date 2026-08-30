@@ -76,6 +76,14 @@ Crons that produce the inputs the strategies consume.
   vol-ramp all ≤ 0. Verdict NO-GO, earnings calendar retained as a blackout
   gate proposal. Documents two look-ahead traps (t = 3.94 and t = 6.25) and
   a ranker that ran t = 4.50 in 2025 and t = −0.13 in 2026.
+- [research/strategy-finetuning-profitability-2026-08-30.md](./research/strategy-finetuning-profitability-2026-08-30.md) —
+  Book-wide profitability review (scoreboard through 2026-08). Persistent
+  pairs remain the only proven earner (+₹126k live) but August went idle
+  (+₹251) while the looser baseline blew up (−₹175k). Per-strategy finetune
+  knobs, what not to rebuild (IV-crush, TPO reversal, Kalman-trend, AS MM,
+  buy-on-gap), and a test queue of new sleeves that fit this stack
+  (NIFTY–BANKNIFTY pair, STF cross-sectional reversal, MA index-futures
+  momentum). 90-day sequence is subtraction-first.
 
 ## Cross-reference: cron timer ↔ doc
 

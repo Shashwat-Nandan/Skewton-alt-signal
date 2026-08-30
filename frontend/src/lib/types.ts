@@ -626,3 +626,122 @@ export type PortfolioResponse = {
   underlyings: UnderlyingExposure[];
   broker_net: BrokerPosition[] | null;
 };
+
+// ── Short-call-into-earnings (paper) ────────────────────────────────────────
+// NOTE: the strategy this describes has NO measured edge. See
+// docs/research/pre-earnings-iv-crush-2026-08-29.md. `health_note` carries that
+// through to the UI on purpose.
+
+export type ShortCallUpcomingEvent = {
+  symbol: string;
+  event_date: string;
+  sessions_until: number | null;
+  announced_at: string | null;
+  ivp: number | null;
+  ivp_basis: string;
+  atm_iv: number | null;
+  spot: number | null;
+  strike: number | null;
+  dte: number | null;
+  est_credit: number | null;
+  lot_size: number | null;
+  est_lots: number | null;
+  target_px: number | null;
+  stop_px: number | null;
+  r_rupees: number | null;
+  est_gross_credit: number | null;
+  qualifies: boolean;
+  blocked_by: string | null;
+};
+
+export type ShortCallIvpRow = {
+  symbol: string;
+  ivp: number;
+  atm_iv: number;
+  spot: number;
+  dte: number;
+  next_results: string | null;
+  days_to_results: number | null;
+};
+
+export type ShortCallUpcomingResponse = {
+  as_of: string;
+  panel_through: string | null;
+  entry_ivp_min: number;
+  n_results_meetings: number;
+  n_in_fno_universe: number;
+  events: ShortCallUpcomingEvent[];
+  top_ivp: ShortCallIvpRow[];
+  note: string;
+};
+
+export type ShortCallOpenPosition = {
+  symbol: string;
+  tradingsymbol: string;
+  event_date: string;
+  strike: number;
+  expiry: string;
+  entry_dt: string | null;
+  credit: number;
+  lots: number;
+  lot_size: number;
+  target_px: number;
+  stop_px: number;
+  r_rupees: number;
+  ivp_at_entry: number;
+  last_mtm_px: number;
+  sessions_held: number;
+  unrealized: number;
+  unrealized_R: number | null;
+};
+
+export type ShortCallClosedTrade = {
+  symbol: string;
+  event_date: string;
+  entry_dt: string | null;
+  exit_dt: string | null;
+  credit: number;
+  exit_px: number | null;
+  lots: number;
+  lot_size: number;
+  exit_reason: string | null;
+  pnl: number;
+  realised_R: number;
+  ivp_at_entry: number;
+};
+
+export type ShortCallDailyRow = {
+  date: string;
+  has_data: boolean;
+  day_pnl: number | null;
+  day_closed: number | null;
+  open_positions: number | null;
+  gap_through_stop: number | null;
+};
+
+export type ShortCallSummary = {
+  latest_date: string | null;
+  n_days_with_data: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  transaction_costs: number;
+  n_closed_trades: number;
+  n_open_positions: number;
+  win_rate: number | null;
+  mean_realised_R: number | null;
+  worst_realised_R: number | null;
+  gap_through_stop_count: number;
+  gap_through_worst_R: number | null;
+  exit_reasons: Record<string, number>;
+  health_note: string;
+};
+
+export type ShortCallResponse = {
+  start_date: string;
+  end_date: string;
+  params: Record<string, number>;
+  summary: ShortCallSummary;
+  daily: ShortCallDailyRow[];
+  open_positions: ShortCallOpenPosition[];
+  closed_trades: ShortCallClosedTrade[];
+};

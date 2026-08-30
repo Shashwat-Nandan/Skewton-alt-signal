@@ -34,6 +34,7 @@ from .routers import (
     portfolio,
     positions,
     runs,
+    short_call,
     strategies,
 )
 from .run_manager import get_run_manager
@@ -111,6 +112,7 @@ def create_app() -> FastAPI:
     app.include_router(portfolio.router, prefix="/api", dependencies=gated)
     app.include_router(equity_swing.router, prefix="/api", dependencies=gated)
     app.include_router(delivery_accum.router, prefix="/api", dependencies=gated)
+    app.include_router(short_call.router, prefix="/api", dependencies=gated)
 
     @app.get("/", tags=["meta"])
     def root():

@@ -20,6 +20,8 @@ import type {
   RunSummary,
   SessionStatus,
   StrategyInfo,
+  ShortCallResponse,
+  ShortCallUpcomingResponse,
 } from "./types";
 
 /**
@@ -116,6 +118,21 @@ export const api = {
     if (params.system) q.set("system", params.system);
     const qs = q.toString();
     return http<ArbitrageResponse>(`/arbitrage-paper${qs ? `?${qs}` : ""}`);
+  },
+
+  shortCall: (params: { days?: number; end?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    if (params.end) q.set("end", params.end);
+    const qs = q.toString();
+    return http<ShortCallResponse>(`/short-call${qs ? `?${qs}` : ""}`);
+  },
+
+  shortCallUpcoming: (params: { days?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.days != null) q.set("days", String(params.days));
+    const qs = q.toString();
+    return http<ShortCallUpcomingResponse>(`/short-call/upcoming${qs ? `?${qs}` : ""}`);
   },
 
   buyOnGapPaper: (params: { days?: number; end?: string; system?: string } = {}) => {

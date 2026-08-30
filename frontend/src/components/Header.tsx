@@ -5,6 +5,7 @@ import {
   LogOut, Menu, X, Activity, BarChart3, Briefcase, CandlestickChart, GitBranch,
   Layers, PackageCheck, Scale, Sigma, TrendingDown, TrendingUp, Wallet,
   type LucideIcon,
+  CalendarClock,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/delivery", label: "Delivery Accum", icon: PackageCheck },
   { to: "/arbitrage", label: "Arbitrage", icon: Scale },
   { to: "/buy-on-gap", label: "Buy-on-Gap", icon: TrendingDown },
+  { to: "/short-call", label: "Short Call", icon: CalendarClock },
   { to: "/kalman-pairs", label: "Kalman Pairs", icon: Sigma },
   { to: "/kalman-trend", label: "Kalman Trend (loop)", icon: Activity },
 ];
