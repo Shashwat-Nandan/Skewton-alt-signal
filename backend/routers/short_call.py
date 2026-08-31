@@ -53,6 +53,11 @@ _FALLBACK = {
 }
 
 _panel_cache: Dict[str, object] = {"mtime": None, "df": None}
+# Latest row + IVP per symbol, keyed on the panel object identity and asof
+# date. id(panel) is monkeypatch-safe: tests pass a new frame, production
+# `_panel()` returns the same object until the parquet mtime changes.
+_ivp_cache: Dict[str, object] = {"panel_id": None, "asof": None,
+                                 "latest": None, "ivps": None}
 
 
 def _today() -> date:
@@ -122,6 +127,26 @@ def _panel() -> Optional[pd.DataFrame]:
             logger.warning("could not read the ATM-IV panel: %s", e)
             return None
     return _panel_cache["df"]                                  # type: ignore[return-value]
+
+
+def _latest_and_ivps(panel: pd.DataFrame, asof: pd.Timestamp):
+    """Latest EOD row (including today) plus IVP ranked through yesterday.
+
+    Matches the two-call contract in ``upcoming``: ``latest_rows(panel,
+    asof+1d)`` for the *value*, ``iv_percentile(..., asof)`` for the
+    history. Vectorized so the 60s poll does not scan 117k rows per symbol.
+    """
+    from strategies import _atm_iv
+
+    asof_n = pd.Timestamp(asof).normalize()
+    pid = id(panel)
+    if (_ivp_cache["panel_id"] == pid and _ivp_cache["asof"] == asof_n
+            and _ivp_cache["latest"] is not None):
+        return _ivp_cache["latest"], _ivp_cache["ivps"]
+    latest = _atm_iv.latest_rows(panel, asof_n + pd.Timedelta(days=1))
+    ivps = _atm_iv.iv_percentiles(panel, asof_n, latest)
+    _ivp_cache.update(panel_id=pid, asof=asof_n, latest=latest, ivps=ivps)
+    return latest, ivps
 
 
 def _read_state() -> dict:
@@ -261,7 +286,6 @@ def upcoming(days: int = Query(21, ge=1, le=90,
                                description="Calendar days ahead to scan")) -> UpcomingResponse:
     """Stocks with results scheduled soon, their IVP, and the prospective trade."""
     from market_data.fetch_board_meetings import load_results_calendar
-    from strategies import _atm_iv
 
     p = _params()
     panel = _panel()
@@ -295,8 +319,7 @@ def upcoming(days: int = Query(21, ge=1, le=90,
     in_fno = window[window.symbol.isin(universe)]
     # Last EOD row (including today once bhavcopy has landed) is the IV *value*.
     # History for the percentile is through yesterday — same as the runner.
-    latest = _atm_iv.latest_rows(panel, today + pd.Timedelta(days=1),
-                                 list(in_fno.symbol.unique()))
+    latest, ivps = _latest_and_ivps(panel, today)
     rowmap = {r.symbol: r for r in latest.itertuples()}
     panel_through = pd.Timestamp(panel.date.max()).date().isoformat()
     now = pd.Timestamp.now()
@@ -321,7 +344,7 @@ def upcoming(days: int = Query(21, ge=1, le=90,
             e.blocked_by = "no recent panel row"
             events.append(e)
             continue
-        ivp = _atm_iv.iv_percentile(panel, ev.symbol, float(row.atm_iv), today)
+        ivp = ivps.get(str(ev.symbol))
         e.ivp = round(ivp, 1) if ivp is not None else None
         e.atm_iv = round(float(row.atm_iv), 4)
         e.spot = round(float(row.spot), 2)
@@ -371,14 +394,13 @@ def upcoming(days: int = Query(21, ge=1, le=90,
 
     # IVP leaderboard across the whole F&O universe, so the page shows the
     # signal landscape even when no results are scheduled.
-    all_latest = _atm_iv.latest_rows(panel, today + pd.Timedelta(days=1))
     next_res: Dict[str, pd.Timestamp] = {}
     fut = cal[cal.event_date >= today].sort_values("event_date")
     for _, r in fut.iterrows():
         next_res.setdefault(r.symbol, pd.Timestamp(r.event_date))
     top: List[IvpRow] = []
-    for r in all_latest.itertuples():
-        v = _atm_iv.iv_percentile(panel, r.symbol, float(r.atm_iv), today)
+    for r in latest.itertuples():
+        v = ivps.get(str(r.symbol))
         if v is None:
             continue
         nr = next_res.get(r.symbol)

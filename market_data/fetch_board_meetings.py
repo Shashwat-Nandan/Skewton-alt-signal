@@ -37,7 +37,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -45,6 +45,12 @@ import requests
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./data_cache") / "board_meetings"
+# load_results_calendar re-reads and re-dedupes every cached month. The
+# dashboard polls that path every 60s; cache against the directory's file
+# signatures so a fresh fetch is still visible on the next request.
+# Invalidation is here, not in the router: tests monkeypatch this function
+# and a router-level cache keyed on disk mtime would ignore them.
+_CALENDAR_CACHE: Dict[str, object] = {"key": None, "df": None}
 NSE_HOMEPAGE = "https://www.nseindia.com/"
 NSE_BM_URL = "https://www.nseindia.com/api/corporate-board-meetings"
 HEADERS = {
@@ -168,6 +174,20 @@ def sync(from_date: date, to_date: date) -> int:
     return total
 
 
+def _calendar_dir_key(d: Path) -> Tuple:
+    """Signature of a board-meeting cache dir: path + (name, mtime, size) per file."""
+    try:
+        if not d.exists():
+            return (str(d), None)
+        files = tuple(
+            (f.name, f.stat().st_mtime_ns, f.stat().st_size)
+            for f in sorted(d.glob("*.json"))
+        )
+        return (str(d.resolve()), files)
+    except OSError:
+        return (str(d), "oserror")
+
+
 def load_results_calendar(cache_dir: Optional[Path] = None) -> pd.DataFrame:
     """
     Read every cached month and return the deduplicated results calendar.
@@ -191,8 +211,18 @@ def load_results_calendar(cache_dir: Optional[Path] = None) -> pd.DataFrame:
                              "announced_at": pd.Series(dtype="datetime64[ns]")})
 
     d = Path(cache_dir) if cache_dir is not None else CACHE_DIR
+    key = _calendar_dir_key(d)
+    cached = _CALENDAR_CACHE["df"]
+    if _CALENDAR_CACHE["key"] == key and cached is not None:
+        return cached.copy()
+
+    def _store(frame: pd.DataFrame) -> pd.DataFrame:
+        _CALENDAR_CACHE["key"] = key
+        _CALENDAR_CACHE["df"] = frame
+        return frame.copy()
+
     if not d.exists():
-        return _empty()
+        return _store(_empty())
     rows: list = []
     for f in sorted(d.glob("*.json")):
         try:
@@ -200,7 +230,7 @@ def load_results_calendar(cache_dir: Optional[Path] = None) -> pd.DataFrame:
         except (ValueError, OSError) as e:
             logger.warning("skipping unreadable board-meeting cache %s: %s", f, e)
     if not rows:
-        return _empty()
+        return _store(_empty())
 
     df = pd.DataFrame(rows)
     for c in ("bm_symbol", "bm_date", "bm_purpose", "bm_desc", "bm_timestamp"):
@@ -209,7 +239,7 @@ def load_results_calendar(cache_dir: Optional[Path] = None) -> pd.DataFrame:
     text = (df.bm_purpose.fillna("") + " " + df.bm_desc.fillna("")).str.lower()
     df = df[text.str.contains(_RESULTS_RE, regex=True, na=False)].copy()
     if df.empty:
-        return _empty()
+        return _store(_empty())
 
     df["event_date"] = pd.to_datetime(df.bm_date, format="%d-%b-%Y", errors="coerce")
     df["announced_at"] = pd.to_datetime(df.bm_timestamp, format="%d-%b-%Y %H:%M:%S",
@@ -243,7 +273,7 @@ def load_results_calendar(cache_dir: Optional[Path] = None) -> pd.DataFrame:
     out = (df.sort_values(["symbol", "cluster", "announced_at", "event_date"],
                           na_position="last")
              .drop_duplicates(subset=["symbol", "cluster"], keep="last")[cols])
-    return out.sort_values(["event_date", "symbol"]).reset_index(drop=True)
+    return _store(out.sort_values(["event_date", "symbol"]).reset_index(drop=True))
 
 
 def main(argv=None) -> int:

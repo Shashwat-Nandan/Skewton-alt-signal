@@ -1,3 +1,41 @@
+# Short-call `/upcoming` dashboard perf — 2026-08-31
+
+PR #217 landed on `main` (`37bd91e`). `/short-call/upcoming` is still
+1.3–1.7s per call and the SPA polls it every 60s, on the same box as the
+live pair trader. A prior WIP patch was reverted because it broke two
+merged tests (calendar cache defeated the monkeypatch; T-1 `next_session`
+gating was dropped).
+
+Redo the perf fix on top of the merged semantics: T-1 would-enter,
+IVP ranks last EOD against history through yesterday (`asof=today`),
+no self-ranking of today's panel row.
+
+- [x] Vectorized `iv_percentiles` matching scalar `iv_percentile` + `asof=today`
+- [x] Cache `load_results_calendar` by on-disk file signature (not in the router)
+- [x] Wire `upcoming()`; keep existing 9 router tests green
+- [x] Regression: consecutive `upcoming()` calls with different monkeypatched
+      calendars must not leak; vectorized IVP equals scalar on the 90-gate panel
+
+## Review — 2026-08-31 `/upcoming` perf
+
+On the production panel (117,246 rows / 278 symbols) and the on-disk
+board-meeting cache (6,912 rows):
+
+| path | before | after (cold) | after (warm) |
+|---|---|---|---|
+| `load_results_calendar` | ~441–1370 ms | 1373 ms | **1.1 ms** |
+| 278× `iv_percentile` | ~766–2000 ms | 150 ms batched | cached |
+| `GET /short-call/upcoming` | **1330–1741 ms** | 281 ms | **41 ms** |
+
+Batch IVP mismatches vs scalar: **0**. T-1 would-enter and
+through-yesterday ranking are unchanged (pinned by the merged tests).
+Calendar cache lives in `load_results_calendar` so router tests that
+monkeypatch that function still see each new frame.
+`strategies/_atm_iv.py` and `market_data/` are CODEOWNERS money-adjacent;
+the runner still uses scalar `iv_percentile`.
+
+---
+
 # Short-call-into-earnings — paper runner with a 1R target/stop — 2026-08-29
 
 Operator asked to paper-trade the single short-call structure from the

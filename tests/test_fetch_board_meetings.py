@@ -90,6 +90,25 @@ def test_non_results_meetings_are_excluded(tmp_path, monkeypatch):
     assert list(cal.symbol) == ["AAA"]
 
 
+def test_results_calendar_cache_invalidates_when_a_month_file_changes(
+        tmp_path, monkeypatch):
+    """The dashboard polls this every 60s. Caching the parsed frame is fine
+    only if a newly written month file is visible on the next call — otherwise
+    a same-process uvicorn would keep serving the pre-fetch calendar."""
+    monkeypatch.setattr(fbm, "CACHE_DIR", tmp_path)
+    fbm.write_cached([_row("AAA", "10-Jun-2026", "01-Jun-2026 10:00:00")],
+                     date(2026, 6, 1))
+    first = fbm.load_results_calendar(tmp_path)
+    assert list(first.symbol) == ["AAA"]
+    first.loc[:, "symbol"] = "MUTATED"          # caller must not poison the cache
+    fbm.write_cached([_row("BBB", "11-Jun-2026", "01-Jun-2026 10:00:00")],
+                     date(2026, 6, 1))
+    second = fbm.load_results_calendar(tmp_path)
+    assert set(second.symbol) == {"AAA", "BBB"}
+    third = fbm.load_results_calendar(tmp_path)
+    assert set(third.symbol) == {"AAA", "BBB"}
+
+
 def test_unparseable_timestamps_are_surfaced(tmp_path, monkeypatch, caplog):
     """If NSE changes the timestamp format every announced_at becomes NaT and
     the anti-look-ahead gate becomes a silent no-op — exactly the contamination

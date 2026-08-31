@@ -233,6 +233,37 @@ def test_upcoming_would_enter_only_on_t_minus_1(monkeypatch):
     assert "announced" in (by_sym["LATE"].blocked_by or "").lower()
 
 
+def test_upcoming_does_not_stick_a_monkeypatched_calendar_across_calls(monkeypatch):
+    """A router-level calendar cache keyed on disk mtime would ignore the
+    monkeypatched frame on the next request and advertise the previous
+    universe — the exact failure of the reverted WIP patch."""
+    today = date(2026, 8, 28)
+    panel = _gate_passing_panel(["ACME", "OTHER"], last_date=today.isoformat())
+    monkeypatch.setattr(sc, "_panel", lambda: panel)
+    _freeze_upcoming_clock(monkeypatch, today)
+    import market_data.fetch_board_meetings as fbm
+
+    cal1 = pd.DataFrame({
+        "symbol": ["ACME"],
+        "event_date": [pd.Timestamp("2026-08-31")],
+        "announced_at": [pd.Timestamp("2026-07-01")],
+    })
+    monkeypatch.setattr(fbm, "load_results_calendar", lambda *a, **k: cal1)
+    r1 = sc.upcoming(days=30)
+    assert [e.symbol for e in r1.events] == ["ACME"]
+    assert next(e for e in r1.events if e.symbol == "ACME").qualifies is True
+
+    cal2 = pd.DataFrame({
+        "symbol": ["OTHER"],
+        "event_date": [pd.Timestamp("2026-08-31")],
+        "announced_at": [pd.Timestamp("2026-07-01")],
+    })
+    monkeypatch.setattr(fbm, "load_results_calendar", lambda *a, **k: cal2)
+    r2 = sc.upcoming(days=30)
+    assert [e.symbol for e in r2.events] == ["OTHER"]
+    assert next(e for e in r2.events if e.symbol == "OTHER").qualifies is True
+
+
 def test_upcoming_empty_calendar_explains_itself(monkeypatch):
     import market_data.fetch_board_meetings as fbm
     monkeypatch.setattr(fbm, "load_results_calendar",

@@ -37,3 +37,34 @@ def test_latest_rows_also_excludes_today_intraday():
     intraday = pd.Timestamp(f"{today.date()} 15:05")
     rows = _atm_iv.latest_rows(p, intraday, ["ACME"])
     assert rows.iloc[0].date < today
+
+
+def test_iv_percentiles_matches_scalar_including_the_today_row_gate():
+    """The dashboard ranks last-EOD (today included as the *value*) against
+    history through yesterday. Batching that must not drift from the scalar
+    — a 1-row difference flips the 90 gate (227/252 = 90.1 vs 227/253 = 89.7)."""
+    dates = pd.bdate_range(end="2026-08-28", periods=253)
+    iv = [0.30] * 227 + [0.50] * 25 + [0.40]
+    frames = []
+    for i, sym in enumerate(["ACME", "BETA", "SHORT"]):
+        n = 253 if sym != "SHORT" else 50
+        frames.append(pd.DataFrame({
+            "date": dates[-n:], "symbol": sym, "spot": 1000.0, "strike": 1000.0,
+            "dte": 20, "expiry": pd.Timestamp("2026-12-31"), "lot": 100,
+            "ce_px": 30.0, "pe_px": 30.0, "iv_ce": iv[-n:], "iv_pe": iv[-n:],
+            "atm_iv": iv[-n:], "ce_vol": 1, "pe_vol": 1,
+        }))
+    panel = pd.concat(frames, ignore_index=True)
+    today = pd.Timestamp("2026-08-28")
+    latest = _atm_iv.latest_rows(panel, today + pd.Timedelta(days=1))
+    batched = _atm_iv.iv_percentiles(panel, today, latest)
+    for sym in ["ACME", "BETA", "SHORT"]:
+        row = latest[latest.symbol == sym].iloc[0]
+        scalar = _atm_iv.iv_percentile(panel, sym, float(row.atm_iv), today)
+        assert batched[sym] == scalar
+    assert batched["ACME"] is not None and batched["ACME"] >= 90.0
+    including_today = _atm_iv.iv_percentile(
+        panel, "ACME", 0.40, today + pd.Timedelta(days=1))
+    assert including_today is not None and including_today < 90.0
+    assert batched["ACME"] != including_today
+    assert batched["SHORT"] is None

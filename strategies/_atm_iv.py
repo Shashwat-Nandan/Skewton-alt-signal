@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -198,6 +198,60 @@ def iv_percentile(panel: pd.DataFrame, symbol: str, iv: float,
     if len(vals) < min_obs or not np.isfinite(iv):
         return None
     return float((vals < iv).mean() * 100.0)
+
+
+def iv_percentiles(panel: pd.DataFrame, asof: pd.Timestamp,
+                   current: pd.DataFrame,
+                   window: int = IVP_WINDOW,
+                   min_obs: int = IVP_MIN_OBS) -> Dict[str, Optional[float]]:
+    """Rank each ``current`` row's ``atm_iv`` the same way as ``iv_percentile``.
+
+    One groupby pass over history strictly before ``asof``, instead of a
+    full-panel boolean scan per symbol (278 × 117k row comparisons on the
+    production panel). ``current`` must have ``symbol`` and ``atm_iv``.
+    Missing / short-history / non-finite names map to None — never a
+    fabricated 50 (issue #75).
+    """
+    if current is None or current.empty:
+        return {}
+    symbols = [str(s) for s in current["symbol"].tolist()]
+    out: Dict[str, Optional[float]] = {s: None for s in symbols}
+    if panel is None or panel.empty:
+        return out
+
+    live = (current.assign(symbol=current["symbol"].astype(str))
+                    .drop_duplicates("symbol")
+                    .set_index("symbol")["atm_iv"])
+    cutoff = pd.Timestamp(asof).normalize()
+    hist = panel.loc[panel.date < cutoff, ["symbol", "atm_iv"]]
+    if hist.empty:
+        return out
+
+    hist = hist.assign(symbol=hist["symbol"].astype(str))
+    hist = hist[hist.symbol.isin(out)]
+    if hist.empty:
+        return out
+
+    n_raw = hist.groupby("symbol", sort=False).size()
+    eligible = set(n_raw[n_raw >= min_obs].index.astype(str))
+    if not eligible:
+        return out
+
+    hist = hist[hist.symbol.isin(eligible)]
+    hist = hist.groupby("symbol", sort=False).tail(window)
+    hist = hist.merge(live.rename("live_iv"), left_on="symbol", right_index=True)
+    iv_np = hist.atm_iv.to_numpy(float)
+    live_np = hist.live_iv.to_numpy(float)
+    ok = np.isfinite(iv_np) & np.isfinite(live_np)
+    hist = hist.loc[ok].assign(_lt=iv_np[ok] < live_np[ok])
+    if hist.empty:
+        return out
+
+    agg = hist.groupby("symbol", sort=False).agg(n=("_lt", "size"), k=("_lt", "sum"))
+    for sym, row in agg.iterrows():
+        if int(row.n) >= min_obs:
+            out[str(sym)] = float(row.k / row.n * 100.0)
+    return out
 
 
 def latest_rows(panel: pd.DataFrame, asof: pd.Timestamp,
