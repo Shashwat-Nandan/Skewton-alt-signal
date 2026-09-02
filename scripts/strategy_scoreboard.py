@@ -235,6 +235,22 @@ def kalman_trend_monthly(data_cache: Path) -> Tuple[Monthly, Monthly, dict]:
             cumulative_series_monthly(ma, baseline=0.0), last)
 
 
+def ma_momentum_monthly(data_cache: Path) -> Tuple[Monthly, dict]:
+    """Standalone §6.3 MA book: cumulative total_rupees in ma_momentum_eod_*.json."""
+    series: List[Tuple[str, float]] = []
+    last: dict = {}
+    for f in sorted(glob.glob(str(data_cache / "ma_momentum_eod_*.json"))):
+        d = _load(f)
+        if d is None:
+            continue
+        if "total_rupees" not in d or not d.get("date"):
+            _skip(f, "missing 'total_rupees' or 'date' key")
+            continue
+        series.append((d["date"], float(d["total_rupees"])))
+        last = d
+    return cumulative_series_monthly(series, baseline=0.0), last
+
+
 def equity_swing_monthly(db_path: Path) -> Tuple[Monthly, float, float]:
     """dashboard.db equity_positions: closed pnl grouped by exit month; open
     unrealized marked from last_mtm_px. Returns (monthly, cum realized,
@@ -522,6 +538,10 @@ def build_rows(data_cache: Path, db_path: Path, today: date) -> List[dict]:
     add("kalman_trend_ma", "kalman_trend A/B: MA ctl", ma,
         last.get("total_ma_rupees", 0.0), None, verdict="control arm")
 
+    m_ma, last_ma = ma_momentum_monthly(data_cache)
+    add("ma_momentum", "ma-momentum (paper, §6.3)", m_ma,
+        last_ma.get("total_rupees", 0.0), None)
+
     warn_unclaimed_sidecars(data_cache)
     return rows
 
@@ -533,6 +553,7 @@ CLAIMED_EOD_PATTERNS = [
     "pair_paper_persistent_eod_*.json", "pair_paper_eod_2*.json",
     "pair_paper_kalman_eod_*.json", "arbitrage_paper_eod_*.json",
     "buy_on_gap_paper_eod_*.json", "kalman_trend_eod_*.json",
+    "ma_momentum_eod_*.json",
 ]
 
 

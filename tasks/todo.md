@@ -1,3 +1,126 @@
+# PR #218 review fixes — MA-momentum holdout integrity — 2026-09-01
+
+Nine review findings on `feat/ma-momentum-paper-holdout`. All are measurement-
+integrity or fail-loud defects; none weaken a safety guard. Live still raises.
+
+- [x] F1 roll: detect tradingsymbol change on restore, reset + re-seed the SMA window
+- [x] F2 state: `write_state` merges prior blobs so a skipped symbol is not deleted
+- [x] F3 restore: per-symbol failure logs CRITICAL and skips, never wedges the runner
+- [x] F4 halt: daily-loss flag is permanent — say so and give the `rm` resume hint
+- [x] F5 stops: record stop-fill overshoot (level fill vs 30s poll) in the EOD sidecar
+- [x] F6 backtest: bound the fit window at the refit; print post-refit OOS separately
+- [x] F7 seed: reject non-finite closes (inf passed the `x == x` NaN filter)
+- [x] F8 carry: force-close an overnight position at its stored last mark, not a stale stop
+- [x] F9 window: re-seed whenever the restored SMA window is under-filled
+- [x] ruff + full pytest green
+
+### Review
+
+All nine fixed on top of `78a1b41`. No safety guard was weakened: `mode="live"`
+still raises, the halt flags stay scoped, the market-hours gate and `--force`
+semantics are untouched, and the pre-registered §6.3 gate is still the OOS-prior
+slice alone.
+
+Verification (2026-09-01):
+- `ruff check .` clean.
+- `pytest tests/ -q -rs` → **1876 passed**, 0 skips, 0 failures (was 1866; +10 new).
+- `python -m research.backtest_ma_momentum` reproduces the PR's table exactly
+  (BANKNIFTY OOS prior −₹10,325 / Sharpe −0.342 / 1,068 trades; combined
+  −₹13,984 / −0.198). Still **NO-GO**, unchanged — the fit-window bound is
+  inert until the tape is extended past 2026-07-14.
+
+Notes:
+- F5 records the stop-fill overshoot into the EOD sidecar as
+  `stop_overshoot_rupees`; `total_rupees` is deliberately **not** adjusted, so
+  the pre-registered headline is never silently restated.
+- F6 reports post-refit sessions as their own OOS slice rather than folding
+  them into the gate — bounding the IS window must not quietly change what
+  §6.3 pre-registered.
+- Not fixed (out of scope, not a review finding): after a multi-session outage
+  the restored SMA window is contiguous in the deque but not in time. The
+  window is only re-seeded when it is short or the contract rolled.
+- `run_paper_kalman_trend.write_state` still has F2's write-only-surviving-books
+  behaviour. Its series is not decay-scored, so it does not bite there yet;
+  worth a follow-up.
+
+# §6.3 Time-series momentum (MA crossover) — frozen-params harness — 2026-08-31
+
+Pre-registered in `docs/research/strategy-finetuning-profitability-2026-08-30.md`
+§6.3. Promote the Kalman-trend A/B's **MA control** as a standalone
+research replay. Not a new daemon. Do **not** jointly refit SMA lengths
+with CMA-ES.
+
+Frozen from `data_cache/kalman_trend_runner_state.json` (refit 2026-07-15,
+the params that printed the scoreboard +₹40,310):
+
+| index | short | long | offset | stop_ticks | target | lot | cost |
+|---|---:|---:|---:|---:|---|---:|---:|
+| NIFTY | 34 | 53 | 61.416 | 219.998 | None | 75 | 2.5 pts/side |
+| BANKNIFTY | 27 | 109 | 201.223 | 14.380 | None | 15 | 2.5 pts/side |
+
+5-min OHLC + 15:25 flatten + honest touch/gap fills. 1 lot. Tape on disk
+is **spot** through 2026-07-14 (the paper traded the future). The 40-day
+warmup that produced these params starts ~2026-06-05; dates before that
+are the OOS prior. Do not transplant 34/53 onto daily bars.
+
+Kill (any one → no paper daemon, do not then CMA-ES the windows):
+  1. OOS-prior Sharpe ≤ 0
+  2. OOS-prior net < 2× round-trip × trade count
+  3. OOS-prior trades = 0
+
+- [x] Harness `python -m research.backtest_ma_momentum`
+- [x] Pin frozen params; tests forbid a CMA-ES call
+- [x] Score the three kills. **NO-GO.** No paper daemon. Do not then CMA-ES.
+
+Harness: `python -m research.backtest_ma_momentum`
+
+## Review — 2026-08-31 MA-momentum (§6.3)
+
+Tape: spot 5-min OHLC, 10,050 bars, 134 days, 2025-12-26 → 2026-07-14.
+OOS prior = before 2026-06-05 (107d). Fit window = 2026-06-05 → 07-14
+(27d) — that is the ~40-calendar-day warmup the 2026-07-15 refit trained
+on, so it is in-sample. Paper traded the *future*; this is the spot
+proxy. 1 lot, 2.5 pts/side, 15:25 flatten, no target.
+
+| slice | NIFTY net / Sharpe / n | BN net / Sharpe / n | combined |
+|---|---|---|---|
+| **OOS prior (gate)** | **−₹3,659 / −0.07 / 50** | **−₹10,325 / −0.34 / 1,068** | **−₹13,984 / −0.20** |
+| Fit window (IS) | +₹42,607 / **3.75** / 7 | +₹27,395 / **3.33** / 182 | +₹70,002 / 3.81 |
+| Full spot 5-min | +₹38,949 / 0.63 / 57 | +₹14,453 / 0.37 / 1,259 | +₹53,402 / 0.60 |
+
+Paper sidecar (the actual forward after the refit): NIFTY MA sat at
++₹37,553 from 2026-07-15 halt through 08-31 (10 trades, no new entries).
+BN MA +₹2,757 at halt, then 8 stop-outs on 2026-08-31 → +₹431. Combined
+forward after halt is **not** a 60-session standalone MA book; it is a
+halted A/B.
+
+Both OOS-prior Sharpe and 2×RT×n fail on every leg. The scoreboard
++₹40,310 is the fit-window jackpot (and NIFTY's wide 220-tick stop
+survives; BN's 14-tick stop is a churn machine — 1,068 prior trades).
+Same scar as Kalman-trend: in-sample SMA lengths do not travel. Do not
+refit the windows.
+
+## Paper runner — operator override 2026-08-31
+
+OOS-prior was NO-GO. Operator still asked for the pre-registered
+60-session paper holdout. PAPER ONLY; live raises. 1 lot. Frozen
+windows. No CMA-ES.
+
+- [x] `strategies/ma_momentum.py` — frozen params, `mode=live` raises
+- [x] `runners/run_paper_ma_momentum.py` — own lock/state/EOD/scoped halt
+- [x] Scoreboard row `ma_momentum` + claimed EOD glob
+- [x] `deploy/ma-momentum-paper.{service,timer}` — **not installed**
+- [x] Tests: live raises, no CMA-ES in source, restore refuses a drifted
+      stop under an open position, EOD shape is what the scoreboard reads
+
+Start by hand: `.venv/bin/python -m runners.run_paper_ma_momentum --force`
+(outside hours). Timer install is an operator action (`deploy/` is
+CODEOWNERS). Kill remains the standing decay rule.
+
+---
+
+---
+
 # Short-call `/upcoming` dashboard perf — 2026-08-31
 
 PR #217 landed on `main` (`37bd91e`). `/short-call/upcoming` is still
@@ -33,6 +156,124 @@ Calendar cache lives in `load_results_calendar` so router tests that
 monkeypatch that function still see each new frame.
 `strategies/_atm_iv.py` and `market_data/` are CODEOWNERS money-adjacent;
 the runner still uses scalar `iv_percentile`.
+
+---
+
+# §6.1 NIFTY vs BANKNIFTY futures pair — research harness — 2026-08-30
+
+Pre-registered in `docs/research/strategy-finetuning-profitability-2026-08-30.md`
+§6.1. Reuse `research.backtest_pairs.backtest_one`. Frozen persistent z-band
+(entry 2.0 / exit 0.75 / stop 4 / 7d / lookback 60). Train/holdout on
+`NIFTY_daily` + `BANKNIFTY_daily` (2018–2026 spot proxy for index futures).
+Do **not** then try `entry_z=1.5`.
+
+Kill if any of: holdout Sharpe ≤ 0; holdout net < 2× round-trip × trade
+count; train half-life > 7d.
+
+- [x] Load 8y index-daily panel, freeze β + direction on train only
+- [x] Report HL, Hurst, Engle–Granger p, rolling 130d ADF persistence
+- [x] Holdout P&L via `backtest_one` (same cost model as persistent pairs)
+- [x] Score the three kill gates. **NO-GO.** No paper daemon. Do not retune z.
+
+Harness: `python -m research.backtest_nifty_bn_pair`
+
+## Review — 2026-08-30 NIFTY/BANKNIFTY
+
+Panel: 2,035 days, 2018-04-10 → 2026-06-25 (spot; 5-min too short for the
+window). Train 70% through 2024-01-05. Orientation BANKNIFTY/NIFTY, β=2.05
+(60d OLS 2.15). Lots 75 / 15.
+
+| diagnostic | value | meaning |
+|---|---|---|
+| Engle-Granger p (train) | 0.38 | not cointegrated |
+| half-life (train) | **116d** | kill is 7d |
+| Hurst | 0.495 | random walk |
+| rolling 130d ADF p<0.05 | 5/382 (**1.3%**) | spread does not stay stationary |
+
+| slice | trades | win% | net | Sharpe |
+|---|---|---|---|---|
+| train (IS, not a gate) | 0 | — | ₹0 | — |
+| **holdout** | 15 | 13.3 | **−₹231,833** | **−2.03** |
+
+First holdout fill stopped (z −2.1 → −5.6); the post-STOP latch then sat
+through z drifting to ±15 — the frozen train mean is the wrong object.
+Gross also negative (−₹180k), so this is not a cost-only miss.
+
+All three kill gates FAIL. Same verdict as Chan §4.1 on index-like slow
+spreads: this is not a 7-day pair. Kalman-γ on these two series is a
+different strategy and is already parked (`kalman_pairs`).
+
+---
+
+# §6.5 BANKNIFTY vs FINNIFTY — same frozen recipe — 2026-08-30
+
+User asked to evaluate NIFTY BANK vs NIFTY FIN SERVICE. Same kill gates as
+§6.1, no z retune. `FINNIFTY_daily.parquet` is NOT on disk (the 08-30 doc
+was wrong); panel is IDF front-month from bhavcopy. Lots from
+`bhavcopy_fo_20260827.parquet`.
+
+- [x] Run `--symbols BANKNIFTY,FINNIFTY` at frozen persistent z-band
+- [x] Score the three §6.1 kills + the §6.5 2×RT tightness skip
+- [x] **NO-GO.** No paper daemon. Do not then try entry_z=1.5
+
+## Review — 2026-08-30 BANKNIFTY/FINNIFTY
+
+Panel: 575 IDF days, 2024-05-02 → 2026-08-27. Train through 2025-12-12
+(402d). Orientation BANKNIFTY/FINNIFTY. Lots 30 / 60 (1-lot ≈ ₹1.74M /
+₹1.59M).
+
+| diagnostic | NIFTY/BN (§6.1) | **BN/FINNIFTY** |
+|---|---|---|
+| Engle-Granger p | 0.38 | **0.81** (worse) |
+| half-life | 116d | **44d** (better, still ≫ 7d) |
+| Hurst | 0.495 | 0.452 |
+| rolling 130d ADF p<0.05 | 1.3% | 2.2% |
+| train β vs last-60d β | 2.05 / 2.15 | **1.70 / 2.94** (unstable) |
+| §6.5 tightness | — | CLEARS (₹33k vs 2×RT ₹7k) |
+| holdout Sharpe | −2.03 | **+0.21** (PASS, n=6) |
+| holdout net | −₹232k | **+₹5,242** vs hurdle ₹41k FAIL |
+
+Train: 0 trades. Holdout: 6 trades, 33% win, gross +₹26k, costs ₹21k,
+maxDD −₹15k.
+
+Tighter economically than NIFTY/BN (spread vol 1.8% vs 6.7%) and not
+"too tight to pay 1-lot costs" — §6.5's worry. Still not a 7-day pair:
+HL 44d, residual not stationary, β not stable, holdout net does not
+clear 2×RT×n. Sharpe pass is 6 trades of noise. Do not retune z.
+
+---
+
+# Calendar mean-reversion — backtest then (maybe) paper — 2026-08-30
+
+`docs/research/strategy-finetuning-profitability-2026-08-30.md` §3.6:
+strategy is already coded (`strategies/calendar_meanreversion.py`) but never
+promoted. Protocol: run `research/backtest_calendar_meanreversion.py` on the
+full bhavcopy archive, net of `core.costs`, train/holdout, shorts-only as
+coded. Promote to paper **only** if holdout is net-positive AND average
+hold clears 2× round-trip cost.
+
+- [x] Run full-archive backtest at production defaults (`entry_n_sd=1.5`,
+      `allow_long=false`, `min_avg_volume=1000`, `max_leg_notional=1e6`)
+- [x] Split train / holdout (last 30% of dates) and report net P&L, win-rate,
+      avg hold, avg cost, 2×-cost hurdle
+- [x] Go/no-go: **NO-GO**. Do not add a daemon / STRATEGIES / scoreboard
+      entry. Keep the tests. Promotion path is closed.
+
+## Review — 2026-08-30 full-archive run
+
+Panel: 350,515 STF rows, 575 days, 278 names, 2024-05-02 → 2026-08-27.
+Skipped `bhavcopy_fo_20260828.parquet` (missing `FinInstrmNm`). Split at
+2025-12-15. Artifacts: `/tmp/calendar_meanrev_bt/{curve,trades}.csv`.
+
+| slice | n | win% | net | gross | costs | avg hold | 2× cost hurdle |
+|---|---|---|---|---|---|---|---|
+| train (< 2025-12-15) | 155 | 7.1 | −₹227,697 | +₹13,565 | ₹241,262 | 2.40d | FAIL (₹88 vs ₹3,113) |
+| holdout (≥ 2025-12-15) | 61 | 14.8 | −₹38,255 | +₹60,640 | ₹98,895 | 3.28d | FAIL (₹994 vs ₹3,242) |
+| full | 216 | 9.3 | −₹265,952 | +₹74,205 | ₹340,157 | 2.65d | FAIL (₹344 vs ₹3,150) |
+
+Max DD −₹282k. CONVERGE fired on 4/216 trades; MAX_HOLD 120, EXPIRY 79.
+Gross edge exists and is larger in holdout, but four-leg F&O costs eat it
+~5×. Same structural diagnosis as the parent calendar arb.
 
 ---
 

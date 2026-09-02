@@ -1,0 +1,57 @@
+[Unit]
+Description=MA-momentum index-futures paper runner — PAPER ONLY, no live mode
+Documentation=docs/research/strategy-finetuning-profitability-2026-08-30.md
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/taleb-karpathy-kite/.env
+#
+# ⚠ HISTORICAL OOS-PRIOR REPLAY WAS NO-GO. See
+# research.backtest_ma_momentum and §6.3 of
+# docs/research/strategy-finetuning-profitability-2026-08-30.md.
+# Frozen SMA windows (NIFTY 34/53, BANKNIFTY 27/109) printed +₹40k
+# in-sample and lost on the prior. This unit is the 60-session paper
+# holdout, 1 lot, no CMA-ES. strategies.ma_momentum raises for live.
+#
+# --max-daily-loss-inr 25000 is measured on the SESSION delta (closed +
+# open MTM). A breach touches HALT_MA_MOMENTUM_DAILY_LOSS and suspends
+# ENTRIES only — exits and the 15:25 flatten still run. Scoped so it
+# never freezes the other runners.
+#
+# ⚠ The flag is NOT cleared automatically. Once written it halts entries
+# on every LATER session too, for the rest of the 60-session holdout,
+# while EOD sidecars keep being written — so the scoreboard reads "flat"
+# rather than "dead". Operator resumes with:
+#     rm data_cache/HALT_MA_MOMENTUM_DAILY_LOSS
+# The runner logs this at CRITICAL on breach and again at every start
+# while the flag is present.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_ma_momentum --max-daily-loss-inr 25000
+# -------------------------------
+
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/logs /opt/taleb-karpathy-kite/data_cache /opt/taleb-karpathy-kite
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

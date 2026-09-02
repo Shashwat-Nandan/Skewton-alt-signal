@@ -1,0 +1,16 @@
+[Unit]
+Description=Fire ma-momentum-paper.service Mon–Fri at 09:18 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 09:18 IST — staggered after kalman-trend 09:17 so this unit reuses the
+# already-cached .kite_session.json. A fresh login would invalidate the
+# token the LIVE pair runner is holding (2026-06-17 incident). The runner
+# sleeps until 09:15 internally; firing a couple of minutes late is fine.
+OnCalendar=Mon..Fri *-*-* 09:18:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=60
+Unit=ma-momentum-paper.service
+
+[Install]
+WantedBy=timers.target
