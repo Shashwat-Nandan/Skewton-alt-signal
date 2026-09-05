@@ -430,6 +430,67 @@ export type KalmanTrendResponse = {
   lessons: string[]; // newest-first
 };
 
+// ── MA momentum (§6.3 frozen-MA paper holdout) ──
+
+export type MaInstrument = {
+  symbol: string;
+  /** Front-month future actually being quoted (from the live state file). */
+  tradingsymbol: string;
+  /** Current live position (-1 short / 0 flat / +1 long). */
+  open_pos: number;
+  /** Cumulative across the run (NOT this session). */
+  realized_rupees: number;
+  n_trades: number;
+  win_rate: number | null;
+  session_realized_rupees: number;
+  session_trades: SessionTrade[];
+  /** Frozen SMA windows, from the strategy module (not echoed from the sidecar). */
+  short: number | null;
+  long: number | null;
+  /** ₹ by which this leg's stop fills are optimistic (level fill vs 30s poll). */
+  stop_overshoot_rupees: number;
+  n_stop_fills: number;
+  /** True when this row is carried history, not a session result (the runner
+   *  could not load the symbol that session). */
+  carried: boolean;
+};
+
+export type HaltStatus = {
+  entries_halted: boolean;
+  reasons: string[];
+  /** The daily-loss flag persists across sessions — a breach pauses the holdout. */
+  daily_loss_flag: boolean;
+  /** The heartbeat tripped and the runner EXITED — not merely halted; nothing
+   *  is managing an open position either. */
+  runner_silent_fail: boolean;
+};
+
+export type MaMomentumResponse = {
+  latest_date: string | null;
+  /** Every sidecar on disk — NOT progress: a halted session still writes one. */
+  n_sessions_recorded: number;
+  /** Sidecars written with entries LIVE — the only honest progress measure. */
+  n_sessions_measured: number;
+  /** §6.3 pre-registered holdout length. */
+  holdout_sessions: number;
+  /** Cumulative realized ₹ as the runner books it — the pre-registered number. */
+  total_rupees: number;
+  /** Same figure corrected for stop-fill overshoot. Shown alongside, never instead. */
+  total_rupees_ex_overshoot: number;
+  stop_overshoot_rupees: number;
+  n_stop_fills: number;
+  n_trades: number;
+  instruments: MaInstrument[];
+  halt: HaltStatus;
+  /** When the runner last wrote its state file (ISO), or null. */
+  state_updated: string | null;
+  /** True when that write predates the latest session — positions are NOT live. */
+  positions_stale: boolean;
+  /** Symbols whose row is carried history rather than a session result. */
+  carried_symbols: string[];
+  note: string;
+};
+
 // ── Equity Swing ──
 
 export type EquityPosition = {

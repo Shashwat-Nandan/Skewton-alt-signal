@@ -12,6 +12,7 @@ import { ShortCallPage } from "@/pages/ShortCallPage";
 import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { KalmanPairsPage } from "@/pages/KalmanPairsPage";
 import { KalmanTrendPage } from "@/pages/KalmanTrendPage";
+import { MaMomentumPage } from "@/pages/MaMomentumPage";
 import { MarketProfilePage } from "@/pages/MarketProfilePage";
 import { MpTrendPage } from "@/pages/MpTrendPage";
 import { PairCandidatesPage } from "@/pages/PairCandidatesPage";
@@ -79,6 +80,7 @@ export default function App() {
           <Route path="/buy-on-gap" element={<BuyOnGapPage />} />
           <Route path="/kalman-pairs" element={<KalmanPairsPage />} />
           <Route path="/kalman-trend" element={<KalmanTrendPage />} />
+          <Route path="/ma-momentum" element={<MaMomentumPage />} />
           <Route path="/equity-swing" element={<EquitySwingPage />} />
           <Route path="/delivery" element={<DeliveryAccumPage />} />
           <Route path="/short-call" element={<ShortCallPage />} />

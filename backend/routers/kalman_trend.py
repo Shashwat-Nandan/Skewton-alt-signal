@@ -114,8 +114,16 @@ def _live_positions(data_cache: Path) -> dict:
         return {}
     try:
         blob = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError) as e:
+    except (OSError, ValueError) as e:
+        # ValueError covers JSONDecodeError AND UnicodeDecodeError (non-UTF-8
+        # bytes); the narrower tuple let a corrupt state file 500 the tab
+        # instead of degrading to "no live positions". Kept in step with
+        # routers/ma_momentum.py — one convention, not two (Rule 7).
         logger.warning("Failed to read kalman_trend_runner_state.json: %s", e)
+        return {}
+    if not isinstance(blob, dict):
+        logger.warning("kalman_trend_runner_state.json decoded to %s, not an object",
+                       type(blob).__name__)
         return {}
     out: dict = {}
     for inst in blob.get("instruments") or []:
@@ -225,7 +233,8 @@ def kalman_trend(
         except Exception as e:
             logger.warning("Failed to read %s: %s", path, e)
 
-    report = report or {}                          # guard None / fall-through
+    # guard None / fall-through / a sidecar that decoded to a non-object
+    report = report if isinstance(report, dict) else {}
     raw_instruments = report.get("instruments")
     if not isinstance(raw_instruments, list):      # present-but-null / wrong type
         raw_instruments = []

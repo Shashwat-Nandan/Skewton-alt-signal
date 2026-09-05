@@ -9,6 +9,7 @@ import type {
   FiiDiiResponse,
   KalmanPairsResponse,
   KalmanTrendResponse,
+  MaMomentumResponse,
   MarketProfileResponse,
   MarketProfileSymbol,
   MpTrendResponse,
@@ -163,6 +164,13 @@ export const api = {
     if (params.end) q.set("end", params.end);
     const qs = q.toString();
     return http<KalmanTrendResponse>(`/kalman-trend${qs ? `?${qs}` : ""}`);
+  },
+
+  maMomentum: (params: { end?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.end) q.set("end", params.end);
+    const qs = q.toString();
+    return http<MaMomentumResponse>(`/ma-momentum${qs ? `?${qs}` : ""}`);
   },
 
   equityPositions: (status?: "open" | "closed") => {
