@@ -75,6 +75,12 @@ logger = logging.getLogger(__name__)
 # (a normal session is ~360 ticks; this only bites pathological cases).
 _DIAG_HISTORY_CAP = 500
 
+# Smallest |delta| a contract may have and still be used as a DELTA hedge.
+# Below this the lots needed scale as 1/|Δ| and the order is really buying
+# vega/gamma, not delta — refuse rather than emit it (see
+# _generate_soft_delta_proposals).
+MIN_SOFT_HEDGE_DELTA = 0.10
+
 # Audit 3.5: cap closed_trades written to the (per-tick-rewritten) state file.
 # The dashboard reads today-only, and a session closes well under this many,
 # so today's trades survive a same-day restart while the file stops growing
@@ -865,6 +871,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         # to enable. Bounded by the existing cost gate so we don't
         # rehedge into negative-EV trades.
         t0_factor = self.tunable_params.get("t0_band_factor", 1.0)
+        t0_applied = False
         if t0_factor < 1.0 and self.state.positions:
             now = self._clock()
             min_days_to_exp = float("inf")
@@ -880,6 +887,7 @@ class TalebKarpathyStrategy(BaseStrategy):
                     continue
             if min_days_to_exp < 1.0:
                 band_lots *= t0_factor
+                t0_applied = True
                 logger.info(
                     "Phase 5 T-0 tightening: band ×%.2f (min %.2f days to "
                     "expiry) → band=%.3f lots",
@@ -888,6 +896,58 @@ class TalebKarpathyStrategy(BaseStrategy):
         delta_in_lots = abs(delta) / lot_size
 
         if delta_in_lots < band_lots:
+            return []
+
+        # ── Minimum hedgeable drift ──
+        # The band can sit below the smallest drift ANY hedge path can improve,
+        # and firing it there cannot help. The floor is set by the SOFT path,
+        # because it is the finer of the two instruments:
+        #
+        #   hard : futures, delta 1.0 per lot. round(x) lots, so a drift under
+        #          0.5 lots rounds to 0 and emits nothing.
+        #   soft : an ATM option (strike = round(spot/interval)*interval), so
+        #          delta ≈ 0.5 per lot, and its max(round(x), 1) floor buys one
+        #          lot ≈ 0.5 lots of delta. Residual is |x − 0.5|, which beats
+        #          leaving x unhedged whenever x > 0.25.
+        #
+        # So 0.25 lots — NOT 0.5 — is the point below which neither path helps.
+        # An earlier revision of this gate used the hard path's 0.5 and claimed
+        # the soft path "over-hedges past zero"; that is only true for a
+        # delta-1.0 instrument and it suppressed the 0.25–0.5 band where the
+        # soft floor is actually near-exact. Between 0.25 and 0.5 we let the
+        # tick through: hedge_decision may pick soft (which hedges well), and
+        # if it picks hard the sizing guard there declines it.
+        soft_lot_delta = 0.5           # ATM option delta, per lot
+        min_hedgeable_lots = soft_lot_delta / 2.0
+        if delta_in_lots <= min_hedgeable_lots:
+            diag = self.hedge_diagnostics()
+            diag["unhedgeable_drift_skips"] += 1
+            if diag["unhedgeable_drift_skips"] == 1:
+                logger.info(
+                    "Rehedge band fired at %.3f lots (band %.3f), under the "
+                    "%.2f-lot minimum: futures round to 0, and one ATM option "
+                    "(~%.2f lots of delta) would leave MORE delta than doing "
+                    "nothing. Skipping before the cost gate; further "
+                    "occurrences at DEBUG (counts in the EOD report).",
+                    delta_in_lots, band_lots, min_hedgeable_lots,
+                    soft_lot_delta,
+                )
+                if t0_applied:
+                    # Guarded on whether the factor was APPLIED, not on how it
+                    # is configured: best_params ships t0_band_factor=0.5, so
+                    # keying off the tunable would send an operator to a knob
+                    # that had no effect on this band on a non-expiry day.
+                    logger.warning(
+                        "T-0 band tightening (factor %.2f) put the rehedge "
+                        "band under the minimum hedgeable drift — on this book "
+                        "it cannot scalp the pin it was added to scalp. Raise "
+                        "t0_band_factor or accept it is inert here.", t0_factor,
+                    )
+            else:
+                logger.debug(
+                    "Rehedge skipped: %.3f lots is unhedgeable (occurrence %d)",
+                    delta_in_lots, diag["unhedgeable_drift_skips"],
+                )
             return []
 
         logger.info(
@@ -937,6 +997,14 @@ class TalebKarpathyStrategy(BaseStrategy):
         # a 2× larger one. This recovers scalps that the previous linear
         # gate killed when γ was modest and cost was high.
         expected_scalp = self._estimate_gamma_scalp_pnl(greeks, spot)
+        # NOTE this pre-gate prices a FUTURES round trip at the futures lot
+        # count. That is a LOWER BOUND on what a rehedge can cost: the soft
+        # path buys options (wider spreads, premium) and, since delta-aware
+        # sizing, roughly 1/|Δ| ≈ 2× as many lots. It stays here as a cheap
+        # early-out — it is evaluated before we know which path will be
+        # chosen — but it is no longer the only cost check. The real
+        # proposals are re-priced against the same hurdle below, or a soft
+        # rehedge could clear a gate sized for half the trade.
         hedge_lots = max(abs(round(delta / lot_size)), 1)
         cost_one_side = estimate_transaction_cost(spot, hedge_lots, lot_size, "BUY", "FUT")
         estimated_round_trip_cost = cost_one_side * 2
@@ -982,6 +1050,43 @@ class TalebKarpathyStrategy(BaseStrategy):
                     )
                     prop.margin_required *= lots_cap / prop.quantity
                     prop.quantity = lots_cap
+                    # The cap counts CONTRACT lots, not delta lots — 20 futures
+                    # lots is 20 lots of delta, 20 ATM options only ~10. Rewrite
+                    # the rationale so it does not advertise the pre-clamp
+                    # delta the hedge no longer carries.
+                    if prop.option_type != "FUT":
+                        prop.rationale = (
+                            f"SOFT delta hedge: buy {lots_cap} "
+                            f"{prop.option_type} @ {prop.strike} "
+                            f"(CLAMPED by max_rehedge_lots_per_tick; residual "
+                            f"delta left for next tick)"
+                        )
+
+        # ── Cost gate, re-applied to what will ACTUALLY trade ──
+        # The pre-gate above priced a futures round trip. These proposals may
+        # be options, at ~1/|Δ| the lot count, so re-price them and re-apply
+        # the same Whalley-Wilmott hurdle. Without this a soft rehedge clears
+        # a gate sized for roughly half its true cost.
+        if proposals:
+            actual_cost = 0.0
+            for prop in proposals:
+                actual_cost += 2 * estimate_transaction_cost(
+                    prop.price, prop.quantity, prop.lot_size,
+                    prop.transaction_type,
+                    "FUT" if prop.option_type == "FUT" else "OPT",
+                )
+            if expected_scalp < actual_cost * (cost_hurdle ** (1 / 3)):
+                diag = self.hedge_diagnostics()
+                diag["cost_gated_rehedges"] += 1
+                logger.info(
+                    "Skipping rehedge after sizing: scalp %.0f < WW threshold "
+                    "%.0f on the REAL proposals (cost %.0f vs %.0f assumed by "
+                    "the futures pre-gate). %s",
+                    expected_scalp, actual_cost * (cost_hurdle ** (1 / 3)),
+                    actual_cost, estimated_round_trip_cost,
+                    ", ".join(f"{p.quantity}×{p.tradingsymbol}" for p in proposals),
+                )
+                return []
 
         # Post-emission bookkeeping runs ONLY when a rehedge is actually
         # emitted. An empty proposal list (e.g. a sub-1-lot hard hedge that
@@ -1016,13 +1121,21 @@ class TalebKarpathyStrategy(BaseStrategy):
         End-of-day report with bleed forecast (Gaps #12, #13, #15)
         and three-level neutrality check (Gap #18).
         """
+        # Hedge diagnostics ride on EVERY return path, including the two
+        # degraded ones. A book that drifted sub-lot 200 times and was then
+        # flattened by _should_exit at 13:00 reports "no_positions" at 15:20 —
+        # dropping the counts in exactly the case they exist for, with the
+        # only other trace a single INFO line from the morning.
+        diag = {k: v for k, v in self.hedge_diagnostics().items() if k != "date"}
         if not self.state.positions:
-            return {"status": "no_positions"}
+            return {"status": "no_positions", "hedge_diagnostics": diag}
 
         spot = self._get_spot_price()
         if not spot or spot <= 0:
             logger.warning("EOD report: spot unavailable; returning degraded report")
-            return {"status": "spot_unavailable", "n_positions": len(self.state.positions)}
+            return {"status": "spot_unavailable",
+                    "n_positions": len(self.state.positions),
+                    "hedge_diagnostics": diag}
         # Build per-leg T for multi-expiry books (calendars / diagonals
         # from Phase 3). Single-expiry books pass per_leg_T=None and
         # the helpers fall back to a single T as before.
@@ -1081,6 +1194,13 @@ class TalebKarpathyStrategy(BaseStrategy):
                 "theta_paid": self.state.theta_decay_paid,
                 "rehedge_count": self.state.rehedge_count,
                 "max_drawdown": self.state.max_drawdown,
+                # Rehedges the band WANTED but no instrument could express.
+                # Surfaced because after the first occurrence they are logged
+                # at DEBUG: without these counts a book that was structurally
+                # unhedgeable all session looks exactly like one that never
+                # drifted. Large numbers here mean the band is mis-scaled
+                # against the lot size, not that the book was quiet.
+                **diag,
             },
         }
 
@@ -1093,6 +1213,38 @@ class TalebKarpathyStrategy(BaseStrategy):
             logger.info("EOD: Lock delta — Up: %.0f  Down: %.0f", pf.lock_delta_up, pf.lock_delta_down)
 
         return report
+
+    def hedge_diagnostics(self) -> Dict:
+        """Per-SESSION counts of rehedges the book wanted but could not place.
+
+        Keyed on the trading date on purpose. research/backtest.py builds ONE
+        TalebKarpathyStrategy and replays many sessions through it, so a plain
+        attribute counter reports a run-cumulative number under a per-session
+        label — and the "log once" throttles below would fire once for an
+        entire multi-month replay (and never at all, for the T-0 diagnosis, if
+        the first skip happened to land on a non-expiry day).
+
+        These matter because after the first occurrence each path logs at
+        DEBUG: without a count, a book that was structurally unhedgeable all
+        session is indistinguishable from one that never drifted.
+        """
+        today = self._clock().date()
+        d = getattr(self, "_hedge_diag_state", None)
+        if d is None or d.get("date") != today:
+            d = {
+                "date": today,
+                # drift under the minimum any instrument can express
+                "unhedgeable_drift_skips": 0,
+                # hard path chosen, but round(delta/lot_size) == 0
+                "sub_lot_hard_noops": 0,
+                # soft path chosen, but the contract was unusable as a delta
+                # hedge (IV unsolvable, or |Δ| below MIN_SOFT_HEDGE_DELTA)
+                "soft_hedge_refusals": 0,
+                # proposals dropped by the post-sizing cost re-check
+                "cost_gated_rehedges": 0,
+            }
+            self._hedge_diag_state = d
+        return d
 
     def reset_state(self):
         """Reset session state. Preserves ATM IV history (cross-session durable)."""
@@ -1560,13 +1712,29 @@ class TalebKarpathyStrategy(BaseStrategy):
         lot_size = self._get_lot_size()
         lots = round(delta_to_hedge / lot_size)
         if lots == 0:
-            # Drift cleared the threshold gate but rounded to <1 lot.
-            # Without this log the no-hedge looks identical to a successful one.
-            logger.info(
-                "Hard hedge sized to 0 lots: %.1f delta / %d lot_size = %.2f rounds to 0. "
-                "Raise rehedge_delta_threshold so threshold passes only when round() >= 1.",
-                delta_to_hedge, lot_size, delta_to_hedge / lot_size,
-            )
+            # Reachable for drift in (0.25, 0.5] lots: check_and_rehedge lets
+            # that through because hedge_decision may pick the SOFT path, whose
+            # ATM option hedges it well. When it picks hard instead, there is
+            # no whole lot to trade and we emit nothing.
+            #
+            # The advice here used to be "raise rehedge_delta_threshold". That
+            # was wrong: the band is the threshold AFTER the shadow-gamma
+            # rescale and the T-0 factor, so any base value can still be scaled
+            # under one lot. The floor belongs at the gate, not in the seed.
+            diag = self.hedge_diagnostics()
+            diag["sub_lot_hard_noops"] += 1
+            if diag["sub_lot_hard_noops"] == 1:
+                logger.info(
+                    "Hard hedge sized to 0 lots: %.1f delta / %d lot_size = "
+                    "%.2f rounds to 0 — no hedge emitted. Further occurrences "
+                    "at DEBUG (count in the EOD report).",
+                    delta_to_hedge, lot_size, delta_to_hedge / lot_size,
+                )
+            else:
+                logger.debug(
+                    "Hard hedge sized to 0 lots (%.2f, occurrence %d)",
+                    delta_to_hedge / lot_size, diag["sub_lot_hard_noops"],
+                )
             return []
         fut_symbol = self._get_futures_symbol()
         # Entry price MUST come off the futures contract, not spot: the leg
@@ -1601,6 +1769,19 @@ class TalebKarpathyStrategy(BaseStrategy):
             rationale=f"HARD delta hedge: {greeks.net_delta:.1f}Δ via {lots} lots futures",
         )]
 
+    def _log_soft_refusal(self, msg: str, *args) -> None:
+        """Count a refused soft hedge and log it once per session at ERROR,
+        then at DEBUG. Unthrottled this fires every tick for the rest of a
+        session on a thin chain; uncounted it is invisible in the EOD report,
+        which is the failure this diagnostic exists to prevent."""
+        diag = self.hedge_diagnostics()
+        diag["soft_hedge_refusals"] += 1
+        if diag["soft_hedge_refusals"] == 1:
+            logger.error(msg + " Further occurrences at DEBUG (count in the "
+                               "EOD report).", *args)
+        else:
+            logger.debug(msg, *args)
+
     def _generate_soft_delta_proposals(self, greeks, spot, T):
         """
         Gap #20: Options-based delta hedge for positions with gamma flip risk.
@@ -1609,8 +1790,10 @@ class TalebKarpathyStrategy(BaseStrategy):
         """
         delta_to_hedge = -greeks.net_discrete_delta
         lot_size = self._get_lot_size()
-        lots = max(abs(round(delta_to_hedge / lot_size)), 1)
         option_type = "CE" if delta_to_hedge > 0 else "PE"
+        # NB: sizing happens AFTER the instrument is chosen — an option's
+        # delta is not 1.0, so lots cannot be known until we know which
+        # contract we are buying. See the delta-aware block below.
 
         # Look up the actual option instrument from the chain
         chain = self._get_options_chain()
@@ -1674,13 +1857,76 @@ class TalebKarpathyStrategy(BaseStrategy):
             logger.warning("Zero price for %s, cannot place soft delta hedge", symbol)
             return []
 
+        # ── Delta-aware sizing ──
+        # An option is NOT a delta-1.0 instrument. Sizing this hedge as
+        # round(delta_to_hedge / lot_size) — the futures formula — silently
+        # under-hedges by a factor of 1/|Δ|: an ATM option is ~0.5Δ, so a
+        # 150-delta drift got 2 lots ≈ 75 delta, half the hedge it asked for.
+        # (The sub-1-lot case looked right only by accident: max(...,1) buys
+        # one ATM lot ≈ 0.5 lots of delta, which happens to fit a ~0.45-lot
+        # drift.) Size off the contract's own delta instead.
+        #
+        # IV/delta are solved exactly as the skew selector does above
+        # (implied_volatility_bisect → greeks.delta), so there is one
+        # convention in this file, not two.
+        try:
+            hedge_iv = implied_volatility_bisect(
+                price, spot, strike, T, 0.065, option_type)
+            if not (0.03 < hedge_iv < 3.0):
+                raise ValueError(f"IV {hedge_iv:.4f} outside (0.03, 3.0)")
+            opt_delta = self.greeks.delta(spot, strike, T, hedge_iv, option_type)
+        except Exception as e:
+            # Same "refuse rather than guess" stance the futures hedge takes
+            # when its price is unusable: a mis-sized hedge follows the
+            # position to its grave, whereas drift re-proposes next tick.
+            #
+            # Counted and throttled like the other silent no-hedge paths: a
+            # thin chain or a stale quote can make this fire on EVERY tick for
+            # the rest of the session, and an unthrottled ERROR per tick is
+            # noise while a count of zero would be a lie.
+            self._log_soft_refusal(
+                "Soft delta hedge: cannot solve IV/delta for %s (%s) — "
+                "refusing rather than sizing it as if it were a future "
+                "(%.1f delta left unhedged this tick).",
+                symbol, e, delta_to_hedge,
+            )
+            return []
+
+        # A near-zero-delta contract cannot hedge delta at any sane size: the
+        # lots needed explode as 1/|Δ| and what you actually buy is vega and
+        # gamma. Refuse instead of emitting a huge order for the wrong greek.
+        if abs(opt_delta) < MIN_SOFT_HEDGE_DELTA:
+            self._log_soft_refusal(
+                "Soft delta hedge: %s has |Δ|=%.3f < %.2f — hedging %.1f delta "
+                "with it would need %.0f lots and would buy vega, not delta. "
+                "Refusing.",
+                symbol, opt_delta, MIN_SOFT_HEDGE_DELTA, delta_to_hedge,
+                abs(delta_to_hedge) / max(abs(opt_delta) * lot_size, 1e-9),
+            )
+            return []
+
+        delta_per_lot = abs(opt_delta) * lot_size
+        lots = max(round(abs(delta_to_hedge) / delta_per_lot), 1)
+        logger.info(
+            "Soft hedge sizing: %.1f delta / (|Δ|%.3f × %d) = %.2f → %d lot(s) "
+            "of %s (≈%.1f delta hedged)",
+            delta_to_hedge, opt_delta, lot_size,
+            abs(delta_to_hedge) / delta_per_lot, lots, symbol,
+            lots * delta_per_lot,
+        )
+
         return [TradeProposal(
             tradingsymbol=symbol, instrument_token=instrument_token,
             strike=strike, expiry=str(row.get("expiry", expiry)),
             option_type=option_type, lot_size=lot_size, quantity=lots,
-            price=price, transaction_type="BUY", iv=0, bid_ask_spread_pct=spread,
+            price=price, transaction_type="BUY", iv=hedge_iv,
+            bid_ask_spread_pct=spread,
             margin_required=price * lot_size * lots,
-            rationale=f"SOFT delta hedge: buy {lots} {option_type} @ {strike} (gamma flip protection)",
+            rationale=(
+                f"SOFT delta hedge: buy {lots} {option_type} @ {strike} "
+                f"(|Δ|={abs(opt_delta):.2f}, ≈{lots * delta_per_lot:.0f} delta; "
+                f"gamma flip protection)"
+            ),
         )]
 
     def _estimate_gamma_scalp_pnl(self, greeks, spot):

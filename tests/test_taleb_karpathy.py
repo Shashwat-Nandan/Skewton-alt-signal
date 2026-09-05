@@ -2965,11 +2965,15 @@ class TestLayeredStructures:
         assert result == []
         h._pre_trade_checks.assert_not_called()
 
-    def test_t0_band_tightens_on_expiry_day(self):
-        """Phase 5: when t0_band_factor < 1.0 and any leg has < 1 day
-        to expiry, the rehedge band is multiplied by the factor —
-        making the trigger tighter and capturing sticky-strike scalps.
-        With factor 1.0 (default), behaviour is unchanged."""
+    def test_sub_lot_drift_on_t0_is_refused(self):
+        """A 0.2-lot drift is refused, tightened band or not.
+
+        This test used to be called test_t0_band_tightens_on_expiry_day and
+        claimed to verify "capturing sticky-strike scalps". It never did: with
+        a 0.5-lot base band, the UNtightened band alone already rejects 0.2
+        lots, so deleting t0_band_factor entirely leaves it passing. The
+        feature is pinned by test_t0_tightening_captures_a_scalp_it_can_
+        actually_size instead; this one keeps only the claim it can support."""
         from datetime import datetime
         h = self._make_hedger(max_layers=1, regime=False)
         h.tunable_params.update({
@@ -3019,15 +3023,123 @@ class TestLayeredStructures:
         h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
         h.state.portfolio_greeks = pf
         proposals = h.check_and_rehedge()
-        # round(15/75)=0 so the hard-hedge proposal list is empty even though
-        # the tightened band fired (per the 2026-05-07 lesson). The robust
-        # signal that the band fired is that the method proceeded past the
-        # band + cost gates to the hedge decision — hedge_decision is only
-        # reached when delta clears the band. rehedge_count is NOT a valid
-        # proxy: the 2026-06-02 C2 fix stops it incrementing on empty proposals
-        # (a 0-lot non-hedge must not count toward the session cap).
-        h.risk.hedge_decision.assert_called_once()
+        # 15 delta / 75 = 0.2 lots — under the 0.25-lot minimum, so neither
+        # path can improve it: futures round to 0, and one ATM option (≈0.5
+        # lots of delta) would over-hedge past zero. The old assertion checked
+        # that we REACHED hedge_decision, pinning the wasteful path rather than
+        # the intent.
         assert proposals == [], "0-lot drift should yield no proposal here"
+        h.risk.hedge_decision.assert_not_called()
+
+    def test_t0_tightening_captures_a_scalp_it_can_actually_size(self):
+        """The USEFUL window for t0_band_factor: drift below the untightened
+        band but at least one whole lot. Below half a lot the tightening is
+        structurally inert (nothing can be sized), so if this window did not
+        exist the feature would do nothing at all. Base 0.9 lots (the live
+        seed) tightened by 0.33 → 0.297; a 0.8-lot drift sits between them and
+        rounds to 1 lot, so a real hedge is emitted."""
+        from datetime import datetime
+        h = self._make_hedger(max_layers=1, regime=False)
+        h.tunable_params.update({
+            "rehedge_delta_threshold": 0.9,
+            "gamma_scalp_band_pct": 1.5,
+            "cost_hurdle_factor": 1.0,
+            "max_holding_period_hours": 8,
+            "t0_band_factor": 0.33,
+        })
+        h._clock = lambda: datetime(2026, 5, 28, 10, 0)
+        h._cached_lot_size = 75
+        h._get_lot_size = lambda: 75
+        h._consecutive_quote_failures = 0
+        h._update_positions_prices = lambda spot: None
+        h._record_spot_sample = lambda *a: None
+        h._should_exit = lambda *a: False
+        h._get_spot_price = lambda: 23800.0
+        h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
+        h._get_futures_price = lambda sym: 23800.0
+        h._estimate_gamma_scalp_pnl = lambda greeks, spot: 1e9
+        h.kite.quote = MagicMock(return_value={
+            "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
+        })
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry="2026-05-28", option_type="CE",
+                lot_size=75, quantity=1, entry_price=120.0,
+                current_price=120.0, iv=0.20,
+            ),
+        ]
+        h.state.entry_time = datetime(2026, 5, 28, 9, 30)
+        h.risk = MagicMock()
+        h.risk.hedge_decision = MagicMock(return_value=MagicMock(
+            use_soft_delta=False, rationale="test",
+        ))
+        # 60 delta / 75 = 0.8 lots: under the 0.9 untightened band, over the
+        # 0.297 tightened one, and round(0.8) = 1 → one futures lot.
+        pf = MagicMock(
+            net_delta=60.0, net_discrete_delta=60.0,
+            net_shadow_gamma=0.4, net_shadow_gamma_up=0.4,
+            net_shadow_gamma_down=0.4, net_gamma=0.4,
+            net_shadow_theta=-2400.0, net_vega=2000.0,
+        )
+        h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
+        h.state.portfolio_greeks = pf
+
+        proposals = h.check_and_rehedge()
+        h.risk.hedge_decision.assert_called_once()
+        assert len(proposals) == 1
+        assert proposals[0].option_type == "FUT"
+        assert proposals[0].quantity == 1
+        assert proposals[0].transaction_type == "SELL"   # long delta → sell
+
+    def test_unhedgeable_drift_is_refused_before_the_cost_gate(self):
+        """Drift under 0.25 lots reaches no hedge path, so it must not reach
+        the WW cost gate or the hedge decision: it can emit nothing, so the
+        work (and the last_hedge_decision write) is pure waste."""
+        from datetime import datetime
+        h = self._make_hedger(max_layers=1, regime=False)
+        h.tunable_params.update({
+            "rehedge_delta_threshold": 0.1,
+            "gamma_scalp_band_pct": 1.5,
+            "cost_hurdle_factor": 1.0,
+            "max_holding_period_hours": 8,
+            "t0_band_factor": 1.0,
+        })
+        h._clock = lambda: datetime(2026, 5, 20, 10, 0)
+        h._cached_lot_size = 75
+        h._get_lot_size = lambda: 75
+        h._consecutive_quote_failures = 0
+        h._update_positions_prices = lambda spot: None
+        h._record_spot_sample = lambda *a: None
+        h._should_exit = lambda *a: False
+        h._get_spot_price = lambda: 23800.0
+        scalp_calls = []
+        h._estimate_gamma_scalp_pnl = lambda g, s: scalp_calls.append(1) or 1e9
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry="2026-05-28", option_type="CE",
+                lot_size=75, quantity=1, entry_price=120.0,
+                current_price=120.0, iv=0.20,
+            ),
+        ]
+        h.state.entry_time = datetime(2026, 5, 20, 9, 30)
+        h.risk = MagicMock()
+        h.risk.hedge_decision = MagicMock()
+        # 0.2 lots: below the 0.25-lot floor, so no instrument can express it.
+        pf = MagicMock(
+            net_delta=15.0, net_discrete_delta=15.0,
+            net_shadow_gamma=0.4, net_shadow_gamma_up=0.4,
+            net_shadow_gamma_down=0.4, net_gamma=0.4,
+            net_shadow_theta=-2400.0, net_vega=2000.0,
+        )
+        h.greeks.compute_portfolio_greeks = MagicMock(return_value=pf)
+        h.state.portfolio_greeks = pf
+
+        assert h.check_and_rehedge() == []
+        h.risk.hedge_decision.assert_not_called()
+        assert scalp_calls == [], "cost gate must not run for an unhedgeable drift"
+        assert h.state.last_hedge_decision is None
 
     def test_count_active_structures_by_expiry(self):
         """Two legs sharing one expiry (a straddle) count as ONE
@@ -4153,3 +4265,320 @@ class TestIVPercentileGateUnderRegimeDispatch:
             assert builder.called, (
                 f"in-band IV 30 must still enter (regime_enabled={regime_enabled})"
             )
+
+
+class TestSubLotHedgeFloor:
+    """The floor is set by the SOFT path, not the hard one. An earlier revision
+    used the hard path's 0.5 lots and suppressed the 0.25–0.5 band where the
+    soft path's ATM option (delta ≈ 0.5/lot) is a near-exact hedge."""
+
+    def _h(self, *, delta, t0=1.0, base=0.9, expiry="2026-05-28",
+           now=datetime(2026, 5, 20, 10, 0), soft=False):
+        from types import SimpleNamespace
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.state = HedgeState()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26MAY23800CE", instrument_token=1,
+                strike=23800, expiry=expiry, option_type="CE", lot_size=75,
+                quantity=1, entry_price=120.0, current_price=120.0, iv=0.20,
+            )
+        ]
+        h.state.entry_time = None
+        h.state.portfolio_greeks = SimpleNamespace(
+            net_discrete_delta=float(delta),
+            net_shadow_gamma=1.0, net_gamma=1.0,
+            net_shadow_gamma_up=1.0, net_shadow_gamma_down=1.0,
+        )
+        h.tunable_params = {
+            "rehedge_delta_threshold": base, "cost_hurdle_factor": 1.0,
+            "gamma_scalp_band_pct": 1.5, "t0_band_factor": t0,
+            "max_rehedge_lots_per_tick": 0, "rehedge_cooldown_seconds": 0,
+            "max_rehedges_per_session": 0,
+        }
+        h.underlying = "NIFTY"
+        h._clock = lambda: now
+        h._get_spot_price = lambda: 23800.0
+        h._check_spot = lambda spot: True
+        h._record_spot_sample = lambda *a: None
+        h._update_positions_prices = lambda spot: None
+        h._update_portfolio_greeks = lambda: None
+        h._should_exit = lambda greeks, spot: False
+        h._get_lot_size = lambda: 75
+        h._estimate_gamma_scalp_pnl = lambda greeks, spot: 1e9
+        h._generate_close_all_proposals = lambda: []
+        def _prop(kind):
+            return TradeProposal(
+                tradingsymbol="X", instrument_token=0, strike=24000,
+                expiry="2026-09-24", option_type=kind, lot_size=75, quantity=1,
+                price=1.0,                       # ~free, so the cost re-check passes
+                transaction_type="BUY", iv=0.15, bid_ask_spread_pct=0.01,
+                margin_required=0.0, rationale=kind,
+            )
+        h._generate_soft_delta_proposals = lambda g, s, T: [_prop("CE")]
+        h._generate_hard_delta_proposals = lambda g, s: [_prop("FUT")]
+        h.risk = MagicMock()
+        h.risk.hedge_decision = MagicMock(return_value=MagicMock(
+            use_soft_delta=soft, rationale="test"))
+        return h
+
+    def test_soft_path_still_reachable_between_quarter_and_half_a_lot(self):
+        """33.75 delta = 0.45 lots. One ATM option ≈ 0.5 lots of delta, so the
+        soft floor hedges it near-exactly. Gating at the hard path's 0.5 lots
+        would have made this unreachable — the regression this pins."""
+        # base band 0.3 lots so 0.45 clears it; the floor is what is on trial
+        h = self._h(delta=33.75, base=0.3, soft=True)
+        out = h.check_and_rehedge()
+        assert len(out) == 1 and out[0].option_type == "CE"
+        h.risk.hedge_decision.assert_called_once()
+
+    def test_half_a_lot_reaches_the_decision_even_though_futures_round_to_zero(self):
+        """Exactly 0.5 lots: round(0.5) is 0 under banker's rounding, so the
+        HARD path emits nothing — but soft can still hedge it, so the tick must
+        not be refused at the band."""
+        h = self._h(delta=37.5, base=0.3, soft=True)
+        out = h.check_and_rehedge()
+        assert len(out) == 1 and out[0].option_type == "CE"
+
+    def test_below_a_quarter_lot_no_path_is_tried(self):
+        h = self._h(delta=15.0, base=0.1)          # 0.2 lots
+        assert h.check_and_rehedge() == []
+        h.risk.hedge_decision.assert_not_called()
+        assert h.hedge_diagnostics()["unhedgeable_drift_skips"] == 1
+
+    def test_t0_warning_only_when_the_factor_actually_applied(self, caplog):
+        """best_params ships t0_band_factor=0.5, so keying the warning off the
+        tunable would blame T-0 tightening on every non-expiry day."""
+        import logging
+        # 5 days to expiry → the factor is configured but NEVER applied.
+        h = self._h(delta=15.0, base=0.1, t0=0.5, expiry="2026-05-28",
+                    now=datetime(2026, 5, 23, 10, 0))
+        with caplog.at_level(logging.WARNING, logger="strategies.taleb_karpathy"):
+            assert h.check_and_rehedge() == []
+        assert "T-0 band tightening" not in caplog.text
+
+    def test_t0_warning_fires_when_tightening_caused_the_skip(self, caplog):
+        import logging
+        h = self._h(delta=15.0, base=0.1, t0=0.5, expiry="2026-05-20",
+                    now=datetime(2026, 5, 20, 10, 0))     # same day → applied
+        with caplog.at_level(logging.WARNING, logger="strategies.taleb_karpathy"):
+            assert h.check_and_rehedge() == []
+        assert "T-0 band tightening" in caplog.text
+
+    def test_counters_reach_the_eod_report_even_when_degraded(self):
+        """After the first occurrence these are DEBUG-only, so without the EOD
+        counts a structurally unhedgeable book is indistinguishable from a
+        quiet one.
+
+        The earlier version of this test built the stats dict itself and never
+        called generate_eod_report, so deleting the entire session_stats wiring
+        left it green (Rule 9). It now calls the real method — on BOTH degraded
+        paths, because a book flattened at 13:00 reports "no_positions" at
+        15:20 and that is exactly when the counts must survive."""
+        h = self._h(delta=15.0, base=0.1)
+        h.check_and_rehedge()
+        h.check_and_rehedge()
+        assert h.hedge_diagnostics()["unhedgeable_drift_skips"] == 2
+
+        # spot_unavailable path
+        h._get_spot_price = lambda: 0.0
+        rep = h.generate_eod_report()
+        assert rep["status"] == "spot_unavailable"
+        assert rep["hedge_diagnostics"]["unhedgeable_drift_skips"] == 2
+
+        # no_positions path — the book was flattened before EOD
+        h.state.positions = []
+        rep = h.generate_eod_report()
+        assert rep["status"] == "no_positions"
+        assert rep["hedge_diagnostics"]["unhedgeable_drift_skips"] == 2
+
+    def test_real_proposal_cost_is_re_gated_after_sizing(self):
+        """The pre-gate prices a FUTURES round trip at the futures lot count.
+        Delta-aware sizing means the soft path trades ~1/|Δ| ≈ 2× as many
+        OPTION lots, so a soft rehedge could clear a gate sized for roughly
+        half its true cost. The proposals are re-priced against the same
+        hurdle."""
+        h = self._h(delta=75.0, base=0.3, soft=True)
+        # Futures cost is notional-based and option cost is premium-based, so
+        # the pre-gate is not uniformly lax — for a CHEAP option it actually
+        # over-states. It under-states for a large, expensive option hedge,
+        # which is what delta-aware sizing makes more likely: here the futures
+        # pre-gate demands ₹953 while the real proposals demand ₹1,296
+        # (cost_hurdle_factor is 1.0 in this fixture, so the cube root is 1).
+        h._estimate_gamma_scalp_pnl = lambda g, s: 1000.0
+        h._generate_soft_delta_proposals = lambda g, s, T: [TradeProposal(
+            tradingsymbol="NIFTY26SEP24000CE", instrument_token=0, strike=24000,
+            expiry="2026-09-24", option_type="CE", lot_size=75, quantity=12,
+            price=600.0, transaction_type="BUY", iv=0.15,
+            bid_ask_spread_pct=2.0, margin_required=540000.0, rationale="soft",
+        )]
+        assert h.check_and_rehedge() == []
+        assert h.hedge_diagnostics()["cost_gated_rehedges"] == 1
+
+    def test_a_cheap_hedge_still_passes_the_re_gate(self):
+        """The re-gate must not become a blanket refusal."""
+        h = self._h(delta=75.0, base=0.3, soft=True)
+        h._estimate_gamma_scalp_pnl = lambda g, s: 1e9
+        out = h.check_and_rehedge()
+        assert len(out) == 1
+        assert h.hedge_diagnostics()["cost_gated_rehedges"] == 0
+
+    def test_clamped_soft_rationale_drops_the_pre_clamp_delta(self):
+        """max_rehedge_lots_per_tick counts CONTRACT lots, not delta lots, so a
+        clamped option hedge carries about half the delta its rationale
+        advertised before the clamp."""
+        h = self._h(delta=75.0, base=0.3, soft=True)
+        h.tunable_params["max_rehedge_lots_per_tick"] = 2
+        h._generate_soft_delta_proposals = lambda g, s, T: [TradeProposal(
+            tradingsymbol="NIFTY26SEP24000CE", instrument_token=0, strike=24000,
+            expiry="2026-09-24", option_type="CE", lot_size=75, quantity=6,
+            price=1.0, transaction_type="BUY", iv=0.15, bid_ask_spread_pct=0.01,
+            margin_required=600.0,
+            rationale="SOFT delta hedge: buy 6 CE @ 24000 (≈237 delta)",
+        )]
+        out = h.check_and_rehedge()
+        assert out[0].quantity == 2
+        assert "237 delta" not in out[0].rationale
+        assert "CLAMPED" in out[0].rationale
+
+    def test_counters_are_per_session_not_per_run(self):
+        """research/backtest.py builds ONE strategy and replays many sessions
+        through it, so a plain attribute counter reports a run-cumulative
+        number under a per-session label — and the log-once throttles would
+        fire once for a whole multi-month replay."""
+        day1 = datetime(2026, 5, 20, 10, 0)
+        h = self._h(delta=15.0, base=0.1, now=day1)
+        h.check_and_rehedge()
+        h.check_and_rehedge()
+        assert h.hedge_diagnostics()["unhedgeable_drift_skips"] == 2
+        h._clock = lambda: datetime(2026, 5, 21, 10, 0)     # next session
+        assert h.hedge_diagnostics()["unhedgeable_drift_skips"] == 0
+        h.check_and_rehedge()
+        assert h.hedge_diagnostics()["unhedgeable_drift_skips"] == 1
+
+
+class TestSoftHedgeDeltaSizing:
+    """_generate_soft_delta_proposals had no direct test — it was only ever
+    stubbed — which is how it shipped sizing an OPTION hedge with the FUTURES
+    formula, round(delta / lot_size). An option is not a delta-1.0 instrument,
+    so that under-hedges by 1/|Δ|."""
+
+    SPOT = 24000.0
+    T = 7 / 365.0
+    IV = 0.15
+
+    def _chain(self, strikes):
+        import pandas as pd
+        return pd.DataFrame([
+            {"tradingsymbol": f"NIFTY26SEP{int(k)}CE", "instrument_token": 1000 + i,
+             "strike": float(k), "instrument_type": "CE", "expiry": "2026-09-24"}
+            for i, k in enumerate(strikes)
+        ])
+
+    def _h(self, *, net_delta, strikes=(24000.0,)):
+        from types import SimpleNamespace
+        from core.greeks_engine import GreeksEngine
+        h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
+        h.state = HedgeState()
+        h.state.positions = [
+            OptionContract(
+                tradingsymbol="NIFTY26SEP24000PE", instrument_token=1,
+                strike=24000, expiry="2026-09-24", option_type="PE",
+                lot_size=75, quantity=1, entry_price=100.0,
+                current_price=100.0, iv=0.15,
+            )
+        ]
+        h.greeks = GreeksEngine(risk_free_rate=0.065)
+        h.underlying = "NIFTY"
+        h._clock = lambda: datetime(2026, 9, 17, 11, 0)   # diagnostics key
+        h._get_lot_size = lambda: 75
+        h._get_options_chain = lambda: self._chain(strikes)
+        h._primary_expiry_slice = lambda c: c
+        # Price each contract at its own fair value so IV solves back to self.IV
+        def _quote(keys):
+            sym = keys[0].split(":")[1]
+            k = float(sym.replace("NIFTY26SEP", "").replace("CE", ""))
+            px = h.greeks.bs_price(self.SPOT, k, self.T, self.IV, "CE")
+            return {keys[0]: {"last_price": px,
+                              "depth": {"buy": [{"price": px * 0.99}],
+                                        "sell": [{"price": px * 1.01}]}}}
+        h.kite = MagicMock()
+        h.kite.quote = _quote
+        greeks = SimpleNamespace(net_discrete_delta=-float(net_delta))
+        return h, greeks
+
+    def test_sizes_off_the_option_delta_not_the_futures_formula(self):
+        """150 delta of drift. ATM CE is ~0.52Δ → ~39 delta per 75-lot, so the
+        hedge needs ~4 lots. The old futures formula gave round(150/75) = 2 —
+        half the hedge that was asked for."""
+        h, g = self._h(net_delta=150.0)
+        out = h._generate_soft_delta_proposals(g, self.SPOT, self.T)
+        assert len(out) == 1
+        d = abs(h.greeks.delta(self.SPOT, 24000.0, self.T, self.IV, "CE"))
+        expected = max(round(150.0 / (d * 75)), 1)
+        assert out[0].quantity == expected
+        assert expected >= 3, "ATM delta ~0.5 must need roughly double the lots"
+        assert out[0].quantity != 2, "2 lots is the old futures-formula answer"
+        # the hedge now actually covers the drift
+        assert out[0].quantity * d * 75 == pytest.approx(150.0, rel=0.25)
+
+    def test_sub_lot_drift_still_gets_one_lot(self):
+        """The ~0.45-lot case looked correct under the old formula only by
+        accident (max(...,1) buys one ATM lot ≈ 0.5 lots of delta). Correct
+        sizing must reach the same answer, not a different one."""
+        h, g = self._h(net_delta=33.75)
+        out = h._generate_soft_delta_proposals(g, self.SPOT, self.T)
+        assert out[0].quantity == 1
+
+    def test_refuses_a_near_zero_delta_contract(self):
+        """Only a far-OTM strike is available, so the nearest-strike fallback
+        picks it. Hedging delta with a ~0Δ option needs lots ∝ 1/|Δ| and buys
+        vega, not delta."""
+        h, g = self._h(net_delta=150.0, strikes=(30000.0,))
+        assert h._generate_soft_delta_proposals(g, self.SPOT, self.T) == []
+
+    def test_refuses_when_iv_cannot_be_solved(self):
+        """Refuse rather than size it as if it were a future — the same stance
+        the futures hedge takes when its price is unusable."""
+        h, g = self._h(net_delta=150.0)
+        h.kite.quote = lambda keys: {
+            keys[0]: {"last_price": 1e6,          # far outside no-arb bounds
+                      "depth": {"buy": [{"price": 1.0}], "sell": [{"price": 2.0}]}}
+        }
+        assert h._generate_soft_delta_proposals(g, self.SPOT, self.T) == []
+
+    def test_proposal_records_the_iv_it_solved(self):
+        """iv was hard-coded to 0 even though the sizing now solves for it."""
+        h, g = self._h(net_delta=150.0)
+        out = h._generate_soft_delta_proposals(g, self.SPOT, self.T)
+        assert out[0].iv == pytest.approx(self.IV, abs=0.02)
+        assert out[0].margin_required == pytest.approx(
+            out[0].price * 75 * out[0].quantity)
+
+    def test_put_is_chosen_and_sized_for_negative_drift(self):
+        """delta_to_hedge < 0 → buy PE. |Δ| of an ATM put is also ~0.5, so the
+        lot count must scale the same way."""
+        import pandas as pd
+        h, g = self._h(net_delta=-150.0)
+        h._get_options_chain = lambda: pd.DataFrame([{
+            "tradingsymbol": "NIFTY26SEP24000PE", "instrument_token": 2000,
+            "strike": 24000.0, "instrument_type": "PE", "expiry": "2026-09-24",
+        }])
+        px = h.greeks.bs_price(self.SPOT, 24000.0, self.T, self.IV, "PE")
+        h.kite.quote = lambda keys: {keys[0]: {
+            "last_price": px,
+            "depth": {"buy": [{"price": px * 0.99}], "sell": [{"price": px * 1.01}]}}}
+        out = h._generate_soft_delta_proposals(g, self.SPOT, self.T)
+        assert len(out) == 1 and out[0].option_type == "PE"
+        d = abs(h.greeks.delta(self.SPOT, 24000.0, self.T, self.IV, "PE"))
+        assert out[0].quantity == max(round(150.0 / (d * 75)), 1)
+
+    def test_refusals_are_counted_and_throttled(self):
+        """These are silent no-hedge paths: unthrottled they log an ERROR every
+        tick for the rest of a session on a thin chain, and uncounted they are
+        invisible in the EOD report — the exact failure the diagnostics exist
+        to prevent."""
+        h, g = self._h(net_delta=150.0, strikes=(30000.0,))
+        for _ in range(4):
+            assert h._generate_soft_delta_proposals(g, self.SPOT, self.T) == []
+        assert h.hedge_diagnostics()["soft_hedge_refusals"] == 4
