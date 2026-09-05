@@ -1,3 +1,43 @@
+# ma-momentum EOD carry — completing the #218 F2 fix — 2026-09-02
+
+Review of the /ma-momentum tab (#219) found that #218's F2 fix was incomplete:
+`write_state` carries the blob of a symbol the runner could not load, but
+`write_eod`/`eod_report` still iterated only the loaded books. The EOD sidecar
+is what `scripts/strategy_scoreboard.ma_momentum_monthly` reads as a CUMULATIVE
+series, so the phantom-loss artifact F2 was written to prevent survived through
+the other writer.
+
+- [x] `eod_report(books, today, carry)` rebuilds a row from the stored blob
+- [x] carried rows flagged `"carried": true` + `carried_symbols` at top level
+- [x] CRITICAL log when a session is partial (totals whole, session is not)
+- [x] `_carried_entry` degrades to None on a blob it cannot parse
+- [x] sidecar records `entries_halted` + `halt_reasons` (a halted session still
+      writes a file, so counting files as holdout progress counts dead sessions)
+- [x] ruff + full pytest green
+
+### Review
+
+Verified 2026-09-02: `ruff check .` clean; `pytest tests/ -q -rs` → 1880 passed,
+0 skips (+4 new). Totals now include a carried symbol's lifetime P&L, and the
+row is marked so a reader cannot mistake carried history for a session result.
+
+Not changed: `scripts/strategy_scoreboard.ma_momentum_monthly` needs no edit —
+it reads `total_rupees`, which is now whole.
+
+**CORRECTION (review of this PR).** An earlier note here claimed
+`run_paper_kalman_trend`'s identical bug was safe to defer because "that series
+is not decay-scored". That was **wrong**. `scripts/strategy_scoreboard.py:536`
+adds `kalman_trend` with `verdict=None`, and `apply_decay` skips only rows where
+`verdict is not None` — so the series IS machine-scored. Only the
+`kalman_trend_ma` control arm is exempt (`verdict="control arm"`).
+
+Worse, `run_paper_kalman_trend.write_state(books)` (line 268) takes no `carry`
+argument at all, so an unloaded symbol's history is **deleted from the state
+file**, not merely omitted from one sidecar — strictly worse than the bug this
+PR fixes, on a decay-scored series. Raised to a priority follow-up; not fixed
+here only because it is a separate runner and belongs in its own reviewed
+change, not bundled blind into this one.
+
 # PR #218 review fixes — MA-momentum holdout integrity — 2026-09-01
 
 Nine review findings on `feat/ma-momentum-paper-holdout`. All are measurement-

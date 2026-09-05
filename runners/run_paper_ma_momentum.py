@@ -143,7 +143,77 @@ class InstrumentBook:
         return inst
 
 
-def eod_report(books: List[InstrumentBook], today: date) -> dict:
+def _carried_entry(blob: dict) -> Optional[dict]:
+    """Rebuild an EOD row for a symbol we could NOT load today, straight from
+    its stored blob — without instantiating the strategy (restore is exactly
+    what may have failed).
+
+    Without this the sidecar silently omits the symbol, and since
+    `total_rupees` sums the *cumulative* realized_rupees the scoreboard reads
+    as a cumulative series, its whole lifetime P&L drops out for that session.
+    write_state() already carries the blob; the EOD sidecar has to carry it
+    too or the artifact survives in the ledger the decay machine scores.
+    """
+    book = blob.get("book")
+    if not isinstance(book, dict):
+        logger.critical("carried blob for %s has no 'book' object — its stored "
+                        "history cannot be read", blob.get("symbol"))
+        return None
+    try:
+        realized_points = float(book.get("realized_points") or 0.0)
+        # lot_size is REQUIRED, never coerced. `or 0.0` would turn a missing
+        # field into realized_rupees = 0.0 on a row that still looks
+        # well-formed — the phantom-loss artifact masked instead of visible,
+        # which is worse than the bug this function exists to fix.
+        if book.get("lot_size") in (None, 0, 0.0, ""):
+            raise ValueError("missing/zero lot_size")
+        lot = float(book["lot_size"])
+        # These live INSIDE the guard: they are the fields most likely to be
+        # corrupt, and this path only runs for a blob whose restore already
+        # failed. Outside it, an unparseable value propagated out of main()
+        # and NO sidecar was written for the session at all.
+        overshoot_points = float(blob.get("stop_overshoot_points") or 0.0)
+        n_stop_fills = int(blob.get("n_stop_fills") or 0)
+        trades = book.get("trades") or []
+        wins = sum(1 for t in trades
+                   if isinstance(t, dict) and float(t.get("pnl_points") or 0.0) > 0)
+        summary = {
+            "signal_kind": str(book.get("signal_kind", "ma")),
+            "n_trades": len(trades),
+            "realized_points": round(realized_points, 2),
+            "realized_rupees": round(realized_points * lot, 2),
+            "win_rate": round(wins / len(trades), 3) if trades else None,
+            "open_pos": int(book.get("pos") or 0),
+            "n_bars": int(book.get("n_bars") or 0),
+            # It did not trade today — by construction, it was never loaded.
+            "session_n_trades": 0,
+            "session_realized_rupees": 0.0,
+            "session_trades": [],
+        }
+    except (TypeError, ValueError) as e:
+        logger.critical(
+            "carried blob for %s is unreadable (%s) — its stored history is "
+            "NOT in this sidecar; totals are short by that book's lifetime P&L",
+            blob.get("symbol"), e)
+        return None
+    return {
+        "symbol": blob.get("symbol"),
+        "tradingsymbol": blob.get("tradingsymbol") or "",
+        "ma": summary,
+        "stop_overshoot_points": round(overshoot_points, 2),
+        "stop_overshoot_rupees": round(overshoot_points * lot, 2),
+        "n_stop_fills": n_stop_fills,
+        # Fail loud in the artifact itself: this row is carried history, not a
+        # session result. A reader that ignores it still gets correct totals.
+        "carried": True,
+    }
+
+
+def eod_report(books: List[InstrumentBook], today: date,
+               carry: Optional[Dict[str, dict]] = None,
+               *, entries_halted: bool = False,
+               halt_reasons: Optional[List[str]] = None,
+               entries_halted_intraday: bool = False) -> dict:
     per = []
     total = 0.0
     n_trades = 0
@@ -156,16 +226,56 @@ def eod_report(books: List[InstrumentBook], today: date) -> dict:
                     "ma": s,
                     "stop_overshoot_points": round(b.stop_overshoot_points, 2),
                     "stop_overshoot_rupees": round(over_inr, 2),
-                    "n_stop_fills": b.n_stop_fills})
+                    "n_stop_fills": b.n_stop_fills,
+                    "carried": False})
         total += s["realized_rupees"]
         n_trades += s["n_trades"]
         overshoot_rupees += over_inr
         n_stop_fills += b.n_stop_fills
+
+    loaded = {b.symbol for b in books}
+    carried: List[str] = []
+    dropped: List[str] = []
+    for sym, blob in (carry or {}).items():
+        if sym in loaded:
+            continue
+        entry = _carried_entry(blob)
+        if entry is None:
+            # Record it. Silently skipping removed the symbol from
+            # carried_symbols too, which is what gates the PARTIAL alarm — so
+            # the sidecar reported itself COMPLETE while its totals were short
+            # by that book's lifetime P&L. The one path added to make this
+            # loud was the one place it went silent.
+            dropped.append(str(sym))
+            continue
+        per.append(entry)
+        total += entry["ma"]["realized_rupees"]
+        n_trades += entry["ma"]["n_trades"]
+        overshoot_rupees += entry["stop_overshoot_rupees"]
+        n_stop_fills += entry["n_stop_fills"]
+        carried.append(str(sym))
+
     return {
         "date": today.isoformat(),
         "system": "ma_momentum",
         "total_rupees": round(total, 2),
         "n_trades": n_trades,
+        # Symbols whose stored history is carried into this row because the
+        # runner could not load them today. Non-empty = the session is partial.
+        "carried_symbols": sorted(carried),
+        # Symbols whose stored blob could not be read at all, so their history
+        # is MISSING from these totals. Non-empty = the totals are wrong low.
+        "dropped_symbols": sorted(dropped),
+        # True when entries were NEVER possible during this session — the
+        # sense the dashboard uses to exclude a session from holdout progress.
+        # A session that traded and only later breached the cap is NOT this:
+        # it took entries, so it counts as measured.
+        "entries_halted": bool(entries_halted),
+        # True when entries were allowed for part of the session and suspended
+        # for the rest (e.g. an intraday daily-loss breach). Such a session
+        # still counts as measured; this records that it was cut short.
+        "entries_halted_intraday": bool(entries_halted_intraday),
+        "halt_reasons": list(halt_reasons or []),
         # Cumulative \u20b9 by which stop fills are optimistic: check_exit books at
         # the stop LEVEL, the 30s poll means price was already through it.
         # total_rupees is NOT adjusted (that would silently restate the
@@ -223,9 +333,45 @@ def state_session_date() -> Optional[date]:
         return None
 
 
-def write_eod(books: List[InstrumentBook], today: date) -> Path:
+def current_halt_reasons() -> List[str]:
+    """Flags suppressing entries right now, by name. Recorded into the EOD
+    sidecar so a reader can tell a session that TRADED from one that merely
+    produced a file — the daily-loss flag persists across sessions."""
+    reasons: List[str] = []
+    for path in (HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH, HALT_ENTRIES_PATH,
+                 HALT_DAILY_LOSS_PATH):
+        if path.exists():
+            reasons.append(path.name)
+    return reasons
+
+
+def write_eod(books: List[InstrumentBook], today: date,
+              carry: Optional[Dict[str, dict]] = None,
+              gate: Optional[dict] = None) -> Path:
+    """`gate` is the entry-gate observation latched DURING the session (see
+    main()). A single snapshot at write time is the wrong question: a session
+    that took three trades and then breached the cap at 13:40 would record
+    `entries_halted: true` and be excluded from holdout progress — discounting
+    the very session that produced the biggest loss. The inverse is just as
+    wrong: an operator clearing a flag at 15:00 after a frozen day would make
+    a dead session count as measured.
+
+    Falls back to a snapshot only when the gate was never evaluated (no tick
+    ran at all), where there is nothing better to report.
+    """
     path = DATA_CACHE / f"ma_momentum_eod_{today.isoformat()}.json"
-    path.write_text(json.dumps(eod_report(books, today), default=str, indent=2))
+    if gate and gate.get("evaluated"):
+        never_allowed = not gate["allowed"]
+        intraday = bool(gate["allowed"] and gate["halted"])
+        reasons = sorted(gate["reasons"])
+    else:
+        reasons = current_halt_reasons()
+        never_allowed = bool(reasons)
+        intraday = False
+    report = eod_report(books, today, carry,
+                        entries_halted=never_allowed, halt_reasons=reasons,
+                        entries_halted_intraday=intraday)
+    path.write_text(json.dumps(report, default=str, indent=2))
     return path
 
 
@@ -433,11 +579,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.force and not args.once:
         sleep_until(open_t, logger)
 
+    # Entry-gate observation, latched across the whole session. `allowed` /
+    # `halted` are sticky: what the sidecar needs to record is whether entries
+    # were EVER possible, not what the flags happen to say at 15:25.
+    gate = {"allowed": False, "halted": False, "evaluated": 0,
+            "reasons": set()}
+
+    def _gate(ok: bool, reason: Optional[str] = None) -> bool:
+        gate["evaluated"] += 1
+        if ok:
+            gate["allowed"] = True
+        else:
+            gate["halted"] = True
+            if reason:
+                gate["reasons"].add(reason)
+        return ok
+
     def _allow_entry() -> bool:
-        if HALT_NEW_ENTRIES_PATH.exists() or HALT_ENTRIES_PATH.exists():
-            return False
+        if HALT_NEW_ENTRIES_PATH.exists():
+            return _gate(False, HALT_NEW_ENTRIES_PATH.name)
+        if HALT_ENTRIES_PATH.exists():
+            return _gate(False, HALT_ENTRIES_PATH.name)
         if HALT_DAILY_LOSS_PATH.exists():
-            return False
+            return _gate(False, HALT_DAILY_LOSS_PATH.name)
         if args.max_daily_loss_inr > 0:
             pnl = session_pnl_rupees(books, last_px)
             if pnl <= -args.max_daily_loss_inr:
@@ -455,8 +619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "holdout. Operator: `rm %s` to resume.",
                     pnl, -args.max_daily_loss_inr,
                     HALT_DAILY_LOSS_PATH, HALT_DAILY_LOSS_PATH)
-                return False
-        return True
+                return _gate(False, HALT_DAILY_LOSS_PATH.name)
+        return _gate(True)
 
     if HALT_DAILY_LOSS_PATH.exists():
         logger.critical(
@@ -532,8 +696,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                     b.symbol, b.tradingsymbol, b.book.pos)
     write_state(books, prior)
     if ok:
-        path = write_eod(books, today)
-        rep = eod_report(books, today)
+        path = write_eod(books, today, prior, gate)
+        rep = json.loads(path.read_text())
+        if rep["dropped_symbols"]:
+            logger.critical(
+                "EOD sidecar could NOT read stored history for %s — these "
+                "totals are short by those books' lifetime P&L. Do not feed "
+                "this session to the scoreboard until the state file is "
+                "repaired.", ", ".join(rep["dropped_symbols"]))
+        if rep["carried_symbols"]:
+            logger.critical(
+                "EOD sidecar carries stored history for %s — those symbols did "
+                "NOT trade today. Totals are whole, but this session is "
+                "PARTIAL; do not read it as a full session.",
+                ", ".join(rep["carried_symbols"]))
         logger.info("EOD MA-momentum ₹%.0f n=%d → %s",
                     rep["total_rupees"], rep["n_trades"], path.name)
     return 1 if silent_dead else 0

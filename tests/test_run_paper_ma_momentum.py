@@ -177,3 +177,183 @@ def test_last_px_round_trips_so_a_crashed_position_can_be_marked():
     assert restored.book.pos == 1
     rec = restored.book.force_close(restored.last_px)
     assert rec.exit_price == pytest.approx(24012.5)
+
+
+def test_eod_carries_a_symbol_the_runner_could_not_load(tmp_path, monkeypatch):
+    """write_state's carry kept the STATE whole, but the EOD sidecar is what the
+    scoreboard reads as a cumulative series. Omitting the symbol there drops its
+    whole lifetime P&L for that session — the same phantom-loss artifact, just
+    through the other writer."""
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(r, "STATE_PATH", tmp_path / "state.json")
+
+    # BANKNIFTY has history but fails to load today.
+    bn = mm.build_book("BANKNIFTY")
+    bn.pos, bn.entry_price = 1, 57000.0
+    bn.force_close(57100.0)                       # +100 pts × 15 − costs
+    carried_rupees = bn.realized_rupees()
+    carry = {"BANKNIFTY": r.InstrumentBook(
+        symbol="BANKNIFTY", book=bn, tradingsymbol="BANKNIFTY26SEPFUT").serialize()}
+
+    nifty = mm.build_book("NIFTY")
+    nifty.pos, nifty.entry_price = 1, 24000.0
+    nifty.force_close(24100.0)
+    loaded = r.InstrumentBook(symbol="NIFTY", book=nifty,
+                              tradingsymbol="NIFTY26SEPFUT")
+
+    rep = r.eod_report([loaded], date(2026, 9, 4), carry)
+
+    assert rep["carried_symbols"] == ["BANKNIFTY"]
+    assert {i["symbol"] for i in rep["instruments"]} == {"NIFTY", "BANKNIFTY"}
+    # the headline still contains BANKNIFTY's lifetime P&L
+    assert rep["total_rupees"] == pytest.approx(
+        nifty.realized_rupees() + carried_rupees)
+    assert rep["n_trades"] == 2
+    # and the carried row is flagged, not passed off as a session result
+    bn_row = next(i for i in rep["instruments"] if i["symbol"] == "BANKNIFTY")
+    assert bn_row["carried"] is True
+    assert bn_row["ma"]["session_n_trades"] == 0
+    assert bn_row["ma"]["session_realized_rupees"] == 0.0
+    assert next(i for i in rep["instruments"]
+                if i["symbol"] == "NIFTY")["carried"] is False
+
+
+def test_eod_does_not_double_count_a_symbol_that_did_load(tmp_path, monkeypatch):
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    book = mm.build_book("NIFTY")
+    book.pos, book.entry_price = 1, 24000.0
+    book.force_close(24100.0)
+    inst = r.InstrumentBook(symbol="NIFTY", book=book)
+    carry = {"NIFTY": inst.serialize()}           # same symbol in BOTH
+
+    rep = r.eod_report([inst], date(2026, 9, 4), carry)
+    assert rep["carried_symbols"] == []
+    assert len(rep["instruments"]) == 1
+    assert rep["total_rupees"] == pytest.approx(book.realized_rupees())
+
+
+def test_eod_records_whether_entries_were_halted(tmp_path, monkeypatch):
+    """A halted session still writes a sidecar. Without this flag a reader
+    counting files as holdout progress counts sessions that could never
+    trade — the daily-loss flag persists across sessions."""
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(r, "HALT_DAILY_LOSS_PATH",
+                        tmp_path / "HALT_MA_MOMENTUM_DAILY_LOSS")
+    monkeypatch.setattr(r, "HALT_ALL_PATH", tmp_path / "HALT_ALL")
+    monkeypatch.setattr(r, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES")
+    monkeypatch.setattr(r, "HALT_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES_ma_momentum")
+    inst = r.InstrumentBook(symbol="NIFTY", book=mm.build_book("NIFTY"))
+
+    path = r.write_eod([inst], date(2026, 9, 4))
+    assert json.loads(path.read_text())["entries_halted"] is False
+
+    (tmp_path / "HALT_MA_MOMENTUM_DAILY_LOSS").write_text("breached\n")
+    path = r.write_eod([inst], date(2026, 9, 5))
+    blob = json.loads(path.read_text())
+    assert blob["entries_halted"] is True
+    assert blob["halt_reasons"] == ["HALT_MA_MOMENTUM_DAILY_LOSS"]
+
+
+def test_carried_entry_skips_a_blob_it_cannot_parse():
+    """A corrupt stored blob must not take the EOD write down — it is the
+    fallback path for a symbol whose restore ALREADY failed."""
+    assert r._carried_entry({"symbol": "NIFTY"}) is None
+    assert r._carried_entry({"symbol": "NIFTY", "book": "not-a-dict"}) is None
+    assert r._carried_entry({"symbol": "NIFTY",
+                             "book": {"realized_points": "nope"}}) is None
+
+
+def test_carried_entry_survives_corrupt_overshoot_fields():
+    """These conversions sat OUTSIDE the guard, so an unparseable value
+    propagated out of main() and NO sidecar was written for the session — the
+    inverse of the contract, on a path that only runs for blobs whose restore
+    already failed."""
+    book = mm.build_book("NIFTY")
+    blob = r.InstrumentBook(symbol="NIFTY", book=book).serialize()
+    blob["stop_overshoot_points"] = "oops"
+    assert r._carried_entry(blob) is None          # not an exception
+
+    blob2 = r.InstrumentBook(symbol="NIFTY", book=mm.build_book("NIFTY")).serialize()
+    blob2["n_stop_fills"] = "nope"
+    assert r._carried_entry(blob2) is None
+
+
+def test_missing_lot_size_is_unreadable_not_zero_pnl():
+    """`or 0.0` turned a missing lot_size into realized_rupees=0.0 on a row
+    that still looked well-formed — the phantom-loss artifact masked rather
+    than visible, which is worse than the bug this fixes."""
+    book = mm.build_book("BANKNIFTY")
+    book.pos, book.entry_price = 1, 57000.0
+    book.force_close(57100.0)
+    assert book.realized_rupees() != 0.0
+    blob = r.InstrumentBook(symbol="BANKNIFTY", book=book).serialize()
+    del blob["book"]["lot_size"]
+    assert r._carried_entry(blob) is None
+
+    blob["book"]["lot_size"] = 0
+    assert r._carried_entry(blob) is None
+
+
+def test_an_unreadable_carried_blob_still_trips_the_partial_alarm(tmp_path, monkeypatch):
+    """Skipping it silently removed the symbol from carried_symbols too — the
+    field gating the PARTIAL alarm — so the sidecar reported itself COMPLETE
+    while its totals were short."""
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    inst = r.InstrumentBook(symbol="NIFTY", book=mm.build_book("NIFTY"))
+    carry = {"BANKNIFTY": {"symbol": "BANKNIFTY", "book": None}}
+
+    rep = r.eod_report([inst], date(2026, 9, 4), carry)
+    assert rep["dropped_symbols"] == ["BANKNIFTY"]
+    assert rep["carried_symbols"] == []
+    assert {i["symbol"] for i in rep["instruments"]} == {"NIFTY"}
+
+
+class TestEntryGateLatch:
+    """`entries_halted` must mean 'entries were NEVER possible this session',
+    which is how the dashboard excludes a session from holdout progress. A
+    15:25 snapshot answered a different question."""
+
+    def _write(self, tmp_path, gate):
+        inst = r.InstrumentBook(symbol="NIFTY", book=mm.build_book("NIFTY"))
+        return json.loads(r.write_eod([inst], date(2026, 9, 4), None, gate).read_text())
+
+    def test_a_session_that_traded_then_breached_still_counts_as_measured(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+        gate = {"evaluated": 40, "allowed": True, "halted": True,
+                "reasons": {"HALT_MA_MOMENTUM_DAILY_LOSS"}}
+        blob = self._write(tmp_path, gate)
+        # it took entries — excluding it would discount the session that
+        # produced the biggest loss
+        assert blob["entries_halted"] is False
+        assert blob["entries_halted_intraday"] is True
+        assert blob["halt_reasons"] == ["HALT_MA_MOMENTUM_DAILY_LOSS"]
+
+    def test_a_fully_frozen_session_is_not_measured(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+        gate = {"evaluated": 40, "allowed": False, "halted": True,
+                "reasons": {"HALT_MA_MOMENTUM_DAILY_LOSS"}}
+        blob = self._write(tmp_path, gate)
+        assert blob["entries_halted"] is True
+        assert blob["entries_halted_intraday"] is False
+
+    def test_a_clean_session_is_measured(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+        gate = {"evaluated": 40, "allowed": True, "halted": False, "reasons": set()}
+        blob = self._write(tmp_path, gate)
+        assert blob["entries_halted"] is False
+        assert blob["entries_halted_intraday"] is False
+        assert blob["halt_reasons"] == []
+
+    def test_falls_back_to_a_snapshot_when_no_tick_ever_ran(self, tmp_path, monkeypatch):
+        """Clearing a flag at 15:00 after a frozen day must not make a dead
+        session count as measured — but with zero evaluations there is nothing
+        better than the snapshot."""
+        monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+        monkeypatch.setattr(r, "HALT_DAILY_LOSS_PATH", tmp_path / "HALT_MA_MOMENTUM_DAILY_LOSS")
+        monkeypatch.setattr(r, "HALT_ALL_PATH", tmp_path / "HALT_ALL")
+        monkeypatch.setattr(r, "HALT_NEW_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES")
+        monkeypatch.setattr(r, "HALT_ENTRIES_PATH", tmp_path / "HALT_NEW_ENTRIES_ma_momentum")
+        (tmp_path / "HALT_MA_MOMENTUM_DAILY_LOSS").write_text("x\n")
+        blob = self._write(tmp_path, {"evaluated": 0, "allowed": False,
+                                      "halted": False, "reasons": set()})
+        assert blob["entries_halted"] is True
