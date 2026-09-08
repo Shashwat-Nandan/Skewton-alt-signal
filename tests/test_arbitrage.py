@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -1562,3 +1562,203 @@ class TestReviewFixes20260711:
         s._observe_universe = lambda: [self._snap(next_price=101.20)]  # mtm −20
         exits = s.check_and_rehedge()
         assert len(exits) == 2 and all("STOP_LOSS" in p.rationale for p in exits)
+
+
+# ──────────────────────────────────────────────────────────
+# Issue #222: quoted depth logged at fill time
+# ──────────────────────────────────────────────────────────
+
+def _quote(bid, ask, ltp, bid_qty=500, ask_qty=400):
+    """A Kite quote row shaped like the live feed's."""
+    return {
+        "last_price": ltp,
+        "depth": {
+            "buy": [{"price": bid, "quantity": bid_qty, "orders": 3},
+                    {"price": bid - 1, "quantity": 900, "orders": 5}],
+            "sell": [{"price": ask, "quantity": ask_qty, "orders": 2},
+                     {"price": ask + 1, "quantity": 700, "orders": 4}],
+        },
+    }
+
+
+class TestDepthLogging:
+    """WHY these exist (Rule 9): the paper book fills at last_price and the
+    cost model charges a flat 2bps of slippage per side, while the measured
+    far-month touch is 8-21bps wide. Re-pricing the 38 verified trades at the
+    real touch turned +₹68,496 into −₹33,469 — the whole live/no-live question
+    turns on a number we were not recording. Each test fails if the touch stops
+    reaching the closed_trades row, or starts claiming a spread it never
+    measured."""
+
+    _open_calendar = TestReview20260711._open_calendar
+    _snap = TestReview20260711._snap
+
+    def _snap_with_depth(self, near=(99.9, 100.1), far=(100.7, 101.3), **kw):
+        return self._snap(
+            near_quote=ArbitrageStrategy._touch(_quote(near[0], near[1], 100.0)),
+            next_quote=ArbitrageStrategy._touch(_quote(far[0], far[1], 101.0)),
+            **kw)
+
+    # ── the extractor ────────────────────────────────────────────────────
+
+    def test_touch_reads_depth_one_not_the_whole_book(self):
+        t = ArbitrageStrategy._touch(_quote(99.9, 100.1, 100.0,
+                                            bid_qty=500, ask_qty=400))
+        # Depth-2 rows (99.9−1 / 100.1+1) must not leak into the touch: an
+        # order crosses level 1, so a wider level would understate nothing
+        # and overstate everything.
+        assert t == {"bid": 99.9, "ask": 100.1, "bid_qty": 500,
+                     "ask_qty": 400, "ltp": 100.0}
+
+    @pytest.mark.parametrize("quote, why", [
+        (None, "no quote at all"),
+        ({"last_price": 100.0}, "no depth — the backtest's MockKiteArb feed"),
+        ({"last_price": 100.0, "depth": {"buy": [], "sell": []}}, "empty book"),
+        ({"last_price": 100.0,
+          "depth": {"buy": [{"price": 0, "quantity": 0}],
+                    "sell": [{"price": 100.1, "quantity": 5}]}}, "no bid"),
+        ({"last_price": 100.0,
+          "depth": {"buy": [{"price": 100.5, "quantity": 5}],
+                    "sell": [{"price": 100.1, "quantity": 5}]}}, "crossed book"),
+        ({"last_price": 100.0,
+          "depth": {"buy": [{"price": 100.1, "quantity": 5}],
+                    "sell": [{"price": 100.1, "quantity": 5}]}}, "locked book"),
+    ])
+    def test_touch_is_none_when_the_book_is_not_measurable(self, quote, why):
+        # None must mean "not measurable", never "zero spread" — a re-pricing
+        # analysis that read an unusable book as free would reproduce exactly
+        # the optimism this issue exists to remove (Rule 12).
+        assert ArbitrageStrategy._touch(quote) is None, why
+
+    def test_snapshot_carries_the_touch_from_the_live_feed(self):
+        # End-to-end through the real _observe_universe_uncached: the depth
+        # kite.quote() already returns was being thrown away here.
+        s = _make_strategy(mode="paper", universe=["AAA"])
+        s.kite.instruments.return_value = [
+            {"name": "AAA", "tradingsymbol": "AAA26APRFUT", "instrument_type": "FUT",
+             "expiry": date(2026, 4, 28), "lot_size": 100, "segment": "NFO-FUT"},
+            {"name": "AAA", "tradingsymbol": "AAA26MAYFUT", "instrument_type": "FUT",
+             "expiry": date(2026, 5, 26), "lot_size": 100, "segment": "NFO-FUT"},
+        ]
+        s.kite.quote.side_effect = lambda keys: {
+            "NSE:AAA": {"last_price": 99.5},
+            "NFO:AAA26APRFUT": _quote(99.9, 100.1, 100.0),
+            "NFO:AAA26MAYFUT": _quote(100.7, 101.3, 101.0),
+        }
+        snap = s._observe_universe_uncached()[0]
+        assert snap["near_quote"]["ask"] == 100.1
+        assert snap["next_quote"]["bid"] == 100.7
+
+    # ── the ledger row ───────────────────────────────────────────────────
+
+    def test_closed_row_carries_both_ends_of_every_leg(self):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02,
+                           calendar_exit_annual=0.005)
+        s._observe_universe = lambda: [self._snap_with_depth(
+            dte_near=20, carry_diff=0.05)]
+        s.execute_proposals(s.scan_and_propose())
+        # Exit a tick later on a DIFFERENT book — the row must record the
+        # touch each end actually crossed, not the entry's twice.
+        s._observe_universe = lambda: [self._snap_with_depth(
+            near=(99.5, 99.7), far=(100.2, 100.8), carry_diff=0.001)]
+        s.execute_proposals(s.check_and_rehedge())
+
+        q = s.state.closed_trades[-1]["leg_quotes"]
+        assert set(q) == {"AAA26APRFUT", "AAA26MAYFUT"}
+        assert q["AAA26APRFUT"]["entry"]["ask"] == 100.1
+        assert q["AAA26APRFUT"]["exit"]["ask"] == 99.7
+        assert q["AAA26MAYFUT"]["entry"]["bid"] == 100.7
+        assert q["AAA26MAYFUT"]["exit"]["bid"] == 100.2
+        # The spread this trade would have paid, from the row alone: the
+        # point of the whole exercise.
+        entry = q["AAA26APRFUT"]["entry"]
+        assert entry["ask"] - entry["bid"] == pytest.approx(0.2)
+
+    def test_row_is_still_written_when_the_feed_has_no_depth(self):
+        # The backtest and any signals-only feed carry no depth. That must
+        # degrade to "not measured", never break the ledger.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02,
+                           calendar_exit_annual=0.005)
+        s._observe_universe = lambda: [self._snap(dte_near=20, carry_diff=0.05)]
+        s.execute_proposals(s.scan_and_propose())
+        s._observe_universe = lambda: [self._snap(carry_diff=0.001)]
+        s.execute_proposals(s.check_and_rehedge())
+
+        row = s.state.closed_trades[-1]
+        assert row["realized_pnl"] is not None
+        assert row["leg_quotes"]["AAA26APRFUT"] == {"entry": None, "exit": None}
+
+    def test_exit_touch_is_restamped_on_a_later_attempt(self):
+        # Same reason pnl_verified re-stamps per attempt (F4): a debounced or
+        # rejected attempt must not leave its stale touch standing in place of
+        # the tick that actually fills.
+        s = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        trade = self._open_calendar(s)
+        # First attempt: the far leg has rolled out of the snapshot — no touch.
+        s._observe_universe = lambda: [self._snap_with_depth(
+            carry_diff=0.001, next=None, next_price=None)]
+        s.check_and_rehedge()
+        assert trade.leg_quotes["AAA26MAYFUT"]["exit"] is None
+        # Second attempt, clean book: the recorded touch must be this one.
+        s._observe_universe = lambda: [self._snap_with_depth(
+            far=(100.2, 100.8), carry_diff=0.001)]
+        s.execute_proposals(s.check_and_rehedge())
+        assert s.state.closed_trades[-1]["leg_quotes"]["AAA26MAYFUT"]["exit"]["ask"] \
+            == 100.8
+
+    def test_entry_touch_survives_the_session_boundary(self):
+        # A calendar opened today usually exits days later, so the entry touch
+        # has to round-trip through the state file or the closed row can never
+        # carry both ends.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        s._observe_universe = lambda: [self._snap_with_depth(
+            dte_near=20, carry_diff=0.05)]
+        s.execute_proposals(s.scan_and_propose())
+
+        fresh = _make_strategy(mode="paper", calendar_exit_annual=0.005)
+        fresh.restore_state(s.serialize_state())
+        restored = fresh.state.open_calendars["AAA"]
+        assert restored.leg_quotes["AAA26APRFUT"]["entry"]["bid"] == 99.9
+
+        fresh._observe_universe = lambda: [self._snap_with_depth(carry_diff=0.001)]
+        fresh.execute_proposals(fresh.check_and_rehedge())
+        q = fresh.state.closed_trades[-1]["leg_quotes"]["AAA26APRFUT"]
+        assert q["entry"]["bid"] == 99.9 and q["exit"] is not None
+
+    def test_a_restored_trade_does_not_share_sub_dicts_with_the_blob(self):
+        # Restoring from a dict the caller still holds — a reconcile or repair
+        # script, not the runner's JSON round-trip — must copy the per-leg
+        # ends, or a later edit to the blob silently rewrites a live trade's
+        # recorded touch.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        s._observe_universe = lambda: [self._snap_with_depth(
+            dte_near=20, carry_diff=0.05)]
+        s.execute_proposals(s.scan_and_propose())
+        blob = s.serialize_state()
+        fresh = _make_strategy(mode="paper")
+        fresh.restore_state(blob)
+        blob["open_calendars"][0]["leg_quotes"]["AAA26APRFUT"]["entry"] = None
+        assert fresh.state.open_calendars["AAA"].leg_quotes[
+            "AAA26APRFUT"]["entry"] is not None
+
+    def test_the_serialized_blob_is_not_a_window_into_live_state(self):
+        # The other direction of the same aliasing: a caller that edits the
+        # blob it got back — a reconcile or repair script — must not reach
+        # through into the open trade's recorded touches.
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.02)
+        s._observe_universe = lambda: [self._snap_with_depth(
+            dte_near=20, carry_diff=0.05)]
+        s.execute_proposals(s.scan_and_propose())
+        blob = s.serialize_state()
+        blob["open_calendars"][0]["leg_quotes"]["AAA26APRFUT"]["entry"] = None
+        assert s.state.open_calendars["AAA"].leg_quotes[
+            "AAA26APRFUT"]["entry"] is not None
+
+    def test_restore_of_a_pre_222_blob_reads_as_not_measured(self):
+        s = _make_strategy(mode="paper")
+        self._open_calendar(s)
+        blob = s.serialize_state()
+        del blob["open_calendars"][0]["leg_quotes"]      # written before #222
+        fresh = _make_strategy(mode="paper")
+        fresh.restore_state(blob)
+        assert fresh.state.open_calendars["AAA"].leg_quotes == {}

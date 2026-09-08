@@ -100,6 +100,16 @@ class CalendarTrade:
     exit_reason: Optional[str] = None
     exit_carry_diff: Optional[float] = None
     pnl_verified: bool = True
+    # Quoted depth-1 touch per leg at the tick the entry and the exit were
+    # PROPOSED — {tradingsymbol: {"entry": touch|None, "exit": touch|None}}.
+    # Kept on the trade (not the leg) because legs are removed as they close,
+    # and the closed_trades row is built after the last one is gone. Paper
+    # fills at last_price and the cost model charges a flat 2bps of slippage
+    # per side; a calendar crosses FOUR touches per round trip and its far
+    # leg is 30-100x thinner than the near one, so that 2bps is the wrong
+    # order of magnitude. Recording the touch is what lets a paper trade be
+    # re-priced at the spread it would actually have paid (issue #222).
+    leg_quotes: Dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -119,6 +129,11 @@ class ArbitrageState:
     # lifecycle as pending_entry_diff (proposal tick → _apply_fill; never
     # serialized). Lands on CalendarTrade.expected_harvest for the stop.
     pending_expected_harvest: Dict[str, float] = field(default_factory=dict)
+    # Entry-tick touch keyed by TRADINGSYMBOL (not underlying): an entry has
+    # two legs filling in separate _apply_fill calls, so a per-underlying key
+    # would only survive for the first one. Never serialized — it lives from
+    # the proposal to the same tick's fill.
+    pending_entry_quotes: Dict[str, Optional[dict]] = field(default_factory=dict)
 
 
 class ArbitrageStrategy(BaseStrategy):
@@ -558,6 +573,16 @@ class ArbitrageStrategy(BaseStrategy):
                     "converge_streak": t.converge_streak,
                     "expected_harvest": t.expected_harvest,
                     "pnl_verified": t.pnl_verified,
+                    # Entry touches must survive the session boundary — a
+                    # calendar opened today usually exits days later, and the
+                    # closed row needs both ends (issue #222). Copied one level
+                    # down, like `legs` below: embedding the live sub-dicts by
+                    # reference means an in-process restore_state(
+                    # serialize_state()) — the tests, and any scripts/ reconcile
+                    # tool — shares them, so one trade's exit re-stamp silently
+                    # rewrites the other's recorded touch.
+                    "leg_quotes": {ts: dict(ends)
+                                   for ts, ends in t.leg_quotes.items()},
                     "legs": [
                         {
                             "symbol": l.symbol,
@@ -606,6 +631,10 @@ class ArbitrageStrategy(BaseStrategy):
                 expected_harvest=(float(tblob["expected_harvest"])
                                   if tblob.get("expected_harvest") is not None else None),
                 pnl_verified=bool(tblob.get("pnl_verified", True)),
+                # .get: blobs written before issue #222 lack the key; an empty
+                # map reads as "not measured", which is what it was.
+                leg_quotes={ts: dict(ends) for ts, ends
+                            in (tblob.get("leg_quotes") or {}).items()},
                 legs=[
                     CalendarLeg(
                         symbol=l["symbol"],
@@ -826,6 +855,11 @@ class ArbitrageStrategy(BaseStrategy):
                 "basis_annual_next": basis_ann_next,
                 "carry_implied": carry_implied,
                 "carry_diff": carry_diff,
+                # Depth-1 touch at THIS tick (issue #222). Consumed by the
+                # entry/exit builders; None whenever the feed carries no
+                # usable depth.
+                "near_quote": self._touch(near_q),
+                "next_quote": self._touch(next_q),
             })
 
         return snapshots
@@ -893,6 +927,39 @@ class ArbitrageStrategy(BaseStrategy):
         if cache is None or cache[0] is not id(instruments) or cache[1] != today:
             self._fut_index_cache = (id(instruments), today, self._build_fut_index(instruments, today))
         return self._fut_index_cache[2].get(symbol, [])
+
+    @staticmethod
+    def _touch(quote: Optional[dict]) -> Optional[dict]:
+        """Depth-1 touch from a Kite quote — the prices an order would cross.
+
+        Returns None when the book is unusable for that purpose: no quote, no
+        depth (the backtest's MockKiteArb and any signals-only feed), an empty
+        side, or a crossed/locked book. None means "not measurable", NOT "no
+        spread" — a re-pricing analysis must exclude those legs rather than
+        treat them as free (Rule 12).
+
+        bid == ask is rejected for that reason: on an STF far leg a printed
+        depth-1 lock is a stale or degraded payload, not a genuinely free
+        crossing, and it would contribute a 0.0 half-spread to the very
+        average the live decision turns on (0.133% measured against a 0.084%
+        breakeven).
+        """
+        if not quote:
+            return None
+        depth = quote.get("depth") or {}
+        buy = (depth.get("buy") or [{}])[0] or {}
+        sell = (depth.get("sell") or [{}])[0] or {}
+        bid = float(buy.get("price") or 0.0)
+        ask = float(sell.get("price") or 0.0)
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            return None
+        return {
+            "bid": bid,
+            "ask": ask,
+            "bid_qty": int(buy.get("quantity") or 0),
+            "ask_qty": int(sell.get("quantity") or 0),
+            "ltp": float(quote.get("last_price") or 0.0),
+        }
 
     def _safe_quote(self, keys: List[str]) -> Dict[str, dict]:
         try:
@@ -1082,6 +1149,10 @@ class ArbitrageStrategy(BaseStrategy):
             f"(diff={cd*100:.2f}% ann., near {snap['dte_near']}d / next {snap['dte_next']}d)"
         )
         self.state.pending_expected_harvest[symbol] = expected_pnl
+        # Same lifecycle as pending_expected_harvest, keyed per contract
+        # (issue #222): _apply_fill lands these on the trade's leg_quotes.
+        self.state.pending_entry_quotes[near["tradingsymbol"]] = snap.get("near_quote")
+        self.state.pending_entry_quotes[nxt["tradingsymbol"]] = snap.get("next_quote")
         return [
             self._make_fut_proposal(near, qty, snap["near_price"], side_near,
                                     rationale, margin_required=leg_margin),
@@ -1109,10 +1180,17 @@ class ArbitrageStrategy(BaseStrategy):
         for leg in trade.legs:
             # Match the leg back to a future in the snapshot for current price.
             current_px: Optional[float] = None
+            touch: Optional[dict] = None
             if snap.get("near") and snap["near"]["tradingsymbol"] == leg.tradingsymbol:
                 current_px = snap["near_price"]
+                touch = snap.get("near_quote")
             elif snap.get("next") and snap["next"] and snap["next"]["tradingsymbol"] == leg.tradingsymbol:
                 current_px = snap["next_price"]
+                touch = snap.get("next_quote")
+            # Re-stamped on every exit attempt, like pnl_verified above: a
+            # debounced or rejected attempt must not leave its stale touch
+            # standing in place of the tick that actually fills (issue #222).
+            trade.leg_quotes.setdefault(leg.tradingsymbol, {})["exit"] = touch
 
             if current_px is None:
                 # The leg's contract is no longer in the snapshot — usually
@@ -1213,6 +1291,14 @@ class ArbitrageStrategy(BaseStrategy):
 
         existing = next((l for l in trade.legs if l.tradingsymbol == prop.tradingsymbol), None)
         if existing is None:
+            # setdefault, not assignment: the pending entry is always popped
+            # (so nothing stale survives the tick), but a touch already
+            # recorded for this contract wins. Only the FIRST fill is the
+            # entry, and overwriting it with a later None would silently
+            # destroy the measurement.
+            trade.leg_quotes.setdefault(prop.tradingsymbol, {}).setdefault(
+                "entry", self.state.pending_entry_quotes.pop(prop.tradingsymbol, None)
+            )
             trade.legs.append(CalendarLeg(
                 symbol=symbol,
                 tradingsymbol=prop.tradingsymbol,
@@ -1271,6 +1357,10 @@ class ArbitrageStrategy(BaseStrategy):
                 "held_days": round((now - trade.entry_time).total_seconds() / 86400.0, 2),
                 "expected_harvest": trade.expected_harvest,
                 "pnl_verified": trade.pnl_verified,
+                # Issue #222: the entry/exit touch per leg, so this row can be
+                # re-priced at the spread a live fill would have crossed
+                # instead of the last_price the paper fill assumed.
+                "leg_quotes": trade.leg_quotes,
             })
             del self.state.open_calendars[symbol]
 

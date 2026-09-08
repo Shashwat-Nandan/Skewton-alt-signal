@@ -1,3 +1,62 @@
+# Calendar spread: log quoted depth at fill time (#222) — 2026-09-07
+
+A live cutover of the calendar book was proposed on the strength of "it turned
+positive" (verified rows, entries from 07-29: 38 trades, +₹68,496, t=2.07).
+`_paper_execute` fills at `last_price` and `core/costs.py` charges a flat 2bps
+of slippage per side, but a calendar crosses FOUR touches per round trip and
+its far leg is 30-100x thinner than the near one. Measured on 2026-09-07: near
+half-spread ~0.075%, far ~0.16%, average 0.133% against a breakeven of 0.084%.
+Re-priced per name at the real touch, that +₹68,496 becomes **−₹33,469**.
+
+The number the live decision turns on was never being recorded. `kite.quote()`
+already returns depth and `_observe_universe_uncached` was throwing it away.
+
+- [x] `_touch()` extracts the depth-1 touch (bid/ask/sizes/ltp); returns None
+      on an unusable book (no depth, empty side, crossed) — "not measurable",
+      never "free"
+- [x] snapshot carries `near_quote` / `next_quote`
+- [x] entry builder stashes both legs' touch → `_apply_fill` lands it on the
+      trade (keyed per contract: the two legs fill in separate calls)
+- [x] exit builder stamps the exit touch per leg, re-stamped every attempt so a
+      debounced/rejected attempt can't leave a stale touch standing
+- [x] `leg_quotes` on the closed_trades row, and through serialize/restore so a
+      multi-day calendar keeps both ends
+- [x] 12 tests, both insertion points mutation-checked
+- [x] ruff + full pytest green; backtest smoke (no-depth feed) still closes trades
+- [x] verified against the live feed through the production code path
+
+### Review fixes (code review of PR #223)
+
+- **`_touch` accepted a locked book.** The guard rejected `ask < bid` but let
+  `ask == bid` through as a 0.0 half-spread. On an STF far leg a printed
+  depth-1 lock is a stale payload, not a free crossing — and 0.0 is exactly
+  the "read an unusable book as free" outcome the docstring forbids, dragging
+  down the very average the live call turns on (0.133% vs 0.084% breakeven).
+- **serialize/restore shared the per-leg sub-dicts by reference.** Harmless
+  through the runner's JSON round-trip, but an in-process
+  `restore_state(serialize_state())` — the tests, and any `scripts/` reconcile
+  tool — let an edit on one side silently rewrite the other's recorded touch.
+  Both directions now copy one level down, like `legs` already did, and each
+  side is pinned by its own test (the first pair of tests written for this
+  did not actually pin either side — either copy alone defeated them).
+
+### Review
+
+Kept deliberately out of scope: the far-leg spread gate (its threshold is not
+knowable until this data exists — that is the point of collecting it), and the
+scoring script that will consume these rows. Writing the scorer now, against
+zero rows, would bake in the very assumptions this measurement exists to test.
+
+Also unchanged: `calendar_margin_pct = 0.06` over-reserves ~1.7x against the
+₹69,627 the broker quoted for the 3 open spreads on 2026-09-07 — informational
+only, nothing gates on `margin_required` in this path.
+
+**Still open before live** (issue #222, second half): `execute_proposals` has no
+entry-batch atomicity and no margin precheck. Leg 2 rejecting after leg 1 fills
+leaves a naked ~₹650k future. `pair_trading` has both; arbitrage has neither.
+
+---
+
 # ma-momentum EOD carry — completing the #218 F2 fix — 2026-09-02
 
 Review of the /ma-momentum tab (#219) found that #218's F2 fix was incomplete:
