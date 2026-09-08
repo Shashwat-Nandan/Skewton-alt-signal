@@ -45,6 +45,11 @@ DEFAULT_THROTTLED_METHODS = (
     "positions",
     "holdings",
     "margins",
+    # Entry-batch margin precheck (arbitrage #222, and pair_trading's H15
+    # which has been calling it unthrottled since 2026-07-13). The arbitrage
+    # book can propose many calendars in one tick and each entry group costs
+    # one of these, so it belongs in the bucket.
+    "basket_order_margins",
     "profile",
 )
 

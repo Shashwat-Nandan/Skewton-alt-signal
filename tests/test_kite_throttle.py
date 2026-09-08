@@ -145,3 +145,8 @@ class TestThrottleKite:
         # this assertion stable against future additions.
         critical = {"quote", "ltp", "instruments", "place_order"}
         assert critical <= set(DEFAULT_THROTTLED_METHODS)
+        # Both margin calls: the arbitrage entry precheck (#222) issues one
+        # basket_order_margins per entry group per tick, and a book that can
+        # never fund an entry re-proposes the same groups every tick — an
+        # unthrottled call in a hot path is exactly what 429s the quote path.
+        assert {"margins", "basket_order_margins"} <= set(DEFAULT_THROTTLED_METHODS)

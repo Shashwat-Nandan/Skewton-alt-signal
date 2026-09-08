@@ -43,13 +43,21 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from core.trade_proposer import TradeProposal
 
 from .base import BaseStrategy, ExecutionMode
 
 logger = logging.getLogger(__name__)
+
+# Headroom on the broker's quoted basket margin before an entry batch is
+# allowed through. SPAN moves with vol between the quote and the fill, and a
+# batch refused here costs nothing while a leg rejected mid-batch costs a
+# reversal. Not config-exposed: this strategy is paper-only, and a new
+# __init__ attribute would have to be mirrored into the backtest builders
+# (research/backtest_arbitrage.make_strategy) for no present benefit.
+MARGIN_HEADROOM = 1.05
 
 CalendarPosition = Literal["FLAT", "LONG_CALENDAR", "SHORT_CALENDAR"]
 
@@ -441,6 +449,7 @@ class ArbitrageStrategy(BaseStrategy):
             return [self._emit_signal(p) for p in proposals]
 
         results: List[Dict] = []
+        tradable: List[TradeProposal] = []
         for prop in proposals:
             # Basis-side proposals (BOTH legs) are signals-only by policy —
             # cash because retail can't reliably execute it, and the futures
@@ -449,21 +458,267 @@ class ArbitrageStrategy(BaseStrategy):
             # mode so paper/live state is never touched.
             if prop.option_type in ("CASH", "FUT_BASIS"):
                 results.append(self._emit_signal(prop))
-                continue
+            else:
+                tradable.append(prop)
 
-            result = self._paper_execute(prop) if self.is_paper_mode else self._live_execute(prop)
-            results.append(result)
-            # C-1 fix (audit 2026-06-10, task 1.2): COMPLETE-whitelist —
-            # PENDING/REJECTED used to fall through to _apply_fill and book
-            # phantom fills. Same contract as pair_trading/taleb.
-            if result.get("status") != "COMPLETE":
-                logger.warning("Order not COMPLETE for %s: status=%s error=%s",
-                               prop.tradingsymbol, result.get("status"),
-                               result.get("error", ""))
-                continue
-            self._apply_fill(prop, result)
+        # Atomicity is per CALENDAR, not per tick (issue #222). One
+        # scan_and_propose call can carry entry legs for several underlyings
+        # and check_and_rehedge can carry exit legs for several more; the
+        # unit that must not end up half-open is one symbol's two legs.
+        # dict preserves first-seen order, and both builders emit a symbol's
+        # legs consecutively, so this does not reorder `results` in practice.
+        groups: Dict[str, List[TradeProposal]] = {}
+        for prop in tradable:
+            groups.setdefault(
+                self._symbol_from_tradingsymbol(prop.tradingsymbol), []
+            ).append(prop)
+
+        # Free margin is read ONCE and then decremented by every batch this
+        # call approves. One scan can propose entries for many underlyings
+        # (the max_open_calendars cap is evaluated against state that does not
+        # change during a scan), and re-reading margins() per group would gate
+        # each batch against a balance that does not yet reflect the batches
+        # already approved this tick — Kite does not refresh `net` that fast
+        # either. None = unreadable, which means "proceed" (see
+        # _available_margin).
+        available: Optional[float] = None
+        if not self.is_paper_mode and any(
+                sym not in self.state.open_calendars for sym in groups):
+            available = self._available_margin()
+
+        for symbol, group in groups.items():
+            # Classified BEFORE any leg executes: the first entry fill creates
+            # open_calendars[symbol], which would flip this mid-batch and
+            # disarm the reversal for the very legs it exists to protect.
+            is_entry = symbol not in self.state.open_calendars
+            if is_entry and available is not None:
+                required = self._batch_margin_required(symbol, group)
+                if required > available:
+                    logger.warning(
+                        "%s: insufficient margin — required ₹%.0f > available "
+                        "₹%.0f (after batches already approved this tick). "
+                        "Skipping entry batch (issue #222).",
+                        symbol, required, available,
+                    )
+                    continue
+                # Decremented on approval, not on fill: a batch that then fails
+                # leaves the rest of the tick gated conservatively, which is
+                # the safe direction.
+                available -= required
+
+            filled: List[Tuple[TradeProposal, Dict]] = []
+            for prop in group:
+                result = (self._paper_execute(prop) if self.is_paper_mode
+                          else self._live_execute(prop))
+                results.append(result)
+                # C-1 fix (audit 2026-06-10, task 1.2): COMPLETE-whitelist —
+                # PENDING/REJECTED used to fall through to _apply_fill and book
+                # phantom fills. Same contract as pair_trading/taleb.
+                if result.get("status") != "COMPLETE":
+                    logger.warning("Order not COMPLETE for %s: status=%s error=%s",
+                                   prop.tradingsymbol, result.get("status"),
+                                   result.get("error", ""))
+                    continue
+                self._apply_fill(prop, result)
+                if is_entry:
+                    filled.append((prop, result))
+
+            # Entry-batch atomicity: any leg failed while another filled →
+            # reverse the filled ones now. A calendar with one leg standing is
+            # not a hedged spread, it is an outright future on a ~₹650k
+            # notional that nothing in this strategy manages or exits.
+            # Exits are deliberately excluded: a half-filled exit leaves a
+            # position we still own, and the next tick's check_and_rehedge
+            # re-proposes the remainder.
+            if is_entry and filled and len(filled) < len(group):
+                logger.critical(
+                    "ENTRY BATCH PARTIAL FILL on %s: %d of %d legs filled — "
+                    "reversing filled legs to avoid naked exposure",
+                    symbol, len(filled), len(group),
+                )
+                self._reverse_filled_legs(symbol, filled, group)
 
         return results
+
+    def _available_margin(self) -> Optional[float]:
+        """Free margin per the broker, or None when it cannot be read.
+
+        None means "proceed without the gate" — same don't-block-on-flake
+        philosophy as pair_trading's H15: the entry-batch reversal is the
+        backstop for a post-fact reject, and a flaky margins() call must not
+        stop the book from trading.
+
+        There is no refresh-and-retry on a TokenException, unlike
+        pair_trading: this strategy has no _try_refresh_kite, and
+        run_paper_arbitrage authenticates once at startup with no refresh path
+        of its own. A token that dies mid-session therefore disarms this gate
+        for the rest of the session — bounded, because the same dead token
+        fails place_order, so no batch gets placed either. Wire a refresh here
+        the day the runner grows one (Rule 7: one convention, not two).
+        """
+        try:
+            margins = self.kite.margins()
+            equity = margins["equity"]
+            if not isinstance(equity, dict):
+                raise TypeError("equity blob is not a dict")
+            net = equity.get("net")
+            avail = equity.get("available")
+            if not isinstance(avail, dict):
+                avail = {}
+            if net is not None:
+                # equity.net is Zerodha's own free-margin figure: it counts
+                # pledged collateral and subtracts utilised debits. Summing
+                # live_balance+collateral instead double-counts collateral
+                # already consumed (pair_trading, 2026-07-13).
+                return float(net)
+            if avail:
+                return (float(avail.get("live_balance") or 0)
+                        + float(avail.get("collateral") or 0))
+            raise KeyError("margins() has neither 'net' nor 'available'")
+        except Exception as e:
+            logger.warning(
+                "margins() unusable (%s) — proceeding without the margin "
+                "precheck", e,
+            )
+            return None
+
+    def _batch_margin_required(
+        self, symbol: str, proposals: List[TradeProposal],
+    ) -> float:
+        """Broker-quoted margin for the two legs, with estimate fallback.
+
+        basket_order_margins is the ONLY number that carries the calendar
+        spread benefit: measured 2026-09-07, three open spreads netted
+        ₹69,627 against ₹433,947 unnetted. The proposal-side estimate
+        (calendar_margin_pct) is a static 6% of one leg's notional — it ran
+        ~1.7x ABOVE the broker on that date, so falling back to it is
+        conservative for a gate, which is the right direction.
+
+        The number that must clear is the PEAK of the placement sequence, and
+        for a calendar that is one leg's own outright margin: leg 1 is an
+        unhedged future until leg 2 lands, after which the spread benefit
+        applies. So peak = max(largest per-leg margin, netted basket total).
+
+        NOT max(initial, final), which pair_trading uses: for a cross-stock
+        pair SPAN nets nothing so initial ≈ final, but for a calendar
+        `initial` is the fully UN-NETTED sum of both legs — measured
+        2026-09-07 on TECHM, initial ₹207,159 (= both legs outright) against
+        final ₹33,284. Gating on that would refuse batches the account can
+        comfortably fund, ~6x over, and defeat the calendar benefit this call
+        exists to capture. `orders` missing or malformed falls back to
+        max(initial, final), the conservative shape.
+        """
+        estimate = sum(float(p.margin_required or 0) for p in proposals)
+        params = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": p.tradingsymbol,
+                "transaction_type": p.transaction_type,
+                "variety": "regular",
+                "product": "NRML",
+                "order_type": "LIMIT",
+                "quantity": int(abs(p.quantity)) * int(p.lot_size),
+                "price": float(p.price),
+            }
+            for p in proposals
+        ]
+        try:
+            basket = self.kite.basket_order_margins(params, consider_positions=True)
+            netted = float(basket["final"]["total"])
+            per_leg = [float(o["total"]) for o in (basket.get("orders") or [])
+                       if isinstance(o, dict) and o.get("total") is not None]
+            if per_leg:
+                raw = max(max(per_leg), netted)
+            else:
+                raw = max(float(basket["initial"]["total"]), netted)
+        except Exception as e:
+            logger.warning(
+                "%s: basket_order_margins failed (%s) — falling back to "
+                "Σ estimate ₹%.0f", symbol, e, estimate,
+            )
+            return estimate
+        if raw <= 0:
+            # Shape-valid but vacuous (zeroed totals from a degraded RMS
+            # response) would pass the gate trivially — trust the estimate.
+            logger.warning(
+                "%s: basket_order_margins returned non-positive total (₹%.0f) "
+                "— falling back to Σ estimate ₹%.0f", symbol, raw, estimate,
+            )
+            return estimate
+        required = raw * MARGIN_HEADROOM
+        logger.info(
+            "%s: broker basket margin ₹%.0f ×%.2f headroom → ₹%.0f (est ₹%.0f)",
+            symbol, raw, MARGIN_HEADROOM, required, estimate,
+        )
+        return required
+
+    def _reverse_filled_legs(
+        self, symbol: str, filled: List[Tuple[TradeProposal, Dict]],
+        group: Optional[List[TradeProposal]] = None,
+    ) -> None:
+        """Best-effort MARKET reversal of the legs that filled in a broken
+        entry batch. Ported from pair_trading._reverse_filled_legs, which has
+        run this path live since 2026-06-11 (Rule 7: one convention).
+
+        The batch MUST end flat. A reversal that itself fails is logged
+        CRITICAL — that is a naked leg in the market and the operator has to
+        square it off by hand before the next session.
+        """
+        trade = self.state.open_calendars.get(symbol)
+        if trade is not None:
+            # Segment these in the ledger: the closed row this produces is a
+            # cost-only scratch, not a calendar that was traded and exited.
+            trade.exit_reason = "UNWIND_PARTIAL_BATCH"
+            # _apply_fill only finalizes `position` once BOTH legs are on the
+            # trade, which by definition never happens for a half-filled
+            # entry — so without this the row archives as the CalendarTrade
+            # default and a rejected SHORT_CALENDAR is attributed to the long
+            # side by anything that segments closed_trades by direction.
+            # Same convention as _apply_fill: BUY the near leg = SHORT_CALENDAR.
+            if group:
+                near = min(group, key=lambda p: p.expiry)
+                trade.position = ("SHORT_CALENDAR"
+                                  if near.transaction_type == "BUY"
+                                  else "LONG_CALENDAR")
+            # Keep the #222 row shape uniform. This path closes the trade
+            # through _apply_fill directly, never through _build_calendar_exit
+            # — the only place an exit touch is stamped — so without this the
+            # row carries {"entry": ...} and no "exit" key at all, where every
+            # other closed row has both ends. None is the honest value: an
+            # unwind crosses at whatever the market gives it, and this leg was
+            # never quoted for an exit. A re-pricing scorer must skip these
+            # rows anyway (exit_reason segments them), but it should skip them
+            # by choice, not trip over a missing key.
+            for prop, _ in filled:
+                trade.leg_quotes.setdefault(prop.tradingsymbol, {}).setdefault(
+                    "exit", None)
+        for prop, fill_result in filled:
+            reverse_prop = TradeProposal(
+                tradingsymbol=prop.tradingsymbol,
+                instrument_token=prop.instrument_token,
+                strike=prop.strike, expiry=prop.expiry,
+                option_type=prop.option_type, lot_size=prop.lot_size,
+                quantity=fill_result.get("filled_lots") or prop.quantity,
+                price=fill_result.get("average_price") or prop.price,
+                transaction_type=("SELL" if prop.transaction_type == "BUY"
+                                  else "BUY"),
+                iv=prop.iv, bid_ask_spread_pct=prop.bid_ask_spread_pct,
+                margin_required=prop.margin_required,
+                rationale="UNWIND_PARTIAL_BATCH (paired leg failed)",
+            )
+            result = (self._paper_execute(reverse_prop) if self.is_paper_mode
+                      else self._live_execute(reverse_prop))
+            if result.get("status") != "COMPLETE":
+                logger.critical(
+                    "REVERSAL FAILED for %s — NAKED LEG IN MARKET. Manual "
+                    "intervention required. status=%s error=%s",
+                    prop.tradingsymbol, result.get("status"),
+                    result.get("error"),
+                )
+                continue
+            self._apply_fill(reverse_prop, result)
+            logger.info("Reversed leg %s (%d lots)",
+                        prop.tradingsymbol, reverse_prop.quantity)
 
     def generate_eod_report(self) -> Dict:
         return {

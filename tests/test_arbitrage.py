@@ -1,6 +1,7 @@
 """Tests for the arbitrage strategy — fair-value math, signal/calendar generation, fill handling."""
 from __future__ import annotations
 
+import logging as _logging
 import math
 import os
 import sys
@@ -1762,3 +1763,400 @@ class TestDepthLogging:
         fresh = _make_strategy(mode="paper")
         fresh.restore_state(blob)
         assert fresh.state.open_calendars["AAA"].leg_quotes == {}
+# Issue #222: entry-batch atomicity + margin precheck
+# ──────────────────────────────────────────────────────────
+
+def _leg(symbol, month, side, lots=1, price=1000.0):
+    return TradeProposal(
+        tradingsymbol=f"{symbol}26{month}FUT", instrument_token=1, strike=0,
+        expiry="2026-04-28" if month == "APR" else "2026-05-26",
+        option_type="FUT", lot_size=100, quantity=lots, price=price,
+        transaction_type=side, iv=0, bid_ask_spread_pct=0.01,
+        margin_required=20_000, rationale="calendar leg",
+    )
+
+
+class _Executor:
+    """Stub _live_execute: returns REJECTED for the named contracts."""
+
+    def __init__(self, reject=()):
+        self.reject = set(reject)
+        self.placed = []
+
+    def __call__(self, prop):
+        self.placed.append((prop.tradingsymbol, prop.transaction_type))
+        if prop.tradingsymbol in self.reject:
+            return {"order_id": None, "status": "REJECTED", "error": "margin"}
+        return {"order_id": "X", "status": "COMPLETE", "mode": "live",
+                "average_price": prop.price}
+
+
+class TestEntryBatchAtomicity:
+    """WHY these exist (Rule 9): execute_proposals booked each leg's fill
+    independently, so leg 2 rejecting after leg 1 filled left a NAKED single
+    future — an outright ~₹650k directional position that no exit path in this
+    strategy manages, on a book whose whole thesis is that the two legs hedge
+    each other. Paper never saw it because _paper_execute always returns
+    COMPLETE. Each test fails if the guard is removed."""
+
+    def _live(self, **kw):
+        s = _make_strategy(mode="live", **kw)
+        # Margin gate out of the way unless a test is exercising it: None is
+        # the "balance unreadable → proceed" path.
+        s._available_margin = lambda: None
+        return s
+
+    def test_partial_entry_is_reversed_to_flat(self):
+        s = self._live()
+        s._live_execute = ex = _Executor(reject={"AAA26MAYFUT"})
+        s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                             _leg("AAA", "MAY", "SELL")])
+        assert s.state.open_calendars == {}, \
+            "a half-filled calendar must not survive as a naked leg"
+        # The reversal is the opposite side of the leg that DID fill.
+        assert ("AAA26APRFUT", "SELL") in ex.placed
+
+    def test_partial_entry_logs_critical(self, caplog):
+        s = self._live()
+        s._live_execute = _Executor(reject={"AAA26MAYFUT"})
+        with caplog.at_level(_logging.CRITICAL, logger="strategies.arbitrage"):
+            s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                                 _leg("AAA", "MAY", "SELL")])
+        assert any("ENTRY BATCH PARTIAL FILL" in r.message for r in caplog.records)
+
+    def test_reversal_row_is_marked_in_the_ledger(self):
+        s = self._live()
+        s._live_execute = _Executor(reject={"AAA26MAYFUT"})
+        s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                             _leg("AAA", "MAY", "SELL")])
+        row = s.state.closed_trades[-1]
+        assert row["exit_reason"] == "UNWIND_PARTIAL_BATCH", \
+            "a cost-only scratch must not read as a traded-and-exited calendar"
+        assert row["realized_pnl"] < 0        # two round-trip costs, no edge
+
+    def test_failed_reversal_screams(self, caplog):
+        # Both the entry leg's pair AND the unwind reject: the position is
+        # genuinely naked and the operator has to square it by hand. Fail loud
+        # (Rule 12) — never let this look like a clean skip.
+        s = self._live()
+        s._live_execute = _Executor(reject={"AAA26MAYFUT", "AAA26APRFUT"})
+        # First call fills APR, the reversal of APR then rejects.
+        calls = {"n": 0}
+
+        def _exec(prop):
+            calls["n"] += 1
+            if prop.tradingsymbol == "AAA26APRFUT" and calls["n"] == 1:
+                return {"order_id": "X", "status": "COMPLETE",
+                        "average_price": prop.price}
+            return {"order_id": None, "status": "REJECTED", "error": "boom"}
+
+        s._live_execute = _exec
+        with caplog.at_level(_logging.CRITICAL, logger="strategies.arbitrage"):
+            s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                                 _leg("AAA", "MAY", "SELL")])
+        assert any("NAKED LEG IN MARKET" in r.message for r in caplog.records)
+        assert s.state.open_calendars["AAA"].legs, \
+            "the unreversed leg must stay on the book, not vanish silently"
+
+    def test_clean_entry_is_untouched(self):
+        s = self._live()
+        s._live_execute = ex = _Executor()
+        s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                             _leg("AAA", "MAY", "SELL")])
+        assert len(s.state.open_calendars["AAA"].legs) == 2
+        assert len(ex.placed) == 2, "no reversal orders on a clean batch"
+
+    def test_atomicity_is_per_calendar_not_per_tick(self):
+        # One scan tick proposes entries for two underlyings. BBB's second leg
+        # rejects; AAA is a clean, unrelated spread and must NOT be unwound.
+        s = self._live()
+        s._live_execute = _Executor(reject={"BBB26MAYFUT"})
+        s.execute_proposals([
+            _leg("AAA", "APR", "BUY"), _leg("AAA", "MAY", "SELL"),
+            _leg("BBB", "APR", "BUY"), _leg("BBB", "MAY", "SELL"),
+        ])
+        assert len(s.state.open_calendars["AAA"].legs) == 2
+        assert "BBB" not in s.state.open_calendars
+
+    def test_a_half_filled_exit_is_not_reversed(self):
+        # An exit that half-fills leaves a position we still OWN — re-buying
+        # the leg we just closed would re-open risk. The next tick's
+        # check_and_rehedge re-proposes the remainder instead.
+        s = self._live()
+        s._live_execute = _Executor()
+        s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                             _leg("AAA", "MAY", "SELL")])
+        s._live_execute = ex = _Executor(reject={"AAA26MAYFUT"})
+        ex.placed.clear()
+        s.execute_proposals([_leg("AAA", "APR", "SELL"),
+                             _leg("AAA", "MAY", "BUY")])
+        assert [p for p in ex.placed if p == ("AAA26APRFUT", "BUY")] == [], \
+            "the closed leg must not be re-bought"
+        assert len(s.state.open_calendars["AAA"].legs) == 1
+
+
+class TestMarginPrecheck:
+    """WHY (Rule 9): leg 2 rejecting on margin AFTER leg 1 filled is the main
+    way a calendar goes naked, and this book never asked the broker for a
+    margin number at all. Refusing the batch is free; a mid-batch reject costs
+    a reversal at market."""
+
+    def _live(self):
+        s = _make_strategy(mode="live")
+        s._live_execute = _Executor()
+        return s
+
+    def _props(self):
+        return [_leg("AAA", "APR", "BUY"), _leg("AAA", "MAY", "SELL")]
+
+    def _margins(self, net):
+        return {"equity": {"net": net,
+                           "available": {"live_balance": net, "collateral": 0}}}
+
+    def _basket(self, total):
+        return {"initial": {"total": total}, "final": {"total": total}}
+
+    def test_batch_is_refused_when_the_broker_cannot_fund_it(self):
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(50_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._basket(70_000))
+        s.execute_proposals(self._props())
+        assert s._live_execute.placed == [], "nothing may be placed"
+        assert s.state.open_calendars == {}
+
+    def test_batch_proceeds_when_funded(self):
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(500_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._basket(70_000))
+        s.execute_proposals(self._props())
+        assert len(s.state.open_calendars["AAA"].legs) == 2
+
+    def test_gate_uses_the_peak_not_the_settled_basket_figure(self):
+        # Legs are placed sequentially, so the pre-benefit requirement is what
+        # has to clear. Taking `final` alone would wave through a batch that
+        # rejects on leg 2.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(100_000))
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 200_000}, "final": {"total": 70_000}})
+        s.execute_proposals(self._props())
+        assert s._live_execute.placed == []
+
+    def test_broker_quote_beats_the_static_estimate(self):
+        # The Σ estimate is 2 × ₹20k = ₹40k; the broker says ₹200k. Gating on
+        # the estimate would place a batch the account cannot fund — the whole
+        # reason this calls basket_order_margins.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(100_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._basket(200_000))
+        s.execute_proposals(self._props())
+        assert s._live_execute.placed == []
+
+    def test_margins_flake_does_not_block_the_book(self):
+        # Don't-block-on-flake (pair_trading H15): the reversal is the backstop
+        # for a post-fact reject; a broken margins() must not halt trading.
+        s = self._live()
+        s.kite.margins = MagicMock(side_effect=RuntimeError("net down"))
+        s.execute_proposals(self._props())
+        assert len(s.state.open_calendars["AAA"].legs) == 2
+
+    def test_basket_flake_falls_back_to_the_estimate(self):
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(30_000))
+        s.kite.basket_order_margins = MagicMock(side_effect=RuntimeError("boom"))
+        s.execute_proposals(self._props())
+        # Σ estimate ₹40k × headroom is NOT applied to the fallback, but ₹40k
+        # already exceeds ₹30k available → refused rather than placed blind.
+        assert s._live_execute.placed == []
+
+    def test_vacuous_basket_quote_falls_back_to_the_estimate(self):
+        # Zeroed totals from a degraded RMS response would pass any gate
+        # trivially; trusting them would book a phantom-zero requirement.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(30_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._basket(0))
+        s.execute_proposals(self._props())
+        assert s._live_execute.placed == []
+
+    def test_paper_never_calls_the_broker(self):
+        s = _make_strategy(mode="paper")
+        s.kite.margins = MagicMock(side_effect=AssertionError("paper called margins()"))
+        s.kite.basket_order_margins = MagicMock(
+            side_effect=AssertionError("paper called basket_order_margins()"))
+        s.execute_proposals(self._props())
+        assert len(s.state.open_calendars["AAA"].legs) == 2
+
+    def test_exits_are_never_prechecked(self):
+        # We already own the position; refusing to exit on a margin reading
+        # would trap the book in a trade it has decided to leave.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(500_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._basket(70_000))
+        s.execute_proposals(self._props())
+        s.kite.margins = MagicMock(side_effect=AssertionError("exit was prechecked"))
+        s.execute_proposals([_leg("AAA", "APR", "SELL"), _leg("AAA", "MAY", "BUY")])
+        assert s.state.open_calendars == {}
+
+
+class TestMarginPrecheckReviewFixes:
+    """WHY (Rule 9): the first cut of the gate was ported from pair_trading
+    verbatim and inherited two assumptions that invert for a calendar. Both
+    were caught in review of PR #224; each test fails if the fix is reverted."""
+
+    def _live(self):
+        s = _make_strategy(mode="live")
+        s._live_execute = _Executor()
+        return s
+
+    def _props(self, symbol="AAA"):
+        return [_leg(symbol, "APR", "BUY"), _leg(symbol, "MAY", "SELL")]
+
+    def _margins(self, net):
+        return {"equity": {"net": net, "available": {}}}
+
+    # ── the peak is one leg outright, NOT the un-netted sum of both ────────
+
+    def _calendar_basket(self):
+        # Shaped on the real 2026-09-07 TECHM quote: initial is the fully
+        # un-netted sum of both legs, final carries the spread benefit.
+        return {"initial": {"total": 207_159}, "final": {"total": 33_284},
+                "orders": [{"total": 103_500}, {"total": 103_659}]}
+
+    def test_funded_calendar_is_not_refused_on_the_unnetted_sum(self):
+        # ₹150k funds a spread whose real peak is one ₹103.7k leg (×1.05 =
+        # ₹108.8k). Gating on initial (₹207k) would refuse it — ~6x the
+        # netted requirement, defeating the calendar benefit the basket call
+        # exists to capture.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(150_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.execute_proposals(self._props())
+        assert len(s.state.open_calendars["AAA"].legs) == 2
+
+    def test_peak_still_gates_when_one_leg_alone_is_unaffordable(self):
+        # ₹90k cannot carry the ₹103.7k first leg, even though the settled
+        # basket figure (₹33.3k) would fit — gating on `final` alone would
+        # place a batch whose leg 1 rejects.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(90_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.execute_proposals(self._props())
+        assert s._live_execute.placed == []
+
+    def test_missing_per_leg_totals_fall_back_to_the_conservative_shape(self):
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(150_000))
+        s.kite.basket_order_margins = MagicMock(return_value={
+            "initial": {"total": 207_159}, "final": {"total": 33_284}})
+        s.execute_proposals(self._props())
+        assert s._live_execute.placed == [], \
+            "without per-leg totals the gate must stay conservative"
+
+    # ── balance read once per call, decremented across batches ────────────
+
+    def test_balance_is_decremented_across_batches_in_one_tick(self):
+        # A single scan proposes entries for two underlyings. ₹150k funds the
+        # first (₹108.8k with headroom) but not both; re-reading margins() per
+        # group would let the second through against a balance that does not
+        # yet reflect the first — the exact mid-batch reject this gate exists
+        # to prevent.
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(150_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.execute_proposals(self._props("AAA") + self._props("BBB"))
+        assert "AAA" in s.state.open_calendars
+        assert "BBB" not in s.state.open_calendars
+        assert s.kite.margins.call_count == 1, "balance must be read once per call"
+
+    def test_both_batches_pass_when_the_balance_actually_covers_them(self):
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(500_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.execute_proposals(self._props("AAA") + self._props("BBB"))
+        assert len(s.state.open_calendars) == 2
+
+    def test_no_broker_call_at_all_when_the_tick_is_exits_only(self):
+        s = self._live()
+        s.kite.margins = MagicMock(return_value=self._margins(500_000))
+        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.execute_proposals(self._props())
+        s.kite.margins.reset_mock()
+        s.execute_proposals([_leg("AAA", "APR", "SELL"), _leg("AAA", "MAY", "BUY")])
+        assert s.kite.margins.call_count == 0
+
+
+class TestUnwindRowDirection:
+    """WHY (Rule 9): _apply_fill only finalizes `position` once BOTH legs are
+    on the trade, which never happens for a half-filled entry — so the unwind
+    row archived as the CalendarTrade default and a rejected SHORT_CALENDAR
+    was counted on the long side by anything segmenting closed_trades by
+    direction (sweeps, the decay ledger)."""
+
+    def test_unwound_short_calendar_is_not_recorded_as_long(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor(reject={"AAA26MAYFUT"})
+        # BUY near + SELL far = SHORT_CALENDAR, per _apply_fill's convention.
+        s.execute_proposals([_leg("AAA", "APR", "BUY"),
+                             _leg("AAA", "MAY", "SELL")])
+        assert s.state.closed_trades[-1]["position"] == "SHORT_CALENDAR"
+
+    def test_unwound_long_calendar_is_recorded_as_long(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor(reject={"AAA26MAYFUT"})
+        s.execute_proposals([_leg("AAA", "APR", "SELL"),
+                             _leg("AAA", "MAY", "BUY")])
+        assert s.state.closed_trades[-1]["position"] == "LONG_CALENDAR"
+
+
+class TestUnwindRowQuoteShape:
+    """WHY (Rule 9): the reversal path closes a trade through _apply_fill
+    directly, never through _build_calendar_exit — the only place an exit
+    touch is stamped. Without an explicit stamp the unwind row carries
+    {"entry": ...} and no "exit" key, where every other closed row has both
+    ends: a re-pricing scorer doing q["exit"] raises KeyError, and one doing
+    q.get("exit") silently keeps a cost-only scratch in the spread sample.
+    Interaction between the two halves of #222 — invisible until both landed."""
+
+    def _entry_with_depth(self):
+        near = _leg("AAA", "APR", "BUY")
+        far = _leg("AAA", "MAY", "SELL")
+        return [near, far]
+
+    def test_unwound_row_carries_both_keys_for_every_leg(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor(reject={"AAA26MAYFUT"})
+        # Entry touch present for the leg that filled, as a real entry would.
+        s.state.pending_entry_quotes["AAA26APRFUT"] = {
+            "bid": 99.9, "ask": 100.1, "bid_qty": 5, "ask_qty": 5, "ltp": 100.0}
+        s.execute_proposals(self._entry_with_depth())
+
+        q = s.state.closed_trades[-1]["leg_quotes"]["AAA26APRFUT"]
+        assert set(q) == {"entry", "exit"}, \
+            "an unwind row must have the same shape as every other closed row"
+        assert q["entry"]["ask"] == 100.1        # the entry touch is preserved
+        assert q["exit"] is None                 # never quoted for an exit
+
+    def test_the_stamp_does_not_overwrite_a_real_exit_touch(self):
+        # setdefault, not assignment: if a leg ever did go through
+        # _build_calendar_exit before landing here, its measured touch wins.
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor(reject={"AAA26MAYFUT"})
+        real = {"bid": 1.0, "ask": 2.0, "bid_qty": 1, "ask_qty": 1, "ltp": 1.5}
+
+        orig = s._apply_fill
+
+        def _seed(prop, result=None):
+            orig(prop, result)
+            trade = s.state.open_calendars.get("AAA")
+            if trade is not None:
+                trade.leg_quotes.setdefault(
+                    "AAA26APRFUT", {})["exit"] = real
+
+        s._apply_fill = _seed
+        s.execute_proposals(self._entry_with_depth())
+        assert s.state.closed_trades[-1][
+            "leg_quotes"]["AAA26APRFUT"]["exit"] == real

@@ -1,3 +1,89 @@
+# Calendar spread: entry-batch atomicity + margin precheck (#222) — 2026-09-07
+
+Second half of #222. `execute_proposals` executed legs sequentially and booked
+each COMPLETE independently: leg 2 rejecting after leg 1 filled left a NAKED
+single future — an outright ~₹650k directional position that no exit path in
+this strategy manages, on a book whose whole thesis is that the two legs hedge
+each other. Paper never saw it because `_paper_execute` always returns COMPLETE.
+`pair_trading` has solved both halves of this since 2026-06-11; arbitrage had
+neither.
+
+- [x] proposals grouped per UNDERLYING — atomicity is per calendar, not per
+      tick (one scan carries entries for several symbols and exits for others)
+- [x] entry/exit classified BEFORE any leg executes: the first entry fill
+      creates `open_calendars[symbol]`, which would otherwise flip the
+      classification mid-batch and disarm the reversal
+- [x] `_reverse_filled_legs` ported from pair_trading; CRITICAL + leg left on
+      the book when the reversal itself fails (never a silent skip)
+- [x] reversal rows stamped `exit_reason="UNWIND_PARTIAL_BATCH"` so a cost-only
+      scratch doesn't read as a traded-and-exited calendar
+- [x] `_margin_precheck_ok` / `_batch_margin_required` on entry batches, live
+      only: `basket_order_margins(consider_positions=True)`, max(initial,final),
+      ×1.05 headroom, Σ-estimate fallback on any flake
+- [x] exits never prechecked and never reversed — we already own the position
+- [x] 16 tests; reversal call, precheck gate and the pre-execution
+      classification each mutation-checked
+- [x] ruff + full pytest green; backtest smoke unchanged
+
+### Review fix — the cross-branch one (finding 8)
+
+`_reverse_filled_legs` closes the trade through `_apply_fill` directly, never
+through `_build_calendar_exit` — the only place #223 stamps an exit touch. The
+unwind row therefore carried `{"entry": ...}` and no `"exit"` key, where every
+other closed row has both ends: a scorer doing `q["exit"]` raises KeyError, one
+doing `q.get("exit")` silently keeps a cost-only scratch in the spread sample.
+
+Only fixable once #223 was merged (`d52b674`) — #224 was branched off main,
+where `CalendarTrade` has no `leg_quotes` at all. Now stamped `None` on the
+unwind path, via `setdefault` so a real measured touch would still win.
+
+### Review fixes (code review of PR #224)
+
+Three findings, all real, all fixed here:
+
+- **The gate threw away the calendar benefit.** `max(initial, final)` is
+  pair_trading's shape, where SPAN nets nothing so initial ≈ final. For a
+  calendar `initial` is the fully UN-NETTED sum of both legs — measured
+  2026-09-07 on TECHM, ₹207,159 against a netted ₹33,284. Now: peak =
+  max(largest per-leg margin, netted total), because leg 1 is an unhedged
+  future until leg 2 lands. `orders` missing falls back to the old shape.
+- **Balance re-read per group.** A single scan can propose entries for many
+  underlyings, so gating each on a fresh `margins()` read let every batch pass
+  against a balance that did not yet reflect the ones already approved. Read
+  once per call, decremented on approval.
+- **Unwind rows archived as the dataclass default.** `_apply_fill` finalizes
+  `position` only when both legs are on the trade, which never happens for a
+  half-filled entry — a rejected SHORT_CALENDAR was attributed to the long
+  side. Direction is now taken from the proposed near leg.
+
+Also: `basket_order_margins` added to `core/kite_throttle` — this PR puts it in
+a hot path (one call per entry group per tick), and pair_trading's H15 has been
+calling it unthrottled since 2026-07-13. The module docstring asks for exactly
+this when a new call site appears.
+
+The docstring claim that "the runner rebinds executor.kite on a token refresh"
+was **wrong** — `run_paper_arbitrage` authenticates once at startup and has no
+refresh path. Corrected in place: a token that dies mid-session disarms the
+gate for the rest of the session, bounded because the same dead token also
+fails `place_order`, so nothing gets placed either.
+
+### Review
+
+`MARGIN_HEADROOM = 1.05` is a module constant, not config: a new `__init__`
+attribute would have to be mirrored into `backtest_arbitrage.make_strategy`
+(the AST parity test enforces this) for no present benefit on a paper-only
+strategy. Expose it if the book ever goes live.
+
+No refresh-and-retry around the broker calls, unlike pair_trading's H15: this
+strategy has no `_try_refresh_kite`, and the runner rebinds `executor.kite` on
+a token refresh. One convention, not two (Rule 7).
+
+Both halves of #222 are now implemented, on separate branches:
+depth logging = PR #223, this = PR #224. Neither is merged; both need a
+CODEOWNERS review. Live still needs the 4 weeks of touch-priced data before
+the P&L question can be answered — the code being ready is not the same as the
+edge being real.
+
 # Calendar spread: log quoted depth at fill time (#222) — 2026-09-07
 
 A live cutover of the calendar book was proposed on the strength of "it turned
