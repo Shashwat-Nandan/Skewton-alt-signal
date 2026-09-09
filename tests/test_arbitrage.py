@@ -2160,3 +2160,123 @@ class TestUnwindRowQuoteShape:
         s.execute_proposals(self._entry_with_depth())
         assert s.state.closed_trades[-1][
             "leg_quotes"]["AAA26APRFUT"]["exit"] == real
+
+
+class TestUniverseResolution:
+    """WHY (Rule 9, issue #226): a universe symbol with no futures was skipped
+    by the scan loop exactly like a symbol with no signal, so a typo, a rename,
+    a delisting and an F&O exit were indistinguishable from a quiet day.
+    TATAMOTORS and LTIM sat in the list for 10.5 and 6.4 months on that basis."""
+
+    def _instruments(self, names):
+        return [{"name": n, "tradingsymbol": f"{n}26APRFUT",
+                 "instrument_type": "FUT", "expiry": date(2026, 4, 28),
+                 "lot_size": 100, "segment": "NFO-FUT"} for n in names]
+
+    def test_missing_symbol_is_named_in_a_warning(self, caplog):
+        s = _make_strategy(mode="paper", universe=["AAA", "DELISTED"])
+        s.kite.instruments.return_value = self._instruments(["AAA"])
+        s.kite.quote.return_value = {}
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            s._observe_universe_uncached()
+        assert any("DELISTED" in r.getMessage() for r in caplog.records), \
+            "a count alone is not actionable — the warning must name the symbol"
+
+    def test_it_does_not_refuse_to_run(self, caplog):
+        # Operator decision 2026-09-09: warn everywhere, refuse nowhere. A
+        # delisting must not stop the book managing what it already holds.
+        s = _make_strategy(mode="paper", universe=["AAA", "DELISTED"])
+        s.kite.instruments.return_value = self._instruments(["AAA"])
+        s.kite.quote.return_value = {}
+        s._observe_universe_uncached()          # must not raise
+
+    def test_warned_once_per_session_not_once_per_tick(self, caplog):
+        # The scan runs every few seconds all session; a per-tick warning would
+        # bury the thing it is trying to surface.
+        s = _make_strategy(mode="paper", universe=["AAA", "DELISTED"])
+        s.kite.instruments.return_value = self._instruments(["AAA"])
+        s.kite.quote.return_value = {}
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            for _ in range(5):
+                s._observe_universe_uncached()
+        hits = [r for r in caplog.records if "DELISTED" in r.getMessage()]
+        assert len(hits) == 1, f"expected exactly one warning, got {len(hits)}"
+
+    def test_a_fully_resolvable_universe_is_silent(self, caplog):
+        s = _make_strategy(mode="paper", universe=["AAA"])
+        s.kite.instruments.return_value = self._instruments(["AAA", "EXTRA"])
+        s.kite.quote.return_value = {}
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            s._observe_universe_uncached()
+        assert not [r for r in caplog.records if "universe" in r.getMessage()]
+
+
+class TestOpenCalendarStaysObservable:
+    """WHY (Rule 9, review of PR #227): check_and_rehedge is the ONLY exit path
+    and it needs a snapshot to fire EXPIRY (cash-settlement), MAX_HOLD or
+    STOP_LOSS. Snapshots came only from `self.universe`, so removing a departed
+    symbol from the list — exactly what scripts/reconcile_universe.py tells the
+    operator to do — orphaned any open calendar on it, silently, all the way to
+    settlement."""
+
+    _open_calendar = TestReview20260711._open_calendar
+
+    def _snap_for(self, symbol):
+        return {
+            "symbol": symbol, "spot": 99.5,
+            "near": {"tradingsymbol": f"{symbol}26APRFUT", "lot_size": 100,
+                     "expiry": "2026-04-28", "instrument_token": 1},
+            "near_price": 100.0, "dte_near": 1,          # inside the EXPIRY zone
+            "next": {"tradingsymbol": f"{symbol}26MAYFUT", "lot_size": 100,
+                     "expiry": "2026-05-26", "instrument_token": 2},
+            "next_price": 101.0, "dte_next": 29,
+            "basis_annual": 0.0, "basis_annual_next": 0.0,
+            "carry_implied": 0.07, "carry_diff": 0.05,
+        }
+
+    def test_an_off_universe_symbol_still_reaches_its_expiry_exit(self):
+        # Given a snapshot, the exit path itself does not care about the
+        # universe. The separate test below is the one that pins the union
+        # actually producing that snapshot — this one would pass without it.
+        s = _make_strategy(mode="paper", universe=["BBB"])   # AAA was removed
+        self._open_calendar(s, symbol="AAA")
+        s._observe_universe = lambda: [self._snap_for("AAA")]
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2 and all("EXPIRY" in p.rationale for p in exits), \
+            "an open calendar must still reach its expiry force-exit"
+
+    def test_the_scan_covers_held_symbols_outside_the_universe(self):
+        s = _make_strategy(mode="paper", universe=["BBB"])
+        self._open_calendar(s, symbol="AAA")
+        s.kite.instruments.return_value = []
+        scanned = []
+        # _observe_universe_uncached iterates the union; with no instruments it
+        # returns early, so assert on the union it builds rather than output.
+        s.kite.instruments.return_value = [
+            {"name": n, "tradingsymbol": f"{n}26APRFUT", "instrument_type": "FUT",
+             "expiry": date(2026, 4, 28), "lot_size": 100, "segment": "NFO-FUT"}
+            for n in ("AAA", "BBB")]
+        s.kite.quote.side_effect = lambda keys: scanned.extend(keys) or {}
+        s._observe_universe_uncached()
+        assert any("AAA" in k for k in scanned), \
+            "the held symbol must be quoted even though it left the universe"
+
+    def test_an_unpriceable_open_calendar_screams_once(self, caplog):
+        s = _make_strategy(mode="paper", universe=["BBB"])
+        self._open_calendar(s, symbol="AAA")
+        s._observe_universe = lambda: []          # no snapshot at all
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            for _ in range(3):
+                s.check_and_rehedge()
+        hits = [r for r in caplog.records if "OPEN CALENDAR AAA" in r.getMessage()]
+        assert len(hits) == 1, \
+            f"expected exactly one warning per symbol per session, got {len(hits)}"
+
+    def test_a_held_off_universe_symbol_cannot_be_re_entered(self):
+        # The entry gate already requires `symbol not in open_calendars`; this
+        # pins that observing extra symbols does not widen what we may OPEN.
+        s = _make_strategy(mode="paper", universe=["BBB"], calendar_entry_annual=0.001)
+        self._open_calendar(s, symbol="AAA")
+        s._observe_universe = lambda: [self._snap_for("AAA")]
+        entries = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert entries == [], "an off-universe symbol may be exited, never entered"

@@ -52,6 +52,7 @@ import pandas as pd
 
 from research.backtest_pairs import load_lot_sizes
 from core.data_cache_io import read_table
+from core import universe as _universe
 from core.screen_pairs import (
     NIFTY_50, _half_life, load_front_month_panel, screen_pairs, screen_pairs_book,
 )
@@ -188,11 +189,22 @@ def load_5min_panel(symbols, directory: Path = STF_5MIN_DIR) -> "pd.DataFrame":
     tables written by market_data/fetch_5min_stf.py. Sorted; per-pair alignment is via dropna."""
     frames = {}
     for s in symbols:
-        try:
-            df = read_table(directory / f"{s}.parquet", parse_dates=["date"])
-        except FileNotFoundError:
-            continue
-        frames[s] = df.set_index("date")["close"]
+        # Follow renames: the 5-min corpus is written per symbol, so a table
+        # for a retired ticker still holds that security's history (#226).
+        for candidate in dict.fromkeys([_universe.canonical(s), s]):
+            try:
+                df = read_table(directory / f"{candidate}.parquet",
+                                parse_dates=["date"])
+            except FileNotFoundError:
+                continue
+            frames[_universe.canonical(s)] = df.set_index("date")["close"]
+            break
+    # Rule 12: a missing 5-min table used to be a bare `continue`, so a symbol
+    # simply vanished from every Kalman study with no message — the same
+    # silent-skip that let two dead tickers survive months in the universe
+    # (review of PR #227).
+    _universe.report_unresolved(symbols, frames, f"5-min panel ({directory})",
+                                log=logger)
     if not frames:
         return pd.DataFrame()
     return pd.DataFrame(frames).sort_index()

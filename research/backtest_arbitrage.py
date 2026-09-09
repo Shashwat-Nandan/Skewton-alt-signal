@@ -40,6 +40,12 @@ import pandas as pd
 from strategies.arbitrage import ArbitrageState, ArbitrageStrategy
 from core.backtest_timeframe import warn_coarse_timeframe
 from core.data_cache_io import find_tables, read_table, table_columns
+from core import universe as _universe
+
+# Trailing sessions used to judge whether a universe symbol is still on the
+# tape. Matches core.screen_pairs._TAIL_DAYS — a symbol reported gone here and
+# a symbol dropped for tail coverage there should be judged over one window.
+_UNRESOLVED_TAIL_DAYS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +105,14 @@ def load_stf_panel(
         if "TtlTradgVol" not in df.columns:
             df = df.assign(TtlTradgVol=pd.NA)
         if universe:
-            df = df[df["TckrSymb"].isin(universe)]
+            # Retired tickers admitted too: a renamed symbol's history lives
+            # under its OLD name in the archive and apply_long() relabels it
+            # onto the current ticker below (issue #226).
+            wanted = set(universe) | {
+                old_sym for old_sym, new_sym in _universe.SYMBOL_ALIASES.items()
+                if new_sym in set(universe)
+            }
+            df = df[df["TckrSymb"].isin(wanted)]
         frames.append(df)
 
     if not frames:
@@ -120,6 +133,20 @@ def load_stf_panel(
     out["spot"] = out["spot"].astype(float)
     # `volume` may be NaN for archives lacking the column; coerce numeric.
     out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    # Corporate actions (issue #226). One call here covers BOTH the research
+    # backtests and calendar_meanreversion._seed_spread_history_from_bhavcopy,
+    # which seeds the paper/live runner off this same loader — a demerger's
+    # pre-cutoff rows must not reach a rolling spread statistic either.
+    out = _universe.apply_long(out)
+    if universe and not out.empty:
+        # Resolve against the RECENT TAIL of the archive, not every symbol
+        # ever seen in it: a name that traded for two years and then stopped
+        # is still in `out["symbol"].unique()`, so a full-window check stays
+        # silent on exactly the decay it is meant to catch (review of PR #227).
+        _recent = sorted(out["date"].unique())[-_UNRESOLVED_TAIL_DAYS:]
+        _universe.report_unresolved(
+            universe, out.loc[out["date"].isin(_recent), "symbol"].unique(),
+            f"bhavcopy STF panel (last {len(_recent)} sessions)", log=logger)
     out = out.sort_values(["date", "symbol", "expiry"]).reset_index(drop=True)
     return out
 

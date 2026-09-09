@@ -42,9 +42,27 @@ CACHE_DIR = Path("./data_cache")
 RAW_DIR = CACHE_DIR / "bhavcopy_raw"
 OUTPUT_PATH = CACHE_DIR / "pair_candidates.csv"
 
-# NIFTY 50 constituents (snapshot — symbols missing from the bhavcopy on a
-# given day are silently skipped, so this list can drift without breaking
-# the screener).
+# Trailing window used both to drop symbols that have fallen off the tape and
+# to decide whether a universe symbol is still resolvable. One number: a
+# symbol dropped for tail coverage and a symbol reported as gone should be
+# judged over the same window.
+_TAIL_DAYS = 30
+
+# NIFTY 50 constituents (snapshot, last reconciled 2026-09-09 — issue #226).
+#
+# This is the repo's canonical universe: the calendar/arbitrage strategies,
+# the pair screener below (whose output feeds the LIVE pair book) and three
+# market_data fetchers all read it. Symbols missing from the bhavcopy are
+# still skipped rather than fatal, but they are no longer SILENT — every
+# consumer now reports them via core.universe.report_unresolved(), because a
+# dead ticker looked exactly like a quiet one and two of them survived here
+# for 10.5 and 6.4 months.
+#
+# Corporate actions belong in core/universe.py, not in edits to this list's
+# history: a rename gets a SYMBOL_ALIASES entry (history carries over), a
+# demerger gets a HISTORY_START cutoff (history does not).
+# Reconciled weekly by scripts/reconcile_universe.py, which reports both
+# departures and newly-listed F&O names.
 NIFTY_50 = [
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC",
     "LT", "KOTAKBANK", "SBIN", "BHARTIARTL", "BAJFINANCE", "ASIANPAINT",
@@ -53,8 +71,8 @@ NIFTY_50 = [
     "POWERGRID", "ONGC", "COALINDIA", "JSWSTEEL", "TATASTEEL", "HINDALCO",
     "BAJAJFINSV", "BAJAJ-AUTO", "BRITANNIA", "DRREDDY", "CIPLA", "EICHERMOT",
     "GRASIM", "HEROMOTOCO", "BPCL", "INDUSINDBK", "DIVISLAB", "APOLLOHOSP",
-    "TECHM", "SHRIRAMFIN", "TATACONSUM", "LTIM", "HDFCLIFE", "SBILIFE",
-    "TATAMOTORS",
+    "TECHM", "SHRIRAMFIN", "TATACONSUM", "LTM", "HDFCLIFE", "SBILIFE",
+    "TMPV",
 ]
 
 
@@ -79,7 +97,14 @@ def load_front_month_panel(
         raise RuntimeError(f"No bhavcopy tables found in {raw_dir}")
     logger.info("Reading %d bhavcopy files from %s", len(files), raw_dir)
 
-    universe_set = set(universe)
+    # Load rows for retired tickers too: a renamed symbol's history lives
+    # under its OLD name in the archive, and apply_wide() merges the two
+    # columns below (issue #226).
+    from core import universe as universe_mod
+    universe_set = set(universe) | {
+        old_sym for old_sym, new_sym in universe_mod.SYMBOL_ALIASES.items()
+        if new_sym in set(universe)
+    }
     rows = []
     for f in files:
         df = read_table(
@@ -104,6 +129,21 @@ def load_front_month_panel(
     long = pd.concat(rows, ignore_index=True)
     panel = long.pivot(index="TradDt", columns="TckrSymb", values="ClsPric").sort_index()
     panel.index = pd.to_datetime(panel.index)
+    # Corporate actions BEFORE coverage is measured: a rename's two part-series
+    # merge into one full-coverage column, and a demerger's pre-cutoff cells
+    # become NaN so the coverage filter — not a truncating dropna — decides
+    # whether the symbol has earned enough post-event history (issue #226).
+    panel = universe_mod.apply_wide(panel)
+    # Resolve against the RECENT TAIL, not the full-archive columns. A symbol
+    # that traded for years and then stopped still HAS a column, so checking
+    # `panel.columns` would have stayed silent for all 10.5 months of the
+    # TATAMOTORS decay — the exact case this warning exists for (review of
+    # PR #227). Only a symbol with zero rows in the whole archive (a typo)
+    # would ever have fired it.
+    _tail = panel.iloc[-_TAIL_DAYS:] if len(panel) >= _TAIL_DAYS else panel
+    universe_mod.report_unresolved(
+        universe, _tail.columns[_tail.notna().any()],
+        f"pair screener panel (last {len(_tail)} sessions)", log=logger)
 
     n_days = len(panel)
     coverage = panel.notna().sum() / n_days
@@ -121,7 +161,7 @@ def load_front_month_panel(
     # back to the day it disappeared. Apply the same coverage threshold
     # to the trailing TAIL_DAYS sessions to drop symbols that have fallen
     # off the tape, regardless of their long-window history.
-    TAIL_DAYS = 30
+    TAIL_DAYS = _TAIL_DAYS
     if n_days >= TAIL_DAYS and keep:
         tail = panel[keep].iloc[-TAIL_DAYS:]
         tail_coverage = tail.notna().sum() / TAIL_DAYS

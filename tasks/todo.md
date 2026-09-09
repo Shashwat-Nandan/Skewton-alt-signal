@@ -1,3 +1,109 @@
+# Universe decay: aliases, history cutoffs, drift reconcile (#226) — 2026-09-09
+
+`core/screen_pairs.NIFTY_50` is the repo's canonical universe (arbitrage +
+calendar_meanrev, `pair_candidates.csv` for the LIVE pair book, three
+`market_data/` fetchers) and it had carried two dead tickers — TATAMOTORS since
+2025-10-23 (10.5 months) and LTIM since 2026-02-26 (6.4 months). Nothing warned:
+a symbol with no futures is skipped exactly like a symbol with no signal.
+
+Evidence for the successors, from ISIN continuity in the equity archive:
+- `LTIM` → `LTM`, ISIN `INE214T01019` on both sides of 2026-02-27. **Rename**,
+  same security, no economic change.
+- `TATAMOTORS` → `TMPV`, ISIN `INE155A01022` on both sides of 2025-10-24. The
+  listed entity kept the ISIN and the CV business demerged out (and does not
+  trade F&O). **Not** an unchanged exposure.
+
+Operator decisions taken 2026-09-09: add TMPV with a history-start cutoff;
+warn everywhere but never refuse; keep the snapshot and add a weekly reconcile.
+
+A rename and a demerger need opposite treatments, and that is the whole point
+of telling them apart:
+- rename → **alias**, so LTIM's 450 days of history carry onto LTM. Without it
+  LTM sits under the 80% coverage floor until ~mid-2027 and valid history is
+  thrown away.
+- demerger → **history cutoff**, so no statistic is fitted across the boundary.
+
+- [x] `core/universe.py`: `SYMBOL_ALIASES`, `HISTORY_START`, appliers for the
+      long and wide frame shapes, and `report_unresolved()`
+- [x] `NIFTY_50`: LTIM→LTM, TATAMOTORS→TMPV, dated provenance comment
+- [x] `screen_pairs.load_front_month_panel`: alias + cutoff + WARN on symbols
+      that produced no rows at all (today it only logs coverage drops at INFO)
+- [x] `backtest_arbitrage.load_stf_panel`: alias + cutoff — one place covers the
+      backtests AND `calendar_meanreversion._seed_spread_history_from_bhavcopy`
+- [x] `ArbitrageStrategy`: WARN once per session naming universe symbols with no
+      futures in the instrument dump
+- [x] `scripts/reconcile_universe.py`: weekly drift report — departures AND
+      newly-listed F&O names, from the latest raw bhavcopy (no Kite auth)
+- [x] `deploy/universe-reconcile.{service,timer}` — Sat 09:30 IST, before the
+      daily 19:00 screen-pairs run
+- [x] tests for each; ruff + full pytest green
+- [x] correct issue #225's claim that the archive is NIFTY_50-filtered
+
+### Review fixes (code review of PR #227)
+
+Eight findings, all real, all fixed. The two that mattered:
+
+- **HIGH — a universe removal orphaned an open calendar.** `check_and_rehedge`
+  is the ONLY exit path and it needs a snapshot; snapshots came only from
+  `self.universe`. So removing a departed symbol — precisely what
+  `reconcile_universe.py` tells the operator to do — left any open calendar on
+  it with no EXPIRY force-exit (cash settlement), no MAX_HOLD, no STOP_LOSS
+  and no warning, riding to settlement. This PR *created the trigger* for a
+  latent bug. Now the scan observes `universe ∪ open_calendars`, and an open
+  calendar that still can't be priced screams once per session. Entries are
+  unaffected — the entry gate already requires `symbol not in open_calendars`,
+  so an off-universe symbol can be exited but never re-entered.
+- **MEDIUM — the fail-loud warning could not detect the decay it was written
+  for.** It resolved against full-archive panel columns, so a symbol with any
+  history at all still had a column: it would have stayed silent for all 10.5
+  months of the TATAMOTORS decay, firing only on a typo. Both call sites now
+  resolve against the trailing 30 sessions, the same window the coverage
+  filter already uses.
+
+Also: `report_unresolved` no longer blames the board for a HISTORY_START cutoff
+this module applied itself (the advice — alias it, or delist it — was wrong for
+that case); `reconcile_universe` warns on a board more than 7 days old rather
+than reporting a confident all-clear after a fetch outage, and survives an
+unreadable newest file by falling back a day instead of dying with no report;
+`load_5min_panel` is alias-aware and loud, which the "every consumer" claim in
+screen_pairs had overstated; `apply_long` is vectorised (it runs on the live
+mean-rev seeding path over ~90k rows).
+
+Two of my own tests were weaker than their names promised — one built the board
+from the list under test so it could not fail, another stubbed the very method
+it claimed to exercise. Both rewritten; the first now runs against the real
+archive and skips where there is none rather than pretending.
+
+### Review
+
+Verified on the real archive, not just fixtures:
+
+- `load_stf_panel(["LTM","TMPV","INFY"])` → **LTM 1,746 rows from 2024-05-02**,
+  identical to INFY, so the rename cost no history (without the alias it would
+  carry ~130 sessions). **TMPV 645 rows, first row exactly 2025-10-24** — zero
+  pre-demerger rows reach a backtest or the mean-rev seeder.
+- `load_front_month_panel(NIFTY_50)` → **582 days × 49 symbols**, up from 48.
+  LTM is back with 2+ years of history; TMPV is dropped by the existing 80%
+  coverage filter at ~38%, logged, and — the point of NaN-ing rather than
+  dropping rows — the shared window is not truncated.
+- `python -m scripts.reconcile_universe` on live data: skipped the 2026-09-08
+  kite-fallback day, read the 210-name board from 09-07, reported **no
+  departures** and 160 uncovered names.
+
+Four mutations, each caught: removing the alias (4 fail), removing the cutoff
+(4 fail), removing the reconcile's fallback guard (3 fail), warning per-tick
+instead of per-session (1 fail).
+
+Deliberately NOT done: `_build_today_stfs_via_kite` filters same-day fallback
+data to the universe, so a session where NSE publishes late enters the archive
+with ~50 underlyings instead of 210 (one day in 583 so far). Out of scope here;
+recorded on issue #225, where the wider-universe data question lives.
+
+Also corrected a wrong claim I had put in issue #225: the bhavcopy archive is
+NOT NIFTY_50-filtered — only the same-day fallback path is.
+
+---
+
 # Calendar spread: entry-batch atomicity + margin precheck (#222) — 2026-09-07
 
 Second half of #222. `execute_proposals` executed legs sequentially and booked

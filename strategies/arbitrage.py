@@ -385,6 +385,18 @@ class ArbitrageStrategy(BaseStrategy):
         for symbol, trade in list(self.state.open_calendars.items()):
             snap = snapshots.get(symbol)
             if snap is None:
+                # Rule 12: this trade got NO exit evaluation this tick — no
+                # EXPIRY force-exit, no MAX_HOLD, no STOP_LOSS. Silence here
+                # is how a position rides to cash settlement unmanaged. Warn
+                # once per symbol per session, not per tick.
+                if symbol not in self._unpriced_open_warned:
+                    self._unpriced_open_warned.add(symbol)
+                    logger.warning(
+                        "OPEN CALENDAR %s has no snapshot — it is NOT being "
+                        "evaluated for EXPIRY / MAX_HOLD / STOP_LOSS this "
+                        "session. Check that its futures are still listed; "
+                        "square it off by hand if they are not.", symbol,
+                    )
                 continue
 
             held_days = (self._clock() - trade.entry_time).total_seconds() / 86400.0
@@ -1031,11 +1043,31 @@ class ArbitrageStrategy(BaseStrategy):
         instruments = self._load_instruments()
         if not instruments:
             return []
+        self._report_unresolved_universe(instruments)
 
         today = self._clock().date()
         snapshots: List[dict] = []
 
-        for sym in self.universe:
+        # Observe the union of the universe and whatever is OPEN. A position
+        # already on the book must stay observable even after its symbol
+        # leaves the list — check_and_rehedge is the only exit path and it
+        # needs a snapshot to fire EXPIRY (cash-settlement), MAX_HOLD or
+        # STOP_LOSS. Without this, removing a departed name from NIFTY_50 —
+        # exactly what scripts/reconcile_universe.py tells the operator to do
+        # — orphans any open calendar on it, silently, all the way to
+        # settlement (review of PR #227). Entries are unaffected: the entry
+        # gate already requires `symbol not in open_calendars`, so an
+        # off-universe symbol can only ever be exited, never re-entered.
+        held = [s for s in self.state.open_calendars if s not in set(self.universe)]
+        if held:
+            logger.warning(
+                "Observing %d open calendar(s) whose symbol is no longer in "
+                "the universe: %s. They can be exited but not re-entered; "
+                "leave the symbol in the list until the position is closed.",
+                len(held), ", ".join(sorted(held)),
+            )
+
+        for sym in list(self.universe) + held:
             futures = self._symbol_futures_sorted(instruments, sym, today)
             if not futures:
                 continue
@@ -1118,6 +1150,42 @@ class ArbitrageStrategy(BaseStrategy):
             })
 
         return snapshots
+
+    @property
+    def _unpriced_open_warned(self) -> set:
+        """Symbols already warned about as unpriceable-while-open this session.
+
+        A property with lazy init rather than an __init__ attribute: the
+        backtest builders bypass __init__ via __new__, and every __init__
+        assignment has to be mirrored there (AST parity test, 2026-07-11).
+        """
+        if getattr(self, "_unpriced_open_warned_set", None) is None:
+            self._unpriced_open_warned_set = set()
+        return self._unpriced_open_warned_set
+
+    def _report_unresolved_universe(self, instruments: List[dict]) -> None:
+        """Name the universe symbols with no futures on the board — once per
+        session (issue #226).
+
+        A symbol that resolves to nothing is skipped by the scan loop exactly
+        like a symbol with no signal, so a typo, a rename, a delisting and an
+        F&O exit were all indistinguishable from a quiet day. TATAMOTORS and
+        LTIM sat in the list for 10.5 and 6.4 months on that basis.
+
+        Warn, never refuse (operator decision, 2026-09-09): a delisting must
+        not stop the book from managing the positions it already holds.
+        """
+        if getattr(self, "_universe_checked", False):
+            return
+        self._universe_checked = True
+        from core.universe import report_unresolved
+        report_unresolved(
+            self.universe,
+            {i.get("name") for i in instruments
+             if i.get("instrument_type") == "FUT"},
+            f"{self.name} universe",
+            log=logger,
+        )
 
     def _load_instruments(self) -> List[dict]:
         if self._instrument_cache is not None:

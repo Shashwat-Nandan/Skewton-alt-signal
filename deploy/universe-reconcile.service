@@ -1,0 +1,35 @@
+[Unit]
+Description=Weekly universe drift report — F&O board vs the NIFTY_50 snapshot (issue #226)
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+# Measurement only: reads the newest usable raw bhavcopy and compares the board
+# against core.screen_pairs.NIFTY_50. No Kite auth, no trading, no writes
+# outside data_cache. Output → journald + data_cache/universe_reconcile.json.
+Type=oneshot
+# --- EDIT THESE FOR YOUR VPS ---
+User=taleb
+WorkingDirectory=/opt/taleb-karpathy-kite
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m scripts.reconcile_universe
+# -------------------------------
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/taleb-karpathy-kite/data_cache
+# NOTE: do NOT set ProtectHome=true if WorkingDirectory is under /root or /home
+# (status=200/CHDIR before ExecStart). See tasks/lessons.md (2026-05-12).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

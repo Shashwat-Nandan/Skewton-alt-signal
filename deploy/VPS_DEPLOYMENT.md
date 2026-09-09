@@ -38,6 +38,8 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `pair-verify.service`         | Oneshot, ~5 min               | Runs `scripts/verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
 | `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
 | `screen-pairs.service`        | Oneshot, ~5–15 min            | Runs `deploy/run_weekly_pair_screen.sh` — bhavcopy fetch + Engle-Granger screen      |
+| `universe-reconcile.timer`    | Sat 09:30 IST + jitter        | Fires `universe-reconcile.service`                                                   |
+| `universe-reconcile.service`  | Oneshot, ~1 min               | Runs `scripts/reconcile_universe.py` — F&O board vs the `NIFTY_50` snapshot; reports departures and newly-listed names (issue #226). No Kite auth |
 | `taleb-autoresearch.timer`    | Sat 10:00 IST + jitter        | Fires `taleb-autoresearch.service`                                                   |
 | `taleb-autoresearch.service`  | Oneshot, up to 2h             | Runs `deploy/run_weekly_autoresearch.sh` — fetches data, sweeps params, logs result  |
 | `fetch-bars.timer`            | Daily 16:30 IST + jitter      | Fires `fetch-bars.service`                                                           |
@@ -116,6 +118,8 @@ sudo cp deploy/pair-verify.service        /etc/systemd/system/
 sudo cp deploy/pair-verify.timer          /etc/systemd/system/
 sudo cp deploy/screen-pairs.service       /etc/systemd/system/
 sudo cp deploy/screen-pairs.timer         /etc/systemd/system/
+sudo cp deploy/universe-reconcile.service /etc/systemd/system/
+sudo cp deploy/universe-reconcile.timer   /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.service /etc/systemd/system/
 sudo cp deploy/taleb-autoresearch.timer   /etc/systemd/system/
 sudo cp deploy/fetch-bars.service         /etc/systemd/system/
@@ -136,6 +140,7 @@ sudo systemctl enable --now taleb-hedger.timer
 sudo systemctl enable --now pair-paper.timer
 sudo systemctl enable --now pair-verify.timer
 sudo systemctl enable --now screen-pairs.timer
+sudo systemctl enable --now universe-reconcile.timer
 sudo systemctl enable --now taleb-autoresearch.timer
 sudo systemctl enable --now fetch-bars.timer
 ```

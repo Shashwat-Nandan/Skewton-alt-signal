@@ -1,0 +1,17 @@
+[Unit]
+Description=Fire universe-reconcile.service Saturdays 09:30 IST (week's bhavcopy all in)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# Saturday morning: the week's bhavcopy files are downloaded (fetch-bhavcopy
+# runs nightly) and markets are closed, so the newest file is a full board
+# rather than a same-day Kite fallback. Ahead of the daily 19:00 IST
+# screen-pairs run, so a drift finding lands before the next candidate
+# regeneration. Idempotent — safe to catch up after downtime.
+OnCalendar=Sat *-*-* 09:30:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=300
+Unit=universe-reconcile.service
+
+[Install]
+WantedBy=timers.target
