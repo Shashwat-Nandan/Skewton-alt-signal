@@ -1,3 +1,117 @@
+# Calendar signal priced off a stale print (#228) — 2026-09-09
+
+First session with depth logging (#223) live produced two GRASIM trades. Both
+were phantom signals: GRASIM's OCT print sat **22 points BELOW its own bid**,
+which inverted the sign of the term structure.
+
+| | trade 1 | trade 2 |
+|---|---|---|
+| carry_diff from the **print** | −10.63% | −10.78% |
+| carry_diff from the **book** | **−0.73%** | **−0.55%** |
+| entry threshold | 5% | 5% |
+
+Neither clears the bar on the real book — by a factor of ~15. The CONVERGE
+exits were the far print catching up to its book, not convergence. Re-priced
+at the recorded touch: paper **+₹9,778 → live −₹6,224** (₹16,003 swing), 77%
+of the adverse fill in the two OCT entry legs alone.
+
+This is a different failure from #222/#225. Those say the edge is eaten by
+execution cost, assuming the signal is real. This says some entries are not
+edges at all — the strategy read a stale number and took the opposite side of
+the real market. Cheaper execution would not have rescued them.
+
+- [x] `_book_price()` — depth-1 mid when there is a book, `last_price` only as
+      fallback, so the backtest (MockKiteArb has no depth) and signals-only
+      feeds are unchanged
+- [x] used for the carry/basis signal, the paper fill price AND the MTM mark:
+      a price nothing can transact at must not drive any of the three
+- [x] spot's discount-back fallback uses the same price, not the raw print
+- [x] `_flag_stale_print()` — WARN once per contract per session when a print
+      sits outside its own book; correcting bad data silently teaches nothing
+- [x] 9 tests, including the exact 2026-09-09 quotes as a regression
+- [x] both halves mutation-checked; backtest smoke byte-identical
+
+### Folded in after the 3-day depth review (2026-09-11)
+
+#229's mid-pricing was ALREADY live in the working tree on 09-10 and 09-11 (the
+runners execute the checked-out tree, not main) — and it did NOT stop the
+09-11 cluster. Seven calendars opened in the 09:15 tick: six with NO two-sided
+far book, so `_book_price` fell back to the very stale print #228 is about, and
+two against books 2.39% and 2.70% wide whose mid is not a price either. Both
+measurable ones lost money crossing (−₹4,241, −₹5,797). Re-priced, the three
+days go paper +₹50,542 → roughly −₹37,000.
+
+- [x] **width ceiling** (`MAX_BOOK_WIDTH = 1%`): a book wider than that has no
+      usable mid. Applied in `_book_price` (pricing) NOT `_touch` (measurement)
+      — #222's study must keep the pathological books or it loses the cases
+      that matter
+- [x] **mixed-basis gate**: if one leg prices off its book and the other off a
+      print, suppress ENTRIES for that symbol. Exits are never suppressed — a
+      position already held must stay manageable. A feed with no depth at all
+      (backtest) is NOT mixed, so it is unaffected
+- [x] `_flag_mixed_basis` warns once per symbol: `_flag_stale_print` returns
+      early when there is no touch, i.e. it was blind on exactly the leg at risk
+- [x] **entry warmup** (`ENTRY_WARMUP_MINUTES = 5`) in the RUNNER, not the
+      strategy — the backtest clock is midnight, so a strategy-side time gate
+      would have silently blocked every backtest entry
+- [x] 11 tests; both strategy gates mutation-checked; backtest smoke still
+      byte-identical
+
+### Second review of PR #229 — six findings, all fixed
+
+**HIGH, and mine twice over.** `if near_px is None: continue` (written in the
+mid-pricing commit) started dropping symbols with a WIDE NEAR book out of the
+snapshot once the width ceiling landed — taking EXPIRY, MAX_HOLD and STOP_LOSS
+with them. That is exactly the orphaned-calendar bug the #227 review caught and
+I fixed, re-entered by a different door two PRs later. The PR description
+claimed "exits are never suppressed" while it was untrue.
+
+The fix separates two things I had conflated: a leg can be UNPRICEABLE without
+being UNOBSERVABLE. `_priced()` returns `(price, basis)` with basis in
+`book` / `print` / `wide`, so a wide book still yields a number that keeps the
+symbol observable, and the TAG blocks discretionary actions instead of the
+symbol vanishing.
+
+That produced a cleaner rule than I had: trust the PAIR, not each leg.
+`book+book` and `print+print` are trusted (a depthless feed is internally
+consistent — the backtest is unaffected); `book+print` is the #228
+sign-inverting mix; anything with `wide` is untrusted.
+
+Untrusted pricing blocks DISCRETIONARY actions only:
+- entries — blocked
+- CONVERGE — blocked; it reads the same carry_diff the entry gate refuses to
+  trust, so a far leg losing its book for a few ticks would otherwise close a
+  spread that never converged
+- EXPIRY / MAX_HOLD / STOP_LOSS — always run; untrusted pricing must never
+  TRAP a position
+- any exit priced on an untrusted basis is stamped `pnl_verified=False` — the
+  ledger must not record P&L at a price the same code calls untradable, and
+  #222's live decision reads those rows
+
+Also: the wide-book rejection now logs (zero entries must not look like a quiet
+market), a missing/throttled far quote is no longer mis-labelled "mixed" (it was
+burning the once-per-session warning a genuine bookless leg would need later),
+and a duplicate `_log()` helper in the runner tests was removed.
+
+**Attempted and reverted:** marking each leg at the side it would exit on. It
+is the honest liquidation value, but it makes the mark MORE negative and so
+makes the live instant-STOP_LOSS problem worse, not better. The real fix means
+splitting an MTM invariant a previous review deliberately created → issue #231.
+
+### Review
+
+Deliberately NOT changed: mid is still not the executable price — you cross to
+the far touch — so a mid-based signal remains optimistic, just no longer
+fictional. Whether the entry hurdle should use `far_ask − near_bid` is exactly
+what #222's four weeks of depth data exists to settle, and it should be decided
+on that evidence rather than guessed now.
+
+Expect materially FEWER entries after this lands. If a large share of recent
+signals were stale-print artifacts, the honest consequence is a quieter book —
+that is the fix working, not the strategy breaking.
+
+---
+
 # Universe decay: aliases, history cutoffs, drift reconcile (#226) — 2026-09-09
 
 `core/screen_pairs.NIFTY_50` is the repo's canonical universe (arbitrage +

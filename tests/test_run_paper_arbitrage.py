@@ -186,3 +186,37 @@ class TestExpiryFlattenGuard:
 def _log():
     import logging
     return logging.getLogger("test-arb-runner")
+
+
+class TestEntryWarmup:
+    """WHY (Rule 9, issue #228): at 09:15 the far-month book is not formed. On
+    2026-09-11 seven calendars opened in the very first tick — six against a far
+    leg with NO two-sided book. The strategy-side gates catch those, but not
+    entering an unformed market at all is the cheaper guard, and it must never
+    suppress EXITS: a position already held has to stay manageable from tick 1."""
+
+    def test_warmup_suppresses_entries_but_not_exits(self):
+        import runners.run_paper_arbitrage as R
+        calls = {"scan": 0, "rehedge": 0}
+
+        class _S:
+            state = type("st", (), {"last_basis_snapshot": [1]})()
+            def scan_and_propose(self):
+                calls["scan"] += 1; return []
+            def check_and_rehedge(self):
+                calls["rehedge"] += 1; return []
+            def execute_proposals(self, p): pass
+
+        R.tick_once(_S(), _log(), halt_all=False, halt_new_entries=True)
+        assert calls == {"scan": 0, "rehedge": 1}, \
+            "warmup must block entries and leave exits running"
+
+    def test_the_warmup_window_is_measured_from_the_open(self):
+        import runners.run_paper_arbitrage as R
+        from datetime import datetime, timedelta
+        assert R.ENTRY_WARMUP_MINUTES >= 1
+        open_ts = datetime(2026, 9, 11, 9, 15)
+        entry_open = open_ts + timedelta(minutes=R.ENTRY_WARMUP_MINUTES)
+        # The 09-11 cluster fired at 09:15:18 — inside any warmup >= 1 minute.
+        assert datetime(2026, 9, 11, 9, 15, 18) < entry_open
+

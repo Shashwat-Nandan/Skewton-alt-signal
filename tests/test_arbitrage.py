@@ -2280,3 +2280,294 @@ class TestOpenCalendarStaysObservable:
         s._observe_universe = lambda: [self._snap_for("AAA")]
         entries = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
         assert entries == [], "an off-universe symbol may be exited, never entered"
+
+
+# ──────────────────────────────────────────────────────────
+# Issue #228: price from the book, not the print
+# ──────────────────────────────────────────────────────────
+
+class TestPriceFromTheBook:
+    """WHY (Rule 9): the strategy priced its signal, its fills and its marks off
+    `last_price`. On a far-month single-stock future that print goes stale, and
+    a stale print does not merely add noise — it INVERTS the term structure.
+
+    On 2026-09-09, GRASIM's OCT print sat 22 points below its own bid. The
+    strategy saw the far month 9 points cheaper than the near (carry_diff
+    −10.63%, threshold 5%) when it was in fact 16 points dearer (real −0.73%).
+    Two entries fired that the real book put nowhere near the bar; re-priced at
+    the touch the day went +₹9,778 paper → −₹6,224 live."""
+
+    def _q(self, ltp, bid, ask, qty=250):
+        return {"last_price": ltp,
+                "depth": {"buy": [{"price": bid, "quantity": qty}],
+                          "sell": [{"price": ask, "quantity": qty}]}}
+
+    # ── the primitive ────────────────────────────────────────────────────
+    def test_mid_is_used_when_there_is_a_book(self):
+        q = self._q(3300.8, 3323.0, 3328.2)
+        assert ArbitrageStrategy._book_price(q, ArbitrageStrategy._touch(q)) == pytest.approx(3325.6)
+
+    def test_last_price_is_the_fallback_without_depth(self):
+        # The backtest's MockKiteArb and any signals-only feed publish no
+        # depth; their behaviour must not change.
+        q = {"last_price": 100.0}
+        assert ArbitrageStrategy._book_price(q, ArbitrageStrategy._touch(q)) == 100.0
+
+    def test_no_quote_no_price(self):
+        assert ArbitrageStrategy._book_price(None, None) is None
+        assert ArbitrageStrategy._book_price({}, None) is None
+
+    # ── the regression, on the real 2026-09-09 quotes ────────────────────
+    def _grasim_strategy(self, *, near, far):
+        s = _make_strategy(mode="paper", universe=["GRASIM"],
+                           calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 0.0
+        s.kite.instruments.return_value = [
+            {"name": "GRASIM", "tradingsymbol": "GRASIM26SEPFUT",
+             "instrument_type": "FUT", "expiry": date(2026, 9, 29),
+             "lot_size": 250, "segment": "NFO-FUT"},
+            {"name": "GRASIM", "tradingsymbol": "GRASIM26OCTFUT",
+             "instrument_type": "FUT", "expiry": date(2026, 10, 27),
+             "lot_size": 250, "segment": "NFO-FUT"},
+        ]
+        s._clock = lambda: datetime(2026, 9, 9, 11, 0)   # 20d / 48d to expiry
+        s.kite.quote.side_effect = lambda keys: {
+            "NSE:GRASIM": {"last_price": 3300.0},
+            "NFO:GRASIM26SEPFUT": near,
+            "NFO:GRASIM26OCTFUT": far,
+        }
+        return s
+
+    def test_the_2026_09_09_phantom_entry_no_longer_fires(self):
+        # The exact books recorded that morning. carry_diff from the print was
+        # −10.63%; from the book it is −0.73%, nowhere near the 5% bar.
+        s = self._grasim_strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                                  far=self._q(3300.8, 3323.0, 3328.2))
+        assert [p for p in s.scan_and_propose() if p.option_type == "FUT"] == [], \
+            "an entry driven by a stale far-month print must not fire"
+
+    def test_a_real_dislocation_still_fires(self):
+        # Same shape, but the BOOK itself is dislocated rather than the print:
+        # the far month genuinely trades below the near. The fix must not have
+        # simply disabled the strategy.
+        s = self._grasim_strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                                  far=self._q(3240.0, 3238.0, 3242.0))
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert len(props) == 2, "a genuine book dislocation must still trade"
+
+    def test_the_signal_is_priced_off_the_book_not_the_print(self):
+        s = self._grasim_strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                                  far=self._q(3300.8, 3323.0, 3328.2))
+        snap = s._observe_universe_uncached()[0]
+        assert snap["near_price"] == pytest.approx(3309.65)   # mid, not the print
+        assert snap["next_price"] == pytest.approx(3325.60)   # mid, not the print
+
+    def test_fills_and_marks_use_the_same_price_as_the_signal(self):
+        # A price nothing can transact at must not drive the signal, the fill
+        # or the mark. Booking a fill at a print 22 points outside the book
+        # would be incoherent once we have decided it is not a price.
+        s = self._grasim_strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                                  far=self._q(3240.0, 3238.0, 3242.0))
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        by_ts = {p.tradingsymbol: p.price for p in props}
+        assert by_ts["GRASIM26SEPFUT"] == pytest.approx(3309.65)
+        assert by_ts["GRASIM26OCTFUT"] == pytest.approx(3240.00)
+
+    # ── fail loud about the bad data ─────────────────────────────────────
+    def test_a_stale_print_is_reported_once_with_its_numbers(self, caplog):
+        s = self._grasim_strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                                  far=self._q(3300.8, 3323.0, 3328.2))
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            for _ in range(3):
+                s._observe_universe_uncached()
+        hits = [r for r in caplog.records if "STALE PRINT" in r.getMessage()]
+        assert len(hits) == 1, f"once per contract per session, got {len(hits)}"
+        msg = hits[0].getMessage()
+        assert "GRASIM26OCTFUT" in msg and "3300.80" in msg and "3323.00" in msg
+
+    def test_a_print_inside_the_book_is_not_flagged(self, caplog):
+        s = self._grasim_strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                                  far=self._q(3325.0, 3323.0, 3328.2))
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            s._observe_universe_uncached()
+        assert not [r for r in caplog.records if "STALE PRINT" in r.getMessage()]
+
+
+class TestUnformedBookGates:
+    """WHY (Rule 9, issue #228 follow-up): #229's mid-pricing was ALREADY live
+    in the working tree on 2026-09-11 and did not stop that day's cluster.
+    Seven calendars opened in the 09:15 tick — six with NO two-sided far book
+    (so `_book_price` fell back to the stale print the fix was about) and two
+    against books 2.39% and 2.70% wide, whose mid is not a price either. Both
+    measurable ones lost money crossing: −₹4,241 and −₹5,797.
+
+    `_implied_carry` annualizes over the ~28-day inter-expiry gap, so a 0.4%
+    error in the far leg is a full 5% of carry — the entire entry threshold."""
+
+    def _q(self, ltp, bid, ask, qty=250):
+        return {"last_price": ltp,
+                "depth": {"buy": [{"price": bid, "quantity": qty}],
+                          "sell": [{"price": ask, "quantity": qty}]}}
+
+    def _strategy(self, *, near, far, universe=("AAA",)):
+        s = _make_strategy(mode="paper", universe=list(universe),
+                           calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 0.0
+        s.kite.instruments.return_value = [
+            {"name": "AAA", "tradingsymbol": "AAA26SEPFUT", "instrument_type": "FUT",
+             "expiry": date(2026, 9, 29), "lot_size": 250, "segment": "NFO-FUT"},
+            {"name": "AAA", "tradingsymbol": "AAA26OCTFUT", "instrument_type": "FUT",
+             "expiry": date(2026, 10, 27), "lot_size": 250, "segment": "NFO-FUT"},
+        ]
+        s._clock = lambda: datetime(2026, 9, 11, 9, 15)
+        s.kite.quote.side_effect = lambda keys: {
+            "NSE:AAA": {"last_price": 3300.0},
+            "NFO:AAA26SEPFUT": near, "NFO:AAA26OCTFUT": far,
+        }
+        return s
+
+    # ── a book too wide to be a price ────────────────────────────────────
+    def test_a_wide_book_is_not_a_price(self):
+        # INDUSINDBK's real far book at 09:15 on 2026-09-11.
+        q = self._q(1000.80, 985.30, 1012.30)
+        assert ArbitrageStrategy._book_price(q, ArbitrageStrategy._touch(q)) is None
+
+    def test_a_normal_book_still_prices(self):
+        q = self._q(3325.0, 3323.0, 3328.2)          # 0.16% — typical far month
+        assert ArbitrageStrategy._book_price(
+            q, ArbitrageStrategy._touch(q)) == pytest.approx(3325.6)
+
+    def test_a_wide_book_is_still_RECORDED(self):
+        # Measurement stays permissive while pricing turns strict: #222's four
+        # weeks of depth data must keep the pathological books, or the study
+        # loses exactly the cases that matter.
+        q = self._q(1000.80, 985.30, 1012.30)
+        t = ArbitrageStrategy._touch(q)
+        assert t is not None and t["bid"] == 985.30 and t["ask"] == 1012.30
+
+    def test_a_wide_far_book_blocks_the_entry(self):
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far=self._q(3240.0, 3200.0, 3280.0))   # 1.24% wide
+        assert [p for p in s.scan_and_propose() if p.option_type == "FUT"] == []
+
+    # ── one leg on a book, the other on a print ──────────────────────────
+    def test_mixed_basis_blocks_the_entry(self):
+        # The 2026-09-11 shape: near has depth, far has none, so the far leg
+        # silently falls back to a print two sessions old.
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far={"last_price": 3240.0})
+        assert [p for p in s.scan_and_propose() if p.option_type == "FUT"] == [], \
+            "legs priced on different bases must not open a calendar"
+
+    def test_mixed_basis_is_reported(self, caplog):
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far={"last_price": 3240.0})
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            for _ in range(3):
+                s._observe_universe_uncached()
+        hits = [r for r in caplog.records
+                if "comparable basis" in r.getMessage()
+                and "CONVERGE suppressed" not in r.getMessage()]
+        assert len(hits) == 1, "once per symbol per session"
+
+    def test_a_depthless_feed_is_not_mixed(self):
+        # The backtest's MockKiteArb publishes no depth at all: BOTH legs use
+        # prints, which is consistent, and must keep trading exactly as before.
+        s = self._strategy(near={"last_price": 3310.0}, far={"last_price": 3240.0})
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert len(props) == 2, "a depthless feed must be unaffected"
+
+    def test_both_legs_on_good_books_still_trade(self):
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far=self._q(3240.0, 3238.0, 3242.0))
+        assert len([p for p in s.scan_and_propose()
+                    if p.option_type == "FUT"]) == 2
+
+    def _open_aaa(self, s, dte_near_snap=None):
+        s.state.open_calendars["AAA"] = CalendarTrade(
+            symbol="AAA", position="SHORT_CALENDAR",
+            entry_time=datetime(2026, 9, 11, 9, 0), entry_carry_diff=0.10,
+            legs=[CalendarLeg(symbol="AAA", tradingsymbol="AAA26SEPFUT",
+                              expiry="2026-09-29", lot_size=250, quantity=1,
+                              entry_price=3310.0, current_price=3310.0),
+                  CalendarLeg(symbol="AAA", tradingsymbol="AAA26OCTFUT",
+                              expiry="2026-10-27", lot_size=250, quantity=-1,
+                              entry_price=3240.0, current_price=3240.0)])
+
+    def test_a_SAFETY_exit_survives_untrusted_pricing(self):
+        # The point of the gate is that untrusted pricing must never TRAP a
+        # position. MAX_HOLD does not read carry_diff, so it must still fire.
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far={"last_price": 3240.0})
+        self._open_aaa(s)
+        s.calendar_max_holding_days = 0.0       # force MAX_HOLD
+        assert len(s.check_and_rehedge()) == 2, \
+            "a safety exit must fire regardless of pricing basis"
+
+    def test_CONVERGE_is_suppressed_on_untrusted_pricing(self):
+        # CONVERGE reads the very carry_diff the entry gate refuses to trust.
+        # A far leg that loses its book for a few ticks would otherwise close
+        # a spread that has not converged, on a print-driven number.
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far={"last_price": 3240.0})
+        self._open_aaa(s)
+        s.calendar_exit_annual = 9.99           # everything "converged"
+        s.calendar_exit_debounce_ticks = 1
+        assert s.check_and_rehedge() == [], \
+            "a discretionary exit must not fire on a number we do not trust"
+
+    def test_CONVERGE_fires_normally_when_both_legs_have_books(self):
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far=self._q(3240.0, 3238.0, 3242.0))
+        self._open_aaa(s)
+        s.calendar_exit_annual = 9.99
+        s.calendar_exit_debounce_ticks = 1
+        assert len(s.check_and_rehedge()) == 2
+
+    def test_a_wide_NEAR_book_does_not_orphan_an_open_calendar(self):
+        # THE regression from the review of PR #229: `near_px is None ->
+        # continue` dropped the symbol from the snapshot entirely, so an open
+        # calendar got no EXPIRY, no MAX_HOLD and no STOP_LOSS — the same
+        # orphaning #227 fixed, re-entered by a different door.
+        s = self._strategy(near=self._q(3310.0, 3280.0, 3340.0),   # 1.8% wide
+                           far=self._q(3240.0, 3238.0, 3242.0))
+        self._open_aaa(s)
+        snaps = s._observe_universe_uncached()
+        assert snaps, "a wide near book must not make the symbol unobservable"
+        s.calendar_max_holding_days = 0.0
+        assert len(s.check_and_rehedge()) == 2, \
+            "the position must still reach its safety exit"
+
+    def test_an_untrusted_exit_is_not_booked_as_verified_pnl(self):
+        # The ledger must not record a fill and a P&L at a price the same code
+        # calls untradable — #222's live-readiness decision reads these rows.
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far={"last_price": 3240.0})
+        self._open_aaa(s)
+        s.calendar_max_holding_days = 0.0
+        s.execute_proposals(s.check_and_rehedge())
+        assert s.state.closed_trades[-1]["pnl_verified"] is False
+
+    def test_a_wide_book_is_reported(self, caplog):
+        # Zero entries for a session must not look the same as a quiet market.
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1),
+                           far=self._q(3240.0, 3200.0, 3280.0))
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            for _ in range(3):
+                s._observe_universe_uncached()
+        hits = [r for r in caplog.records if "WIDE BOOK" in r.getMessage()]
+        assert len(hits) == 1 and "AAA26OCTFUT" in hits[0].getMessage()
+
+    def test_a_missing_far_quote_is_not_called_mixed(self, caplog):
+        # A throttled or failed far quote is "nothing to compare", not "mixed"
+        # — and mis-reporting it burns the once-per-session warning that a
+        # genuine bookless leg later in the day would need.
+        s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1), far=None)
+        s.kite.quote.side_effect = lambda keys: {
+            "NSE:AAA": {"last_price": 3300.0},
+            "NFO:AAA26SEPFUT": self._q(3310.0, 3308.2, 3311.1),
+        }
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            s._observe_universe_uncached()
+        assert not [r for r in caplog.records
+                    if "comparable basis" in r.getMessage()]

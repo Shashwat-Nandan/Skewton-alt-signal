@@ -39,7 +39,7 @@ import os
 import signal
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -82,6 +82,13 @@ DATA_CACHE = HERE / "data_cache"
 # the other; the operator's HALT_ALL / HALT_NEW_ENTRIES switches remain shared
 # (a manual kill switch is meant to stop everything).
 HALT_ARB_DAILY_LOSS_PATH = DATA_CACHE / "HALT_ARBITRAGE_DAILY_LOSS"
+
+# Minutes after the open during which no NEW calendar may be entered. The
+# far-month leg of a single-stock-futures calendar has no formed book in the
+# first minutes of the session — on 2026-09-11 seven entries fired in the
+# 09:15 tick, six of them against a far leg with no two-sided book at all
+# (issue #228). Exits are never suppressed.
+ENTRY_WARMUP_MINUTES = 5
 
 STATE_FILE_TEMPLATE = "arbitrage_paper_state_{system}.json"
 LOCK_FILE_TEMPLATE = ".arbitrage_paper_{system}.lock"
@@ -678,6 +685,8 @@ def main():
     log.info("Entering tick loop (every %ds until %s)",
              TICK_SECONDS, session_end_ts.strftime("%H:%M"))
 
+    entry_open_ts = open_ts + timedelta(minutes=ENTRY_WARMUP_MINUTES)
+    warmup_logged = False
     halt_state = ArbHaltState()
     if args.max_daily_loss_inr <= 0:
         log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
@@ -697,10 +706,24 @@ def main():
             # _observe_universe, which dedupes on this id (see its docstring).
             strategy._obs_tick_id = tick_id
             halt_state.refresh(log)
+            # Opening-minutes warmup (issue #228). At 09:15 the far-month
+            # book does not exist yet: on 2026-09-11 seven calendars opened in
+            # the first tick, six with NO two-sided far book and the other two
+            # against books 2.39% and 2.70% wide. Every one of them was an
+            # artifact of an unformed market. Entries only — exits and the
+            # expiry force-exit run from the first tick, because a position we
+            # already hold must always be manageable.
+            in_warmup = datetime.now() < entry_open_ts
+            if in_warmup and not warmup_logged:
+                warmup_logged = True
+                log.info("Entry warmup: no new calendars until %s (%d min "
+                         "after open) — the far-month book is not formed yet "
+                         "(issue #228). Exits run normally.",
+                         entry_open_ts.strftime("%H:%M"), ENTRY_WARMUP_MINUTES)
             _attempted, errored = tick_once(
                 strategy, log,
                 halt_all=halt_state.halt_all,
-                halt_new_entries=halt_state.halt_new,
+                halt_new_entries=halt_state.halt_new or in_warmup,
             )
             n_ran = 0 if halt_state.halt_all else 1
             n_errored = 1 if errored else 0

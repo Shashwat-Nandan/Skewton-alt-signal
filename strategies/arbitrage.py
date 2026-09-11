@@ -59,6 +59,15 @@ logger = logging.getLogger(__name__)
 # (research/backtest_arbitrage.make_strategy) for no present benefit.
 MARGIN_HEADROOM = 1.05
 
+# Widest depth-1 book whose mid is still treated as a price, as a fraction of
+# that mid. Measured far-month single-stock futures quote 0.08-0.41% wide in
+# normal trade (#223, 2026-09-07); the 09:15 opening books that produced the
+# 2026-09-11 phantom cluster were 2.39% and 2.70%. 1% sits well clear of
+# normal and well below the artifacts. Module constant, not config: a new
+# __init__ attribute has to be mirrored into the backtest builders (AST parity
+# test, 2026-07-11) and this strategy is paper-only.
+MAX_BOOK_WIDTH = 0.01
+
 CalendarPosition = Literal["FLAT", "LONG_CALENDAR", "SHORT_CALENDAR"]
 
 
@@ -360,6 +369,7 @@ class ArbitrageStrategy(BaseStrategy):
                 # the hold can never reach the roll zone (see __init__).
                 and snap["dte_near"] >= self.calendar_entry_min_dte
                 and snap["carry_diff"] is not None
+                and snap.get("pricing_trusted", True)
                 and abs(snap["carry_diff"]) >= self.calendar_entry_annual
                 and snap["symbol"] not in self.state.open_calendars
                 and len(self.state.open_calendars) < self.max_open_calendars
@@ -441,7 +451,25 @@ class ArbitrageStrategy(BaseStrategy):
             # can't fire the exit, but a genuine convergence still banks
             # within ~N minutes — never pinned for days against re-divergence
             # (there is no stop-loss exit below this to catch that).
-            cd = snap.get("carry_diff")
+            # CONVERGE is a DISCRETIONARY exit and it reads the same
+            # carry_diff the entry gate refuses to trust. A far leg that loses
+            # its two-sided book for `calendar_exit_debounce_ticks` ticks —
+            # routine on thin names, and the 09:15 condition this PR is about
+            # — would otherwise close a spread that has not converged, on a
+            # print-driven number (review of PR #229). EXPIRY, MAX_HOLD and
+            # STOP_LOSS above are SAFETY exits and deliberately run regardless:
+            # untrusted pricing must never trap a position.
+            cd = snap.get("carry_diff") if snap.get("pricing_trusted", True) else None
+            if cd is None and not snap.get("pricing_trusted", True):
+                trade.converge_streak = 0
+                if symbol not in self._untrusted_converge_warned:
+                    self._untrusted_converge_warned.add(symbol)
+                    logger.warning(
+                        "%s calendar: CONVERGE suppressed — the legs are not "
+                        "priced on a comparable basis (%s/%s), so carry_diff "
+                        "cannot be trusted to say the spread converged. "
+                        "EXPIRY / MAX_HOLD / STOP_LOSS still apply (#228).",
+                        symbol, snap.get("near_basis"), snap.get("next_basis"))
             if cd is not None and abs(cd) <= self.calendar_exit_annual:
                 trade.converge_streak += 1
                 if trade.converge_streak >= self.calendar_exit_debounce_ticks:
@@ -1100,27 +1128,56 @@ class ArbitrageStrategy(BaseStrategy):
                 if dte > 0:
                     T = dte / 365.0
                     q = self._get_dividend_yield(sym)
-                    spot = float(near_q["last_price"]) * math.exp(
-                        -(self.risk_free_rate - q) * T
-                    )
+                    _px = self._book_price(near_q, self._touch(near_q))
+                    if _px is not None:
+                        spot = _px * math.exp(-(self.risk_free_rate - q) * T)
                     spot_is_fallback = True
 
             if near_q is None or spot is None:
                 continue
 
             dte_near = (self._exp_date(near["expiry"]) - today).days
-            near_px = float(near_q["last_price"])
+            near_touch = self._touch(near_q)
+            near_px, near_basis = self._priced(near_q, near_touch)
+            if near_px is None:
+                continue          # genuinely no price at all — nothing to say
+            if near_basis == "wide":
+                self._flag_wide_book(near["tradingsymbol"], near_touch)
+            self._flag_stale_print(near["tradingsymbol"], near_q, near_touch)
 
             basis_ann = self._annualized_basis(spot, near_px, dte_near, sym)
 
             next_px = None
+            next_touch = None
             dte_next = None
             carry_implied = None
             carry_diff = None
             basis_ann_next = None
+            next_basis = None
             if nxt and next_q is not None:
+                next_touch = self._touch(next_q)
+                next_px, next_basis = self._priced(next_q, next_touch)
+                if next_basis == "wide":
+                    self._flag_wide_book(nxt["tradingsymbol"], next_touch)
+            # Trust the PAIR, not each leg: both legs off books is trusted,
+            # both off prints is trusted too (a feed with no depth at all —
+            # the backtest's MockKiteArb, signals-only — is internally
+            # consistent and must behave exactly as before). One of each is
+            # the sign-inverting mix that #228 is about, and either leg on a
+            # book too wide to price is no better. Computed only when there
+            # IS a far leg that was actually quoted: no far month, or a
+            # throttled quote, is "nothing to compare", not "mixed"
+            # (review of PR #229).
+            pricing_trusted = True
+            if nxt is not None and next_q is not None:
+                pricing_trusted = (near_basis == next_basis
+                                   and near_basis in ("book", "print"))
+                if not pricing_trusted:
+                    self._flag_untrusted_pricing(sym, near_basis, next_basis,
+                                                 nxt["tradingsymbol"])
+            if next_px is not None:
                 dte_next = (self._exp_date(nxt["expiry"]) - today).days
-                next_px = float(next_q["last_price"])
+                self._flag_stale_print(nxt["tradingsymbol"], next_q, next_touch)
                 carry_implied = self._implied_carry(near_px, next_px, dte_near, dte_next)
                 if carry_implied is not None:
                     carry_diff = carry_implied - (
@@ -1145,8 +1202,18 @@ class ArbitrageStrategy(BaseStrategy):
                 # Depth-1 touch at THIS tick (issue #222). Consumed by the
                 # entry/exit builders; None whenever the feed carries no
                 # usable depth.
-                "near_quote": self._touch(near_q),
-                "next_quote": self._touch(next_q),
+                "near_quote": near_touch,
+                "next_quote": next_touch,
+                # True when one leg is priced off its book and the other off a
+                # print — a sign-inverting error of exactly the shape #228 is
+                # about, and the case the 2026-09-11 cluster actually hit: at
+                # 09:15 the far month had no two-sided book at all, so it fell
+                # back to a print two sessions old while the near leg used its
+                # mid. Blocks ENTRIES only; an open calendar must still be
+                # able to exit (issue #228).
+                "pricing_trusted": pricing_trusted,
+                "near_basis": near_basis,
+                "next_basis": next_basis,
             })
 
         return snapshots
@@ -1250,6 +1317,165 @@ class ArbitrageStrategy(BaseStrategy):
         if cache is None or cache[0] is not id(instruments) or cache[1] != today:
             self._fut_index_cache = (id(instruments), today, self._build_fut_index(instruments, today))
         return self._fut_index_cache[2].get(symbol, [])
+
+    def _flag_wide_book(self, tradingsymbol: str, touch: Optional[dict]) -> None:
+        """Say when a book is too wide to price off (issue #228).
+
+        Silently returning None told an operator nothing: zero entries for a
+        session looked identical to a quiet market. Rule 12, and this PR's own
+        rationale — correcting bad data without saying so teaches nothing.
+        """
+        if not touch or tradingsymbol in self._wide_book_warned:
+            return
+        self._wide_book_warned.add(tradingsymbol)
+        mid = (touch["bid"] + touch["ask"]) / 2.0
+        logger.warning(
+            "WIDE BOOK %s: %.2f/%.2f is %.2f%% wide (> %.2f%%) — no usable "
+            "mid, so this leg cannot price a calendar. Entries suppressed "
+            "for it (issue #228).",
+            tradingsymbol, touch["bid"], touch["ask"],
+            100.0 * (touch["ask"] - touch["bid"]) / mid, 100.0 * MAX_BOOK_WIDTH)
+
+    def _flag_untrusted_pricing(self, symbol: str, near_basis: Optional[str],
+                                next_basis: Optional[str],
+                                far_ts: str) -> None:
+        """One leg off its book, the other off a print — say so (issue #228).
+
+        `_flag_stale_print` cannot fire here: it returns early when there is no
+        touch, which is precisely the leg most at risk. Without this the
+        fallback to `last_price` is silent on exactly the contract that
+        prompted the fix. Once per symbol per session.
+        """
+        if symbol in self._mixed_basis_warned:
+            return
+        self._mixed_basis_warned.add(symbol)
+        logger.warning(
+            "%s: legs are not priced on a comparable basis — near=%s, "
+            "far=%s (%s). That is how a stale print inverts the term "
+            "structure. Calendar ENTRIES and the CONVERGE exit are suppressed "
+            "for %s; EXPIRY / MAX_HOLD / STOP_LOSS still apply (issue #228).",
+            symbol, near_basis, next_basis, far_ts, symbol,
+        )
+
+    @property
+    def _mixed_basis_warned(self) -> set:
+        """Lazy, not an __init__ attr (AST parity test, 2026-07-11)."""
+        if getattr(self, "_mixed_basis_warned_set", None) is None:
+            self._mixed_basis_warned_set = set()
+        return self._mixed_basis_warned_set
+
+    @property
+    def _wide_book_warned(self) -> set:
+        if getattr(self, "_wide_book_warned_set", None) is None:
+            self._wide_book_warned_set = set()
+        return self._wide_book_warned_set
+
+    @property
+    def _untrusted_converge_warned(self) -> set:
+        if getattr(self, "_untrusted_converge_warned_set", None) is None:
+            self._untrusted_converge_warned_set = set()
+        return self._untrusted_converge_warned_set
+
+    def _flag_stale_print(self, tradingsymbol: str, quote: Optional[dict],
+                          touch: Optional[dict]) -> None:
+        """Surface a last_price that sits outside its own bid/ask (issue #228).
+
+        Pricing off the book already stops a stale print from corrupting the
+        signal, but silently correcting bad data teaches you nothing (Rule 12):
+        a contract whose print is 22 points outside its book is telling you how
+        thin it is, and that belongs in the log next to the trades it did not
+        cause. Once per contract per session.
+        """
+        if not touch or not quote:
+            return
+        ltp = float(quote.get("last_price") or 0.0)
+        if not ltp or touch["bid"] <= ltp <= touch["ask"]:
+            return
+        if tradingsymbol in self._stale_print_warned:
+            return
+        self._stale_print_warned.add(tradingsymbol)
+        away = touch["bid"] - ltp if ltp < touch["bid"] else ltp - touch["ask"]
+        logger.warning(
+            "STALE PRINT %s: last_price %.2f is %.2f outside the book "
+            "%.2f/%.2f (%.2f%%). Pricing off the mid; the print is not "
+            "tradable (issue #228).",
+            tradingsymbol, ltp, away, touch["bid"], touch["ask"],
+            100.0 * away / ltp,
+        )
+
+    @property
+    def _stale_print_warned(self) -> set:
+        """Contracts already flagged this session. Lazy, not an __init__ attr:
+        the backtest builders bypass __init__ (AST parity test, 2026-07-11)."""
+        if getattr(self, "_stale_print_warned_set", None) is None:
+            self._stale_print_warned_set = set()
+        return self._stale_print_warned_set
+
+    @classmethod
+    def _priced(cls, quote: Optional[dict],
+                touch: Optional[dict]) -> Tuple[Optional[float], Optional[str]]:
+        """(price, basis) for one leg. basis is "book", "print", "wide" or None.
+
+        Split out from `_book_price` because a leg can be UNPRICEABLE without
+        being UNOBSERVABLE, and conflating the two orphaned open calendars:
+        dropping the symbol from the snapshot skips its EXPIRY, MAX_HOLD and
+        STOP_LOSS too (review of PR #229 — the same failure class as #227's,
+        re-entered by a different door).
+
+        So a book too wide to trust still yields a NUMBER, tagged "wide", and
+        the caller blocks discretionary actions on the tag rather than by
+        making the symbol vanish. "print" is honest and fine when BOTH legs
+        are prints (the backtest, signals-only); it is dangerous only mixed
+        with a "book" leg, which the caller also checks.
+        """
+        if touch:
+            mid = (touch["bid"] + touch["ask"]) / 2.0
+            width = (touch["ask"] - touch["bid"]) / mid if mid > 0 else 1.0
+            if width <= MAX_BOOK_WIDTH:
+                return mid, "book"
+            ltp = float((quote or {}).get("last_price") or 0.0)
+            return (ltp or None), "wide"
+        ltp = float((quote or {}).get("last_price") or 0.0)
+        return (ltp, "print") if ltp else (None, None)
+
+    @staticmethod
+    def _book_price(quote: Optional[dict],
+                    touch: Optional[dict]) -> Optional[float]:
+        """The price to reason and transact at: depth-1 mid, else last_price.
+
+        `last_price` is the last trade, not a price anything can transact at.
+        On a far-month single-stock future — 30-100x thinner than the near
+        month — it goes stale, and a stale print does not merely add noise: on
+        2026-09-09 GRASIM's OCT print sat 22 points BELOW its own bid, which
+        inverted the sign of the term structure and fired two entries the real
+        book put at −0.73% and −0.55% against a 5% threshold (issue #228).
+
+        Mid is not the executable price either — you cross to the far touch —
+        so a mid-based signal is still optimistic, just no longer fictional.
+        Whether the hurdle should use the executable spread is what #222's
+        depth collection exists to settle.
+
+        Falls back to last_price when there is no usable book, so the backtest
+        (MockKiteArb publishes no depth) and any signals-only feed are
+        unchanged.
+        """
+        if touch:
+            mid = (touch["bid"] + touch["ask"]) / 2.0
+            width = (touch["ask"] - touch["bid"]) / mid if mid > 0 else 1.0
+            if width > MAX_BOOK_WIDTH:
+                # A book this wide has no mid worth the name. _implied_carry
+                # annualizes over the ~28-day inter-expiry gap, so a 0.4%
+                # error in the far leg is a full 5% of carry — the entire
+                # entry threshold. On 2026-09-11 at 09:15 the far books were
+                # 2.39% and 2.70% wide and both trades lost money crossing
+                # them. Returning None makes the leg unpriceable, which the
+                # mixed-basis gate below turns into "do not trade this
+                # calendar" (issue #228).
+                return None
+            return mid
+        if quote and quote.get("last_price"):
+            return float(quote["last_price"])
+        return None
 
     @staticmethod
     def _touch(quote: Optional[dict]) -> Optional[dict]:
@@ -1496,7 +1722,15 @@ class ArbitrageStrategy(BaseStrategy):
         # previous attempt that latched False and then failed to fill (quote
         # gap + interrupt, live rejection) must not mislabel a later clean
         # exit as approximate — every path re-stamps all three fields here.
-        trade.pnl_verified = True
+        trade.pnl_verified = snap.get("pricing_trusted", True)
+        if not trade.pnl_verified:
+            logger.warning(
+                "%s %s: a leg is priced off a print while the other uses its "
+                "book (%s/%s) — booking the fill but marking the row "
+                "pnl_verified=False: this P&L is at a price the same code "
+                "calls untradable (#228).",
+                trade.symbol, reason, snap.get("near_basis"),
+                snap.get("next_basis"))
         trade.exit_reason = reason
         trade.exit_carry_diff = snap.get("carry_diff")
         proposals: List[TradeProposal] = []
