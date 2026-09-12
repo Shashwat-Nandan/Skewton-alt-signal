@@ -117,6 +117,12 @@ class CalendarTrade:
     exit_reason: Optional[str] = None
     exit_carry_diff: Optional[float] = None
     pnl_verified: bool = True
+    # Entry friction in rupees (costs + the half-spread actually crossed),
+    # frozen once BOTH legs are on the trade. Read live it would drift:
+    # `costs` is a LIFETIME total, so after a half-filled exit the surviving
+    # naked leg would be judged against a bar still carrying the departed
+    # leg's costs (review of PR #232). None on legacy trades → recomputed.
+    entry_friction: Optional[float] = None
     # Quoted depth-1 touch per leg at the tick the entry and the exit were
     # PROPOSED — {tradingsymbol: {"entry": touch|None, "exit": touch|None}}.
     # Kept on the trade (not the leg) because legs are removed as they close,
@@ -316,6 +322,69 @@ class ArbitrageStrategy(BaseStrategy):
         return max(self.calendar_min_dte_near, self.calendar_max_holding_days + 2)
 
     @staticmethod
+    def _entry_friction(trade: "CalendarTrade") -> float:
+        """Rupees the trade was already down the instant it filled, before the
+        market moved at all (issue #231).
+
+        Entering costs money twice: brokerage/STT/stamp (`trade.costs`) and the
+        spread you cross to get in. Both sit inside `mtm`, so a stop that
+        compares raw `mtm` against `-mult × expected_harvest` charges the trade
+        for the cost of having been entered. In LIVE both legs are crossed
+        adversely, so at the measured spreads (#223: near ~0.075%, far ~0.16%
+        half-spread) that is ~0.235% of leg notional against a threshold of
+        ~0.185% at the 5% entry gate — the trade is stopped out on tick one for
+        a guaranteed round-trip loss. Paper never showed it because there the
+        fill price IS the mark.
+
+        The crossing term is recoverable only because #223 records the entry
+        touch. It is legitimately ZERO in paper (the fill is the mid) and for
+        trades opened before that logging existed — in both cases this reduces
+        to the cost term, which is the conservative direction.
+
+        Deliberately threshold-side, not a second MTM: `_leg_mtm` remains "the
+        SINGLE formula shared by the unrealized-P&L maintainers and the
+        STOP_LOSS trigger", so the stop still fires on exactly the number the
+        ledger reports — it just measures it against a bar that ignores what
+        entry cost.
+        """
+        if trade.entry_friction is not None:
+            return trade.entry_friction
+        # Legacy trades (opened before this was snapshotted) recompute live.
+        return trade.costs + sum(
+            ArbitrageStrategy._leg_crossing_cost(
+                leg, (trade.leg_quotes.get(leg.tradingsymbol) or {}).get("entry"))
+            for leg in trade.legs)
+
+    @staticmethod
+    def _leg_crossing_cost(leg: CalendarLeg, touch: Optional[dict]) -> float:
+        """Rupees this leg gave up crossing to get filled — adverse only, and
+        bounded by the half-spread (review of PR #232).
+
+        The naive `abs(entry_price - mid)` was wrong twice. The executor prices
+        a marketable LIMIT off a FRESH ltp padded by limit_protection_pct and
+        polls per leg, and the two legs are placed sequentially, so everything
+        the book does between the scan quote and the second fill landed in the
+        number — and `abs()` made it additive whichever way it went. A fill
+        BETTER than the mid then both booked a positive `_leg_mtm` and enlarged
+        the friction, loosening the stop twice for the same good luck.
+
+        So: count only the adverse side (a BUY above the mid, a SELL below),
+        and cap it at the half-spread that was actually there to cross. Drift
+        beyond the touch is market movement — which is exactly what the stop
+        exists to measure, and must not be laundered into the bar it is
+        measured against.
+        """
+        if not touch:
+            return 0.0
+        mid = (touch["bid"] + touch["ask"]) / 2.0
+        half = (touch["ask"] - touch["bid"]) / 2.0
+        adverse = ((leg.entry_price - mid) if leg.quantity > 0
+                   else (mid - leg.entry_price))
+        if adverse <= 0:
+            return 0.0
+        return min(adverse, half) * abs(leg.quantity) * leg.lot_size
+
+    @staticmethod
     def _leg_mtm(leg: CalendarLeg) -> float:
         """One leg's mark-to-market ₹. The SINGLE formula shared by the
         unrealized-P&L maintainers and the STOP_LOSS trigger, so the stop can
@@ -438,11 +507,38 @@ class ArbitrageStrategy(BaseStrategy):
                     expected = (max(abs(trade.entry_carry_diff) - self.calendar_exit_annual, 0.0)
                                 * notional * self.calendar_max_holding_days / 365.0)
                 mtm = trade.realized + sum(self._leg_mtm(l) for l in trade.legs)
-                if expected > 0 and mtm <= -self.calendar_stop_loss_mult * expected:
+                # Judge MOVEMENT, not the cost of having been entered. See
+                # _entry_friction: the adjustment is on the THRESHOLD side so
+                # `_leg_mtm` stays the single formula the ledger and the stop
+                # both read (issue #231).
+                friction = self._entry_friction(trade)
+                # Rule 12, and the reason this offset is not a free lunch: if
+                # crossing cost as much as the trade ever expected to harvest,
+                # the position is expected-negative from the instant it filled.
+                # The entry hurdle cannot catch that — calendar_cost_hurdle_mult
+                # models brokerage/STT only and has NO crossing term — so this
+                # is the first place in the strategy that measures it. Without
+                # saying so, #231's instant stop-outs are merely replaced by a
+                # SILENT cluster of trades riding to MAX_HOLD for the same loss
+                # (review of PR #232). Feeding this back into the entry hurdle
+                # is issue #233.
+                if (expected > 0 and friction >= expected
+                        and symbol not in self._doomed_entry_warned):
+                    self._doomed_entry_warned.add(symbol)
                     logger.warning(
-                        "%s calendar: MTM ₹%.0f ≤ -%.1fx expected harvest ₹%.0f "
-                        "— thesis invalidated, exiting STOP_LOSS",
-                        symbol, mtm, self.calendar_stop_loss_mult, expected)
+                        "%s calendar: entry friction ₹%.0f ≥ expected harvest "
+                        "₹%.0f — this trade cannot pay for itself and is not a "
+                        "stop-loss problem. The entry hurdle does not model "
+                        "crossing cost (issue #233).",
+                        symbol, friction, expected)
+                if (expected > 0
+                        and mtm + friction <= -self.calendar_stop_loss_mult * expected):
+                    logger.warning(
+                        "%s calendar: MTM ₹%.0f + entry friction ₹%.0f = ₹%.0f "
+                        "≤ -%.1fx expected harvest ₹%.0f — thesis invalidated, "
+                        "exiting STOP_LOSS",
+                        symbol, mtm, friction, mtm + friction,
+                        self.calendar_stop_loss_mult, expected)
                     proposals.extend(self._build_calendar_exit(trade, snap, "STOP_LOSS"))
                     continue
 
@@ -868,6 +964,7 @@ class ArbitrageStrategy(BaseStrategy):
                     "converge_streak": t.converge_streak,
                     "expected_harvest": t.expected_harvest,
                     "pnl_verified": t.pnl_verified,
+                    "entry_friction": t.entry_friction,
                     # Entry touches must survive the session boundary — a
                     # calendar opened today usually exits days later, and the
                     # closed row needs both ends (issue #222). Copied one level
@@ -926,6 +1023,8 @@ class ArbitrageStrategy(BaseStrategy):
                 expected_harvest=(float(tblob["expected_harvest"])
                                   if tblob.get("expected_harvest") is not None else None),
                 pnl_verified=bool(tblob.get("pnl_verified", True)),
+                entry_friction=(float(tblob["entry_friction"])
+                                if tblob.get("entry_friction") is not None else None),
                 # .get: blobs written before issue #222 lack the key; an empty
                 # map reads as "not measured", which is what it was.
                 leg_quotes={ts: dict(ends) for ts, ends
@@ -1363,6 +1462,13 @@ class ArbitrageStrategy(BaseStrategy):
         if getattr(self, "_mixed_basis_warned_set", None) is None:
             self._mixed_basis_warned_set = set()
         return self._mixed_basis_warned_set
+
+    @property
+    def _doomed_entry_warned(self) -> set:
+        """Trades already flagged as expected-negative at entry this session."""
+        if getattr(self, "_doomed_entry_warned_set", None) is None:
+            self._doomed_entry_warned_set = set()
+        return self._doomed_entry_warned_set
 
     @property
     def _wide_book_warned(self) -> set:
@@ -1891,6 +1997,13 @@ class ArbitrageStrategy(BaseStrategy):
         if len(trade.legs) == 2 and trade.legs[0].quantity * trade.legs[1].quantity < 0:
             near_leg = min(trade.legs, key=lambda l: l.expiry)
             trade.position = "SHORT_CALENDAR" if near_leg.quantity > 0 else "LONG_CALENDAR"
+            # Freeze entry friction here — the one moment it means what its
+            # name says: both legs filled, nothing exited yet (#232 review).
+            if trade.entry_friction is None:
+                trade.entry_friction = trade.costs + sum(
+                    self._leg_crossing_cost(
+                        leg, (trade.leg_quotes.get(leg.tradingsymbol) or {}).get("entry"))
+                    for leg in trade.legs)
 
         # If the trade is now empty, archive and remove. realized_pnl /
         # transaction_costs are THIS trade's own locally-accumulated totals, so

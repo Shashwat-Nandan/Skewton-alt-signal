@@ -1,3 +1,78 @@
+# STOP_LOSS must judge movement, not the cost of entering (#231) — 2026-09-11
+
+In LIVE both legs of a calendar are crossed adversely to enter, so MTM is
+negative the instant it fills, before the market moves at all. STOP_LOSS
+compared that raw MTM against `-mult x expected_harvest`, so a trade entered
+near the 5% gate was stopped out on its FIRST tick for a guaranteed round-trip
+loss. At the measured spreads (#223: near ~0.075%, far ~0.16% half-spread) the
+instant mark is ~0.235% of leg notional against a ~0.185% threshold. Paper never
+showed it, because there the fill price IS the mark — it would have appeared on
+the first live session as a cluster of instant stop-outs looking like "the
+strategy is just losing".
+
+Operator decision 2026-09-11: **adjust the threshold, not the MTM.**
+
+- [x] `_entry_friction(trade)` = booked costs + the spread actually crossed at
+      entry, the latter recoverable only because #223 records the entry touch
+- [x] stop fires on `mtm + friction <= -mult x expected`, so `_leg_mtm` remains
+      "the SINGLE formula shared by the unrealized-P&L maintainers and the
+      STOP_LOSS trigger" — the stop still fires on the number the ledger
+      reports, just against a bar that ignores what entry cost
+- [x] zero friction in paper (the fill IS the mid) and for pre-#223 trades, in
+      both cases reducing to the cost term — the conservative direction
+- [x] 6 tests; both directions mutation-checked (restoring the raw comparison
+      re-fires the bug; a friction that swallows everything disables the stop)
+
+### Review fixes (code review of PR #232)
+
+Four findings. The first I had plainly wrong.
+
+- **The spread term was not the spread.** `abs(entry_price - mid)` measured the
+  fill against the SCAN-tick touch, but `KiteOrderExecutor` prices a marketable
+  LIMIT off a FRESH ltp padded by `limit_protection_pct`, polls per leg, and the
+  legs go sequentially — so book movement between the scan quote and the second
+  fill landed in "friction". `abs()` made it additive either way, so a fill
+  BETTER than mid booked a positive `_leg_mtm` AND enlarged the friction,
+  loosening the stop twice for the same good luck. Since friction only ever
+  loosens a safety exit, drift was disarming it — worst on fast, wide-book
+  entries, precisely where the stop matters most. Now adverse-side only, capped
+  at the half-spread that was actually there to cross.
+- **`trade.costs` is a lifetime total**, so after a half-filled exit the
+  surviving naked leg was judged against a bar still carrying the departed
+  leg's costs. Friction is now FROZEN when the second leg fills — the one
+  moment the name is true — and round-trips through serialize/restore; legacy
+  trades recompute.
+- **A trade that cannot pay for itself now says so.** If crossing cost as much
+  as the trade ever expected to harvest it is expected-negative from the
+  instant it filled, and the entry hurdle cannot see that (it models fees
+  only). Without a warning, #231's instant stop-outs merely become a SILENT
+  cluster riding to MAX_HOLD for the same loss. Structural half → issue #233,
+  deliberately sequenced WITH #222's data rather than guessed now.
+- **The verification claim was weak.** "Backtest byte-identical" was worthless
+  here: STOP_LOSS fires ZERO times in that backtest, because the cost hurdle
+  admits ~1 calendar. Measured the real shift instead — on the paper ledger
+  **18 of 54** verified trades exited via STOP_LOSS, and the bar moves a
+  **median 24% of expected_harvest** in paper. Live adds the crossing term on
+  top, which no backtest here can show.
+
+### Review
+
+Rejected option: stopping on `carry_diff` instead of rupees. It reads well
+until you notice #229 just made `carry_diff` untrustworthy whenever a leg loses
+its book — and the stop is a SAFETY exit that has to work hardest exactly then.
+It would disable the stop in the conditions that most need it.
+
+Also rejected earlier: marking each leg at its exit side. Honest liquidation
+value, but a full spread per leg rather than a half, so it made this bug worse.
+
+Caught while writing the tests: three of them passed vacuously at first
+because the fixture gave `check_and_rehedge` no snapshot, so the symbol was
+skipped entirely and "no exit proposals" was trivially true. Added
+`test_the_fixture_actually_observes_the_symbol` to pin that the harness can
+fire a stop at all.
+
+---
+
 # Calendar signal priced off a stale print (#228) — 2026-09-09
 
 First session with depth logging (#223) live produced two GRASIM trades. Both

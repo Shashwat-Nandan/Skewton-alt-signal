@@ -2571,3 +2571,216 @@ class TestUnformedBookGates:
             s._observe_universe_uncached()
         assert not [r for r in caplog.records
                     if "comparable basis" in r.getMessage()]
+
+
+class TestStopIgnoresEntryFriction:
+    """WHY (Rule 9, issue #231): in LIVE both legs are crossed adversely to
+    enter, so a calendar's MTM is negative the instant it fills, before the
+    market moves at all. STOP_LOSS compared that raw MTM against
+    −1×expected_harvest, so a trade entered near the 5% gate was stopped out on
+    its FIRST tick for a guaranteed round-trip loss. Paper never showed it,
+    because there the fill price IS the mark — it would have appeared on the
+    first live session as a cluster of instant stop-outs that looked like
+    'the strategy is just losing'."""
+
+    LOT = 250
+
+    def _touch(self, bid, ask):
+        return {"bid": bid, "ask": ask, "bid_qty": self.LOT,
+                "ask_qty": self.LOT, "ltp": (bid + ask) / 2}
+
+    def _live_entered_trade(self, s, *, costs=500.0, expected=800.0):
+        """A SHORT_CALENDAR entered the way LIVE enters: buy the near at its
+        ask, sell the far at its bid, with the entry touches recorded."""
+        near_touch, far_touch = self._touch(1000.0, 1001.5), self._touch(1010.0, 1013.0)
+        trade = CalendarTrade(
+            symbol="AAA", position="SHORT_CALENDAR",
+            entry_time=datetime(2026, 9, 11, 10, 0), entry_carry_diff=0.06,
+            expected_harvest=expected, costs=costs, realized=-costs,
+            legs=[CalendarLeg(symbol="AAA", tradingsymbol="AAA26SEPFUT",
+                              expiry="2026-09-29", lot_size=self.LOT, quantity=1,
+                              entry_price=1001.5,      # crossed to the ask
+                              current_price=1000.75),  # marked at the mid
+                  CalendarLeg(symbol="AAA", tradingsymbol="AAA26OCTFUT",
+                              expiry="2026-10-27", lot_size=self.LOT, quantity=-1,
+                              entry_price=1010.0,      # crossed to the bid
+                              current_price=1011.5)])
+        trade.leg_quotes = {"AAA26SEPFUT": {"entry": near_touch},
+                            "AAA26OCTFUT": {"entry": far_touch}}
+        s.state.open_calendars["AAA"] = trade
+        return trade
+
+    def _snap(self, near_px=1000.75, far_px=1011.5):
+        """Marks both legs at their mids — i.e. no market movement since the
+        entry. Without a real snapshot check_and_rehedge skips the symbol
+        entirely and every assertion here would pass vacuously."""
+        return {
+            "symbol": "AAA", "spot": 1000.0,
+            "near": {"tradingsymbol": "AAA26SEPFUT", "lot_size": self.LOT,
+                     "expiry": "2026-09-29", "instrument_token": 1},
+            "near_price": near_px, "dte_near": 18,
+            "next": {"tradingsymbol": "AAA26OCTFUT", "lot_size": self.LOT,
+                     "expiry": "2026-10-27", "instrument_token": 2},
+            "next_price": far_px, "dte_next": 46,
+            "basis_annual": 0.0, "basis_annual_next": 0.0,
+            "carry_implied": 0.13, "carry_diff": 0.06,
+            "near_quote": self._touch(1000.0, 1001.5),
+            "next_quote": self._touch(1010.0, 1013.0),
+            "pricing_trusted": True, "near_basis": "book", "next_basis": "book",
+        }
+
+    def _strategy(self, near_px=1000.75, far_px=1011.5):
+        s = _make_strategy(mode="paper")
+        s.calendar_stop_loss_mult = 1.0
+        s.calendar_max_holding_days = 99
+        s.calendar_exit_annual = 0.005          # 0.06 is nowhere near CONVERGE
+        s._clock = lambda: datetime(2026, 9, 11, 10, 1)
+        s._observe_universe = lambda: [self._snap(near_px, far_px)]
+        return s
+
+    def test_the_fixture_actually_observes_the_symbol(self):
+        # Guard against the vacuous pass: if check_and_rehedge skipped AAA for
+        # want of a snapshot, every "no exit" assertion below would be
+        # meaningless. Force the stop and prove it CAN fire here.
+        s = self._strategy(far_px=1016.5)
+        t = self._live_entered_trade(s)
+        t.expected_harvest = 1.0
+        assert len(s.check_and_rehedge()) == 2
+
+    def test_friction_is_costs_plus_the_spread_actually_crossed(self):
+        s = self._strategy()
+        trade = self._live_entered_trade(s)
+        # near: |1001.50 − 1000.75| × 250 = 187.50 ; far: |1010 − 1011.50| × 250 = 375
+        assert ArbitrageStrategy._entry_friction(trade) == pytest.approx(500 + 562.5)
+
+    def test_a_freshly_filled_live_calendar_does_not_stop_itself_out(self):
+        s = self._strategy()
+        self._live_entered_trade(s)
+        # No market movement: MTM is exactly −friction, which must read as
+        # "nothing has happened", not "thesis invalidated".
+        assert s.check_and_rehedge() == [], \
+            "entry friction alone must never trip the stop"
+
+    def test_a_genuine_adverse_move_still_stops(self):
+        # The guard must not have disabled the stop: push the short far leg
+        # 5 points against us and it has to fire.
+        s = self._strategy(far_px=1016.5)
+        self._live_entered_trade(s)
+        exits = s.check_and_rehedge()
+        assert len(exits) == 2 and all("STOP_LOSS" in p.rationale for p in exits)
+
+    def test_a_trade_with_no_recorded_touch_falls_back_to_costs(self):
+        # Paper fills AT the mid, and trades opened before #223 have no touch
+        # at all. Both reduce to the cost term — the conservative direction,
+        # and it must not raise.
+        s = self._strategy()
+        trade = self._live_entered_trade(s)
+        trade.leg_quotes = {}
+        assert ArbitrageStrategy._entry_friction(trade) == pytest.approx(500.0)
+        s.check_and_rehedge()          # must not raise
+
+    def test_the_ledger_mtm_is_untouched(self):
+        # The invariant the previous review wrote: the stop fires on exactly
+        # the number the ledger reports. The adjustment is on the THRESHOLD,
+        # so unrealized_pnl must be unchanged by any of this.
+        s = self._strategy()
+        trade = self._live_entered_trade(s)
+        s._recompute_unrealized_from_open_legs()
+        assert s.state.unrealized_pnl == pytest.approx(-562.5)
+        assert sum(ArbitrageStrategy._leg_mtm(l) for l in trade.legs) \
+            == pytest.approx(-562.5)
+
+
+class TestEntryFrictionIsBounded:
+    """WHY (Rule 9, review of PR #232): the first cut computed
+    `abs(entry_price - mid)` against the SCAN-tick touch. The executor prices a
+    marketable LIMIT off a FRESH ltp padded by limit_protection_pct and polls
+    per leg, and the legs are placed sequentially — so everything the book did
+    between the scan quote and the second fill landed in 'friction', and
+    `abs()` made it additive whichever way it went. Since friction only ever
+    LOOSENS the stop, drift and good luck alike were quietly disarming a safety
+    exit."""
+
+    LOT = 250
+
+    def _leg(self, qty, entry_price):
+        return CalendarLeg(symbol="AAA", tradingsymbol="AAA26SEPFUT",
+                           expiry="2026-09-29", lot_size=self.LOT,
+                           quantity=qty, entry_price=entry_price,
+                           current_price=entry_price)
+
+    _touch = {"bid": 1000.0, "ask": 1002.0, "bid_qty": 250,
+              "ask_qty": 250, "ltp": 1001.0}      # mid 1001, half-spread 1.0
+
+    def test_a_long_leg_crossing_to_the_ask_pays_the_half_spread(self):
+        cost = ArbitrageStrategy._leg_crossing_cost(self._leg(1, 1002.0), self._touch)
+        assert cost == pytest.approx(1.0 * self.LOT)
+
+    def test_a_short_leg_crossing_to_the_bid_pays_the_half_spread(self):
+        cost = ArbitrageStrategy._leg_crossing_cost(self._leg(-1, 1000.0), self._touch)
+        assert cost == pytest.approx(1.0 * self.LOT)
+
+    def test_a_fill_better_than_the_mid_costs_nothing(self):
+        # It also books a positive _leg_mtm. Counting it as friction too would
+        # loosen the stop twice for the same good luck.
+        assert ArbitrageStrategy._leg_crossing_cost(
+            self._leg(1, 1000.5), self._touch) == 0.0
+        assert ArbitrageStrategy._leg_crossing_cost(
+            self._leg(-1, 1001.5), self._touch) == 0.0
+
+    def test_drift_beyond_the_touch_is_capped_at_the_half_spread(self):
+        # Filled 5 points through the ask: 1 point was the spread, 4 were the
+        # market moving. Market movement is what the stop MEASURES; laundering
+        # it into the bar would disarm the stop exactly on fast entries.
+        cost = ArbitrageStrategy._leg_crossing_cost(self._leg(1, 1007.0), self._touch)
+        assert cost == pytest.approx(1.0 * self.LOT), \
+            "drift must not inflate the bar the stop is judged against"
+
+    def test_no_touch_means_no_crossing_charge(self):
+        assert ArbitrageStrategy._leg_crossing_cost(self._leg(1, 1002.0), None) == 0.0
+
+
+class TestEntryFrictionIsFrozen:
+    """WHY (Rule 9, review of PR #232): `trade.costs` is a LIFETIME total.
+    execute_proposals deliberately does not reverse a half-filled EXIT, so on
+    the next tick the surviving naked leg was judged against a bar still
+    carrying the departed leg's costs — a quantity that drifts, not the entry
+    measurement the docstring claims."""
+
+    def test_friction_is_frozen_when_the_second_leg_fills(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor()
+        s.execute_proposals([_leg("AAA", "APR", "BUY"), _leg("AAA", "MAY", "SELL")])
+        trade = s.state.open_calendars["AAA"]
+        assert trade.entry_friction is not None
+        assert trade.entry_friction == pytest.approx(trade.costs)   # paper-shaped: no touch
+
+    def test_a_later_cost_does_not_move_the_frozen_bar(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor()
+        s.execute_proposals([_leg("AAA", "APR", "BUY"), _leg("AAA", "MAY", "SELL")])
+        trade = s.state.open_calendars["AAA"]
+        frozen = trade.entry_friction
+        trade.costs += 5_000.0          # a half-filled exit books more cost
+        assert ArbitrageStrategy._entry_friction(trade) == pytest.approx(frozen)
+
+    def test_it_survives_serialize_restore(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor()
+        s.execute_proposals([_leg("AAA", "APR", "BUY"), _leg("AAA", "MAY", "SELL")])
+        frozen = s.state.open_calendars["AAA"].entry_friction
+        fresh = _make_strategy(mode="paper")
+        fresh.restore_state(s.serialize_state())
+        assert fresh.state.open_calendars["AAA"].entry_friction == pytest.approx(frozen)
+
+    def test_a_legacy_trade_recomputes_instead_of_crashing(self):
+        s = _make_strategy(mode="live")
+        s._available_margin = lambda: None
+        s._live_execute = _Executor()
+        s.execute_proposals([_leg("AAA", "APR", "BUY"), _leg("AAA", "MAY", "SELL")])
+        trade = s.state.open_calendars["AAA"]
+        trade.entry_friction = None                      # pre-#232 blob
+        assert ArbitrageStrategy._entry_friction(trade) == pytest.approx(trade.costs)
