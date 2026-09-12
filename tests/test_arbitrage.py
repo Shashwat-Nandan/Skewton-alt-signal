@@ -65,6 +65,7 @@ def _make_strategy(
     s.lots_per_leg = 1
     s.max_open_calendars = 5
     s.calendar_margin_pct = 0.06
+    s.calendar_crossing_mult = 0.0      # #233: measure-only by default
     s.max_leg_notional = None
     s.total_capital = 500_000
     s.state = ArbitrageState()
@@ -2784,3 +2785,203 @@ class TestEntryFrictionIsFrozen:
         trade = s.state.open_calendars["AAA"]
         trade.entry_friction = None                      # pre-#232 blob
         assert ArbitrageStrategy._entry_friction(trade) == pytest.approx(trade.costs)
+
+
+class TestCrossingAwareHurdle:
+    """WHY (Rule 9, issue #233): `calendar_cost_hurdle_mult` models brokerage,
+    STT, exchange fees and stamp — and has NO crossing term. Crossing is the
+    larger number: at the measured spreads (#223) it is ~0.235% of leg notional
+    against an expected harvest of ~0.185% at the 5% gate, so a trade can be
+    expected-negative the instant it fills and still clear the gate.
+
+    Default is MEASURE-ONLY (`calendar_crossing_mult = 0.0`). The right
+    multiplier is what #222's four weeks of depth data exists to decide;
+    setting it now would bake in the assumption the measurement is meant to
+    test. So these tests pin two things: the measurement is correct, and it
+    changes nothing until an operator turns it on."""
+
+    def _q(self, ltp, bid, ask, qty=250):
+        return {"last_price": ltp,
+                "depth": {"buy": [{"price": bid, "quantity": qty}],
+                          "sell": [{"price": ask, "quantity": qty}]}}
+
+    def _snap(self, near_half=1.0, far_half=2.0, carry_diff=0.30):
+        # carry_diff sized so the trade clears the FEE-only hurdle and fails
+        # only once crossing is charged — otherwise 'the default changes
+        # nothing' is unobservable, because fees alone reject it.
+        near_mid, far_mid = 1000.0, 1010.0
+        return {
+            "symbol": "AAA", "spot": 1000.0,
+            "near": {"tradingsymbol": "AAA26SEPFUT", "lot_size": 250,
+                     "expiry": "2026-09-29", "instrument_token": 1},
+            "near_price": near_mid, "dte_near": 20,
+            "next": {"tradingsymbol": "AAA26OCTFUT", "lot_size": 250,
+                     "expiry": "2026-10-27", "instrument_token": 2},
+            "next_price": far_mid, "dte_next": 48,
+            "basis_annual": 0.0, "basis_annual_next": 0.0,
+            "carry_implied": carry_diff + 0.07, "carry_diff": carry_diff,
+            "near_quote": ArbitrageStrategy._touch(
+                self._q(near_mid, near_mid - near_half, near_mid + near_half)),
+            "next_quote": ArbitrageStrategy._touch(
+                self._q(far_mid, far_mid - far_half, far_mid + far_half)),
+            "pricing_trusted": True, "near_basis": "book", "next_basis": "book",
+        }
+
+    def test_the_SHIPPED_default_is_measure_only(self):
+        # Every other test here sets the multiplier explicitly, and so does
+        # _make_strategy — so none of them would notice if the production
+        # default changed. Mutation-checking revealed exactly that hole. This
+        # pins the promise the PR actually makes: merging #233 does not move
+        # entry behaviour until an operator sets the knob.
+        import inspect
+        src = inspect.getsource(ArbitrageStrategy.__init__)
+        assert 'cfg.get("calendar_crossing_mult", 0.0)' in src, \
+            "the shipped default must stay 0.0 (measure-only) until #222's " \
+            "data decides the multiplier"
+
+    # ── the measurement ──────────────────────────────────────────────────
+    def test_it_counts_four_crossings(self):
+        # Both legs in, both legs out: 2 x qty x (near_half x lot + far_half x lot).
+        snap = self._snap(near_half=1.0, far_half=2.0)
+        cost = ArbitrageStrategy._expected_crossing_cost(snap, qty=1,
+                                                         near_lot=250, next_lot=250)
+        assert cost == pytest.approx(2.0 * (1.0 * 250 + 2.0 * 250))
+
+    def test_it_scales_with_size(self):
+        snap = self._snap()
+        one = ArbitrageStrategy._expected_crossing_cost(snap, 1, 250, 250)
+        two = ArbitrageStrategy._expected_crossing_cost(snap, 2, 250, 250)
+        assert two == pytest.approx(2 * one)
+
+    def test_no_book_measures_zero_not_a_guess(self):
+        # With no touch there is nothing to measure, and #229 already refuses
+        # to ENTER on that basis — so a zero here can never wave through a
+        # trade that gate would have stopped.
+        snap = self._snap()
+        snap["next_quote"] = None
+        assert ArbitrageStrategy._expected_crossing_cost(snap, 1, 250, 250) == 0.0
+
+    # ── inert until switched on ──────────────────────────────────────────
+    def _strategy(self, crossing_mult):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 2.0
+        s.calendar_crossing_mult = crossing_mult
+        s._observe_universe = lambda: [self._snap(near_half=3.0, far_half=6.0)]
+        return s
+
+    def test_default_does_not_change_who_gets_in(self):
+        # The whole point: merging this must not move entry behaviour before
+        # #222's data says what the multiplier should be.
+        assert len([p for p in self._strategy(0.0).scan_and_propose()
+                    if p.option_type == "FUT"]) == 2
+
+    def test_charging_the_crossing_rejects_the_same_trade(self):
+        assert [p for p in self._strategy(1.0).scan_and_propose()
+                if p.option_type == "FUT"] == []
+
+    def test_it_says_so_when_it_would_have_rejected(self, caplog):
+        # Rule 12: a trade that cannot pay for itself must not pass silently
+        # just because the gate is off — that log line IS the deliverable of
+        # this change until the operator flips the multiplier.
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            self._strategy(0.0).scan_and_propose()
+        assert any("would REJECT" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_it_stays_quiet_when_the_trade_clears_either_way(self, caplog):
+        s = self._strategy(0.0)
+        s._observe_universe = lambda: [self._snap(near_half=0.01, far_half=0.01)]
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            s.scan_and_propose()
+        assert not [r for r in caplog.records if "crossing-aware" in r.getMessage()]
+
+
+class TestCrossingHurdleReviewFixes:
+    """WHY (Rule 9, review of PR #234): the first cut shipped a gate that was a
+    silent no-op in the conditions it most needed to bite, and a knob that
+    another knob could switch off."""
+
+    def _t(self, bid, ask, qty=250):
+        return ArbitrageStrategy._touch(
+            {"last_price": (bid + ask) / 2,
+             "depth": {"buy": [{"price": bid, "quantity": qty}],
+                       "sell": [{"price": ask, "quantity": qty}]}})
+
+    def _snap(self, near_q, next_q, carry=0.30):
+        return {"symbol": "AAA", "spot": 1000.0,
+                "near": {"tradingsymbol": "AAA26SEPFUT", "lot_size": 250,
+                         "expiry": "2026-09-29", "instrument_token": 1},
+                "near_price": 1000.0, "dte_near": 20,
+                "next": {"tradingsymbol": "AAA26OCTFUT", "lot_size": 250,
+                         "expiry": "2026-10-27", "instrument_token": 2},
+                "next_price": 1010.0, "dte_next": 48,
+                "basis_annual": 0.0, "basis_annual_next": 0.0,
+                "carry_implied": carry + 0.07, "carry_diff": carry,
+                "near_quote": near_q, "next_quote": next_q,
+                "pricing_trusted": True,
+                "near_basis": "book" if near_q else "print",
+                "next_basis": "book" if next_q else "print"}
+
+    def _s(self, snap, *, hurdle=2.0, crossing=0.0):
+        s = _make_strategy(mode="paper", calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = hurdle
+        s.calendar_crossing_mult = crossing
+        s._observe_universe = lambda: [snap]
+        return s
+
+    def test_unmeasurable_crossing_is_announced_not_treated_as_free(self, caplog):
+        # print+print IS pricing_trusted, so #229 lets it enter — the earlier
+        # docstring claimed otherwise. With the charge armed and no book, the
+        # gate cannot bite, and that must not be silent.
+        s = self._s(self._snap(None, None), crossing=5.0)
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert len(props) == 2, "a depthless feed must still trade (backtest)"
+        assert any("UNMEASURABLE" in r.getMessage() for r in caplog.records)
+
+    def test_the_crossing_knob_works_with_the_fee_hurdle_disabled(self):
+        # `calendar_cost_hurdle_mult = 0` is documented as disabling the FEE
+        # hurdle. It must not also disable a crossing charge the operator
+        # explicitly armed.
+        snap = self._snap(self._t(997, 1003), self._t(1004, 1016))
+        assert [p for p in self._s(snap, hurdle=0.0, crossing=5.0).scan_and_propose()
+                if p.option_type == "FUT"] == []
+
+    def test_fee_hurdle_alone_is_unchanged_when_crossing_is_off(self):
+        snap = self._snap(self._t(999.9, 1000.1), self._t(1009.9, 1010.1))
+        assert len([p for p in self._s(snap, hurdle=2.0, crossing=0.0).scan_and_propose()
+                    if p.option_type == "FUT"]) == 2
+
+    def test_the_counterfactual_states_the_knob_accurately(self, caplog):
+        # It used to say "not charged" for any partial multiple, and print
+        # 0.05 as 0.1 — this line is the input to #222's decision.
+        snap = self._snap(self._t(997, 1003), self._t(1004, 1016))
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            self._s(snap, hurdle=2.0, crossing=0.05).scan_and_propose()
+        msgs = [r.getMessage() for r in caplog.records if "would REJECT" in r.getMessage()]
+        assert msgs and "charged at 0.05x" in msgs[0], msgs
+        assert "not charged" not in msgs[0]
+
+    def test_the_counterfactual_does_not_repeat_every_tick(self, caplog):
+        snap = self._snap(self._t(997, 1003), self._t(1004, 1016))
+        s = self._s(snap, hurdle=2.0, crossing=0.0)
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            for _ in range(5):
+                s._obs_tick_id = _          # force a fresh scan each tick
+                s.scan_and_propose()
+        assert len([r for r in caplog.records if "would REJECT" in r.getMessage()]) == 1
+
+    def test_thin_depth_is_reported_as_a_lower_bound(self, caplog):
+        # depth-1 holding less than the order means the half-spread understates
+        # what the remainder pays — and #222 calibrates off this number.
+        snap = self._snap(self._t(997, 1003, qty=100), self._t(1004, 1016, qty=100))
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            self._s(snap, hurdle=2.0, crossing=0.0).scan_and_propose()
+        assert any("LOWER bound" in r.getMessage() for r in caplog.records)
+
+    def test_ample_depth_is_not_reported(self, caplog):
+        snap = self._snap(self._t(999.9, 1000.1, qty=5000),
+                          self._t(1009.9, 1010.1, qty=5000))
+        with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
+            self._s(snap, hurdle=2.0, crossing=0.0).scan_and_propose()
+        assert not [r for r in caplog.records if "LOWER bound" in r.getMessage()]

@@ -316,6 +316,10 @@ def make_strategy(
     # calendar_min_dte_near / calendar_max_holding_days above.
     s.calendar_stop_loss_mult = 1.0     # production default (thesis stop)
     s.calendar_margin_pct = 0.06        # production default (2026-06-17 fix)
+    # Mirror of the __init__ default (#233). Measure-only, and inert here in
+    # any case: the backtest feed has no depth, so _expected_crossing_cost
+    # returns 0.0 regardless.
+    s.calendar_crossing_mult = 0.0
     # Session-delta baselines (read by generate_eod_report; latent here only
     # because the backtest never called it — set for parity anyway).
     s._session_start_realized = 0.0

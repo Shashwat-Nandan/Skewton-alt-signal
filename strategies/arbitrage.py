@@ -276,6 +276,16 @@ class ArbitrageStrategy(BaseStrategy):
         # too high). This is an informational proxy; the authoritative live
         # number is kite.basket_order_margins — gate live sizing on THAT.
         self.calendar_margin_pct = float(cfg.get("calendar_margin_pct", 0.06))
+        # Multiple of the measured round-trip crossing cost to charge in the
+        # entry hurdle. DEFAULT 0.0 = measure and log only, entry behaviour
+        # unchanged (issue #233). Applied INDEPENDENTLY of
+        # calendar_cost_hurdle_mult — the hurdle is
+        #   expected_carry >= cost_hurdle_mult x fees + crossing_mult x crossing
+        # so 1.0 here means "cover crossing once", not "cover it
+        # cost_hurdle_mult times" (#233 review). The right value is what #222's four weeks of
+        # depth data exists to decide; setting it before that would bake in the
+        # assumption the measurement is meant to test. Operator-owned.
+        self.calendar_crossing_mult = float(cfg.get("calendar_crossing_mult", 0.0))
         # Per-leg notional cap so a 1-lot RELIANCE+ITC pair doesn't deploy ₹50L silently.
         mln = cfg.get("max_leg_notional", "").strip()
         self.max_leg_notional: Optional[float] = float(mln) if mln else None
@@ -1769,22 +1779,74 @@ class ArbitrageStrategy(BaseStrategy):
         # expectation is also the STOP_LOSS exit's yardstick, stashed on the
         # trade via pending_expected_harvest below.
         expected_pnl = harvest_annual * notional * horizon_days / 365.0
-        if self.calendar_cost_hurdle_mult > 0:
-            from strategies.taleb_karpathy import estimate_transaction_cost
-            round_trip_cost = sum(
-                estimate_transaction_cost(px, qty, near_lot, side, "FUT")
-                for px in (snap["near_price"], snap["next_price"])
-                for side in ("BUY", "SELL"))
-            if expected_pnl < self.calendar_cost_hurdle_mult * round_trip_cost:
+        # Fees and crossing are measured together and gated INDEPENDENTLY
+        # (#233 review). Nesting the crossing charge inside the fee hurdle made
+        # `calendar_cost_hurdle_mult = 0` — documented as "disables the fee
+        # hurdle" — silently disable the crossing charge too, so an operator
+        # asking for "gate on measured crossing, not modelled fees" got no gate
+        # at all. They are separate decisions and each carries its own multiple:
+        # charging crossing at hurdle x crossing_mult would have meant setting
+        # crossing_mult=1.0 ("cover crossing once") actually demanded 2x it.
+        from strategies.taleb_karpathy import estimate_transaction_cost
+        fee_cost = sum(
+            estimate_transaction_cost(px, qty, near_lot, side, "FUT")
+            for px in (snap["near_price"], snap["next_price"])
+            for side in ("BUY", "SELL"))
+        crossing = self._expected_crossing_cost(snap, qty, near_lot, next_lot)
+
+        # Rule 12: with the charge armed but the books unreadable, crossing is
+        # UNMEASURABLE, not zero — and a silent zero turns the gate into a
+        # no-op in exactly the degraded-book ticks where crossing is worst.
+        # Deliberately does NOT block: a feed with no depth at all (the
+        # backtest, signals-only) would otherwise never trade.
+        if self.calendar_crossing_mult > 0 and crossing <= 0:
+            if symbol not in self._crossing_unmeasurable_warned:
+                self._crossing_unmeasurable_warned.add(symbol)
+                logger.warning(
+                    "%s calendar: crossing charge is armed "
+                    "(calendar_crossing_mult=%g) but neither leg has a usable "
+                    "book, so crossing is UNMEASURABLE — entering with it "
+                    "uncharged. This is not a zero-cost tick (issue #233).",
+                    symbol, self.calendar_crossing_mult)
+        # Depth-1 may not hold the whole order on a far month 30-100x thinner
+        # than the near one, in which case the half-spread understates what
+        # the rest of the order pays — the direction that matters, since #222
+        # calibrates the multiplier off this number.
+        self._warn_if_depth_thin(symbol, snap, qty, near_lot, next_lot)
+
+        if self.calendar_cost_hurdle_mult > 0 or self.calendar_crossing_mult > 0:
+            required = (self.calendar_cost_hurdle_mult * fee_cost
+                        + self.calendar_crossing_mult * crossing)
+            if expected_pnl < required:
                 logger.info(
-                    "%s calendar: expected carry ₹%.0f over %.0fd < %.1fx "
-                    "round-trip cost ₹%.0f — skipping (rupee cost hurdle; "
-                    "carry_diff %.2f%% ann. passed the %% gate but can't be "
-                    "monetized at this size/horizon)",
-                    symbol, expected_pnl, horizon_days,
-                    self.calendar_cost_hurdle_mult, round_trip_cost, cd * 100,
+                    "%s calendar: expected carry ₹%.0f over %.0fd < ₹%.0f "
+                    "(%.2fx fees ₹%.0f + %.2fx crossing ₹%.0f) — skipping "
+                    "(rupee cost hurdle; carry_diff %.2f%% ann. passed the %% "
+                    "gate but can't be monetized at this size/horizon)",
+                    symbol, expected_pnl, horizon_days, required,
+                    self.calendar_cost_hurdle_mult, fee_cost,
+                    self.calendar_crossing_mult, crossing, cd * 100,
                 )
                 return []
+
+        # Counterfactual: what a hurdle that charged crossing ONCE would have
+        # done. This is the measurement #233 exists to produce, and the input
+        # to #222's decision — so it must state the knob accurately rather than
+        # claim "not charged" whenever it is only partly charged.
+        if crossing > 0 and self.calendar_crossing_mult < 1.0:
+            reference = self.calendar_cost_hurdle_mult * fee_cost + crossing
+            if (expected_pnl < reference
+                    and symbol not in self._crossing_counterfactual_warned):
+                self._crossing_counterfactual_warned.add(symbol)
+                logger.warning(
+                    "%s calendar: ENTERING but a hurdle charging crossing once "
+                    "would REJECT — expected carry ₹%.0f < ₹%.0f (%.2fx fees "
+                    "₹%.0f + crossing ₹%.0f). Crossing is charged at %gx; see "
+                    "issue #233.",
+                    symbol, expected_pnl, reference,
+                    self.calendar_cost_hurdle_mult, fee_cost, crossing,
+                    self.calendar_crossing_mult,
+                )
 
         # Calendar-spread margin: one-leg notional × calendar_margin_pct, split
         # evenly across the two legs (they net for margin — not 0.20 per leg).
@@ -1814,6 +1876,85 @@ class ArbitrageStrategy(BaseStrategy):
             self._make_fut_proposal(nxt, qty, snap["next_price"], side_next,
                                     rationale, margin_required=leg_margin),
         ]
+
+    def _warn_if_depth_thin(self, symbol: str, snap: dict, qty: int,
+                            near_lot: int, next_lot: int) -> None:
+        """Say when depth-1 cannot hold the order (#233 review).
+
+        `_touch` records `bid_qty`/`ask_qty` and nothing consumed them. On a
+        far month 30-100x thinner than the near one, depth-1 is routinely below
+        a single lot — so pricing the crossing at the depth-1 half-spread
+        understates what the rest of the order pays. That is the direction that
+        matters: #222 calibrates the multiplier off this number, and an
+        estimate biased low biases the multiplier low.
+        """
+        for side_key, lot in (("near_quote", near_lot), ("next_quote", next_lot)):
+            touch = snap.get(side_key)
+            if not touch:
+                continue
+            need = qty * lot
+            have = min(int(touch.get("bid_qty") or 0), int(touch.get("ask_qty") or 0))
+            if have >= need or have <= 0:
+                continue
+            key = (symbol, side_key)
+            if key in self._thin_depth_warned:
+                continue
+            self._thin_depth_warned.add(key)
+            logger.warning(
+                "%s %s: depth-1 holds %d of the %d shares this order needs — "
+                "the crossing estimate is a LOWER bound (issue #233).",
+                symbol, side_key.replace("_quote", " leg"), have, need)
+
+    @property
+    def _crossing_unmeasurable_warned(self) -> set:
+        if getattr(self, "_crossing_unmeasurable_warned_set", None) is None:
+            self._crossing_unmeasurable_warned_set = set()
+        return self._crossing_unmeasurable_warned_set
+
+    @property
+    def _crossing_counterfactual_warned(self) -> set:
+        """Per-symbol, because a symbol whose proposals are blocked downstream
+        (margin precheck, HALT_NEW_ENTRIES, max_open_calendars) never reaches
+        open_calendars and would re-warn every tick — ~390 lines per symbol per
+        session at a 60s tick (#233 review)."""
+        if getattr(self, "_crossing_counterfactual_warned_set", None) is None:
+            self._crossing_counterfactual_warned_set = set()
+        return self._crossing_counterfactual_warned_set
+
+    @property
+    def _thin_depth_warned(self) -> set:
+        if getattr(self, "_thin_depth_warned_set", None) is None:
+            self._thin_depth_warned_set = set()
+        return self._thin_depth_warned_set
+
+    @staticmethod
+    def _expected_crossing_cost(snap: dict, qty: int, near_lot: int,
+                                next_lot: int) -> float:
+        """Rupees this calendar expects to give up crossing, round trip.
+
+        Four crossings — both legs in, both legs out — each costing the
+        half-spread quoted right now.
+
+        Returns 0.0 when either leg has no usable touch — meaning UNMEASURABLE,
+        not free, and the caller says so rather than letting the gate quietly
+        become a no-op (#233 review). An earlier version of this docstring
+        claimed "#229 already refuses to ENTER on that basis". That is FALSE:
+        `pricing_trusted` requires only that both legs share a basis, so a
+        snapshot with NO depth on either leg is print+print — trusted, and it
+        enters. The degraded-book tick is exactly where crossing is worst and
+        where this returns zero.
+
+        Uses the same depth #223 records, so the estimate is of the spread
+        actually on screen at proposal time rather than a modelled constant —
+        which is the whole reason the fee-only hurdle could not see it.
+        """
+        near_t, next_t = snap.get("near_quote"), snap.get("next_quote")
+        if not near_t or not next_t:
+            return 0.0
+        near_half = (near_t["ask"] - near_t["bid"]) / 2.0
+        next_half = (next_t["ask"] - next_t["bid"]) / 2.0
+        # x2 per leg: crossed on the way in and again on the way out.
+        return 2.0 * qty * (near_half * near_lot + next_half * next_lot)
 
     def _build_calendar_exit(
         self, trade: CalendarTrade, snap: dict, reason: str,

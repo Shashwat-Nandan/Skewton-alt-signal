@@ -1,3 +1,80 @@
+# Entry hurdle: measure crossing cost, charge it only on request (#233) — 2026-09-12
+
+`calendar_cost_hurdle_mult` models brokerage, STT, exchange fees and stamp —
+and has NO crossing term. Crossing is the larger number: at the measured
+spreads (#223) it is ~0.235% of leg notional against an expected harvest of
+~0.185% at the 5% gate, so a calendar can be expected-negative the instant it
+fills and still clear the gate. #232 surfaced this (its `_entry_friction` was
+the first place in the strategy that measured crossing at all) but used it only
+to loosen a safety exit, never to decide whether to enter.
+
+**Concern stated before building, and it still stands:** the right multiplier
+is what #222's four weeks of depth data exists to decide. Setting it now would
+bake in the assumption the measurement is meant to test. So this ships
+MEASURING by default and CHARGING only on request — the repo's own "merge
+inert" precedent (MC gate #161: default gbm, thresholds operator-owned).
+
+- [x] `_expected_crossing_cost()` — four crossings (both legs in, both out) at
+      the half-spread quoted at proposal time, from the depth #223 already
+      records. Returns 0.0 with no usable touch, which is honest: #229 already
+      refuses to ENTER on that basis, so a zero can never wave through a trade
+      that gate would have stopped
+- [x] `calendar_crossing_mult`, **default 0.0** = measure only, entry behaviour
+      unchanged; operator-owned
+- [x] when the gate is off but a crossing-aware hurdle WOULD have rejected, log
+      it (Rule 12) — that line is the deliverable until the knob is flipped,
+      and it is the evidence #222 needs
+- [x] mirrored into both `__new__` builders (the AST parity test caught the new
+      `__init__` attr immediately, as designed)
+- [x] 8 tests; default-inertness and the counterfactual warning both
+      mutation-checked
+
+### Review fixes (code review of PR #234)
+
+Six findings. The two that mattered were both "the gate is a no-op exactly
+where it should bite", verified by running the code rather than reading it:
+
+- **The no-book zero silently disabled the charge, and the docstring claimed
+  otherwise.** I wrote that "#229 already refuses to ENTER on that basis, so a
+  zero here can never wave through a trade that gate would have stopped". FALSE:
+  `pricing_trusted` requires only that both legs share a basis, so print+print
+  (no depth at all) is TRUSTED and enters. Confirmed empirically —
+  `crossing_mult=5.0` with both books absent still emitted both legs and charged
+  nothing. Now: unmeasurable is announced, not treated as free, and it
+  deliberately does not block (a depthless feed — the backtest — must still
+  trade).
+- **The two knobs were coupled.** The crossing charge sat inside
+  `if calendar_cost_hurdle_mult > 0`, so setting the fee hurdle to 0
+  (documented as "disables") also silently disabled a crossing charge the
+  operator had explicitly armed. Now independent, and the gate is
+  `cost_hurdle_mult x fees + crossing_mult x crossing` — which also removes the
+  calibration trap where crossing was charged at hurdle x crossing_mult, so
+  "cover crossing once" would really have demanded 2x.
+
+Also: the counterfactual line claimed "not charged" for any partial multiple and
+printed 0.05 as 0.1 via `%.1f` (that line is the input to #222's decision, so a
+wrong statement in it IS the bug); it had no per-symbol dedupe, so a symbol
+blocked downstream would re-warn every tick (~390 lines/session); `bid_qty`/
+`ask_qty` were recorded and never consumed, so thin depth-1 — routine on a far
+month — made the estimate a silent lower bound; and `config_template.ini` did
+not mention the new knob at all.
+
+### Review
+
+Two process notes, both mine:
+
+- The first mutation run "passed" and I nearly believed it. My tests set the
+  multiplier explicitly and so does `_make_strategy`, so flipping the shipped
+  DEFAULT broke nothing — the promise the PR actually makes was unpinned.
+  `test_the_SHIPPED_default_is_measure_only` closes it by asserting on the
+  `__init__` source, the same technique as the parity sweep.
+- I reverted a mutation with `git checkout tests/test_arbitrage.py` while that
+  same file held uncommitted new tests, and destroyed them. Recovered from the
+  scratchpad copy. Mutation-test a file by restoring from a BACKUP, never from
+  git, when the file also holds work in progress.
+
+---
+
 # STOP_LOSS must judge movement, not the cost of entering (#231) — 2026-09-11
 
 In LIVE both legs of a calendar are crossed adversely to enter, so MTM is
