@@ -81,11 +81,44 @@ _DIAG_HISTORY_CAP = 500
 # _generate_soft_delta_proposals).
 MIN_SOFT_HEDGE_DELTA = 0.10
 
+
+def _norm_expiry(value) -> str:
+    """Canonical YYYY-MM-DD for Kite date objects vs serialized strings.
+
+    Issue #237: ``chain["expiry"]`` from ``kite.instruments`` is
+    ``datetime.date``; ``OptionContract.expiry`` is the ``'YYYY-MM-DD'``
+    string ``TradeProposal`` and state restore persist. Comparing them
+    with ``==`` is always False, so the same-expiry soft-hedge filter
+    emptied the chain and the hedge never fired (paper 2026-09-11).
+    """
+    if value is None or value == "":
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value)[:10]
+
 # Audit 3.5: cap closed_trades written to the (per-tick-rewritten) state file.
 # The dashboard reads today-only, and a session closes well under this many,
 # so today's trades survive a same-day restart while the file stops growing
 # unboundedly across sessions.
 _CLOSED_TRADES_PERSIST = 200
+
+
+# A strategy is constructed once per ``run_backtest`` call, so an
+# autoresearch sweep builds thousands of them in one process. The
+# "not operator-promoted" warning is a property of the FILE, not of the run:
+# emit it once per distinct message so the sweep log stays readable without
+# the warning becoming invisible (#238 review).
+_WARNED_ONCE: set = set()
+
+
+def _warn_once(msg: str, *args) -> None:
+    key = msg % args
+    if key in _WARNED_ONCE:
+        logger.debug(key)
+        return
+    _WARNED_ONCE.add(key)
+    logger.warning(msg, *args)
 
 
 def _apply_best_params(tunable_params: Dict, path: Path) -> Tuple[int, List[str]]:
@@ -98,6 +131,25 @@ def _apply_best_params(tunable_params: Dict, path: Path) -> Tuple[int, List[str]
     them. Returns ``(applied_count, ignored_keys)``. Missing or malformed
     files yield ``(0, [])`` and a warning so a misplaced file does not
     silently fall back to config defaults.
+
+    Issue #237: refuse the overlay unless the file carries BOTH promotion
+    markers. The June production file had no validation block and a negative
+    net_pnl; applying it is how ``enable_regime_dispatch=true`` reached the
+    NIFTY paper book and turned a first-order straddle into a fourth-moment
+    call backspread.
+
+      ``validation.promote_ok``  — the autoresearch checklist passed. This
+          is a MACHINE verdict and it is not sufficient on its own: on a
+          thin-data host it falls back to the pre-#159 trades/bleed/tail
+          formula and passes with the absolute-edge gates UNTESTED (see the
+          "checks PASS, but ... UNTESTED" branch in run_autoresearch.py).
+      ``validation.promoted_by`` — a non-empty operator signature, written
+          by the human who copied a candidate onto best_params.json.
+          run_autoresearch prints "promotion remains an operator decision";
+          this field is what makes that true in code rather than in prose
+          (#238 review).
+
+    Config defaults win until both are present.
     """
     if not path.exists():
         return 0, []
@@ -106,9 +158,29 @@ def _apply_best_params(tunable_params: Dict, path: Path) -> Tuple[int, List[str]
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("best_params at %s could not be read: %s — using config defaults", path, e)
         return 0, []
-    best = data.get("best_params") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        logger.warning("best_params at %s is not an object — using config defaults", path)
+        return 0, []
+    best = data.get("best_params")
     if not isinstance(best, dict):
         logger.warning("best_params at %s missing 'best_params' object — using config defaults", path)
+        return 0, []
+    validation = data.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    checks_ok = validation.get("promote_ok") is True
+    promoted_by = str(validation.get("promoted_by") or "").strip()
+    if not (checks_ok and promoted_by):
+        missing = []
+        if not checks_ok:
+            missing.append("validation.promote_ok is not True")
+        if not promoted_by:
+            missing.append("validation.promoted_by is empty")
+        _warn_once(
+            "best_params at %s is not operator-promoted (%s) — using config "
+            "defaults. See issue #237.",
+            path, " and ".join(missing),
+        )
         return 0, []
     applied = 0
     ignored: List[str] = []
@@ -324,9 +396,16 @@ class TalebKarpathyStrategy(BaseStrategy):
             ),
         }
 
-        # Overlay autoresearch optimum on top of config defaults so the
-        # output of runners/run_autoresearch.py actually reaches live trading.
-        # Disable with [strategy] use_best_params = false in config.ini.
+        # Overlay a *promoted* autoresearch optimum on top of config
+        # defaults. _apply_best_params no-ops unless the file carries both
+        # validation.promote_ok (machine checklist) and a non-empty
+        # validation.promoted_by (operator signature) — issue #237 plus the
+        # #238 review. Disable entirely with
+        # [strategy] use_best_params = false in config.ini.
+        # How many params the overlay actually contributed. Research tools
+        # label their baseline off this rather than assuming an overlay
+        # happened (#238 review) — 0 means "config defaults only".
+        self._best_params_applied = 0
         if self.config.getboolean("strategy", "use_best_params", fallback=True):
             bp_path = Path(self.config.get(
                 "strategy", "best_params_path", fallback="best_params.json",
@@ -334,6 +413,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             if not bp_path.is_absolute():
                 bp_path = Path(__file__).resolve().parent.parent / bp_path
             applied, ignored = _apply_best_params(self.tunable_params, bp_path)
+            self._best_params_applied = applied
             if applied:
                 logger.info("Overlaid %d tunable params from %s", applied, bp_path)
             if ignored:
@@ -1808,8 +1888,8 @@ class TalebKarpathyStrategy(BaseStrategy):
         # introduce its own basis risk. If flat (shouldn't happen here,
         # but defensive), pin to the primary slice.
         if self.state.positions and self.state.positions[0].expiry:
-            position_expiry = self.state.positions[0].expiry
-            chain = chain[chain["expiry"] == position_expiry]
+            position_expiry = _norm_expiry(self.state.positions[0].expiry)
+            chain = chain[chain["expiry"].map(_norm_expiry) == position_expiry]
             if chain.empty:
                 logger.warning(
                     "Soft delta hedge: position expiry %s not in chain — "

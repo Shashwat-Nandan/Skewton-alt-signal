@@ -59,13 +59,20 @@ def main() -> int:
 
     rows = []
     # Seed first — the comparison baseline, and it warms the shared tape
-    # cache for the candidate evals. NOTE: TalebKarpathyStrategy overlays
-    # best_params.json onto config.ini at construction, so this seed is the
-    # same config.ini+overlay baseline the weekly sweep starts from.
-    logger.info("Scoring seed params (config.ini + best_params overlay) "
-                "over %d sessions...", loop.eval_cycles)
+    # cache for the candidate evals. NOTE (#237 / #238 review): the overlay
+    # is no longer unconditional — TalebKarpathyStrategy applies
+    # best_params.json only when it carries validation.promote_ok AND
+    # validation.promoted_by. So this seed is config.ini alone unless the
+    # on-disk file is operator-promoted, and re-score numbers produced
+    # BEFORE #237 (which always included the June overlay) are not
+    # comparable to these. Report which baseline actually ran.
+    overlay_applied = getattr(hedger, "_best_params_applied", 0)
+    seed_label = ("SEED (config+best_params)" if overlay_applied
+                  else "SEED (config only — no promoted overlay)")
+    logger.info("Scoring seed params (%s) over %d sessions...",
+                seed_label, loop.eval_cycles)
     seed_fit = loop._run_experiment(hedger.tunable_params)
-    rows.append(("SEED (config+best_params)", None, seed_fit))
+    rows.append((seed_label, None, seed_fit))
 
     for path in candidates:
         data = json.load(open(path))

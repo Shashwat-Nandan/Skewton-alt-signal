@@ -720,6 +720,25 @@ class TestSaveBestParamsSweepQuality:
         # _migrations preservation must survive the new exclusion.
         assert out["_migrations"] == [{"date": "2026-06-07", "note": "history"}]
 
+    def test_stale_validation_not_preserved_across_params_rewrite(
+            self, tmp_path, monkeypatch):
+        """promoted_by signs THIS payload, not the filename. LOOP-FOREVER
+        writes canonical best_params.json without a fresh verdict; if
+        validation rides along, the overlay applies the new unvalidated
+        set. Same exclusion class as sweep_quality (#238 review)."""
+        import json
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "best_params.json").write_text(json.dumps({
+            "best_params": {"old": 1},
+            "validation": {"promote_ok": True, "promoted_by": "operator"},
+            "_migrations": [{"date": "2026-06-07", "note": "history"}],
+        }))
+        self._saving_loop()._save_best_params()
+        out = json.loads((tmp_path / "best_params.json").read_text())
+        assert "validation" not in out
+        assert out["best_params"] == {"gamma_scalp_band_pct": 1.5}
+        assert out["_migrations"] == [{"date": "2026-06-07", "note": "history"}]
+
 
 # ── Tape cache across experiments (2026-07-02) ──
 

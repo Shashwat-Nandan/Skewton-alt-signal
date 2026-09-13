@@ -114,6 +114,79 @@ class TestHedgeDecision:
         decision = analyzer.hedge_decision(long_straddle, 22000, 30 / 365)
         assert len(decision.rationale) > 0
 
+    def test_call_backspread_uses_soft_delta(self, analyzer):
+        """A 1×2 call backspread is Taleb's fourth-moment bet: gamma flips
+        through the short strike. Ch 16 p.263: never sell hard deltas on a
+        flipping book."""
+        positions = [
+            OptionContract("ATM", 0, 22000, "2026-04-30", "CE", 25, -1, 300, 300, 0.15),
+            OptionContract("OTM", 0, 22800, "2026-04-30", "CE", 25, 2, 80, 80, 0.15),
+        ]
+        decision = analyzer.hedge_decision(positions, 22000, 7 / 365)
+        assert decision.gamma_flips, "backspread must show a gamma flip"
+        assert decision.use_soft_delta is True
+        assert decision.use_hard_delta is False
+
+    def test_flip_with_nonnegative_tails_is_still_soft(self, analyzer, long_straddle):
+        """#237: 11 Sep 14:21 paper. Flips existed, both tails printed
+        slightly positive (±1e-4), and the 'futures acceptable' branch
+        emitted a hard future onto a flipping backspread. Taleb p.263
+        forbids hard deltas on a flipping book regardless of tail sign."""
+        analyzer.greeks.find_gamma_flip_points = lambda *a, **k: [23308.0]
+        prices = [round(23435 * (1 - 0.08 + i * 0.16 / 32), 2) for i in range(33)]
+        grid = {p: 0.0001 for p in prices}
+        grid[prices[len(prices) // 2]] = -0.02  # the hole
+        analyzer.greeks.gamma_grid = lambda *a, **k: grid
+        decision = analyzer.hedge_decision(long_straddle, 23435, 4 / 365)
+        assert decision.use_hard_delta is False
+        assert decision.use_soft_delta is True
+
+    def test_noise_sized_wiggle_is_not_a_flip(self, analyzer, long_straddle):
+        """A ±1e-4 zero-crossing is grid noise, not a Ch 16 gamma flip.
+        Treating it as a flip forced the (then-broken) soft path for 25
+        minutes on 11 Sep before the nonnegative-tail branch slapped on
+        a future. Noise must stay on the hard path a straddle uses."""
+        analyzer.greeks.find_gamma_flip_points = lambda *a, **k: [23308.0]
+        prices = [round(23435 * (1 - 0.08 + i * 0.16 / 32), 2) for i in range(33)]
+        grid = {p: 0.0001 for p in prices}
+        grid[prices[0]] = -0.0001
+        analyzer.greeks.gamma_grid = lambda *a, **k: grid
+        decision = analyzer.hedge_decision(long_straddle, 23435, 4 / 365)
+        assert decision.gamma_flips == []
+        assert decision.use_hard_delta is True
+        assert decision.use_soft_delta is False
+
+    def test_banknifty_scale_hole_is_a_flip(self, analyzer, long_straddle):
+        """#238: the floor is 1% of THIS book's peak |γ|, not a constant 1e-3.
+        A BANKNIFTY 1-lot weekly peaks near 0.01; a 1×2 hole around −7e-4 is
+        a real short-gamma region and must take the soft path. An absolute
+        1e-3 would file it as noise and emit futures onto the hole."""
+        prices = [round(56000 * (1 - 0.08 + i * 0.16 / 32), 2) for i in range(33)]
+        hole = prices[len(prices) // 2]
+        grid = {p: 0.01 for p in prices}
+        grid[hole] = -0.0007
+        analyzer.greeks.find_gamma_flip_points = lambda *a, **k: [hole]
+        analyzer.greeks.gamma_grid = lambda *a, **k: grid
+        decision = analyzer.hedge_decision(long_straddle, 56000, 7 / 365)
+        assert decision.use_soft_delta is True
+        assert decision.use_hard_delta is False
+
+    def test_nifty_scale_quantization_wiggle_is_not_a_flip(
+            self, analyzer, long_straddle):
+        """The matching NIFTY pin: peak ~0.11, tails ±1e-4 (two ticks of
+        gamma_grid's 4-dp rounding). That wiggle must stay hard — dropping
+        the floor to 0 would treat any zero-crossing as a flip."""
+        prices = [round(23435 * (1 - 0.08 + i * 0.16 / 32), 2) for i in range(33)]
+        grid = {p: 0.11 for p in prices}
+        grid[prices[0]] = -0.0001
+        grid[prices[-1]] = 0.0001
+        analyzer.greeks.find_gamma_flip_points = lambda *a, **k: [prices[0]]
+        analyzer.greeks.gamma_grid = lambda *a, **k: grid
+        decision = analyzer.hedge_decision(long_straddle, 23435, 4 / 365)
+        assert decision.gamma_flips == []
+        assert decision.use_hard_delta is True
+        assert decision.use_soft_delta is False
+
 
 class TestMethodOfSquares:
     def test_returns_dict(self, analyzer, long_straddle):

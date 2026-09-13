@@ -95,6 +95,57 @@ class HedgeDecision:
     rationale: str = ""
 
 
+# ``gamma_grid`` rounds every value to 4 dp, so ±1e-4 is pure quantization —
+# that is exactly what paper 2026-09-11 printed in the tails and treated as
+# "negative in tails" / "flips exist". See issue #237.
+GAMMA_GRID_QUANTUM = 1e-4
+GAMMA_FLIP_NOISE_FLOOR = 2 * GAMMA_GRID_QUANTUM
+# ...but net gamma is NOT scale-free: it is per-share γ × quantity × lot_size,
+# so it scales with the book. A NIFTY (lot 75) 1-lot straddle peaks near 0.13
+# while the BANKNIFTY twin (lot 15) peaks near 0.02 — an absolute floor is
+# therefore ~10x stricter on BANKNIFTY and would file a real short-gamma hole
+# as noise. Judge a hole against the book's OWN peak |γ|, with the
+# quantization floor as the absolute backstop (#238 review).
+GAMMA_FLIP_NOISE_FRACTION = 0.01
+
+
+def _flip_noise_floor(grid: Dict[float, float]) -> float:
+    """|γ| below this is noise for THIS book: 1% of its own peak |γ|, but
+    never below the grid's 2-tick quantization."""
+    peak = max((abs(g) for g in grid.values()), default=0.0)
+    return max(GAMMA_FLIP_NOISE_FLOOR, GAMMA_FLIP_NOISE_FRACTION * peak)
+
+
+def _material_gamma_flips(
+    grid: Dict[float, float],
+    flips: List[float],
+    floor: Optional[float] = None,
+) -> List[float]:
+    """Keep zero-crossings that have |γ| >= floor on at least one side,
+    or that sit on a grid whose most-negative γ is a real hole.
+
+    A quantization-sized wiggle is interpolation noise. A backspread hole
+    has material negative gamma and must survive (Taleb Ch 16 p.263).
+    ``floor`` defaults to ``_flip_noise_floor(grid)`` — book-relative.
+    """
+    if not flips or not grid:
+        return []
+    if floor is None:
+        floor = _flip_noise_floor(grid)
+    prices = sorted(grid)
+    material: List[float] = []
+    for fp in flips:
+        left = max((p for p in prices if p <= fp), default=None)
+        right = min((p for p in prices if p >= fp), default=None)
+        g_l = abs(grid[left]) if left is not None else 0.0
+        g_r = abs(grid[right]) if right is not None else 0.0
+        if g_l >= floor or g_r >= floor:
+            material.append(fp)
+    if not material and min(grid.values()) <= -floor:
+        return list(flips)
+    return material
+
+
 class RiskAnalyzer:
     """
     Comprehensive risk analysis following Taleb's framework.
@@ -512,38 +563,48 @@ class RiskAnalyzer:
 
         Rule: If gamma flips to negative further out, using hard deltas (futures)
         would make tail P/L worse. Use soft deltas (options) instead.
+
+        Issue #237: a zero-crossing below this book's gamma noise floor
+        (``_flip_noise_floor``) is grid noise, not a flip. A *material* flip
+        forbids hard deltas regardless of whether the far tails print
+        slightly positive — that "futures acceptable" branch is how 11 Sep
+        14:21 put a future on a backspread.
         """
         decision = HedgeDecision()
-        flips = self.greeks.find_gamma_flip_points(positions, spot, T)
+        raw_flips = self.greeks.find_gamma_flip_points(positions, spot, T)
+        if not raw_flips:
+            decision.use_hard_delta = True
+            decision.use_soft_delta = False
+            decision.rationale = (
+                "No gamma flip points detected. Safe to use futures for delta hedging."
+            )
+            return decision
+
+        gamma_grid = self.greeks.gamma_grid(positions, spot, T, range_pct=8.0, steps=33)
+        floor = _flip_noise_floor(gamma_grid)
+        flips = _material_gamma_flips(gamma_grid, raw_flips, floor)
         decision.gamma_flips = flips
 
         if not flips:
             decision.use_hard_delta = True
             decision.use_soft_delta = False
-            decision.rationale = "No gamma flip points detected. Safe to use futures for delta hedging."
-        else:
-            # Check if gamma becomes negative in the tails
-            gamma_grid = self.greeks.gamma_grid(positions, spot, T, range_pct=8.0, steps=33)
-            tail_prices = sorted(gamma_grid.keys())
-            low_tail_gamma = gamma_grid[tail_prices[0]]
-            high_tail_gamma = gamma_grid[tail_prices[-1]]
+            decision.rationale = (
+                f"Gamma zero-crossings at {raw_flips} are below the "
+                f"{floor:.5f} noise floor (1% of this book's peak |γ|, min "
+                f"{GAMMA_FLIP_NOISE_FLOOR}). Treating as no flip — futures "
+                "hedge is safe."
+            )
+            return decision
 
-            if low_tail_gamma < 0 or high_tail_gamma < 0:
-                decision.use_soft_delta = True
-                decision.use_hard_delta = False
-                decision.rationale = (
-                    f"Gamma flips at {flips} and becomes negative in tails "
-                    f"(low={low_tail_gamma:.4f}, high={high_tail_gamma:.4f}). "
-                    "Use soft deltas (options) to avoid amplifying tail risk."
-                )
-            else:
-                decision.use_hard_delta = True
-                decision.use_soft_delta = False
-                decision.rationale = (
-                    f"Gamma flips at {flips} but remains positive in tails. "
-                    "Futures hedging is acceptable."
-                )
-
+        # Material flip: never hard (Taleb Ch 16 p.263). Soft if the
+        # chain can supply a matching-expiry option; otherwise this tick
+        # skips. check_and_rehedge must not fall through to futures.
+        decision.use_soft_delta = True
+        decision.use_hard_delta = False
+        decision.rationale = (
+            f"Gamma flips at {flips}. Hard (futures) deltas would amplify "
+            "the short-gamma region. Use soft deltas (options) or skip."
+        )
         return decision
 
     # ═════════════════════════════════════════════════════════

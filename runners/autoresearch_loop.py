@@ -1258,7 +1258,9 @@ class HedgeResearchLoop:
 
         Preserves out-of-schema fields (e.g. `_migrations` semantic-shift
         history) from the canonical best_params.json so they survive each
-        autoresearch run instead of being clobbered.
+        autoresearch run instead of being clobbered. Per-payload stamps
+        (`sweep_quality`, `validation`) are not preserved — they bind to
+        the params that were written with them.
 
         Writes via a temp file + atomic rename (audit 2026-06-10 task 2.3):
         a `kill -9` mid-write can never leave `out_file` half-written. The
@@ -1274,9 +1276,12 @@ class HedgeResearchLoop:
             for k, v in existing.items():
                 # sweep_quality is per-run — a stale one preserved from a
                 # promoted candidate would mislabel THIS run's output.
+                # validation.promoted_by signs THAT payload; keeping it
+                # while replacing best_params would overlay the new
+                # unvalidated set (LOOP-FOREVER path, #238 review).
                 if k not in ("best_params", "best_metric",
                              "total_experiments", "timestamp",
-                             "sweep_quality"):
+                             "sweep_quality", "validation"):
                     preserved[k] = v
         except (FileNotFoundError, json.JSONDecodeError):
             pass

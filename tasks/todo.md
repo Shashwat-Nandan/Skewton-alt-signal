@@ -1,3 +1,74 @@
+# Review fixes for PR #238 (Taleb first-order convexity) — 2026-09-13
+
+Code review of #238 confirmed the three code fixes are correct (verified: the
+soft path returns `[]` and never falls through to futures; `_norm_expiry`
+matches the `str(row["expiry"])` convention already used elsewhere in the file;
+`_material_gamma_flips` routed every genuine backspread hole to soft across
+T in {2..45}d x widths {200,400,800}). Eight findings, all applied here.
+
+**The headline defect was in the config half, not the code half.** Refusing
+the unpromoted overlay made the template values binding for the first time,
+and `config_template.ini` shipped `vega_limit = 500` — a per-lot,
+scale-invariant gate no NIFTY straddle can clear at any size.
+
+    config_template.ini alone                   ->  0 trades
+    config_template.ini + vega_limit=4000       -> 14 trades
+
+The PR had worked around this by injecting `vega_limit=4000` +
+`mc_min_mean_pnl=-10000` into the tests, including the one named
+`test_default_config_produces_trades`. Measured both knobs separately: the MC
+floor was never the blocker (14 trades either way), so `mc_min_mean_pnl` is
+left at the template's 0.0 — it is an operator-owned risk budget, not ours.
+
+- [x] 1. `vega_limit` 500 -> 4000 in both templates (sync test forces one
+      shared value; host configs still narrow it: 4000 NIFTY / 3700 BANKNIFTY)
+- [x] 2. `test_default_config_produces_trades` takes NO overrides again, and
+      `_SYNTHETIC_CAN_TRADE` is gone from all four call sites
+- [x] 3. `test_on_disk_best_params_are_unpromoted...` replaced with a
+      behaviour pin — it asserted the production file is un-promoted, so it
+      would have failed CI the day an operator legitimately promoted one
+- [x] 4. overlay now needs `validation.promoted_by` as well as `promote_ok`:
+      `promote_ok` is a MACHINE verdict that passes on thin data with the
+      absolute-edge gates untested, so it cannot stand for "an operator
+      promoted this". Autoresearch checklist semantics deliberately untouched
+- [x] 5. `rescore_candidates_convexity.py` no longer labels its baseline
+      "SEED (config+best_params)" unconditionally — reads the new
+      `strategy._best_params_applied`. Pre-#237 re-score numbers are not
+      comparable to post-#237 ones
+- [x] 6. the template comment justifying `rehedge_delta_threshold = 1.0`
+      claimed it "must stay >= 0.6 or futures round to 0" — untrue, and it
+      contradicted `check_and_rehedge`, which floors at 0.25 and deliberately
+      lets 0.25-0.5 through for the soft path (Rule 7). 1.0 kept, reason fixed
+- [x] 7. gamma noise floor is book-relative (`_flip_noise_floor`): 1% of peak
+      |gamma|, min 2e-4 (two ticks of `gamma_grid`'s 4-dp rounding). The
+      absolute 1e-3 was ~10x stricter on the BANKNIFTY twin (lot 15) than on
+      NIFTY (lot 75) and would file a real hole as noise
+- [x] 8. the "not operator-promoted" WARNING fires once per message — a
+      strategy is built per `run_backtest`, so a sweep emitted thousands
+
+### Not bundled (deliberate)
+
+`find_gamma_flip_points` scans +/-5% of spot while `hedge_decision` judges
+materiality on a +/-8% grid, so a flip 5-8% out is never detected at all.
+Pre-existing, unrelated to #238, and widening it changes live hedging
+behaviour — wants its own issue and its own paper evidence. Documented in
+`docs/strategies/taleb_karpathy.md` §6.
+
+`mc_min_mean_pnl` untouched (operator-owned). NIFTY host runs -10000,
+BANKNIFTY host runs 0.0; the shared template default stays 0.0.
+
+### Follow-up review (HEAD a641436) — 2026-09-13
+
+Four suggestions, no bugs. Applied here.
+
+- [x] 1. Pin the book-relative gamma floor: BANKNIFTY-scale hole (~−7e-4 on
+      peak ~0.01) → soft; NIFTY-scale ±1e-4 wiggle on peak ~0.11 → hard
+- [x] 2. `test_default_config_produces_trades` copies the template with
+      `use_best_params=false` so a legitimate promotion cannot ride the test
+- [x] 3. Template comment: overlay needs `promote_ok` AND `promoted_by`
+- [x] 4. `_save_best_params` does not preserve `validation` — LOOP-FOREVER
+      must not keep a stale `promoted_by` on a rewritten payload
+
 # max_open_calendars is not a cap on the book (#235) — 2026-09-12
 
 `max_open_calendars` capped how many calendars were open when the SCAN STARTED,

@@ -411,18 +411,23 @@ new entries until expiry.
 
 ## Parameter reference
 
-All read from `[strategy]` section of `config.ini`, with autoresearch
-overlay from `best_params.json` (line 282).
+All read from `[strategy]` section of `config.ini`. Autoresearch overlay
+from `best_params.json` applies **only** when that file carries *both*
+`validation.promote_ok = true` (the machine checklist) **and** a non-empty
+`validation.promoted_by` (the operator who promoted it). Issue #237 — the
+June overlay had no promotion gate and turned NIFTY paper into a call
+backspread; `promote_ok` alone is insufficient because on a thin-data host
+the checklist passes with the absolute-edge gates untested (#238 review).
 
 ### Tunable (autoresearch-controlled)
 
 | Param | Default | Units | Controls |
 |---|---|---|---|
-| `rehedge_delta_threshold` | varies | lots | Base rehedge band; multiplied by √(γ_side/γ_avg) |
+| `rehedge_delta_threshold` | 1.0 | lots | Base rehedge band; multiplied by √(γ_side/γ_avg). A deliberately wide Path A band, **not** a floor forced by the hedger — `check_and_rehedge` already skips drift under `min_hedgeable_lots` = 0.25 and lets 0.25–0.5 through for the soft path. |
 | `gamma_scalp_band_pct` | varies | % of spot | Expected gamma scalp move used in cost gate |
 | `position_size_pct` | varies | % of capital | Fraction of capital deployed per straddle |
-| `vega_limit` | varies | per lot | Cap on `|net_vega|`; scales with n_long_lots |
-| `max_holding_period_hours` | varies | hours | Time-stop trigger |
+| `vega_limit` | 4000 | per lot | Cap on `|net_vega|` (`\|net_vega\| <= vega_limit × n_long_lots`). **Scale-invariant** — shrinking the structure cannot satisfy it, so too low a value is an off switch, not a cap. The book default was 500 until #238; that blocked every NIFTY entry and was masked only because the unpromoted overlay supplied 4000. |
+| `max_holding_period_hours` | 168 | hours | Time-stop trigger. 168h = one calendar week; expiry-day flatten is the real stop (#237). |
 | `entry_iv_percentile_min` | varies | 0–100 | Lower band of IV-percentile entry window |
 | `entry_iv_percentile_max` | varies | 0–100 | Upper band |
 | `max_entry_alpha` | 25000 | INR | Cap on `|net_alpha|` at entry (Gap #22) |
@@ -519,15 +524,39 @@ on nonzero exit.
    called out in the comment).
 
 5. **Regime dispatch / layering / T-0 disabled by default** (Phase 3.1
-   / 4 / 5). They are tested but require config flag flip to activate.
-   See `project_taleb_profitability_uplift_2026_05_23.md` memory for
-   the rationale ("ship the always-on uplift first, gate the rest").
+   / 4 / 5). Issue #237: NIFTY paper had dispatch forced on by an
+   unpromoted `best_params.json` overlay and ran a 4th-moment call
+   backspread through the first-order scalp loop. The overlay now
+   requires `validation.promote_ok` **and** `validation.promoted_by`;
+   Path A is straddle-only until an operator promotes a config that
+   actually has convexity edge. Research tools should read
+   `strategy._best_params_applied` rather than assume an overlay ran.
 
-6. **Live mode is not wired**. The strategy raises in `__init__` if
+6. **Soft vs hard delta (Ch 16 p.263 / #237).** A gamma zero-crossing
+   below this book's noise floor is grid noise, not a flip. A *material*
+   flip forbids futures (hard) deltas — the 11 Sep 14:21 branch that
+   emitted a future because the tails printed slightly positive is gone.
+   Soft hedges compare expiry as `YYYY-MM-DD` on both sides so a Kite
+   `date` matches a restored string.
+
+   The floor is **book-relative** (`_flip_noise_floor`): 1% of the grid's
+   own peak `|γ|`, never below `2e-4` (two ticks of `gamma_grid`'s 4-dp
+   rounding). Net gamma is per-share γ × quantity × lot_size, so an
+   absolute floor is ~10× stricter on the BANKNIFTY twin (lot 15, peak
+   |γ| ≈ 0.02) than on NIFTY (lot 75, peak ≈ 0.13) and would file a real
+   short-gamma hole as noise (#238 review).
+
+   *Known gap, pre-existing:* `find_gamma_flip_points` scans ±5% of spot
+   while `hedge_decision` judges materiality on a ±8% grid, so a flip
+   between 5% and 8% out is never detected in the first place. Widening
+   it changes live hedging behaviour and is deliberately not bundled
+   here.
+
+7. **Live mode is not wired**. The strategy raises in `__init__` if
    `mode=live`. Migration to live requires the same hardening pair_trading
    went through 2026-05-21 (see deferred.md and pair-trading docs).
 
-7. **Per-tick spot-fetch failures escalate** to ERROR after 5
+8. **Per-tick spot-fetch failures escalate** to ERROR after 5
    consecutive misses (line 318 counter `_consecutive_spot_failures`) —
    useful to detect a wrong symbol or session issue rather than burying
    it in unrelated stack traces.

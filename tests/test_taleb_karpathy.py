@@ -1298,7 +1298,10 @@ class TestApplyBestParams:
     def test_overlays_known_keys(self, tmp_path):
         import json
         path = tmp_path / "best.json"
-        path.write_text(json.dumps({"best_params": {"a": 99, "b": 42}}))
+        path.write_text(json.dumps({
+            "best_params": {"a": 99, "b": 42},
+            "validation": {"promote_ok": True, "promoted_by": "operator"},
+        }))
         params = {"a": 1, "b": 2, "c": 3}
         applied, ignored = _apply_best_params(params, path)
         assert applied == 2
@@ -1310,13 +1313,90 @@ class TestApplyBestParams:
         # Stale autoresearch outputs may contain renamed/removed knobs.
         # They must not pollute the tunable surface.
         path = tmp_path / "best.json"
-        path.write_text(json.dumps({"best_params": {"a": 99, "stale_param": 7}}))
+        path.write_text(json.dumps({
+            "best_params": {"a": 99, "stale_param": 7},
+            "validation": {"promote_ok": True, "promoted_by": "operator"},
+        }))
         params = {"a": 1, "b": 2}
         applied, ignored = _apply_best_params(params, path)
         assert applied == 1
         assert ignored == ["stale_param"]
         assert params == {"a": 99, "b": 2}
         assert "stale_param" not in params
+
+    def test_refuses_overlay_without_promote_ok(self, tmp_path):
+        """#237: a file with best_params but no validation.promote_ok is the
+        June production overlay that turned NIFTY paper into a call
+        backspread. Config defaults must win until an operator promotes."""
+        import json
+        path = tmp_path / "best.json"
+        path.write_text(json.dumps({"best_params": {"a": 99}}))
+        params = {"a": 1}
+        applied, ignored = _apply_best_params(params, path)
+        assert applied == 0
+        assert ignored == []
+        assert params == {"a": 1}
+
+    def test_refuses_overlay_when_promote_ok_is_false(self, tmp_path):
+        """The 12 Sep candidate had validation.promote_ok=false. Overlaying
+        it would be the same class of error as the June file."""
+        import json
+        path = tmp_path / "best.json"
+        path.write_text(json.dumps({
+            "best_params": {"a": 99},
+            "validation": {"promote_ok": False},
+        }))
+        params = {"a": 1}
+        applied, ignored = _apply_best_params(params, path)
+        assert applied == 0
+        assert params == {"a": 1}
+
+    def test_refuses_overlay_without_an_operator_signature(self, tmp_path):
+        """promote_ok alone is a MACHINE verdict — on a thin-data host the
+        autoresearch checklist passes with the absolute-edge gates untested
+        and still writes promote_ok=true. run_autoresearch prints "promotion
+        remains an operator decision"; validation.promoted_by is what makes
+        that true in code rather than in prose (#238 review)."""
+        import json
+        path = tmp_path / "best.json"
+        for validation in ({"promote_ok": True},
+                           {"promote_ok": True, "promoted_by": ""},
+                           {"promote_ok": True, "promoted_by": "   "}):
+            path.write_text(json.dumps({
+                "best_params": {"a": 99}, "validation": validation,
+            }))
+            params = {"a": 1}
+            applied, _ = _apply_best_params(params, path)
+            assert applied == 0, validation
+            assert params == {"a": 1}, validation
+
+    def test_on_disk_best_params_overlay_follows_its_promotion_markers(self):
+        """Behaviour pin on the production file, NOT a state pin.
+
+        An earlier revision asserted the on-disk file is un-promoted, which
+        would turn CI red the day an operator legitimately promotes one — the
+        very act this gate exists to enable (#238 review). Assert the contract
+        instead: the overlay applies exactly when both markers are present.
+        """
+        import json
+        from pathlib import Path
+        path = Path(__file__).resolve().parent.parent / "best_params.json"
+        data = json.loads(path.read_text())
+        on_disk = data.get("best_params") or {}
+        assert on_disk, "production best_params.json has no best_params object"
+        v = data.get("validation") or {}
+        promoted = (v.get("promote_ok") is True
+                    and bool(str(v.get("promoted_by") or "").strip()))
+
+        sentinel = object()
+        params = {k: sentinel for k in on_disk}
+        applied, _ = _apply_best_params(params, path)
+        assert (applied > 0) is promoted, (
+            f"best_params.json promotion markers say promoted={promoted} but "
+            f"{applied} params were overlaid"
+        )
+        if not promoted:
+            assert all(val is sentinel for val in params.values())
 
     def test_malformed_json_no_overlay(self, tmp_path):
         path = tmp_path / "best.json"
@@ -4506,6 +4586,23 @@ class TestSoftHedgeDeltaSizing:
         h.kite.quote = _quote
         greeks = SimpleNamespace(net_discrete_delta=-float(net_delta))
         return h, greeks
+
+    def test_string_position_expiry_matches_date_chain_expiry(self):
+        """#237: OptionContract.expiry is a 'YYYY-MM-DD' string (TradeProposal
+        and state restore). Kite's chain expiry is datetime.date. Comparing
+        them with == emptied the same-expiry filter and the soft hedge
+        never fired (paper 2026-09-11, 25 consecutive ticks)."""
+        from datetime import date
+        import pandas as pd
+        h, g = self._h(net_delta=150.0)
+        h._get_options_chain = lambda: pd.DataFrame([{
+            "tradingsymbol": "NIFTY26SEP24000CE", "instrument_token": 1000,
+            "strike": 24000.0, "instrument_type": "CE",
+            "expiry": date(2026, 9, 24),
+        }])
+        out = h._generate_soft_delta_proposals(g, self.SPOT, self.T)
+        assert len(out) == 1
+        assert out[0].tradingsymbol == "NIFTY26SEP24000CE"
 
     def test_sizes_off_the_option_delta_not_the_futures_formula(self):
         """150 delta of drift. ATM CE is ~0.52Δ → ~39 delta per 75-lot, so the

@@ -11,6 +11,18 @@ from research.backtest import (
     load_captured_tape, list_captured_sessions,
 )
 
+# Issue #237: CI copies config_template.ini → config.ini and no longer
+# overlays unpromoted best_params.json, so the template's own values are now
+# what these tests exercise. Pin the template explicitly — a gitignored local
+# config.ini must not be able to mask CI, in either direction.
+#
+# These tests deliberately take NO vega/MC overrides (#238 review). An earlier
+# revision injected vega_limit=4000 + mc_min_mean_pnl=-10000 here, which hid a
+# real defect: the template shipped vega_limit=500, a scale-invariant gate that
+# blocks every entry, so the book defaults could not trade at all. The fix
+# belongs in the template, and these tests are what prove it.
+_TEMPLATE = "config_template.ini"
+
 
 class TestSyntheticData:
     def test_generates_data(self):
@@ -118,12 +130,15 @@ class TestBacktestIntegration:
         # SESSION and needs 30 prior sessions to leave warmup, so a 5-day
         # tape can never fire an entry regardless of the band.
         data = generate_synthetic_data(days=40, ticks_per_day=12)
-        # Widen entry filters so synthetic data passes all pre-trade gates
-        results = run_backtest(data, underlying="NIFTY", tunable_params={
-            "entry_iv_percentile_min": 0,
-            "entry_iv_percentile_max": 100,
-            "max_entry_alpha": 50000,
-        })
+        # Widen entry filters so synthetic data passes all pre-trade gates.
+        results = run_backtest(
+            data, underlying="NIFTY", config_path=_TEMPLATE,
+            tunable_params={
+                "entry_iv_percentile_min": 0,
+                "entry_iv_percentile_max": 100,
+                "max_entry_alpha": 50000,
+            },
+        )
 
         assert results["metrics"]["total_trades"] > 0, (
             "Backtest produced 0 trades — clock injection or pre_trade_checks likely broken"
@@ -144,16 +159,20 @@ class TestBacktestIntegration:
         """P1: run_backtest must apply tunable_params to the hedger, not ignore them."""
         data = generate_synthetic_data(days=2, ticks_per_day=4)
         # Use an impossibly tight IV window so the hedger cannot trade
-        results_blocked = run_backtest(data, underlying="NIFTY", tunable_params={
-            "entry_iv_percentile_min": 99,
-            "entry_iv_percentile_max": 100,
-        })
+        results_blocked = run_backtest(
+            data, underlying="NIFTY", config_path=_TEMPLATE, tunable_params={
+                "entry_iv_percentile_min": 99,
+                "entry_iv_percentile_max": 100,
+            },
+        )
         # Use a wide IV window + wide alpha so the hedger can trade
-        results_open = run_backtest(data, underlying="NIFTY", tunable_params={
-            "entry_iv_percentile_min": 0,
-            "entry_iv_percentile_max": 100,
-            "max_entry_alpha": 50000,
-        })
+        results_open = run_backtest(
+            data, underlying="NIFTY", config_path=_TEMPLATE, tunable_params={
+                "entry_iv_percentile_min": 0,
+                "entry_iv_percentile_max": 100,
+                "max_entry_alpha": 50000,
+            },
+        )
         # The blocked run must have fewer or equal trades than the open run
         assert results_blocked["metrics"]["total_trades"] <= results_open["metrics"]["total_trades"]
 
@@ -171,16 +190,46 @@ class TestBacktestIntegration:
                 f"Entries only on {entry_days} — multi-day re-entry is broken"
             )
 
-    def test_default_config_produces_trades(self):
-        """P1: Default config must produce trades with synthetic data (no param overrides)."""
+    def test_default_config_produces_trades(self, tmp_path):
+        """P1: the shipped book defaults must be able to trade — NO overrides.
+
+        This is the whole point of the test, so it passes no tunable_params
+        at all: config_template.ini exactly as an operator would copy it
+        (`cp config_template.ini config.ini`, per AGENTS.md), Path A dispatch
+        off, IV band 30–70.
+
+        It is load-bearing after #237. While the unpromoted best_params.json
+        overlay was applied unconditionally it was silently supplying
+        vega_limit=4000, so nobody noticed the template shipped 500 — a
+        per-lot, scale-invariant gate that no NIFTY straddle can clear at any
+        size. Refusing the overlay made that binding and this test went to 0
+        trades. If it ever does again, the book defaults are an off switch and
+        a fresh deploy cannot enter a position (#238 review).
+
+        The one allowed deviation: use_best_params=false. The template leaves
+        that at the code fallback (true), so construction still reads the
+        tracked best_params.json. Today that file is unpromoted and CI lucks
+        into the template — the same coincidence that hid vega_limit=500.
+        A legitimate promotion (the act the overlay gate exists to enable)
+        would then overlay production params and this test would stop proving
+        a fresh `cp`. BANKNIFTY's cold seed already sets the same flag.
+        """
         import numpy as np
+        from pathlib import Path
+        text = Path(_TEMPLATE).read_text()
+        cfg = tmp_path / "book_defaults.ini"
+        cfg.write_text(text.replace(
+            "[strategy]", "[strategy]\nuse_best_params = false", 1,
+        ))
         np.random.seed(42)
         # 40 days: see test_backtest_produces_trades — 30 prior sessions are
         # needed before the IV-percentile gate can leave warmup.
         data = generate_synthetic_data(days=40, ticks_per_day=12)
-        results = run_backtest(data, underlying="NIFTY")
+        results = run_backtest(data, underlying="NIFTY", config_path=str(cfg))
         assert results["metrics"]["total_trades"] > 0, (
-            "Default backtest still produces 0 trades — not a meaningful validator"
+            "config_template.ini book defaults produced 0 trades — a fresh "
+            "deploy would take no position. Check vega_limit (per-LOT and "
+            "scale-invariant) and mc_min_mean_pnl."
         )
 
     def test_backtest_flattens_at_end_of_data(self):
@@ -195,11 +244,14 @@ class TestBacktestIntegration:
         # IV-percentile pool never leaves warmup, no trade fires, and the
         # skip guard below silently stops exercising the flatten path.
         data = generate_synthetic_data(days=40, ticks_per_day=12)
-        results = run_backtest(data, underlying="NIFTY", tunable_params={
-            "entry_iv_percentile_min": 0,
-            "entry_iv_percentile_max": 100,
-            "max_entry_alpha": 50000,
-        })
+        results = run_backtest(
+            data, underlying="NIFTY", config_path=_TEMPLATE,
+            tunable_params={
+                "entry_iv_percentile_min": 0,
+                "entry_iv_percentile_max": 100,
+                "max_entry_alpha": 50000,
+            },
+        )
         # Only meaningful if the engine actually traded
         if results["metrics"]["total_trades"] == 0:
             pytest.skip("No trades produced — flatten path not exercised")
