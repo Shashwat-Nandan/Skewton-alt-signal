@@ -403,10 +403,25 @@ class ArbitrageStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         proposals: List[TradeProposal] = []
+        # Calendars this scan has already decided to open (issue #235).
+        planned = 0
         snapshots = self._observe_universe()
         self.state.last_basis_snapshot = snapshots
 
-        for snap in snapshots:
+        # Strongest dislocation first (#235 review). Now that the cap binds
+        # MID-scan, it does not merely limit how many calendars open — it
+        # decides WHICH. Left in config order, a symbol at carry_diff 0.051
+        # (barely over the gate) would take a slot from one at 0.40, every
+        # session, deterministically, and names late in a 50-symbol universe
+        # could never trade on a busy morning. Before the cap bound, order was
+        # irrelevant because everything got in. `basis` order is preserved for
+        # the signals-only arm below, which is unaffected by capacity.
+        entry_order = sorted(
+            snapshots,
+            key=lambda x: abs(x["carry_diff"]) if x.get("carry_diff") is not None else -1.0,
+            reverse=True)
+
+        for snap in entry_order:
             # Cash-futures basis is ALWAYS emitted as a signal regardless of
             # execution mode — the strategy doubles as a basis-monitoring
             # service. The proposals are routed to _emit_signal in
@@ -451,7 +466,20 @@ class ArbitrageStrategy(BaseStrategy):
                 and snap.get("pricing_trusted", True)
                 and abs(snap["carry_diff"]) >= self.calendar_entry_annual
                 and snap["symbol"] not in self.state.open_calendars
-                and len(self.state.open_calendars) < self.max_open_calendars
+                # Count what this scan has already PLANNED, not just what was
+                # already open (issue #235). open_calendars does not change
+                # during a scan — positions are booked later, in
+                # execute_proposals -> _apply_fill — so every symbol in this
+                # loop used to test against the SAME pre-scan count. With 4
+                # open and a cap of 5 every remaining symbol saw `4 < 5`: on
+                # 2026-09-11 seven calendars opened in one tick, peaking at 11
+                # concurrent against the cap of 5. The breach size is however
+                # many symbols happen to fire together, so it is unbounded in
+                # principle, and this cap is the ONLY thing bounding the
+                # book's aggregate exposure — max_leg_notional bounds one leg
+                # of one spread, and #224's margin precheck sees one batch at
+                # a time.
+                and len(self.state.open_calendars) + planned < self.max_open_calendars
                 and abs(snap["basis_annual"]) <= self.calendar_max_leg_basis
                 and snap.get("basis_annual_next") is not None
                 and abs(snap["basis_annual_next"]) <= self.calendar_max_leg_basis
@@ -459,6 +487,11 @@ class ArbitrageStrategy(BaseStrategy):
                 cal_proposals = self._build_calendar_entry(snap)
                 if cal_proposals:
                     self.state.pending_entry_diff[snap["symbol"]] = snap["carry_diff"]
+                    # Only a proposal that was actually BUILT consumes a slot.
+                    # _build_calendar_entry returns [] on its own gates (the
+                    # rupee cost hurdle, the crossing hurdle), and a rejected
+                    # candidate must not eat a slot a later symbol could use.
+                    planned += 1
                 proposals.extend(cal_proposals)
 
         return proposals
@@ -621,8 +654,9 @@ class ArbitrageStrategy(BaseStrategy):
 
         # Free margin is read ONCE and then decremented by every batch this
         # call approves. One scan can propose entries for many underlyings
-        # (the max_open_calendars cap is evaluated against state that does not
-        # change during a scan), and re-reading margins() per group would gate
+        # (a scan can propose entries for many underlyings in one tick — the
+        # max_open_calendars cap bounds how many, but a whole tick's worth of
+        # batches still has to be funded from one balance reading), and re-reading margins() per group would gate
         # each batch against a balance that does not yet reflect the batches
         # already approved this tick — Kite does not refresh `net` that fast
         # either. None = unreadable, which means "proceed" (see

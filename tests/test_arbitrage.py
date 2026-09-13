@@ -2985,3 +2985,118 @@ class TestCrossingHurdleReviewFixes:
         with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
             self._s(snap, hurdle=2.0, crossing=0.0).scan_and_propose()
         assert not [r for r in caplog.records if "LOWER bound" in r.getMessage()]
+
+
+class TestMaxOpenCalendarsIsAActualCap:
+    """WHY (Rule 9, issue #235): `max_open_calendars` capped how many calendars
+    were open when the SCAN STARTED, not how many the book holds.
+    `state.open_calendars` does not change during a scan — positions are booked
+    later in execute_proposals -> _apply_fill — so every symbol in the loop
+    tested the same pre-scan count. On 2026-09-11, with 4 open and a cap of 5,
+    seven calendars opened in one tick and the book peaked at 11 concurrent:
+    2.2x the cap.
+
+    This cap is the ONLY thing bounding the strategy's aggregate exposure —
+    max_leg_notional bounds one leg of one spread, and #224's margin precheck
+    sees one batch at a time.
+
+    Note the shape of these tests: they put MANY qualifying symbols in ONE
+    scan. A fixture that opens one calendar per tick passes the buggy code
+    happily, which is presumably how this survived."""
+
+    def _snap(self, sym):
+        return {
+            "symbol": sym, "spot": 1000.0,
+            "near": {"tradingsymbol": f"{sym}26SEPFUT", "lot_size": 250,
+                     "expiry": "2026-09-29", "instrument_token": 1},
+            "near_price": 1000.0, "dte_near": 20,
+            "next": {"tradingsymbol": f"{sym}26OCTFUT", "lot_size": 250,
+                     "expiry": "2026-10-27", "instrument_token": 2},
+            "next_price": 1010.0, "dte_next": 48,
+            "basis_annual": 0.0, "basis_annual_next": 0.0,
+            "carry_implied": 0.37, "carry_diff": 0.30,
+            "near_quote": None, "next_quote": None,
+            "pricing_trusted": True, "near_basis": "print", "next_basis": "print",
+        }
+
+    def _strategy(self, n_symbols, cap, already_open=0):
+        syms = [f"S{i:02d}" for i in range(n_symbols)]
+        s = _make_strategy(mode="paper", universe=syms,
+                           calendar_entry_annual=0.05)
+        s.calendar_cost_hurdle_mult = 0.0
+        s.max_open_calendars = cap
+        for i in range(already_open):
+            s.state.open_calendars[f"OPEN{i}"] = CalendarTrade(
+                symbol=f"OPEN{i}", position="SHORT_CALENDAR",
+                entry_time=datetime(2026, 9, 11, 9, 0), entry_carry_diff=0.06)
+        s._observe_universe = lambda: [self._snap(x) for x in syms]
+        return s
+
+    def _n_entries(self, proposals):
+        return len([p for p in proposals if p.option_type == "FUT"]) // 2
+
+    def test_one_scan_cannot_exceed_the_cap(self):
+        s = self._strategy(n_symbols=20, cap=5)
+        assert self._n_entries(s.scan_and_propose()) == 5
+
+    def test_it_counts_what_is_already_open(self):
+        # The 2026-09-11 shape exactly: 4 already open, cap 5 → ONE slot left.
+        s = self._strategy(n_symbols=20, cap=5, already_open=4)
+        assert self._n_entries(s.scan_and_propose()) == 1, \
+            "4 open against a cap of 5 leaves one slot, not twenty"
+
+    def test_a_full_book_proposes_nothing(self):
+        s = self._strategy(n_symbols=20, cap=5, already_open=5)
+        assert self._n_entries(s.scan_and_propose()) == 0
+
+    def test_a_rejected_candidate_does_not_eat_a_slot(self):
+        # _build_calendar_entry returns [] on its own gates (cost hurdle,
+        # crossing hurdle). A candidate that never became a proposal must not
+        # consume capacity a later symbol could use.
+        s = self._strategy(n_symbols=6, cap=3)
+        real = s._build_calendar_entry
+        rejected = {"S00", "S01"}
+        s._build_calendar_entry = lambda snap: (
+            [] if snap["symbol"] in rejected else real(snap))
+        props = s.scan_and_propose()
+        assert self._n_entries(props) == 3
+        opened = {p.tradingsymbol[:3] for p in props if p.option_type == "FUT"}
+        assert not (opened & rejected), "a rejected symbol must not appear"
+
+    def test_capacity_returns_after_positions_close(self):
+        # The previous version of this test was a verbatim duplicate of
+        # test_one_scan_cannot_exceed_the_cap and never ran a second tick, so
+        # the regression it was named for went untested (#235 review proved it:
+        # hoisting `planned` to persist across scans still passed). `planned`
+        # must be per-scan, not per-session — otherwise the book opens 5 on the
+        # first tick of the day and proposes nothing afterwards, even after
+        # every one of them has closed.
+        s = self._strategy(n_symbols=20, cap=5)
+        assert self._n_entries(s.scan_and_propose()) == 5
+        s.state.open_calendars.clear()          # they all closed
+        assert self._n_entries(s.scan_and_propose()) == 5, \
+            "capacity must come back on the next scan"
+
+    def test_a_second_tick_fills_only_the_remaining_slots(self):
+        # Tick 1 fills the book to the cap via real fills; tick 2 must propose
+        # nothing. Exercises the scan -> execute -> scan path the duplicate
+        # test skipped entirely.
+        s = self._strategy(n_symbols=20, cap=5)
+        s.execute_proposals(s.scan_and_propose())
+        assert len(s.state.open_calendars) == 5
+        assert self._n_entries(s.scan_and_propose()) == 0
+
+    def test_the_strongest_dislocation_takes_the_slot(self):
+        # Now that the cap binds mid-scan it decides WHICH calendars open, not
+        # just how many. Config order must not beat signal strength (#235
+        # review): S00 is first in the universe but weakest.
+        s = self._strategy(n_symbols=4, cap=1)
+        strengths = {"S00": 0.06, "S01": 0.09, "S02": 0.40, "S03": 0.07}
+        base = s._observe_universe()
+        for snap in base:
+            snap["carry_diff"] = strengths[snap["symbol"]]
+            snap["carry_implied"] = snap["carry_diff"] + 0.07
+        s._observe_universe = lambda: base
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert {p.tradingsymbol[:3] for p in props} == {"S02"}, \
+            "the one slot must go to the strongest signal, not the first symbol"

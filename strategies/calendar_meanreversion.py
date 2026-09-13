@@ -165,6 +165,8 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
         # same bar are idempotent).
         self._record_history(snapshots)
 
+        # Collected first, allocated after — see the sort below (#235).
+        candidates = []
         for snap in snapshots:
             symbol = snap["symbol"]
             if snap["near"] is None or snap["next"] is None:
@@ -173,9 +175,6 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
                 continue
             if symbol in self.state.open_calendars:
                 continue
-            if len(self.state.open_calendars) >= self.mr_max_open:
-                break
-
             # Expiry-window gate (Varsity: signals cluster around expiry).
             if snap["dte_near"] > self.require_dte_near_le:
                 continue
@@ -206,6 +205,21 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
             else:
                 continue
 
+            candidates.append((abs(entry_z), symbol, snap, position,
+                               side_near, side_next, spread_now, stats, entry_z))
+
+        # Allocate the scarce slots to the strongest signals, not to whoever
+        # comes first in the universe list (#235 review). The capacity check
+        # used to sit inside the loop above with a `break`, so a symbol at
+        # z=1.01 — barely over entry_n_sd — took the slot from one at z=4.0
+        # later in the list. Before the cap bound mid-scan this was invisible,
+        # because every qualifying symbol got in.
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        planned = 0
+        for _z, symbol, snap, position, side_near, side_next, spread_now, stats, entry_z \
+                in candidates:
+            if len(self.state.open_calendars) + planned >= self.mr_max_open:
+                break
             entries = self._build_entry(snap, side_near, side_next, position,
                                         spread_now, stats, entry_z)
             if entries:
@@ -220,6 +234,10 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
                     "position": position,
                 }
                 proposals.extend(entries)
+                # Only a BUILT entry consumes a slot — _build_entry returns []
+                # on its own gates, and a rejected candidate must not eat a
+                # slot a later symbol could use.
+                planned += 1
 
         return proposals
 

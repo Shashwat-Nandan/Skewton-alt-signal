@@ -1,3 +1,81 @@
+# max_open_calendars is not a cap on the book (#235) — 2026-09-12
+
+`max_open_calendars` capped how many calendars were open when the SCAN STARTED,
+not how many the book holds. `state.open_calendars` does not change during a
+scan — positions are booked later, in `execute_proposals` -> `_apply_fill` — so
+every symbol in the loop tested the same pre-scan count. With 4 open and a cap
+of 5, all 46 remaining symbols saw `4 < 5`.
+
+Live evidence, 2026-09-11 paper session (cap = 5): restored with 4 open, then
+**seven calendars opened in a single tick** at 09:15:18. Peak concurrent open
+**11 — 2.2x the cap**, reconstructed from the fill log. It happened on 09-07
+too (6 against 5), smaller only because fewer symbols qualified that morning.
+The breach size is however many symbols fire together, so it is unbounded in
+principle.
+
+This cap is the ONLY thing bounding the strategy's aggregate exposure:
+`max_leg_notional` bounds one leg of one spread, and #224's margin precheck
+sees one batch at a time, so neither can catch an aggregate breach.
+
+- [x] `scan_and_propose` counts what the scan has already PLANNED
+- [x] same defect and same fix in `calendar_meanreversion`, which overrides
+      `scan_and_propose` — it broke on `>=` against the same unchanging state,
+      so starting below the cap it never broke at all
+- [x] only a BUILT proposal consumes a slot: `_build_calendar_entry` returns []
+      on its own gates (cost hurdle, crossing hurdle) and a rejected candidate
+      must not eat capacity a later symbol could use
+- [x] 8 tests across both strategies; three mutations each caught
+
+### Review fixes (code review of PR #236)
+
+Five findings. The first two are a consequence of the fix that I had not
+thought through:
+
+- **Now that the cap BINDS mid-scan, it decides WHICH calendars open, not just
+  how many** — and slots were going to whoever came first in the config list. A
+  symbol at carry_diff 0.051, barely over the gate, would take a slot from one
+  at 0.40, deterministically, every session; names late in a 50-symbol universe
+  could never trade on a busy morning. Invisible before this PR because every
+  qualifying symbol got in. Both strategies now allocate strongest-signal-first
+  (|carry_diff| for arbitrage, |entry_z| for mean-reversion, which needed a
+  collect-then-allocate restructure because z is computed deep in the loop).
+- **`test_the_cap_still_admits_a_full_book_over_several_ticks` was a verbatim
+  duplicate** of the test above it and never ran a second tick, so the
+  regression it was named for was untested. The reviewer proved it by mutation:
+  hoisting `planned` to persist across scans still passed all five tests, while
+  that code would open 5 calendars on the first tick of the day and propose
+  nothing afterwards even after they all closed. Replaced with a real two-tick
+  test and a scan -> execute -> scan test; both mutations now fail.
+
+Also: a comment beside the margin-precheck rationale still asserted the bug
+this PR fixes ("the cap is evaluated against state that does not change during
+a scan") and would have told the next reader the cap does not bind.
+
+**Flagged, not fixed:** `calendar_meanreversion`'s tuned defaults
+(`entry_n_sd = 1.5` and friends) were produced by backtests that ran the
+UNCAPPED behaviour — a single tick could open the entire qualifying set. Those
+runs are no longer reproducible. A re-run should precede the next tuning
+decision; out of scope here, where the question is whether the cap is enforced,
+not what its value should be.
+
+### Review
+
+The tests deliberately put MANY qualifying symbols in ONE scan. A fixture that
+opens one calendar per tick passes the buggy code happily, which is presumably
+how this survived — recorded in the test docstring so it does not get
+simplified back.
+
+Two of my own tests were vacuous before they shipped, both caught here rather
+than in review: the mean-reversion fixture used a FLAT spread history, so
+`sd == 0` skipped every symbol and `test_a_full_book_proposes_nothing` passed
+as `0 == 0` for entirely the wrong reason. It now carries a positive control
+asserting the same fixture produces entries when there IS capacity.
+
+Not in scope: whether 5 is the right number. This is about the cap being
+enforced, not its value.
+
+---
+
 # Entry hurdle: measure crossing cost, charge it only on request (#233) — 2026-09-12
 
 `calendar_cost_hurdle_mult` models brokerage, STT, exchange fees and stamp —

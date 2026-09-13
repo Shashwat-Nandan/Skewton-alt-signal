@@ -506,3 +506,85 @@ class TestIndexPanelIngestion:
         spreads.sort()
         median = spreads[len(spreads) // 2]
         assert median > 0, f"NIFTY median spread should be positive (cost of carry); got {median}"
+
+
+class TestMaxOpenIsAnActualCap:
+    """WHY (Rule 9, issue #235): `max_open` broke the scan on
+    `len(open_calendars) >= mr_max_open`, but open_calendars does not change
+    during a scan — positions are booked later in _apply_fill. Starting below
+    the cap the loop never broke, so one tick could open the entire qualifying
+    set. Same defect as ArbitrageStrategy's, found alongside it: the arbitrage
+    book peaked at 11 concurrent against a cap of 5 on 2026-09-11.
+
+    These tests put MANY qualifying symbols in ONE scan; a fixture that opens
+    one calendar per tick passes the buggy code."""
+
+    def _history(self, symbols, n=80):
+        # Needs VARIANCE: a flat series gives sd == 0 and every symbol is
+        # skipped, which made the first cut of these tests pass vacuously
+        # (0 == 0 against a cap of 5). Small alternating noise, then today's
+        # print lands far above the band → every symbol is a SHORT_CALENDAR
+        # candidate on the same tick.
+        base = date(2026, 4, 17)
+        return {s: [(base - timedelta(days=n - i), 1.0 + (0.1 if i % 2 else -0.1))
+                    for i in range(n)]
+                for s in symbols}
+
+    def _strategy(self, n_symbols, cap, already_open=0):
+        syms = [f"S{i:02d}" for i in range(n_symbols)]
+        s = _make_strategy(universe=syms, max_open=cap, min_history=10,
+                           min_avg_volume=0, entry_n_sd=1.0,
+                           spread_history=self._history(syms),
+                           volume_history={x: [(date(2026, 4, 16), 10**6, 10**6)]
+                                           for x in syms})
+        for i in range(already_open):
+            s.state.open_calendars[f"OPEN{i}"] = CalendarTrade(
+                symbol=f"OPEN{i}", position="SHORT_CALENDAR",
+                entry_time=datetime(2026, 4, 17, 9, 0), entry_carry_diff=0.0)
+        # next_px well above the rolling mean → spread_now > upper for all.
+        s._observe_universe = lambda: [
+            _snap(symbol=x, near_px=100.0, next_px=140.0) for x in syms]
+        return s
+
+    def _n(self, proposals):
+        return len([p for p in proposals if p.option_type == "FUT"]) // 2
+
+    def test_one_scan_cannot_exceed_the_cap(self):
+        assert self._n(self._strategy(20, cap=5).scan_and_propose()) == 5
+
+    def test_it_counts_what_is_already_open(self):
+        assert self._n(self._strategy(20, cap=5, already_open=4)
+                       .scan_and_propose()) == 1
+
+    def test_capacity_returns_after_positions_close(self):
+        # `planned` must be per-scan, not per-session (#235 review).
+        s = self._strategy(20, cap=5)
+        assert self._n(s.scan_and_propose()) == 5
+        s.state.open_calendars.clear()
+        assert self._n(s.scan_and_propose()) == 5
+
+    def test_the_strongest_z_takes_the_slot(self):
+        # The cap now decides WHICH calendars open. A symbol just over
+        # entry_n_sd must not take the slot from a far stronger one later in
+        # the universe list (#235 review).
+        syms = [f"S{i:02d}" for i in range(4)]
+        s = _make_strategy(universe=syms, max_open=1, min_history=10,
+                           min_avg_volume=0, entry_n_sd=1.0,
+                           spread_history=self._history(syms),
+                           volume_history={x: [(date(2026, 4, 16), 10**6, 10**6)]
+                                           for x in syms})
+        # S02 is the widest print; S00 comes first in the universe.
+        widths = {"S00": 101.3, "S01": 101.6, "S02": 140.0, "S03": 101.4}
+        s._observe_universe = lambda: [
+            _snap(symbol=x, near_px=100.0, next_px=widths[x]) for x in syms]
+        props = [p for p in s.scan_and_propose() if p.option_type == "FUT"]
+        assert {p.tradingsymbol[:3] for p in props} == {"S02"}
+
+    def test_a_full_book_proposes_nothing(self):
+        # Paired with a positive control on the SAME fixture, or "zero
+        # proposals" could mean the fixture simply never qualifies — which is
+        # exactly how the first cut of these tests passed vacuously.
+        assert self._n(self._strategy(20, cap=5, already_open=0)
+                       .scan_and_propose()) > 0, "fixture must produce entries"
+        assert self._n(self._strategy(20, cap=5, already_open=5)
+                       .scan_and_propose()) == 0
