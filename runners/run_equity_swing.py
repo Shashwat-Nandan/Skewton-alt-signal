@@ -509,9 +509,8 @@ def main() -> int:
     # need it but the existing strategy ctor takes the kite handle either
     # way for parity with paper/live paths).
     try:
-        from core.kite_auth import KiteAuthManager
-        auth = KiteAuthManager(CONFIG_PATH)
-        kite = auth.get_kite()
+        from core.broker import get_trading_client
+        kite = get_trading_client(CONFIG_PATH)
         prof = kite.profile()
         log.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
     except Exception as e:

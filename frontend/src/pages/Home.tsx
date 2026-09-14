@@ -21,7 +21,7 @@ export function Home() {
   }
 
   if (!auth?.authenticated) {
-    return <LoginCard />;
+    return <LoginCard auth={auth} />;
   }
 
   return (

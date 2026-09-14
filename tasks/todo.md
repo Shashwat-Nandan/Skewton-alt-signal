@@ -1,3 +1,29 @@
+# Broker adapter (Zerodha / Kotak Neo / Groww / Dhan) — 2026-09-14
+
+Toggle the live broker from config instead of hard-wiring Zerodha Kite.
+Kotak Neo gets a real headless TOTP+MPIN login and a Kite-shaped order
+client so `KiteOrderExecutor` and the runners keep their fill semantics.
+Groww and Dhan are registered in the factory and refuse to login/order
+until they pass the paper → live gate (fail loud, not a silent Kite
+fallback). Market-data CLIs (`market_data/fetch_*`, tick capture) stay
+on Kite for this increment.
+
+- [x] 1. `core/broker/` — ABC, factory, mapping, Zerodha wrap, Kotak REST, Groww/Dhan stubs
+- [x] 2. Config templates + gitignore session caches + secrets runbook
+- [x] 3. Trading runners authenticate via `get_broker` / `get_trading_client`
+- [x] 4. `KiteOrderExecutor` (and pair live path) catch broker-agnostic token/network/order errors
+- [x] 5. Dashboard `/api/auth/*` dispatches on configured broker; SPA LoginCard is broker-aware
+- [x] 6. Tests + `ruff check` (new broker tests 22/22; order_executor + auth 48/48; pair token-refresh 5/5)
+- [x] 7. Docs: README, architecture, AGENTS.md repo map, secrets runbook
+- [x] 8. Kotak F&O instrument master (`instruments("NFO")` via scrip-master CSV)
+
+Assumptions (surfaced, not silent):
+- Default `broker.name = zerodha` so existing hosts do not change behaviour.
+- Dashboard never collects MPIN/PIN in the browser — Kotak/Groww/Dhan
+  headless login uses server-side `config.ini` / env, same as Kite TOTP.
+- Groww/Dhan are **not** live-wired in this PR. Selecting them fails at
+  `login()`, which is the paper → live gate working.
+
 # Review fixes for PR #238 (Taleb first-order convexity) — 2026-09-13
 
 Code review of #238 confirmed the three code fixes are correct (verified: the

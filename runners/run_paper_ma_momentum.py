@@ -486,8 +486,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     _ = lock  # keep FD alive
 
-    from core.kite_auth import KiteAuthManager
-    kite = KiteAuthManager("config.ini").get_kite()
+    from core.broker import get_trading_client
+    kite = get_trading_client("config.ini")
     nfo = kite.instruments("NFO")
 
     prior = load_state()

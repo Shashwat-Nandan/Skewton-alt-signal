@@ -36,6 +36,7 @@ from typing import Callable, Dict, List, Literal, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from core.broker.errors import BrokerTokenError
 from core.trade_proposer import TradeProposal
 
 from .base import BaseStrategy, ExecutionMode, OrderValidationError, validate_order
@@ -55,6 +56,8 @@ except Exception:  # pragma: no cover
 
     class _OrderException(Exception):  # type: ignore[no-redef]
         pass
+
+_TOKEN_ERRORS = (_TokenException, BrokerTokenError)
 
 logger = logging.getLogger(__name__)
 
@@ -1876,7 +1879,7 @@ class PairTradingStrategy(BaseStrategy):
         try:
             quote = self.kite.quote([key])
             return float(quote[key]["last_price"])
-        except _TokenException as e:
+        except _TOKEN_ERRORS as e:
             # H8: token expired mid-session. Refresh once and retry.
             if not self._try_refresh_kite("quote", tradingsymbol, e):
                 return None
@@ -1900,7 +1903,7 @@ class PairTradingStrategy(BaseStrategy):
         # handles any post-fact margin reject).
         try:
             margins = self.kite.margins()
-        except _TokenException as e:
+        except _TOKEN_ERRORS as e:
             if not self._try_refresh_kite("margins", "entry_precheck", e):
                 logger.warning(
                     "%s/%s: margins() raised TokenException with no refresh — "
@@ -2027,7 +2030,7 @@ class PairTradingStrategy(BaseStrategy):
 
         try:
             raw = _quote()
-        except _TokenException as e:
+        except _TOKEN_ERRORS as e:
             # Mirror the margins() sibling: refresh-and-retry once. Without
             # this, a token invalidated between margins() and this call
             # (2026-06-17 concurrent-login incident class) would silently

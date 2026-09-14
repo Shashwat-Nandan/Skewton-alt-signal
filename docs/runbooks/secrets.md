@@ -6,9 +6,11 @@ Companion to [`SECURITY.md`](../../SECURITY.md). This records **who holds what**
 ## What secrets exist
 | Secret | Used by | Lives where (never git) |
 |---|---|---|
-| Kite `api_key` / `api_secret` | broker auth (`core/kite_auth.py`) | `config.ini` (local + VPS, `chmod 600`) |
+| Kite `api_key` / `api_secret` | broker auth (`core/kite_auth.py` / `core/broker`) | `config.ini` (local + VPS, `chmod 600`) |
 | Kite `totp_key` (TOTP seed) | automated login | `config.ini` / `.env` |
 | Kite `user_id` / `password` | login | `config.ini` |
+| Kotak `consumer_key` / `mobile_number` / `ucc` / `mpin` / `totp_key` | Kotak Neo login (`core/broker/kotak.py`) | `config.ini` / `KOTAK_*` env |
+| Groww / Dhan API keys | registered, not live-wired | `config.ini` / `GROWW_*` / `DHAN_*` — fill only when those adapters ship |
 | `DASHBOARD_URL`, `KITE_REDIRECT_URL` | OAuth flow | `.env` |
 | Telegram / notify tokens (if used) | `notify-failure.sh`, `pair-eod-telegram.sh` | `.env` / systemd env |
 

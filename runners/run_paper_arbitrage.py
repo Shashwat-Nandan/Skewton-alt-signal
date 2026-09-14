@@ -7,7 +7,7 @@ spreads on single-stock futures). Runs alongside the pair-trading runner
 (runners/run_paper_pairs.py) on its own systemd timer.
 
   - Refuses to run on weekends or dates in holidays.csv (override with --force)
-  - Authenticates via TOTP (kite_auth.KiteAuthManager)
+  - Authenticates via the configured broker adapter (`core.broker.get_trading_client`)
   - Instantiates ONE ArbitrageStrategy over the configured universe (a single
     strategy that monitors the whole universe — unlike pairs, which is one
     strategy per pair)
@@ -616,12 +616,11 @@ def main():
              args.mode.upper(), today, args.system)
     log.info("=" * 60)
 
-    from core.kite_auth import KiteAuthManager
+    from core.broker import get_trading_client
     from core.kite_throttle import KiteRateLimiter, throttle_kite
 
     log.info("Authenticating...")
-    auth = KiteAuthManager(CONFIG_PATH)
-    kite = auth.get_kite()
+    kite = get_trading_client(CONFIG_PATH)
     kite_limiter = KiteRateLimiter(
         rate_per_sec=args.kite_rate_per_sec, burst=args.kite_burst,
     )

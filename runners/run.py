@@ -33,10 +33,9 @@ def main():
     logger.info("TALEB DYNAMIC HEDGER — Starting Up")
     logger.info("=" * 60)
 
-    from core.kite_auth import KiteAuthManager
-    logger.info("[1/3] Authenticating with Zerodha Kite...")
-    auth = KiteAuthManager(CONFIG_PATH)
-    kite = auth.get_kite()
+    from core.broker import get_trading_client
+    logger.info("[1/3] Authenticating with configured broker...")
+    kite = get_trading_client(CONFIG_PATH)
     profile = kite.profile()
     logger.info("Authenticated as: %s (%s)", profile["user_name"], profile["user_id"])
     logger.info("Exchanges: %s", ", ".join(profile["exchanges"]))

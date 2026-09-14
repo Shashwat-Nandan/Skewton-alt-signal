@@ -80,9 +80,20 @@ export const api = {
     http<void>("/session/login", { method: "POST", body: JSON.stringify({ password }) }),
   sessionLogout: () => http<void>("/session/logout", { method: "POST" }),
 
-  // Kite OAuth (the broker session, gated behind the dashboard session)
+  // Broker session (Zerodha OAuth or headless TOTP/MPIN), gated behind
+  // the dashboard password session.
   authStatus: () => http<AuthStatus>("/auth/status"),
-  loginUrl: () => http<{ login_url: string }>("/auth/login"),
+  loginUrl: () =>
+    http<{
+      broker: string;
+      display_name: string;
+      login_style: string;
+      login_url?: string | null;
+    }>("/auth/login"),
+  brokerLogin: () =>
+    http<{ status: string; broker: string; display_name: string }>("/auth/login", {
+      method: "POST",
+    }),
   logout: () => http<void>("/auth/logout", { method: "POST" }),
 
   listStrategies: () => http<StrategyInfo[]>("/strategies"),

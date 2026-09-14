@@ -159,6 +159,19 @@ class TestAuth:
         assert r.status_code == 200
         mock_clear.assert_called_once()
 
+    def test_status_includes_broker_identity(self, client):
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
+            r = client.get("/api/auth/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["broker"] == "zerodha"
+        assert body["login_style"] == "oauth"
+        assert body["display_name"]
+
+    def test_headless_login_rejected_for_zerodha(self, client):
+        r = client.post("/api/auth/login")
+        assert r.status_code == 400
+
 
 # ──────────────────────────────────────────────────────────
 # Runs lifecycle

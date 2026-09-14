@@ -88,6 +88,7 @@ class TestGating:
             ("POST", "/api/runs/some-id/stop"),
             ("GET", "/api/auth/status"),
             ("GET", "/api/auth/login"),
+            ("POST", "/api/auth/login"),
             ("POST", "/api/auth/logout"),
             ("GET", "/api/market-profile/symbols"),
             ("GET", "/api/market-profile/RELIANCE"),

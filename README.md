@@ -79,7 +79,8 @@ Top-level Python entry points (most are CLI scripts):
 | `core/screen_pairs.py` | Engle-Granger cointegration screen on NIFTY-50 stock futures |
 | `market_data/fetch_historical_data.py` / `market_data/fetch_bars.py` / `market_data/fetch_bhavcopy.py` / `market_data/fetch_bhavcopy_eq.py` / `market_data/fetch_fii_dii.py` | Data ingestion (option chains, 30-min bars, F&O bhavcopy, EQ bhavcopy, FII/DII cash flows) |
 | `core/market_profile.py` | TPO / value-area computation (pure, no I/O) |
-| `core/kite_auth.py` | Headless TOTP login (the dashboard uses OAuth instead — see below) |
+| `core/kite_auth.py` | Headless Zerodha TOTP login (the dashboard uses OAuth instead — see below) |
+| `core/broker/` | Broker adapter factory (`broker.name` in config.ini): Zerodha, Kotak Neo, Groww/Dhan (Groww/Dhan refuse until live-wired) |
 | `core/greeks_engine.py` / `core/risk_analyzer.py` / `core/trade_proposer.py` | Greeks, Taleb-style risk tooling, proposal generation |
 | `research/analyze_rv_iv_regime.py` / `core/variance_pnl_gate.py` | RV/IV regime gating |
 | `sweep_*.py` | Focused parameter grid runners |
@@ -105,9 +106,26 @@ pull from.
 
 ---
 
-## Two auth paths, one token cache
+## Broker adapter
 
-Kite has two ways in, and this repo uses both:
+Trading login and live orders go through `core.broker.get_trading_client`,
+selected by `[broker] name` in `config.ini`:
+
+| `name` | Login | Orders | Status |
+|---|---|---|---|
+| `zerodha` (default) | Headless TOTP + dashboard OAuth | Kite Connect (unchanged) | Live |
+| `kotak` | Headless TOTP + MPIN (Neo Trade API) | REST, Kite-shaped client (incl. F&O `instruments()` via scrip master) | Live (paper first) |
+| `groww` / `dhan` | Registered in the factory | **Refuse to login/order** | Not live-wired |
+
+Market-data CLIs (`market_data/fetch_*`, tick capture) still use Kite
+directly. Switching those is a later increment.
+
+Kotak credentials live in `[kotak]` (or `KOTAK_*` env vars). The dashboard
+never collects MPIN in the browser — headless login uses the host config.
+
+## Two auth paths, one token cache (Zerodha)
+
+Kite has two ways in, and this repo uses both when `broker.name = zerodha`:
 
 - **Headless TOTP** (`core/kite_auth.py`) — `.env` carries `KITE_USER_ID`,
   `KITE_PASSWORD`, `KITE_TOTP_KEY` (the 2FA seed). The script
@@ -121,7 +139,7 @@ Both write to the same `.kite_session.json` cache, so once either has
 authenticated the other can use the token until it expires
 (refreshed daily). Make sure the **Redirect URL** registered on the
 Kite developer console matches `KITE_REDIRECT_URL` in `.env`
-byte-for-byte.
+byte-for-byte. Kotak sessions cache separately at `.kotak_session.json`.
 
 ---
 

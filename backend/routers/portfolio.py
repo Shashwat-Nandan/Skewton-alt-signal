@@ -29,8 +29,11 @@ from scripts.portfolio_view import aggregate, collect, taleb_option_positions
 # resolution; import it rather than duplicate (drift risk, review §4.5b).
 from strategies.taleb_karpathy import _INDEX_SPOT_SYMBOLS
 
+from core.broker import get_broker, read_broker_name
+from core.broker.errors import BrokerConfigError
+
 from .. import kite_oauth
-from ..settings import REPO_ROOT
+from ..settings import REPO_ROOT, get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
@@ -130,13 +133,25 @@ def _broker_net(kite) -> Optional[List[BrokerPosition]]:
         return None
 
 
+def _session_client():
+    """Cached broker client for the configured adapter. Zerodha stays on
+    kite_oauth so existing tests that patch that boundary keep working."""
+    name = read_broker_name(str(get_settings().config_path))
+    if name != "zerodha":
+        try:
+            return get_broker(str(get_settings().config_path)).cached_client()
+        except BrokerConfigError:
+            return None
+    return kite_oauth.get_authenticated_kite()
+
+
 @router.get("/exposure", response_model=PortfolioResponse)
 def get_portfolio_exposure() -> PortfolioResponse:
     """Net exposure per underlying across all strategies, augmented with live
-    option delta + broker truth when a Kite session is available."""
+    option delta + broker truth when a broker session is available."""
     books = aggregate(collect(DATA_CACHE))
 
-    kite = kite_oauth.get_authenticated_kite()
+    kite = _session_client()
     session_present = kite is not None
     broker = _broker_net(kite) if session_present else None
     option_delta = _net_option_delta_by_underlying(kite) if session_present else {}

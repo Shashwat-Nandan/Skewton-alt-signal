@@ -2,11 +2,13 @@
 
 ## 1. What this is
 
-A single repository running **two parallel systems** against the same Zerodha
-Kite Connect account:
+A single repository running **two parallel systems** against the same
+configured broker account (Zerodha Kite by default; Kotak Neo via
+`[broker] name = kotak` in `config.ini` — see `core/broker/`):
 
 1. **Headless paper/live-trading + autoresearch daemons.** Run on a VPS under
-   `systemd`. Authenticate via TOTP (`core/kite_auth.py`) and run one strategy per
+   `systemd`. Authenticate via the broker adapter (`core.broker.get_trading_client`;
+   Zerodha still uses TOTP in `core/kite_auth.py`) and run one strategy per
    timer-driven runner through the trading session: Taleb-Karpathy
    (`runners/run_paper.py`), pair trading (`runners/run_paper_pairs.py` — a baseline and a
    persistent system, the latter with a real-money `pair-paper-persistent-live`
@@ -120,7 +122,8 @@ cache and (eventually) `data_cache/`.
 
 | File | Role |
 |---|---|
-| `core/kite_auth.py` | Screen-scrapes the Kite login (`POST /api/login` → `POST /api/twofa` with TOTP from `pyotp`) and exchanges `request_token` → `access_token` via the SDK. Caches to `.kite_session.json`. |
+| `core/broker/` | Factory over Zerodha / Kotak Neo / Groww / Dhan. Runners call `get_trading_client`; `[broker] name` in config.ini selects the adapter. Kotak `instruments("NFO")` is the Neo scrip-master CSV mapped to Kite-shaped rows (cached under `data_cache/kotak_scrip/`). Groww/Dhan refuse to login until live-wired. |
+| `core/kite_auth.py` | Zerodha leaf: screen-scrapes the Kite login (`POST /api/login` → `POST /api/twofa` with TOTP from `pyotp`) and exchanges `request_token` → `access_token` via the SDK. Caches to `.kite_session.json`. |
 | `runners/run_paper.py` | One trading session. Boots `TalebKarpathyStrategy(mode="paper")`, ticks every 60 s from 09:15 to 15:25 IST, flattens, writes the EOD report, exits. Per-day log file under `logs/`. |
 | `runners/run.py` | Long-running version that wires the autoresearch loop in addition to the hedger. Used by the live trading runner (`run_live.py` is a copy with the paper-mode guard removed; see `deploy/VPS_DEPLOYMENT.md` §7). |
 | `runners/run_autoresearch.py` + `runners/autoresearch_loop.py` | Karpathy-style Gaussian random-walk over `tunable_params`. Holds out the last 5-day window for validation. Writes `best_params.json` (top-3) and `results.tsv` (every experiment). |
