@@ -441,6 +441,9 @@ def _safe_seed(kite, token, book: IntradayTrendStrategy,
     try:
         return _seed_from_history(kite, token, book)
     except Exception as e:
+        from core.broker.errors import BrokerNotImplementedError
+        if isinstance(e, BrokerNotImplementedError):
+            raise
         logger.critical(
             "%s: could not seed the SMA window from history (%s) — the book "
             "will emit no signal until %d live bars have accumulated",

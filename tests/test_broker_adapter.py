@@ -23,14 +23,16 @@ from core.broker import (
     get_trading_client,
     read_broker_name,
 )
-from core.broker.kotak import KotakNeoClient
+from core.broker.kotak import KotakNeoClient, _extract_ltp
 from core.broker.kotak_instruments import match_scrip_url, parse_scrip_csv
 from core.broker.mapping import (
+    kite_exchange_from_segment,
     kite_to_kotak_tradingsymbol,
     kotak_segment,
     kotak_side,
     kotak_status,
     kotak_to_kite_tradingsymbol,
+    neo_index_quote_token,
 )
 
 
@@ -107,6 +109,21 @@ class TestFactory:
         with pytest.raises(BrokerConfigError, match="Credentials not configured"):
             get_broker(cfg)
 
+    def test_kotak_uat_environment_fails_loud(self, tmp_path):
+        cfg = _write_ini(
+            tmp_path / "c.ini",
+            "[broker]\nname = kotak\n"
+            "[kotak]\n"
+            "consumer_key = real-consumer\n"
+            "mobile_number = +919876543210\n"
+            "ucc = ABC123\n"
+            "mpin = 654321\n"
+            "totp_key = JBSWY3DPEHPK3PXP\n"
+            "environment = uat\n",
+        )
+        with pytest.raises(BrokerConfigError, match="not wired"):
+            get_broker(cfg)
+
 
 class TestMapping:
     def test_nfo_goes_to_nse_fo_not_cash(self):
@@ -142,6 +159,15 @@ class TestMapping:
         assert kotak_status("complete") == "COMPLETE"
         assert kotak_status("open pending") == "PENDING"
         assert kotak_status("rejected") == "REJECTED"
+
+    def test_segment_round_trip(self):
+        assert kite_exchange_from_segment("nse_fo") == "NFO"
+        assert kite_exchange_from_segment("nse_cm") == "NSE"
+
+    def test_index_spot_is_not_eq_suffix(self):
+        assert neo_index_quote_token("NSE", "NIFTY 50") == ("nse_cm", "Nifty 50")
+        assert neo_index_quote_token("NSE", "NIFTY BANK") == ("nse_cm", "Nifty Bank")
+        assert neo_index_quote_token("NSE", "RELIANCE") is None
 
 
 class TestKotakClient:
@@ -233,6 +259,179 @@ class TestKotakClient:
         body = client.session.request.call_args.kwargs["json"]
         assert body["mobileNumber"] == "+919999999999"
         assert body["totp"] == "123456"
+
+    def test_quote_uses_gateway_token_path_not_tradingsymbol(self):
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [{
+            "instrument_token": 999,
+            "tradingsymbol": "NIFTY25SEP25000CE",
+            "name": "NIFTY",
+            "instrument_type": "CE",
+            "lot_size": 75,
+            "exchange": "NFO",
+        }]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"exchange_token": "Nifty 50", "exchange": "nse_cm", "ltp": "22500.5"},
+            {"exchange_token": "999", "exchange": "nse_fo", "ltp": "120.4"},
+        ]
+        client.session.request.return_value = resp
+        quoted = client.quote(["NSE:NIFTY 50", "NFO:NIFTY25SEP25000CE"])
+        url = client.session.request.call_args[0][1]
+        assert url.startswith("https://gw-napi.kotaksecurities.com/")
+        assert "script-details/1.0/quotes/neosymbol/" in url
+        assert "nse_cm|Nifty" in url
+        assert "nse_fo|999" in url
+        assert "%7C" not in url
+        assert "NIFTY 50-EQ" not in url
+        assert "-EQ" not in url
+        assert quoted["NSE:NIFTY 50"]["last_price"] == 22500.5
+        assert quoted["NFO:NIFTY25SEP25000CE"]["last_price"] == 120.4
+        headers = client.session.request.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "consumer-key"
+        assert "Sid" not in headers
+        assert "Auth" not in headers
+
+    def test_extract_ltp_ignores_iv(self):
+        assert _extract_ltp({"iv": 0.15, "ltp": "12.5"}) == 12.5
+        assert _extract_ltp({"iv": 0.15}) is None
+        assert _extract_ltp({"data": {"ltp": "9.1", "iv": "0.2"}}) == 9.1
+
+    def test_positions_net_qty_exchange_and_kite_symbol(self):
+        client = self._client()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "data": [
+                {
+                    "exSeg": "nse_fo",
+                    "trdSym": "BHARTIARTL26APRFUT",
+                    "flBuyQty": "475",
+                    "flSellQty": "0",
+                    "cfBuyQty": "0",
+                    "cfSellQty": "0",
+                    "avgPrc": "1650.5",
+                    "prod": "NRML",
+                },
+                {
+                    "exSeg": "nse_fo",
+                    "trdSym": "NIFTY25SEPC25000",
+                    "flBuyQty": "0",
+                    "flSellQty": "75",
+                    "cfBuyQty": "0",
+                    "cfSellQty": "0",
+                    "avgPrc": "120.4",
+                    "prod": "NRML",
+                },
+            ]
+        }
+        client.session.request.return_value = resp
+        net = client.positions()["net"]
+        long_ = next(r for r in net if r["tradingsymbol"] == "BHARTIARTL26APRFUT")
+        assert long_["exchange"] == "NFO"
+        assert long_["quantity"] == 475
+        short = next(r for r in net if r["tradingsymbol"] == "NIFTY25SEP25000CE")
+        assert short["exchange"] == "NFO"
+        assert short["quantity"] == -75
+
+    def test_positions_missing_qty_fails_loud(self):
+        client = self._client()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "data": [{"exSeg": "nse_fo", "trdSym": "TCS26JULFUT"}]
+        }
+        client.session.request.return_value = resp
+        with pytest.raises(BrokerOrderError, match="no qty fields"):
+            client.positions()
+
+    def test_margins_maps_neo_net(self):
+        client = self._client()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "stat": "Ok",
+            "Net": "464000.5",
+            "CollateralValue": "38.19",
+            "MarginUsed": "18.78",
+            "SpanMarginPrsnt": "10",
+            "ExposureMarginPrsnt": "8",
+        }
+        client.session.request.return_value = resp
+        m = client.margins()
+        assert m["equity"]["net"] == 464000.5
+        assert m["equity"]["available"]["collateral"] == 38.19
+        assert m["equity"]["available"]["live_balance"] == 464000.5
+
+    def test_margins_missing_net_fails_loud(self):
+        client = self._client()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"stat": "Ok", "Category": "CLIENT_SPECIAL"}
+        client.session.request.return_value = resp
+        with pytest.raises(BrokerOrderError, match="no Net"):
+            client.margins()
+
+    def test_basket_order_margins_sums_check_margin(self):
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [{
+            "instrument_token": 52175,
+            "tradingsymbol": "NIFTY25SEP25000CE",
+            "lot_size": 75,
+            "exchange": "NFO",
+        }]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "data": {"reqdMrgn": "15000", "ordMrgn": "15000", "stat": "Ok"}
+        }
+        client.session.request.return_value = resp
+        basket = client.basket_order_margins([{
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY25SEP25000CE",
+            "transaction_type": "BUY",
+            "quantity": 75,
+            "price": 120.5,
+            "product": "NRML",
+            "order_type": "LIMIT",
+        }])
+        assert basket["initial"]["total"] == 15000.0
+        assert basket["final"]["total"] == 15000.0
+        form = client.session.request.call_args.kwargs["data"]
+        assert form["es"] == "nse_fo"
+        assert form["tk"] == "52175"
+        assert "quick/user/check-margin" in client.session.request.call_args[0][1]
+
+    def test_historical_data_maps_kite_interval_and_candles(self):
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [{
+            "instrument_token": 12346,
+            "tradingsymbol": "NIFTY25SEPFUT",
+            "exchange": "NFO",
+        }]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "status": "success",
+            "data": {
+                "candles": [
+                    ["2026-08-20T09:15:00+0530", 100.0, 101.0, 99.0, 100.5, 10, 0],
+                ]
+            },
+        }
+        client.session.get.return_value = resp
+        rows = client.historical_data(
+            12346, date(2026, 8, 1), date(2026, 8, 20), "5minute",
+        )
+        assert rows[0]["close"] == 100.5
+        assert rows[0]["open"] == 100.0
+        params = client.session.get.call_args.kwargs["params"]
+        assert params["interval"] == "5min"
+        assert params["neosymbol"] == "nse_fo|12346"
+        url = client.session.get.call_args[0][0]
+        assert url.startswith("https://gw-napi.kotaksecurities.com/")
+        assert "market-data/1.0/historical/details" in url
 
 
 class TestKotakAdapterLogin:
@@ -456,6 +655,17 @@ class TestKotakScripMaster:
         )
         assert nifty_fut["tradingsymbol"] == "NIFTY25SEPFUT"
         assert nifty_fut["expiry"] == date(2026, 7, 28)
+
+    def test_fo_missing_lot_is_skipped(self):
+        csv = (
+            "pSymbol,pExchSeg,pSymbolName,pTrdSymbol,pOptionType,pInstType,"
+            "dTickSize,lLotSize,pScripRefKey,dStrikePrice\n"
+            "1,nse_fo,NIFTY,NIFTY25SEPFUT,XX,FUTIDX,5,0,NIFTY28JUL26,0\n"
+            "2,nse_fo,NIFTY,NIFTY25SEPFUT,XX,FUTIDX,5,75,NIFTY28JUL26,0\n"
+        )
+        rows = parse_scrip_csv(csv, "NFO")
+        assert len(rows) == 1
+        assert rows[0]["lot_size"] == 75
 
     def test_html_download_fails_loud(self):
         with pytest.raises(BrokerOrderError, match="HTML"):

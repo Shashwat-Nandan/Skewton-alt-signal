@@ -17,7 +17,7 @@ import json
 import logging
 import os
 from configparser import ConfigParser
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote as urlquote
@@ -36,11 +36,14 @@ from .errors import (
 )
 from .kotak_instruments import match_scrip_url, parse_scrip_csv
 from .mapping import (
+    kite_exchange_from_segment,
     kite_to_kotak_tradingsymbol,
     kotak_order_type,
     kotak_segment,
     kotak_side,
     kotak_status,
+    kotak_to_kite_tradingsymbol,
+    neo_index_quote_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +66,20 @@ _PATHS = {
     "limits": "quick/user/limits",
     "quotes": "script-details/1.0/quotes/neosymbol/{neo_symbols}/{quote_type}",
     "scrip_master": "script-details/1.0/masterscrip/file-paths",
+    "margin": "quick/user/check-margin",
+    "historical_data": "market-data/1.0/historical/details",
+}
+
+_KITE_INTERVAL_TO_NEO = {
+    "minute": "1min",
+    "3minute": "3min",
+    "5minute": "5min",
+    "10minute": "10min",
+    "15minute": "15min",
+    "30minute": "30min",
+    "60minute": "60min",
+    "day": "D",
+    "week": "W",
 }
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -202,6 +219,76 @@ class KotakNeoClient:
     def limits(self) -> dict:
         return self._trade_json("GET", _PATHS["limits"])
 
+    def margins(self) -> dict:
+        """Kite-shaped RMS snapshot from Neo `limits()`.
+
+        Pair H15 gates on `equity.net` (Zerodha free-margin). Neo's `Net`
+        is the equivalent; missing it must not look like ₹0 of cash.
+        """
+        raw = self.limits()
+        inner = _unwrap_data(raw)
+        if "Net" not in inner and "net" not in inner:
+            raise BrokerOrderError(
+                f"Kotak limits() had no Net field: {list(inner)[:12]}"
+            )
+        net = float(inner.get("Net") if inner.get("Net") is not None else inner.get("net") or 0)
+        collateral = float(
+            inner.get("CollateralValue") or inner.get("Collateral") or 0
+        )
+        used = float(inner.get("MarginUsed") or inner.get("MarginUsedPrsnt") or 0)
+        return {
+            "equity": {
+                "enabled": True,
+                "net": net,
+                "available": {
+                    "live_balance": net,
+                    "collateral": collateral,
+                    "cash": net,
+                },
+                "utilised": {
+                    "debits": used,
+                    "span": float(inner.get("SpanMarginPrsnt") or 0),
+                    "exposure": float(inner.get("ExposureMarginPrsnt") or 0),
+                },
+            }
+        }
+
+    def basket_order_margins(self, params, consider_positions=True) -> dict:
+        """Sum of Neo per-order `check-margin`. No native basket endpoint.
+
+        Returns the Kite `{initial,final}.total` shape pair H15 reads.
+        `consider_positions` is ignored: Neo RMS already includes the book.
+        """
+        del consider_positions
+        if not params:
+            return {"initial": {"total": 0.0}, "final": {"total": 0.0}}
+        total = 0.0
+        for p in params:
+            token = self._token_for(p["exchange"], p["tradingsymbol"])
+            data = self._trade_json(
+                "POST",
+                _PATHS["margin"],
+                form={
+                    "es": kotak_segment(p["exchange"]),
+                    "pr": _fmt_price(p.get("price") or 0),
+                    "pt": kotak_order_type(p.get("order_type") or "LIMIT"),
+                    "pc": p.get("product") or "NRML",
+                    "qt": str(int(p["quantity"])),
+                    "tk": str(token),
+                    "tt": kotak_side(p["transaction_type"]),
+                },
+            )
+            inner = _unwrap_data(data)
+            mrgn = _first_float(
+                inner, "reqdMrgn", "ordMrgn", "totMrgnUsd", "mrgnUsd",
+            )
+            if mrgn is None:
+                raise BrokerOrderError(
+                    f"Kotak check-margin had no margin figure: {list(inner)[:12]}"
+                )
+            total += mrgn
+        return {"initial": {"total": total}, "final": {"total": total}}
+
     def place_order(
         self,
         variety="regular",
@@ -272,18 +359,51 @@ class KotakNeoClient:
         return kite_rows
 
     def quote(self, keys) -> dict:
-        out: Dict[str, dict] = {}
+        """Official Quotes API: gateway + `segment|instrument_token`.
+
+        Index spots (`NSE:NIFTY 50`) use the index name as the token.
+        Everything else looks up `pSymbol` from the scrip master. Hits
+        `LOGIN_BASE` with consumer_key only — not the order `base_url`.
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+        identities = []
         for key in keys:
             exchange, symbol = _split_quote_key(key)
-            kotak_sym = kite_to_kotak_tradingsymbol(exchange, symbol)
-            seg = kotak_segment(exchange)
-            neo_symbol = urlquote(f"{seg}|{kotak_sym}", safe="")
-            path = _PATHS["quotes"].format(neo_symbols=neo_symbol, quote_type="ltp")
-            data = self._trade_json("GET", path)
-            ltp = _extract_ltp(data)
-            if ltp is None:
-                raise BrokerOrderError(f"Kotak quote for {key} had no LTP: {data}")
-            out[key] = {"last_price": ltp}
+            seg, token = self._quote_identity(exchange, symbol)
+            identities.append((key, seg, token))
+        out: Dict[str, dict] = {}
+        for i in range(0, len(identities), 50):
+            batch = identities[i:i + 50]
+            joined = ",".join(f"{seg}|{tok}" for _, seg, tok in batch)
+            path = _PATHS["quotes"].format(
+                neo_symbols=urlquote(joined, safe="|,"),
+                quote_type="ltp",
+            )
+            url = f"{self.login_base}/{path}"
+            data = self._request_json(
+                "GET", url, headers=self._scrip_headers(),
+            )
+            rows = _quote_rows(data)
+            by_token = {}
+            for row in rows:
+                tok = str(row.get("exchange_token") or row.get("instrument_token") or "")
+                seg = str(row.get("exchange") or row.get("exchange_segment") or "").lower()
+                by_token[(seg, tok)] = row
+            for key, seg, tok in batch:
+                row = by_token.get((seg.lower(), str(tok))) or by_token.get(("", str(tok)))
+                if row is None and len(rows) == 1:
+                    row = rows[0]
+                ltp = _extract_ltp(row) if row is not None else _extract_ltp(data)
+                if ltp is None:
+                    raise BrokerOrderError(
+                        f"Kotak quote for {key} ({seg}|{tok}) had no LTP"
+                    )
+                out[key] = {"last_price": ltp}
+                if isinstance(row, dict) and row.get("ohlc"):
+                    out[key]["ohlc"] = row["ohlc"]
+                if isinstance(row, dict) and row.get("depth"):
+                    out[key]["depth"] = row["depth"]
         return out
 
     def ltp(self, keys) -> dict:
@@ -295,6 +415,54 @@ class KotakNeoClient:
         rows = _extract_list(data)
         net = [_kotak_position_row(r) for r in rows]
         return {"net": net, "day": []}
+
+    def historical_data(
+        self, instrument_token, from_date, to_date, interval,
+        continuous=False, oi=False,
+    ):
+        """Kite-shaped candles from Neo `market-data/1.0/historical/details`.
+
+        Consumer-key only (no Trade token). `interval` is Kite's
+        (`5minute`); mapped to Neo's (`5min`).
+        """
+        del continuous, oi
+        token = str(int(instrument_token))
+        _row, exch = self._row_for_token(int(instrument_token))
+        seg = kotak_segment(exch)
+        neo_iv = _KITE_INTERVAL_TO_NEO.get((interval or "").strip())
+        if not neo_iv:
+            raise BrokerOrderError(
+                f"No Kotak interval for Kite interval {interval!r}."
+            )
+        params = {
+            "neosymbol": f"{seg}|{token}",
+            "interval": neo_iv,
+            "from_date": _fmt_day(from_date),
+            "to_date": _fmt_day(to_date),
+        }
+        url = f"{self.login_base}/{_PATHS['historical_data']}"
+        try:
+            resp = self.session.get(
+                url, headers=self._scrip_headers(), params=params, timeout=60,
+            )
+        except requests.RequestException as e:
+            raise BrokerNetworkError(f"Kotak historical_data failed: {e}") from e
+        if resp.status_code == 403:
+            raise BrokerTokenError("Kotak historical_data rejected (403)")
+        if resp.status_code >= 400:
+            raise BrokerNetworkError(
+                f"Kotak historical_data HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            raise BrokerNetworkError("Kotak historical_data returned non-JSON") from e
+        candles = _historical_candles(payload)
+        if not candles:
+            raise BrokerOrderError(
+                f"Kotak historical_data for {seg}|{token} returned no candles"
+            )
+        return candles
 
     def holdings(self) -> list:
         data = self._trade_json("GET", _PATHS["holdings"])
@@ -377,6 +545,37 @@ class KotakNeoClient:
             "neo-fin-key": self.neo_fin_key,
             "Accept": "application/json",
         }
+
+    def _quote_identity(self, exchange: str, symbol: str) -> tuple[str, str]:
+        indexed = neo_index_quote_token(exchange, symbol)
+        if indexed is not None:
+            return indexed
+        token = self._token_for(exchange, symbol)
+        return kotak_segment(exchange), str(token)
+
+    def _token_for(self, exchange: str, tradingsymbol: str) -> str:
+        rows = self.instruments(exchange)
+        for r in rows:
+            if r.get("tradingsymbol") == tradingsymbol:
+                tok = r.get("instrument_token")
+                if tok:
+                    return str(tok)
+        raise BrokerOrderError(
+            f"No Kotak scrip token for {exchange}:{tradingsymbol}. "
+            "Scrip master loaded but the contract is missing."
+        )
+
+    def _row_for_token(self, token: int) -> tuple[dict, str]:
+        for exch in ("NFO", "NSE", "BFO", "BSE"):
+            for r in self.instruments(exch):
+                try:
+                    if int(r.get("instrument_token") or 0) == int(token):
+                        return r, exch
+                except (TypeError, ValueError):
+                    continue
+        raise BrokerOrderError(
+            f"No Kotak scrip for instrument_token={token}"
+        )
 
     def logout_remote(self) -> None:
         try:
@@ -519,6 +718,12 @@ class KotakNeoAdapter(BrokerAdapter):
             )
             or "prod"
         ).strip().lower()
+        if self.environment != "prod":
+            raise BrokerConfigError(
+                f"Kotak environment={self.environment!r} is not wired. "
+                "Only prod is supported (UAT uses different login hosts "
+                "and paths). Set [kotak] environment = prod or omit it."
+            )
         reject_placeholders({
             "consumer_key": self.consumer_key,
             "mobile_number": self.mobile_number,
@@ -673,22 +878,54 @@ def _extract_order_id(payload: dict) -> Optional[str]:
     return None
 
 
-def _extract_ltp(payload: dict) -> Optional[float]:
-    inner = _unwrap_data(payload)
-    for key in ("ltp", "last_traded_price", "lastPrice", "iv"):
+def _extract_ltp(payload) -> Optional[float]:
+    if payload is None:
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            ltp = _extract_ltp(item)
+            if ltp is not None:
+                return ltp
+        return None
+    inner = _unwrap_data(payload) if isinstance(payload, dict) else {}
+    if not isinstance(inner, dict):
+        inner = payload if isinstance(payload, dict) else {}
+    for key in ("ltp", "last_traded_price", "lastPrice"):
         if inner.get(key) not in (None, ""):
             try:
                 return float(inner[key])
             except (TypeError, ValueError):
                 continue
-    # Some quote payloads nest per-symbol.
-    if isinstance(inner, dict):
-        for v in inner.values():
-            if isinstance(v, dict) and v.get("ltp") not in (None, ""):
-                try:
-                    return float(v["ltp"])
-                except (TypeError, ValueError):
-                    continue
+    for v in inner.values() if isinstance(inner, dict) else []:
+        if isinstance(v, dict) and v.get("ltp") not in (None, ""):
+            try:
+                return float(v["ltp"])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _quote_rows(payload) -> list:
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+        if isinstance(data, dict):
+            return [data]
+        if payload.get("ltp") is not None:
+            return [payload]
+    return []
+
+
+def _first_float(row: dict, *keys) -> Optional[float]:
+    for k in keys:
+        if k in row and row[k] not in (None, ""):
+            try:
+                return float(row[k])
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -708,14 +945,31 @@ def _kotak_history_row(row: dict) -> dict:
 
 
 def _kotak_position_row(row: dict) -> dict:
-    qty = row.get("flBuyQty") or row.get("quantity") or row.get("netQty") or 0
-    try:
-        quantity = int(float(qty))
-    except (TypeError, ValueError):
-        quantity = 0
+    """Kite-shaped net position. Qty is shares: (cf+fl buy) − (cf+fl sell)."""
+    buy_cf = _first_float(row, "cfBuyQty")
+    buy_fl = _first_float(row, "flBuyQty")
+    sell_cf = _first_float(row, "cfSellQty")
+    sell_fl = _first_float(row, "flSellQty")
+    net_direct = _first_float(row, "netQty", "quantity")
+    if all(v is None for v in (buy_cf, buy_fl, sell_cf, sell_fl, net_direct)):
+        raise BrokerOrderError(
+            f"Kotak position row has no qty fields: {list(row)[:12]}"
+        )
+    if any(v is not None for v in (buy_cf, buy_fl, sell_cf, sell_fl)):
+        quantity = int(
+            (buy_cf or 0) + (buy_fl or 0) - (sell_cf or 0) - (sell_fl or 0)
+        )
+    else:
+        quantity = int(net_direct or 0)
+    seg = row.get("exSeg") or row.get("exch") or ""
+    trd = row.get("trdSym") or row.get("tradingsymbol") or ""
+    exchange = kite_exchange_from_segment(seg) if seg else ""
+    tradingsymbol = (
+        kotak_to_kite_tradingsymbol(seg, trd) if trd else ""
+    )
     return {
-        "tradingsymbol": row.get("trdSym") or row.get("tradingsymbol") or "",
-        "exchange": row.get("exch") or "",
+        "tradingsymbol": tradingsymbol,
+        "exchange": exchange,
         "quantity": quantity,
         "average_price": float(row.get("avgPrc") or row.get("average_price") or 0),
         "last_price": float(row.get("ltp") or row.get("last_price") or 0),
@@ -738,6 +992,56 @@ def _fmt_price(price) -> str:
         return f"{float(price):.2f}"
     except (TypeError, ValueError):
         return "0.00"
+
+
+def _fmt_day(value) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10]
+
+
+def _historical_candles(payload) -> list:
+    inner = payload.get("data") if isinstance(payload, dict) else payload
+    rows = []
+    if isinstance(inner, dict):
+        rows = inner.get("candles") or inner.get("data") or []
+    elif isinstance(inner, list):
+        rows = inner
+    out = []
+    for row in rows:
+        if isinstance(row, (list, tuple)) and len(row) >= 5:
+            ts, o, h, l, c = row[0], row[1], row[2], row[3], row[4]
+            vol = row[5] if len(row) > 5 else 0
+            oi = row[6] if len(row) > 6 else 0
+        elif isinstance(row, dict):
+            ts = row.get("timestamp") or row.get("date") or row.get("time")
+            o, h, l, c = row.get("open"), row.get("high"), row.get("low"), row.get("close")
+            vol = row.get("volume") or 0
+            oi = row.get("oi") or 0
+        else:
+            continue
+        out.append({
+            "date": _parse_candle_ts(ts),
+            "open": float(o),
+            "high": float(h),
+            "low": float(l),
+            "close": float(c),
+            "volume": int(float(vol or 0)),
+            "oi": int(float(oi or 0)),
+        })
+    return out
+
+
+def _parse_candle_ts(raw):
+    text = str(raw).strip()
+    if text.endswith("+0530"):
+        text = text[:-5] + "+05:30"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return text
 
 
 def _is_not_ok(payload: dict) -> bool:

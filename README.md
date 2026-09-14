@@ -114,7 +114,7 @@ selected by `[broker] name` in `config.ini`:
 | `name` | Login | Orders | Status |
 |---|---|---|---|
 | `zerodha` (default) | Headless TOTP + dashboard OAuth | Kite Connect (unchanged) | Live |
-| `kotak` | Headless TOTP + MPIN (Neo Trade API) | REST, Kite-shaped client (incl. F&O `instruments()` via scrip master) | Live (paper first) |
+| `kotak` | Headless TOTP + MPIN (Neo Trade API) | Full trading surface: orders, quotes (gateway + token), positions, margins, historical candles, F&O `instruments()` | Paper first, then live |
 | `groww` / `dhan` | Registered in the factory | **Refuse to login/order** | Not live-wired |
 
 Market-data CLIs (`market_data/fetch_*`, tick capture) still use Kite

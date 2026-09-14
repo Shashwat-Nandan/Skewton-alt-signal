@@ -22,6 +22,20 @@ KITE_EXCHANGE_TO_KOTAK_SEGMENT = {
     "CDS": "cde_fo",
 }
 
+KOTAK_SEGMENT_TO_KITE_EXCHANGE = {
+    v: k for k, v in KITE_EXCHANGE_TO_KOTAK_SEGMENT.items()
+}
+
+# Kite quote keys for index spots. Neo's quotes API wants the index *name*
+# as the token (WsToken("nse_cm", "Nifty 50")), not RELIANCE-style -EQ.
+KITE_INDEX_SPOT_TO_NEO = {
+    "NIFTY 50": ("nse_cm", "Nifty 50"),
+    "NIFTY BANK": ("nse_cm", "Nifty Bank"),
+    "NIFTY": ("nse_cm", "Nifty 50"),
+    "BANKNIFTY": ("nse_cm", "Nifty Bank"),
+    "SENSEX": ("bse_cm", "SENSEX"),
+}
+
 KITE_ORDER_TYPE_TO_KOTAK = {
     "LIMIT": "L",
     "MARKET": "MKT",
@@ -54,6 +68,24 @@ def kotak_segment(exchange: str) -> str:
             f"No Kotak exchange_segment for Kite exchange {exchange!r}. "
             "Refusing to guess cash vs F&O."
         ) from e
+
+
+def kite_exchange_from_segment(exchange_segment: str) -> str:
+    key = (exchange_segment or "").strip().lower()
+    try:
+        return KOTAK_SEGMENT_TO_KITE_EXCHANGE[key]
+    except KeyError as e:
+        raise BrokerOrderError(
+            f"No Kite exchange for Kotak segment {exchange_segment!r}."
+        ) from e
+
+
+def neo_index_quote_token(exchange: str, tradingsymbol: str):
+    """Return (nse_cm, 'Nifty 50') for index spots, else None."""
+    if (exchange or "").strip().upper() not in ("NSE", "BSE"):
+        return None
+    key = " ".join((tradingsymbol or "").split()).upper()
+    return KITE_INDEX_SPOT_TO_NEO.get(key)
 
 
 def kotak_order_type(order_type: str) -> str:

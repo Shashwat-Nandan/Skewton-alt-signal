@@ -131,7 +131,12 @@ def scrip_row_to_kite(raw: dict, kite_exchange: str) -> Optional[dict]:
     if inst_type in ("FUT", "CE", "PE") and expiry is None:
         return None
     strike = _parse_strike(row, inst_type)
-    lot = _parse_int(_first(row, "lLotSize", "iLotSize", "iBoardLotQty")) or 1
+    lot = _parse_int(_first(row, "lLotSize", "iLotSize", "iBoardLotQty"))
+    if inst_type in ("FUT", "CE", "PE"):
+        if lot is None or lot <= 0:
+            return None
+    else:
+        lot = lot or 1
     tick = _parse_tick(_first(row, "dTickSize"))
     token = _parse_int(_first(row, "pSymbol")) or 0
     exchange = kite_exchange.upper()
