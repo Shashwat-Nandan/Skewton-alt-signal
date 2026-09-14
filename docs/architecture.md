@@ -18,15 +18,16 @@ configured broker account (Zerodha Kite by default; Kotak Neo via
    Going live is documented in `deploy/VPS_DEPLOYMENT.md` §7 (least-privilege
    user migration in §6.5).
 2. **Browser dashboard.** A FastAPI backend + React SPA. Authenticates via
-   Kite OAuth. Lets a user pick a strategy (Taleb-Karpathy, Pair Trading,
-   Arbitrage, or Equity Swing), pick a mode (signals-only or paper), and watch
-   live signals / trades / P&L. Live trading from the dashboard is
+   the configured broker (Kite OAuth when `broker.name = zerodha`; server-side
+   TOTP+MPIN when `kotak`). Lets a user pick a strategy (Taleb-Karpathy, Pair
+   Trading, Arbitrage, or Equity Swing), pick a mode (signals-only or paper),
+   and watch live signals / trades / P&L. Live trading from the dashboard is
    unconditionally rejected.
 
 Both share:
 
 - the **strategy implementations** in `strategies/`,
-- the **Kite session token cache** at `.kite_session.json`,
+- the **broker session cache** (`.kite_session.json` or `.kotak_session.json`),
 - and the **research artefacts** under `data_cache/` (instrument masters,
   bhav copies, IV history, screener output).
 
@@ -122,21 +123,22 @@ cache and (eventually) `data_cache/`.
 
 | File | Role |
 |---|---|
-| `core/broker/` | Factory over Zerodha / Kotak Neo / Groww / Dhan. Runners call `get_trading_client`; `[broker] name` in config.ini selects the adapter. Kotak `instruments("NFO")` is the Neo scrip-master CSV mapped to Kite-shaped rows (cached under `data_cache/kotak_scrip/`). Groww/Dhan refuse to login until live-wired. |
+| `core/broker/` | Factory over Zerodha / Kotak Neo / Groww / Dhan. Runners call `get_trading_client`; `[broker] name` in config.ini selects the adapter. Kotak is a complete trading client (orders, gateway quotes, positions, margins, historical candles, F&O scrip master). Groww/Dhan refuse to login until live-wired. See [`broker.md`](./broker.md). |
 | `core/kite_auth.py` | Zerodha leaf: screen-scrapes the Kite login (`POST /api/login` → `POST /api/twofa` with TOTP from `pyotp`) and exchanges `request_token` → `access_token` via the SDK. Caches to `.kite_session.json`. |
 | `runners/run_paper.py` | One trading session. Boots `TalebKarpathyStrategy(mode="paper")`, ticks every 60 s from 09:15 to 15:25 IST, flattens, writes the EOD report, exits. Per-day log file under `logs/`. |
 | `runners/run.py` | Long-running version that wires the autoresearch loop in addition to the hedger. Used by the live trading runner (`run_live.py` is a copy with the paper-mode guard removed; see `deploy/VPS_DEPLOYMENT.md` §7). |
 | `runners/run_autoresearch.py` + `runners/autoresearch_loop.py` | Karpathy-style Gaussian random-walk over `tunable_params`. Holds out the last 5-day window for validation. Writes `best_params.json` (top-3) and `results.tsv` (every experiment). |
 
-**Auth lifetime.** Kite tokens expire ~06:00 IST next day. Both flows
-re-authenticate on the next invocation if `_is_token_valid()` fails.
+**Auth lifetime.** Zerodha tokens expire ~06:00 IST next day; Kotak
+sessions are the same calendar-day cache plus a `limits()` probe. Runners
+re-authenticate on the next invocation if the cache is stale.
 
 ### 3.2 Browser dashboard
 
 | Component | Role |
 |---|---|
 | `backend/main.py` | FastAPI app factory + lifespan handler (initialises SQLite schema, hydrates orphan runs to STOPPED, cancels live tasks on shutdown). |
-| `backend/kite_oauth.py` | OAuth redirect flow: `get_login_url()` → user authenticates on Kite → `/api/auth/callback` exchanges `request_token` → cached in `.kite_session.json` (same path as the TOTP daemon — one cache serves both). |
+| `backend/routers/auth.py` | Broker-aware login: Zerodha still uses `kite_oauth` (OAuth URL + callback). Kotak is `POST /api/auth/login` using host `config.ini` (MPIN never leaves the server). |
 | `backend/run_manager.py` | In-memory `RunManager` that owns one asyncio task per active run. Per-tick: calls strategy `scan_and_propose` + `check_and_rehedge`, writes proposals + PnL snapshot to SQLite. |
 | `backend/routers/` | Three thin routers (`auth`, `strategies`, `runs`) — the only public API surface. |
 | `frontend/src/` | React 18 + TS + Tailwind + shadcn primitives. Two pages (Home, RunPage). Polls `/api/runs/{id}` every 2 s while `RUNNING`. |
@@ -267,12 +269,12 @@ backend/
 ├── __init__.py
 ├── main.py            # app factory, lifespan, CORS, router mount
 ├── settings.py        # pydantic-settings loaded from .env
-├── kite_oauth.py      # browser OAuth flow
+├── kite_oauth.py      # Zerodha browser OAuth (Kotak is headless via routers/auth.py)
 ├── run_manager.py     # in-memory Run + RunManager + async tick loop
 ├── db.py              # sqlite3 schema + helpers
 ├── routers/
 │   ├── __init__.py
-│   ├── auth.py        # /api/auth/{status,login,callback,logout}
+│   ├── auth.py        # /api/auth/{status,login,callback,logout} (broker-aware)
 │   ├── strategies.py  # /api/strategies, /api/strategies/{name}/params
 │   └── runs.py        # /api/runs, /api/runs/{id}, /api/runs/{id}/stop
 └── README.md          # OAuth setup checklist
@@ -405,41 +407,26 @@ useEffect:
 
 ## 7. Authentication
 
-Two flows, one cache file.
+`[broker] name` in `config.ini` selects the adapter (`core.broker`). Runners
+always call `get_trading_client`. The dashboard dispatches on `login_style`.
 
-```
-                ┌────────────────────────────────────────────┐
-                │   .kite_session.json                        │
-                │   {access_token, timestamp, user_id, ...}   │
-                └────────────────┬───────────────────────────┘
-                     ▲           │           ▲
-       writes/reads  │           │           │  writes/reads
-                     │           │           │
-        ┌────────────┴───┐       │       ┌───┴────────────────┐
-        │ core/kite_auth.py   │       │       │ backend/kite_oauth │
-        │  TOTP scrape   │       │       │  OAuth redirect    │
-        │  (headless)    │       │       │  (browser)         │
-        └────────────────┘       │       └────────────────────┘
-                     ▲           │           ▲
-                     │           │           │
-           run_paper / run /     │       /api/auth/login →
-           run_autoresearch      │       /api/auth/callback
-                                 │
-                          (used by both)
-```
+**Zerodha** (`name = zerodha`, default) still has two flows sharing
+`.kite_session.json`:
 
 | | TOTP path | OAuth path |
 |---|---|---|
-| Used by | `runners/run_paper.py`, `runners/run.py`, `runners/run_autoresearch.py` | Dashboard `POST /api/runs` |
-| Trigger | Process startup | User clicks "Login with Kite" |
-| Inputs | `KITE_USER_ID`, `KITE_PASSWORD`, `KITE_TOTP_KEY` from `.env` | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` from `.env` |
-| Mechanism | POST to `/api/login` + `/api/twofa` with auto-generated TOTP | Browser-side redirect to `kite.zerodha.com/connect/login`, callback exchanges request_token |
+| Used by | Headless runners | Dashboard `GET /api/auth/login` |
+| Inputs | `KITE_USER_ID`, `KITE_PASSWORD`, `KITE_TOTP_KEY` | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` |
+| Mechanism | `core/kite_auth.py` POST `/api/login` + `/api/twofa` | Browser redirect to Kite; `/api/auth/callback` exchanges `request_token` |
 | Token validity | ~24h (expires ~06:00 IST next day) | Same |
-| Suitable for | Unattended VPS daemon | Operator at a browser |
 
-Both update the same `.kite_session.json`. If you log in via the dashboard,
-the next paper-trade run picks up that token — no second auth needed
-(until expiry).
+**Kotak Neo** (`name = kotak`) is headless TOTP+MPIN only
+(`core/broker/kotak.py`). Cache: `.kotak_session.json` (mode 0600). The
+dashboard button POSTs `/api/auth/login` using host `config.ini` — MPIN
+never goes through the browser. Only `environment = prod` is wired.
+
+Groww/Dhan are registered and refuse at `login()`. Operator setup is in
+[`broker.md`](./broker.md).
 
 ---
 
@@ -846,7 +833,8 @@ internet. HTTPS is managed by certbot's nginx plugin.
 ├── core/greeks_engine.py               # Black-Scholes + IV bisection
 ├── core/trade_proposer.py              # TradeProposal dataclass + ATM straddle proposer
 ├── core/risk_analyzer.py               # MC, bleed, stability
-├── core/kite_auth.py                   # TOTP login (headless daemon path)
+├── core/broker/                        # adapter factory (zerodha / kotak / groww / dhan)
+├── core/kite_auth.py                   # Zerodha TOTP leaf (headless daemon path)
 ├── runners/run.py / runners/run_paper.py / runners/run_autoresearch.py  # entry points
 ├── research/backtest.py                    # MockKite + replay
 ├── market_data/fetch_historical_data.py       # Kite intraday fetcher

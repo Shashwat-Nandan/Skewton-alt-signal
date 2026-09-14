@@ -1,7 +1,8 @@
 # skewton-signal
 
-Automated options-portfolio management for Indian derivatives via the
-Zerodha Kite API, built on Nassim Taleb's *Dynamic Hedging* framework
+Automated options-portfolio management for Indian derivatives via a
+pluggable broker adapter (Zerodha Kite by default; Kotak Neo when
+`[broker] name = kotak`), built on Nassim Taleb's *Dynamic Hedging* framework
 (delta-neutral positioning, gamma scalping, vega/theta management) plus
 an Andrej-Karpathy-style autoresearch loop for unattended parameter
 tuning.
@@ -108,20 +109,12 @@ pull from.
 
 ## Broker adapter
 
-Trading login and live orders go through `core.broker.get_trading_client`,
-selected by `[broker] name` in `config.ini`:
+See [`docs/broker.md`](docs/broker.md) for the toggle, Kotak Neo setup
+(consumer key / TOTP / MPIN), and what still stays on Kite.
 
-| `name` | Login | Orders | Status |
-|---|---|---|---|
-| `zerodha` (default) | Headless TOTP + dashboard OAuth | Kite Connect (unchanged) | Live |
-| `kotak` | Headless TOTP + MPIN (Neo Trade API) | Full trading surface: orders, quotes (gateway + token), positions, margins, historical candles, F&O `instruments()` | Paper first, then live |
-| `groww` / `dhan` | Registered in the factory | **Refuse to login/order** | Not live-wired |
-
-Market-data CLIs (`market_data/fetch_*`, tick capture) still use Kite
-directly. Switching those is a later increment.
-
-Kotak credentials live in `[kotak]` (or `KOTAK_*` env vars). The dashboard
-never collects MPIN in the browser — headless login uses the host config.
+Trading login and orders go through `core.broker.get_trading_client`,
+selected by `[broker] name` in `config.ini` (`zerodha` default; `kotak`
+is a complete trading surface; `groww` / `dhan` refuse until live-wired).
 
 ## Two auth paths, one token cache (Zerodha)
 
@@ -151,6 +144,7 @@ This README is a map. The detailed docs are:
 | --- | --- |
 | Docs index (per-strategy + per-cron deep-dives) | [`docs/README.md`](docs/README.md) |
 | System topology, subsystems, data flow | [`docs/architecture.md`](docs/architecture.md) |
+| Broker toggle (Zerodha / Kotak Neo / Groww / Dhan) | [`docs/broker.md`](docs/broker.md) |
 | Taleb's framework: shadow gamma, rehedging rules, Indian-market adaptations | [`docs/strategies/taleb_framework.md`](docs/strategies/taleb_framework.md) |
 | Autoresearch loop: mutation strategy, hold-out, safety rails | [`docs/research/autoresearch_pattern.md`](docs/research/autoresearch_pattern.md) |
 | The hedger as a packaged "skill" + Taleb compliance checklist | [`SKILL.md`](SKILL.md) |

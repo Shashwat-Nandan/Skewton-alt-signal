@@ -113,7 +113,7 @@ The runner is a single straight-line process per session:
 | Phase | Wall clock | What happens | Source |
 |---|---|---|---|
 | Boot | 09:10 | Setup logging, parse args, load `holidays.csv` | `runners/run_paper.py:_setup_logging`, `:load_holidays` |
-| Auth | 09:10 | TOTP auto-login via `kite_auth.KiteAuthManager` | `runners/run_paper.py` (auth block) |
+| Auth | 09:10 | `core.broker.get_trading_client` (`[broker] name`; Zerodha TOTP or Kotak TOTP+MPIN) | `runners/run_paper.py` (auth block) |
 | Restore | 09:10 | If `data_cache/taleb_paper_state.json` exists, call `restore_state(blob)` | `strategies/taleb_karpathy.py:935` |
 | Backup | 09:10 | `_state_backup.archive_state_backup` rolls a snapshot ring | `runners/run_paper.py:36` |
 | Wait | 09:10–09:15 | Sleep to the bell | `runners/run_paper.py` (wait loop) |
@@ -573,7 +573,7 @@ on nonzero exit.
 | `core/trade_proposer.py` | `TradeProposal` dataclass, `propose_delta_neutral` / `propose_for_structure` |
 | `core/regime_classifier.py` | Phase 3.1 structure routing |
 | `core/variance_pnl_gate.py` | Auxiliary variance/PnL gating |
-| `core/kite_auth.py` | TOTP auto-login |
+| `core/broker/` | Adapter factory (`get_trading_client`); Kotak Neo is a complete trading client |
 | `config.ini` | All defaults under `[strategy]` |
 | `best_params.json` | Autoresearch overlay (applied at boot) |
 | `holidays.csv` | Self-gates the runner |

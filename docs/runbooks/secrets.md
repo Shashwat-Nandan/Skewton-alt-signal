@@ -9,7 +9,7 @@ Companion to [`SECURITY.md`](../../SECURITY.md). This records **who holds what**
 | Kite `api_key` / `api_secret` | broker auth (`core/kite_auth.py` / `core/broker`) | `config.ini` (local + VPS, `chmod 600`) |
 | Kite `totp_key` (TOTP seed) | automated login | `config.ini` / `.env` |
 | Kite `user_id` / `password` | login | `config.ini` |
-| Kotak `consumer_key` / `mobile_number` / `ucc` / `mpin` / `totp_key` | Kotak Neo login (`core/broker/kotak.py`) | `config.ini` / `KOTAK_*` env |
+| Kotak `consumer_key` / `mobile_number` / `ucc` / `mpin` / `totp_key` | Kotak Neo login (`core/broker/kotak.py`) | `config.ini` / `KOTAK_*` env; session `.kotak_session.json` (0600) |
 | Groww / Dhan API keys | registered, not live-wired | `config.ini` / `GROWW_*` / `DHAN_*` — fill only when those adapters ship |
 | `DASHBOARD_URL`, `KITE_REDIRECT_URL` | OAuth flow | `.env` |
 | Telegram / notify tokens (if used) | `notify-failure.sh`, `pair-eod-telegram.sh` | `.env` / systemd env |
@@ -21,8 +21,9 @@ Companion to [`SECURITY.md`](../../SECURITY.md). This records **who holds what**
 - Rotation cadence: ____ (recommend at least every 90 days and on any suspected exposure)
 
 ## Rotate a credential
-1. Generate/reset the new value in the source system (Kite developer console for
-   API key/secret; reset password/TOTP as applicable).
+1. Generate/reset the new value in the source system (Kite developer console
+   for API key/secret; Neo app → Trade API for Kotak consumer key / TOTP;
+   reset password/MPIN/TOTP as applicable).
 2. Update `config.ini` / `.env` **locally** and on the **VPS** (`chmod 600`).
 3. Restart affected units (see [`incident-and-killswitch.md`](./incident-and-killswitch.md)).
 4. Verify a paper session authenticates cleanly before re-enabling live.

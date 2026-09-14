@@ -16,10 +16,11 @@ OpenAPI docs at <http://localhost:8000/docs>.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Health check + version |
-| `GET` | `/api/auth/status` | Whether a Kite session is cached + the user profile |
-| `GET` | `/api/auth/login` | Returns the Kite login URL the SPA should redirect to |
-| `GET` | `/api/auth/callback` | OAuth redirect target — exchanges `request_token` for `access_token` and bounces to the SPA |
-| `POST` | `/api/auth/logout` | Clears the cached session |
+| `GET` | `/api/auth/status` | Whether a broker session is cached + profile (`broker`, `login_style`) |
+| `GET` | `/api/auth/login` | Zerodha: Kite OAuth URL. Kotak: `{login_style: headless, login_url: null}` |
+| `POST` | `/api/auth/login` | Headless brokers (Kotak): TOTP+MPIN using host `config.ini`. MPIN is not accepted from the body. |
+| `GET` | `/api/auth/callback` | Zerodha OAuth redirect — exchanges `request_token` for `access_token` and bounces to the SPA |
+| `POST` | `/api/auth/logout` | Clears the cached broker session |
 | `GET` | `/api/strategies` | List of registered strategies + parameter schemas |
 | `GET` | `/api/strategies/{name}/params` | Parameter schema for one strategy |
 | `POST` | `/api/runs` | Body `{strategy, mode, params}` — starts a backgrounded run |
@@ -57,7 +58,17 @@ boundary anyway. Rotate by editing `.env` and restarting the backend;
 all live sessions are invalidated when `DASHBOARD_SESSION_SECRET`
 changes (signature mismatch).
 
-## Kite Connect setup
+## Broker login
+
+`[broker] name` in `config.ini` selects the adapter (see
+[`docs/broker.md`](../docs/broker.md)).
+
+- **Zerodha** — OAuth redirect (below). Token cache: `.kite_session.json`.
+- **Kotak Neo** — `POST /api/auth/login` using `[kotak]` in `config.ini`
+  (consumer key, mobile, UCC, MPIN, TOTP seed). Token cache:
+  `.kotak_session.json`. The SPA never sends MPIN.
+
+## Kite Connect setup (Zerodha)
 
 The dashboard uses the **OAuth redirect flow**, not the headless TOTP path
 that the VPS daemon uses. Register a Kite Connect app once:
