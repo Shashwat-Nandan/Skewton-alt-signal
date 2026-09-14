@@ -5,9 +5,12 @@ export type SessionStatus = {
   authenticated: boolean;
 };
 
-/** Kite/broker session, returned by /api/auth/status. */
+/** Broker session, returned by /api/auth/status. */
 export type AuthStatus = {
   authenticated: boolean;
+  broker: string;
+  display_name: string;
+  login_style: "oauth" | "headless" | string;
   user_id?: string | null;
   user_name?: string | null;
   email?: string | null;

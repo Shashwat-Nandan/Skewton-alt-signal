@@ -87,7 +87,7 @@ uv pip compile requirements-dev.in --generate-hashes --output-file requirements-
 - `frontend/` — React/Vite/TS dashboard SPA (`taleb-karpathy-dashboard`).
 - `strategies/`, `signal_plane/`, `loop_engine/` — the trading brain (money-affecting).
 - `runners/` — headless daemons/entry points (paper, pairs, arbitrage, equity swing, autoresearch). Money-affecting.
-- `core/` — shared engines & broker I/O: `greeks_engine`, `risk_analyzer`, `market_profile`, `regime_classifier`, `runner_common`, `screen_pairs`, `data_cache_io`, `kite_auth`, `kite_throttle`.
+- `core/` — shared engines & broker I/O: `broker` (adapter factory: zerodha/kotak/groww/dhan), `greeks_engine`, `risk_analyzer`, `market_profile`, `regime_classifier`, `runner_common`, `screen_pairs`, `data_cache_io`, `kite_auth`, `kite_throttle`.
 - `market_data/` — market-data acquisition (`fetch_*`, `tick_capture`, `tape_to_parquet`) plus `holidays.csv`.
 - `research/` — backtests, parameter sweeps, optimizers and validators. Never on a live path.
 - `scripts/` — operational one-shots (scoreboard, decay ledger, verify, feature logging, reports).

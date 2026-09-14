@@ -7,10 +7,13 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from core.broker import get_broker, read_broker_name
+from core.broker.errors import BrokerConfigError
 from strategies import STRATEGIES, VALID_MODES
 
 from .. import db, kite_oauth
 from ..run_manager import get_run_manager
+from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -66,9 +69,19 @@ async def create_run(req: CreateRunRequest):
                    "Use the headless runner (deploy/VPS_DEPLOYMENT.md §7).",
         )
 
-    kite = kite_oauth.get_authenticated_kite()
+    name = read_broker_name(str(get_settings().config_path))
+    if name == "zerodha":
+        kite = kite_oauth.get_authenticated_kite()
+    else:
+        try:
+            kite = get_broker(str(get_settings().config_path)).cached_client()
+        except BrokerConfigError:
+            kite = None
     if kite is None:
-        raise HTTPException(status_code=401, detail="Not authenticated with Kite — log in first")
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated with the broker — log in first",
+        )
 
     manager = get_run_manager()
     try:

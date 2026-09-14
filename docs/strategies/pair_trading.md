@@ -110,7 +110,7 @@ repo root>`, `OnFailure=notify-failure@%n.service`.
 | Boot | Logging setup, holiday gate, kill-switch check | `runners/run_paper_pairs.py:_setup_logging` and HALT_* path checks |
 | Config injection | `ensure_pair_config()` — if `[pair_trading]` section missing or no `max_leg_notional`, write derived config to `data_cache/.pair_paper_config.ini` | line 68-97 |
 | Candidates load | Read `pair_candidates_*.csv`, apply quality floor, log "Selected N of M requested pairs" | (search `Selected.*pair` in source) |
-| Auth | TOTP via `kite_auth` | shared with taleb-hedger |
+| Auth | `core.broker.get_trading_client` | shared with taleb-hedger; `[broker] name` |
 | Strategy init | One `PairTradingStrategy` instance per selected pair | line 87 of strategy file |
 | Restore | If `pair_paper_state_<system>.json` exists, call `restore_state()` for each pair | (see state model below) |
 | Orphan loading | For pairs in the state file but NOT in today's candidates → load as ORPHAN ("management-to-exit") | (search `ORPHAN` in source) |
@@ -509,7 +509,7 @@ From `tasks/live-readiness-deferred.md` Highs section:
 | `core/screen_pairs.py` | Weekly screener (β / HL / p-value / corr) |
 | `scripts/verify_pair_paper.py` | Daily β-drift verification |
 | `core/trade_proposer.py` | `TradeProposal` dataclass |
-| `core/kite_auth.py` | TOTP auto-login |
+| `core/broker/` | Adapter factory (`get_broker` / `get_trading_client`) |
 | `core/_state_backup.py` | Backup ring helpers |
 | `config.ini` | `[pair_trading]` section + shared `[strategy]` |
 | `data_cache/pair_candidates.csv` | Baseline screener output |

@@ -159,6 +159,51 @@ class TestAuth:
         assert r.status_code == 200
         mock_clear.assert_called_once()
 
+    def test_status_includes_broker_identity(self, client):
+        with patch("backend.kite_oauth.get_authenticated_kite", return_value=None):
+            r = client.get("/api/auth/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["broker"] == "zerodha"
+        assert body["login_style"] == "oauth"
+        assert body["display_name"]
+
+    def test_headless_login_rejected_for_zerodha(self, client):
+        r = client.post("/api/auth/login")
+        assert r.status_code == 400
+
+    def test_kotak_login_is_headless_and_does_not_take_mpin_from_body(
+        self, client, tmp_path, monkeypatch,
+    ):
+        cfg = tmp_path / "c.ini"
+        cfg.write_text(
+            "[broker]\nname = kotak\n"
+            "[kotak]\nconsumer_key = real-consumer\n"
+            "mobile_number = +919876543210\n"
+            "ucc = ABC123\nmpin = 654321\n"
+            "totp_key = JBSWY3DPEHPK3PXP\n"
+            "environment = prod\n"
+        )
+        monkeypatch.setenv("CONFIG_PATH", str(cfg))
+        get_settings.cache_clear()
+        try:
+            r = client.get("/api/auth/login")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["broker"] == "kotak"
+            assert body["login_style"] == "headless"
+            assert body["login_url"] is None
+            with patch("backend.routers.auth.get_broker") as gb:
+                adapter = MagicMock()
+                adapter.login.return_value = object()
+                gb.return_value = adapter
+                r2 = client.post("/api/auth/login", json={"mpin": "should-be-ignored"})
+            assert r2.status_code == 200
+            adapter.login.assert_called_once_with()
+            assert r2.json()["broker"] == "kotak"
+        finally:
+            get_settings.cache_clear()
+
 
 # ──────────────────────────────────────────────────────────
 # Runs lifecycle

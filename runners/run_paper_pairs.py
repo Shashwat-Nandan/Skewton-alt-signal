@@ -6,7 +6,7 @@ Unattended intraday loop for the pair-trading strategy. Runs alongside the
 Taleb-Karpathy paper runner (runners/run_paper.py) on its own systemd timer.
 
   - Refuses to run on weekends or dates in holidays.csv (override with --force)
-  - Authenticates via TOTP (kite_auth.KiteAuthManager)
+  - Authenticates via the configured broker adapter (`core.broker.get_broker`)
   - Loads top-N rows from data_cache/pair_candidates.csv and instantiates one
     PairTradingStrategy per pair
   - Restores any prior-session open positions from
@@ -1305,10 +1305,10 @@ def main():
 
     config_path = ensure_pair_config(CONFIG_PATH, args.max_leg_notional, log)
 
-    from core.kite_auth import KiteAuthManager
+    from core.broker import get_broker
     log.info("Authenticating...")
-    auth = KiteAuthManager(CONFIG_PATH)
-    kite = auth.get_kite()
+    broker = get_broker(CONFIG_PATH)
+    kite = broker.login()
 
     # H14: wrap the kite client in a token-bucket throttler before any
     # call goes through. 12 pairs × 2 quote calls/tick at second-0 of
@@ -1350,7 +1350,7 @@ def main():
     # TOTP login), then re-wraps with the same throttler so the strategies
     # don't bypass H14 after a refresh.
     def _refresh_kite():
-        fresh = auth.get_kite()
+        fresh = broker.refresh()
         return throttle_kite(fresh, kite_limiter)
 
     # H13: closure summing open-leg notional, called by each strategy before

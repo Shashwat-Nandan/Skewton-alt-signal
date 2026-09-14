@@ -2,6 +2,9 @@
 config.ini
 config_banknifty.ini
 .kite_session.json
+.kotak_session.json
+.groww_session.json
+.dhan_session.json
 .env
 
 # Python

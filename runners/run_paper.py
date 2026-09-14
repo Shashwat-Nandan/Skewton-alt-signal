@@ -375,12 +375,11 @@ def main():
     log.info("PAPER TRADING SESSION — %s", today)
     log.info("=" * 60)
 
-    from core.kite_auth import KiteAuthManager
+    from core.broker import get_trading_client
     from strategies import TalebKarpathyStrategy
 
     log.info("Authenticating...")
-    auth = KiteAuthManager(config_path)
-    kite = auth.get_kite()
+    kite = get_trading_client(config_path)
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
 

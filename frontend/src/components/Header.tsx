@@ -132,7 +132,7 @@ export function Header() {
             </div>
           ) : (
             <Badge variant="secondary" className="hidden sm:inline-flex">
-              Kite not connected
+              {auth?.display_name ?? "Broker"} not connected
             </Badge>
           )}
           <Button

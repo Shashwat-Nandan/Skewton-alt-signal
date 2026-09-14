@@ -1,4 +1,4 @@
-"""Kite OAuth endpoints."""
+"""Broker auth endpoints (Zerodha OAuth + headless TOTP/MPIN)."""
 from __future__ import annotations
 
 import logging
@@ -8,6 +8,13 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
+from core.broker import get_broker, read_broker_name
+from core.broker.errors import (
+    BrokerAuthError,
+    BrokerConfigError,
+    BrokerNotImplementedError,
+)
+
 from .. import kite_oauth
 from ..settings import get_settings
 
@@ -15,29 +22,73 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_DISPLAY = {
+    "zerodha": "Zerodha Kite",
+    "kotak": "Kotak Securities Neo",
+    "groww": "Groww",
+    "dhan": "Dhan",
+}
+
+
+def _broker_meta() -> tuple[str, str, str]:
+    name = read_broker_name(str(get_settings().config_path))
+    display = _DISPLAY.get(name, name)
+    style = "oauth" if name == "zerodha" else "headless"
+    return name, display, style
+
 
 class AuthStatus(BaseModel):
     authenticated: bool
+    broker: str
+    display_name: str
+    login_style: str
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     email: Optional[str] = None
 
 
 class LoginUrlResponse(BaseModel):
-    login_url: str
+    broker: str
+    display_name: str
+    login_style: str
+    login_url: Optional[str] = None
 
 
 @router.get("/status", response_model=AuthStatus)
 def status():
-    """Whether we have a valid Kite session, plus the logged-in user's profile."""
-    kite = kite_oauth.get_authenticated_kite()
-    if kite is None:
-        return AuthStatus(authenticated=False)
-    profile = kite_oauth.verify_token(kite)
+    """Whether we have a valid broker session, plus the logged-in profile."""
+    name, display, style = _broker_meta()
+    empty = AuthStatus(
+        authenticated=False, broker=name, display_name=display, login_style=style,
+    )
+    if name == "zerodha":
+        kite = kite_oauth.get_authenticated_kite()
+        if kite is None:
+            return empty
+        profile = kite_oauth.verify_token(kite)
+        if not profile:
+            return empty
+        return AuthStatus(
+            authenticated=True,
+            broker=name,
+            display_name=display,
+            login_style=style,
+            user_id=profile.get("user_id"),
+            user_name=profile.get("user_name"),
+            email=profile.get("email"),
+        )
+    try:
+        adapter = get_broker(str(get_settings().config_path))
+    except BrokerConfigError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    profile = adapter.status_profile()
     if not profile:
-        return AuthStatus(authenticated=False)
+        return empty
     return AuthStatus(
         authenticated=True,
+        broker=name,
+        display_name=display,
+        login_style=style,
         user_id=profile.get("user_id"),
         user_name=profile.get("user_name"),
         email=profile.get("email"),
@@ -47,17 +98,42 @@ def status():
 @router.get("/login", response_model=LoginUrlResponse)
 def login_url():
     """
-    Returns the URL the SPA should `window.location.assign()` to in order
-    to start the Kite login flow.
-
-    Returning JSON (instead of a 302) keeps the SPA in control of navigation
-    and works cleanly with CORS.
+    Zerodha: returns the Kite OAuth URL the SPA should navigate to.
+    Headless brokers: login_url is null; the SPA POSTs /auth/login instead.
     """
+    name, display, style = _broker_meta()
+    if style != "oauth":
+        return LoginUrlResponse(
+            broker=name, display_name=display, login_style=style, login_url=None,
+        )
     try:
         url = kite_oauth.get_login_url()
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return LoginUrlResponse(login_url=url)
+    return LoginUrlResponse(
+        broker=name, display_name=display, login_style=style, login_url=url,
+    )
+
+
+@router.post("/login")
+def headless_login():
+    """Server-side TOTP/MPIN login using config.ini / env. Never accepts
+    secrets from the browser — MPIN stays on the host."""
+    name, display, style = _broker_meta()
+    if style != "headless":
+        raise HTTPException(
+            status_code=400,
+            detail="This broker uses OAuth. GET /auth/login for the redirect URL.",
+        )
+    try:
+        adapter = get_broker(str(get_settings().config_path))
+        adapter.login()
+    except BrokerNotImplementedError as e:
+        raise HTTPException(status_code=501, detail=str(e))
+    except (BrokerConfigError, BrokerAuthError) as e:
+        logger.exception("Headless broker login failed")
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"status": "ok", "broker": name, "display_name": display}
 
 
 @router.get("/callback")
@@ -91,5 +167,12 @@ def callback(
 
 @router.post("/logout")
 def logout():
-    kite_oauth.clear_cached_session()
+    name, _, style = _broker_meta()
+    if name == "zerodha" or style == "oauth":
+        kite_oauth.clear_cached_session()
+    else:
+        try:
+            get_broker(str(get_settings().config_path)).logout()
+        except BrokerConfigError:
+            pass
     return {"status": "ok"}

@@ -344,8 +344,8 @@ def main(argv=None) -> int:
         logger.info("--dry-run: skipping auth and trading.")
         return 0
 
-    from core.kite_auth import KiteAuthManager
-    kite = KiteAuthManager(args.config).get_kite()
+    from core.broker import get_trading_client
+    kite = get_trading_client(args.config)
     strategy = ShortCallEarningsStrategy(kite, config_path=args.config, mode="paper")
     strategy.log_effective_params()
     strategy.set_panel(panel)

@@ -294,7 +294,7 @@ def main() -> int:  # pragma: no cover
 
     from dotenv import load_dotenv
 
-    from core.kite_auth import KiteAuthManager
+    from core.broker import get_trading_client
     from core.runner_common import (
         SILENT_FAIL_THRESHOLD,
         HOLIDAYS_PATH,
@@ -333,7 +333,7 @@ def main() -> int:  # pragma: no cover
         return 1
 
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-    kite = KiteAuthManager("config.ini").get_kite()          # reuse cached session
+    kite = get_trading_client("config.ini")          # reuse cached session
     nfo = kite.instruments("NFO")
 
     from core.runner_common import (HALT_ALL_PATH, HALT_NEW_ENTRIES_PATH,

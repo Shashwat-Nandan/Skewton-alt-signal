@@ -1,7 +1,8 @@
 # skewton-signal
 
-Automated options-portfolio management for Indian derivatives via the
-Zerodha Kite API, built on Nassim Taleb's *Dynamic Hedging* framework
+Automated options-portfolio management for Indian derivatives via a
+pluggable broker adapter (Zerodha Kite by default; Kotak Neo when
+`[broker] name = kotak`), built on Nassim Taleb's *Dynamic Hedging* framework
 (delta-neutral positioning, gamma scalping, vega/theta management) plus
 an Andrej-Karpathy-style autoresearch loop for unattended parameter
 tuning.
@@ -79,7 +80,8 @@ Top-level Python entry points (most are CLI scripts):
 | `core/screen_pairs.py` | Engle-Granger cointegration screen on NIFTY-50 stock futures |
 | `market_data/fetch_historical_data.py` / `market_data/fetch_bars.py` / `market_data/fetch_bhavcopy.py` / `market_data/fetch_bhavcopy_eq.py` / `market_data/fetch_fii_dii.py` | Data ingestion (option chains, 30-min bars, F&O bhavcopy, EQ bhavcopy, FII/DII cash flows) |
 | `core/market_profile.py` | TPO / value-area computation (pure, no I/O) |
-| `core/kite_auth.py` | Headless TOTP login (the dashboard uses OAuth instead — see below) |
+| `core/kite_auth.py` | Headless Zerodha TOTP login (the dashboard uses OAuth instead — see below) |
+| `core/broker/` | Broker adapter factory (`broker.name` in config.ini): Zerodha, Kotak Neo, Groww/Dhan (Groww/Dhan refuse until live-wired) |
 | `core/greeks_engine.py` / `core/risk_analyzer.py` / `core/trade_proposer.py` | Greeks, Taleb-style risk tooling, proposal generation |
 | `research/analyze_rv_iv_regime.py` / `core/variance_pnl_gate.py` | RV/IV regime gating |
 | `sweep_*.py` | Focused parameter grid runners |
@@ -105,9 +107,18 @@ pull from.
 
 ---
 
-## Two auth paths, one token cache
+## Broker adapter
 
-Kite has two ways in, and this repo uses both:
+See [`docs/broker.md`](docs/broker.md) for the toggle, Kotak Neo setup
+(consumer key / TOTP / MPIN), and what still stays on Kite.
+
+Trading login and orders go through `core.broker.get_trading_client`,
+selected by `[broker] name` in `config.ini` (`zerodha` default; `kotak`
+is a complete trading surface; `groww` / `dhan` refuse until live-wired).
+
+## Two auth paths, one token cache (Zerodha)
+
+Kite has two ways in, and this repo uses both when `broker.name = zerodha`:
 
 - **Headless TOTP** (`core/kite_auth.py`) — `.env` carries `KITE_USER_ID`,
   `KITE_PASSWORD`, `KITE_TOTP_KEY` (the 2FA seed). The script
@@ -121,7 +132,7 @@ Both write to the same `.kite_session.json` cache, so once either has
 authenticated the other can use the token until it expires
 (refreshed daily). Make sure the **Redirect URL** registered on the
 Kite developer console matches `KITE_REDIRECT_URL` in `.env`
-byte-for-byte.
+byte-for-byte. Kotak sessions cache separately at `.kotak_session.json`.
 
 ---
 
@@ -133,6 +144,7 @@ This README is a map. The detailed docs are:
 | --- | --- |
 | Docs index (per-strategy + per-cron deep-dives) | [`docs/README.md`](docs/README.md) |
 | System topology, subsystems, data flow | [`docs/architecture.md`](docs/architecture.md) |
+| Broker toggle (Zerodha / Kotak Neo / Groww / Dhan) | [`docs/broker.md`](docs/broker.md) |
 | Taleb's framework: shadow gamma, rehedging rules, Indian-market adaptations | [`docs/strategies/taleb_framework.md`](docs/strategies/taleb_framework.md) |
 | Autoresearch loop: mutation strategy, hold-out, safety rails | [`docs/research/autoresearch_pattern.md`](docs/research/autoresearch_pattern.md) |
 | The hedger as a packaged "skill" + Taleb compliance checklist | [`SKILL.md`](SKILL.md) |

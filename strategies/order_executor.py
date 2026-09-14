@@ -32,6 +32,11 @@ import math
 import time
 from typing import Callable, Dict, List, Optional
 
+from core.broker.errors import (
+    BrokerNetworkError,
+    BrokerOrderError,
+    BrokerTokenError,
+)
 from core.trade_proposer import TradeProposal
 
 from .base import OrderValidationError, validate_order
@@ -51,6 +56,12 @@ except Exception:  # pragma: no cover
 
     class _OrderException(Exception):  # type: ignore[no-redef]
         pass
+
+# Kotak (and later Groww/Dhan) raise the broker-agnostic errors; Zerodha
+# raises kiteconnect's. The recovery policy is the same either way.
+_TOKEN_ERRORS = (_TokenException, BrokerTokenError)
+_NETWORK_ERRORS = (_NetworkException, BrokerNetworkError)
+_ORDER_ERRORS = (_OrderException, BrokerOrderError)
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +132,7 @@ class KiteOrderExecutor:
         try:
             quote = self.kite.quote([key])
             return float(quote[key]["last_price"])
-        except _TokenException as e:
+        except _TOKEN_ERRORS as e:
             if not self._try_refresh_kite("quote", tradingsymbol, e):
                 return None
             try:
@@ -221,7 +232,7 @@ class KiteOrderExecutor:
 
         try:
             order_id = _do_place()
-        except _TokenException as e:
+        except _TOKEN_ERRORS as e:
             # H8: token expired mid-session. Refresh once and retry the
             # place_order call exactly once. A second failure is CRITICAL
             # and the order is reported FAILED — the caller's reversal
@@ -242,7 +253,7 @@ class KiteOrderExecutor:
                         "filled_lots": 0, "average_price": 0.0,
                         "error": f"place_order post-refresh: {e2}",
                         "mode": "live"}
-        except _NetworkException as e:
+        except _NETWORK_ERRORS as e:
             # M-B4: transient kite/network blip. Retry once with a brief
             # delay; if the second attempt also fails, give up for this
             # proposal (caller reverses any already-filled sibling).
@@ -260,7 +271,7 @@ class KiteOrderExecutor:
                         "filled_lots": 0, "average_price": 0.0,
                         "error": f"place_order net-retry: {e2}",
                         "mode": "live"}
-        except _OrderException as e:
+        except _ORDER_ERRORS as e:
             # M-B4: broker-side reject (margin, validation, exchange
             # error). Do not retry — the underlying cause is unlikely to
             # clear within seconds and a blind retry can compound an

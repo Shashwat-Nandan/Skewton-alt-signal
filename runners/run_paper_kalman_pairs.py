@@ -779,10 +779,11 @@ def main() -> int:
     pairs = pd.read_csv(args.candidates).sort_values("rank_score").head(args.top)
     config_path = _write_config(args)
 
-    from core.kite_auth import KiteAuthManager
+    from core.broker import get_trading_client
     from core.kite_throttle import KiteRateLimiter, throttle_kite
-    auth = KiteAuthManager(CONFIG_PATH)
-    kite = throttle_kite(auth.get_kite(), KiteRateLimiter(rate_per_sec=8.0, burst=8))
+    kite = throttle_kite(
+        get_trading_client(CONFIG_PATH), KiteRateLimiter(rate_per_sec=8.0, burst=8),
+    )
     prof = kite.profile()
     log.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
     nfo = kite.instruments("NFO") or []

@@ -494,11 +494,10 @@ def main():
 
     kite = None
     if not args.dry_run:
-        from core.kite_auth import KiteAuthManager
+        from core.broker import get_trading_client
         from core.kite_throttle import KiteRateLimiter, throttle_kite
         log.info("Authenticating...")
-        auth = KiteAuthManager(CONFIG_PATH)
-        kite = auth.get_kite()
+        kite = get_trading_client(CONFIG_PATH)
         kite = throttle_kite(kite, KiteRateLimiter(
             rate_per_sec=args.kite_rate_per_sec, burst=args.kite_burst))
         profile = kite.profile()
