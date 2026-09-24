@@ -63,12 +63,13 @@ changes (signature mismatch).
 `[broker] name` in `config.ini` selects the adapter (see
 [`docs/broker.md`](../docs/broker.md)).
 
-- **Zerodha** — OAuth redirect (below). Token cache: `.kite_session.json`.
-- **Kotak Neo** — `POST /api/auth/login` using `[kotak]` in `config.ini`
-  (consumer key, mobile, UCC, MPIN, TOTP seed). Token cache:
-  `.kotak_session.json`. The SPA never sends MPIN.
+- **Kotak Neo** (default) — `POST /api/auth/login` using `[kotak]` in
+  `config.ini` or `KOTAK_*` in `.env` (consumer key, mobile, UCC, MPIN,
+  TOTP seed). Token cache: `.kotak_session.json`. The SPA never sends MPIN.
+- **Zerodha** — set `[broker] name = zerodha`. OAuth redirect (below).
+  Token cache: `.kite_session.json`.
 
-## Kite Connect setup (Zerodha)
+## Kite Connect setup (Zerodha only)
 
 The dashboard uses the **OAuth redirect flow**, not the headless TOTP path
 that the VPS daemon uses. Register a Kite Connect app once:

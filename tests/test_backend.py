@@ -21,13 +21,23 @@ from backend import db, run_manager as rm
 from backend.settings import get_settings
 
 
+def _pin_zerodha(tmp_path, monkeypatch):
+    """These tests exercise the Zerodha OAuth branch. The repo default
+    is Kotak Neo, so the fixture must not inherit the host config."""
+    cfg = tmp_path / "zerodha.ini"
+    cfg.write_text("[broker]\nname = zerodha\n")
+    monkeypatch.setenv("CONFIG_PATH", str(cfg))
+    get_settings.cache_clear()
+
+
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     # Reset the run manager singleton so each test sees an empty registry.
     # Bind the SQLite singleton to a tmp path so we never touch the real
     # data_cache/dashboard.db. Every auth-touching test mocks
     # kite_oauth.get_authenticated_kite at the boundary so the real
     # .kite_session.json is never read or written either.
+    _pin_zerodha(tmp_path, monkeypatch)
     rm._manager = None
     db.reset_for_tests(tmp_path / "test.db")
     app = create_app()
@@ -40,17 +50,20 @@ def client(tmp_path):
         assert r.status_code == 204, r.text
         yield c
     db.reset_for_tests(None)
+    get_settings.cache_clear()
 
 
 @pytest.fixture
-def unauthed_client(tmp_path):
+def unauthed_client(tmp_path, monkeypatch):
     """Same setup as `client` but without the login step."""
+    _pin_zerodha(tmp_path, monkeypatch)
     rm._manager = None
     db.reset_for_tests(tmp_path / "test.db")
     app = create_app()
     with TestClient(app) as c:
         yield c
     db.reset_for_tests(None)
+    get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -60,7 +73,7 @@ def live_mode_client(tmp_path, monkeypatch):
     make the running app's get_settings() return allow_live_mode=True; the cache
     is cleared again on teardown so later tests see the conftest default."""
     monkeypatch.setenv("ALLOW_LIVE_MODE", "true")
-    get_settings.cache_clear()
+    _pin_zerodha(tmp_path, monkeypatch)
     rm._manager = None
     db.reset_for_tests(tmp_path / "test.db")
     app = create_app()

@@ -54,6 +54,13 @@ def _write_taleb_state(cache_dir, underlying_suffix, positions, futures_hedge_de
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     from tests._helpers import login_client
+    from backend.settings import get_settings
+    # Portfolio tests patch the Zerodha session. Pin that broker so the
+    # Kotak default does not skip kite_oauth.
+    cfg = tmp_path / "zerodha.ini"
+    cfg.write_text("[broker]\nname = zerodha\n")
+    monkeypatch.setenv("CONFIG_PATH", str(cfg))
+    get_settings.cache_clear()
     db.reset_for_tests(tmp_path / "test.db")
     cache = tmp_path / "data_cache"
     cache.mkdir()
@@ -64,6 +71,7 @@ def client(tmp_path, monkeypatch):
     c._cache = cache  # stash for tests to seed state
     yield c
     db.reset_for_tests(None)
+    get_settings.cache_clear()
 
 
 def _short_straddle():

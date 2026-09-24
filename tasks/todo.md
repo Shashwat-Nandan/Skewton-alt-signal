@@ -23,6 +23,8 @@ and `POST {baseUrl}/quick/user/limits` with form `jData` returns `Net`.
 `tests/test_broker_adapter.py`: 53 passed. `ruff check` clean on the
 touched Python. `config.ini` on this host (gitignored) has
 `[broker] name = kotak`, so a runner started here authenticates to Kotak.
+The checked-in template and a missing `[broker]` name now resolve to
+`kotak` as well. `name = zerodha` is how a host stays on Kite.
 
 Read-only prod check 2026-09-24 (no order placed): positions on an empty
 book returns `[]`; `instruments("NFO")` is 81275 rows; the front NIFTY

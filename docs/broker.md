@@ -2,23 +2,24 @@
 
 Trading login, quotes, positions, margins, historical candles, F&O
 instrument dumps, and live orders go through `core.broker.get_trading_client`,
-selected by `[broker] name` in `config.ini`. Strategies still speak Kite
-vocabulary (`NFO`, `BUY`, `LIMIT`, `NIFTY25SEP25000CE`); each adapter
-translates at the wire.
+selected by `[broker] name` in `config.ini`. Kotak Neo is the primary
+broker. Strategies still pass orders in the shared vocabulary (`NFO`,
+`BUY`, `LIMIT`, `NIFTY26SEP25000CE`); each adapter translates at the wire.
 
 | `name` | Login | Trading surface | Status |
 |---|---|---|---|
-| `zerodha` (default) | Headless TOTP + dashboard OAuth | Kite Connect | Unchanged |
-| `kotak` | Headless TOTP + MPIN (Neo Trade API) | Orders, quotes (`segment\|token` on the gateway), positions, `margins()` / `basket_order_margins()`, historical candles, F&O `instruments()` | Paper first, then live |
+| `kotak` (default) | Headless TOTP + MPIN (Neo Trade API) | Orders, quotes (`segment\|token` on the gateway), positions, `margins()` / `basket_order_margins()`, historical candles, F&O `instruments()` | Primary. Paper before live |
+| `zerodha` | Headless TOTP + dashboard OAuth | Kite Connect | Supported. Set `name = zerodha` |
 | `groww` / `dhan` | Registered in the factory | **Refuse to login/order** | Not live-wired |
 
-Default is `zerodha` so existing hosts do not switch. Unknown names fail
-loud — they do not fall through to Zerodha.
+A missing `[broker]` section resolves to `kotak`. Unknown names fail
+loud — they do not fall through to another broker. A host that should
+stay on Kite must set `name = zerodha`.
 
 Market-data CLIs (`market_data/fetch_*`, tick capture) still use Kite
 directly. Switching those is a later increment.
 
-## Switch to Kotak Neo
+## Kotak Neo (primary)
 
 1. In the Neo app/web: **More → Trade API → Generate application**. Copy
    the consumer key.

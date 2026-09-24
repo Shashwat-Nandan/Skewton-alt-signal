@@ -43,13 +43,16 @@ def _write_ini(path: Path, body: str) -> str:
 
 
 class TestFactory:
-    def test_missing_file_defaults_zerodha(self, tmp_path):
-        assert read_broker_name(str(tmp_path / "nope.ini")) == "zerodha"
+    def test_missing_file_defaults_kotak(self, tmp_path):
+        # Kotak Neo is the primary broker. A host that still wants Kite
+        # sets [broker] name = zerodha; silence must not pick Zerodha.
+        assert read_broker_name(str(tmp_path / "nope.ini")) == "kotak"
 
-    def test_missing_section_defaults_zerodha(self, tmp_path):
+    def test_missing_section_defaults_kotak(self, tmp_path):
         cfg = _write_ini(tmp_path / "c.ini", "[kite]\napi_key = x\n")
-        assert read_broker_name(cfg) == "zerodha"
-        assert get_broker(cfg).name == "zerodha"
+        assert read_broker_name(cfg) == "kotak"
+        with pytest.raises(BrokerConfigError, match="Credentials not configured"):
+            get_broker(cfg)
 
     def test_explicit_zerodha(self, tmp_path):
         cfg = _write_ini(tmp_path / "c.ini", "[broker]\nname = zerodha\n")

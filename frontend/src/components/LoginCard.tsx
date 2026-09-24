@@ -45,7 +45,7 @@ export function LoginCard({ auth }: { auth?: AuthStatus }) {
           <CardDescription>
             {headless
               ? `Authenticate via ${brokerName} using the credentials in config.ini. The session stays cached locally until ~6 AM IST tomorrow.`
-              : "Authenticate via Kite Connect to start a strategy run. Your session stays cached locally until ~6 AM IST tomorrow."}
+              : `Authenticate via ${brokerName} to start a strategy run. Your session stays cached locally until ~6 AM IST tomorrow.`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -55,7 +55,7 @@ export function LoginCard({ auth }: { auth?: AuthStatus }) {
               ? headless
                 ? "Signing in…"
                 : "Redirecting…"
-              : `Login with ${headless ? brokerName : "Kite"}`}
+              : `Login with ${brokerName}`}
           </Button>
           {error && (
             <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">

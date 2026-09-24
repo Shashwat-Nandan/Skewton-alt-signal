@@ -1,11 +1,11 @@
 """Broker factory — one config key selects the adapter.
 
     [broker]
-    name = zerodha   # kotak | groww | dhan
+    name = kotak   # zerodha | groww | dhan
 
-Missing section / missing file → zerodha, so existing hosts keep working.
-An unknown name fails loud: averaging "whatever we have" onto Kite is
-how an operator who meant Kotak would silently trade the wrong account.
+Kotak Neo is the primary broker. Missing section / missing file → kotak.
+Set name = zerodha to stay on Kite. An unknown name fails loud: it does
+not fall through to another broker.
 """
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ from .groww import GrowwAdapter
 from .kite import ZerodhaKiteAdapter
 from .kotak import KotakNeoAdapter
 
-SUPPORTED = ("zerodha", "kotak", "groww", "dhan")
+SUPPORTED = ("kotak", "zerodha", "groww", "dhan")
+DEFAULT_BROKER = "kotak"
 
 # Aliases operators actually type.
 _ALIASES = {
@@ -35,11 +36,14 @@ _ALIASES = {
 def read_broker_name(config_path: str = "config.ini") -> str:
     path = Path(config_path)
     if not path.exists():
-        return "zerodha"
+        return DEFAULT_BROKER
     cfg = configparser.ConfigParser()
     cfg.read(path)
-    raw = cfg.get("broker", "name", fallback="zerodha") if cfg.has_section("broker") else "zerodha"
-    name = (raw or "zerodha").strip().lower()
+    raw = (
+        cfg.get("broker", "name", fallback=DEFAULT_BROKER)
+        if cfg.has_section("broker") else DEFAULT_BROKER
+    )
+    name = (raw or DEFAULT_BROKER).strip().lower()
     return _ALIASES.get(name, name)
 
 

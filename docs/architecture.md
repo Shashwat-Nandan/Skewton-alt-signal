@@ -3,12 +3,12 @@
 ## 1. What this is
 
 A single repository running **two parallel systems** against the same
-configured broker account (Zerodha Kite by default; Kotak Neo via
-`[broker] name = kotak` in `config.ini` — see `core/broker/`):
+configured broker account (Kotak Neo by default; Zerodha Kite when
+`[broker] name = zerodha` — see `core/broker/`):
 
 1. **Headless paper/live-trading + autoresearch daemons.** Run on a VPS under
    `systemd`. Authenticate via the broker adapter (`core.broker.get_trading_client`;
-   Zerodha still uses TOTP in `core/kite_auth.py`) and run one strategy per
+   Kotak Neo by default, Zerodha TOTP in `core/kite_auth.py` when selected) and run one strategy per
    timer-driven runner through the trading session: Taleb-Karpathy
    (`runners/run_paper.py`), pair trading (`runners/run_paper_pairs.py` — a baseline and a
    persistent system, the latter with a real-money `pair-paper-persistent-live`
@@ -18,8 +18,8 @@ configured broker account (Zerodha Kite by default; Kotak Neo via
    Going live is documented in `deploy/VPS_DEPLOYMENT.md` §7 (least-privilege
    user migration in §6.5).
 2. **Browser dashboard.** A FastAPI backend + React SPA. Authenticates via
-   the configured broker (Kite OAuth when `broker.name = zerodha`; server-side
-   TOTP+MPIN when `kotak`). Lets a user pick a strategy (Taleb-Karpathy, Pair
+   the configured broker (Kotak Neo server-side TOTP+MPIN by default; Kite
+   OAuth when `broker.name = zerodha`). Lets a user pick a strategy (Taleb-Karpathy, Pair
    Trading, Arbitrage, or Equity Swing), pick a mode (signals-only or paper),
    and watch live signals / trades / P&L. Live trading from the dashboard is
    unconditionally rejected.
@@ -410,8 +410,12 @@ useEffect:
 `[broker] name` in `config.ini` selects the adapter (`core.broker`). Runners
 always call `get_trading_client`. The dashboard dispatches on `login_style`.
 
-**Zerodha** (`name = zerodha`, default) still has two flows sharing
-`.kite_session.json`:
+**Kotak Neo** (`name = kotak`, the default) is headless TOTP+MPIN only
+(`core/broker/kotak.py`). Cache: `.kotak_session.json` (mode 0600). The
+dashboard button POSTs `/api/auth/login` using host `config.ini` — MPIN
+never goes through the browser. Only `environment = prod` is wired.
+
+**Zerodha** (`name = zerodha`) has two flows sharing `.kite_session.json`:
 
 | | TOTP path | OAuth path |
 |---|---|---|
@@ -419,11 +423,6 @@ always call `get_trading_client`. The dashboard dispatches on `login_style`.
 | Inputs | `KITE_USER_ID`, `KITE_PASSWORD`, `KITE_TOTP_KEY` | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` |
 | Mechanism | `core/kite_auth.py` POST `/api/login` + `/api/twofa` | Browser redirect to Kite; `/api/auth/callback` exchanges `request_token` |
 | Token validity | ~24h (expires ~06:00 IST next day) | Same |
-
-**Kotak Neo** (`name = kotak`) is headless TOTP+MPIN only
-(`core/broker/kotak.py`). Cache: `.kotak_session.json` (mode 0600). The
-dashboard button POSTs `/api/auth/login` using host `config.ini` — MPIN
-never goes through the browser. Only `environment = prod` is wired.
 
 Groww/Dhan are registered and refuse at `login()`. Operator setup is in
 [`broker.md`](./broker.md).
@@ -436,7 +435,8 @@ Groww/Dhan are registered and refuse at `login()`. Operator setup is in
 
 | Source | Endpoint / file | Used by |
 |---|---|---|
-| Kite Connect REST | `kite.quote()`, `kite.instruments()`, `kite.historical_data()`, `kite.place_order()` | All live-data paths |
+| Configured broker (Kotak Neo by default) | `client.quote()`, `instruments()`, `historical_data()`, `place_order()` | Runners and the dashboard |
+| Kite Connect REST | same methods, via `core/kite_auth.py` | `market_data/fetch_*` and tick capture, and runners when `broker.name = zerodha` |
 | NSE F&O bhav copy (UDiFF) | `archives.nseindia.com/...BhavCopy_NSE_FO_*.csv.zip` | `market_data/fetch_bhavcopy.py`, `core/screen_pairs.py` |
 | Local cached CSVs | `data_cache/NIFTY_*.csv` (intraday option chain), `data_cache/bhavcopy_raw/*.csv` (EOD) | Backtests, screener, autoresearch |
 

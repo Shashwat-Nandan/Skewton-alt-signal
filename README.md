@@ -1,8 +1,8 @@
 # skewton-signal
 
 Automated options-portfolio management for Indian derivatives via a
-pluggable broker adapter (Zerodha Kite by default; Kotak Neo when
-`[broker] name = kotak`), built on Nassim Taleb's *Dynamic Hedging* framework
+pluggable broker adapter (Kotak Neo by default; Zerodha Kite when
+`[broker] name = zerodha`), built on Nassim Taleb's *Dynamic Hedging* framework
 (delta-neutral positioning, gamma scalping, vega/theta management) plus
 an Andrej-Karpathy-style autoresearch loop for unattended parameter
 tuning.
@@ -34,9 +34,10 @@ python3.11 -m venv .venv
 
 # 2. Secrets — fill credentials, lock perms
 cp config_template.ini config.ini && chmod 600 config.ini
-$EDITOR config.ini   # api_key, api_secret, totp_key, user_id, password
-$EDITOR .env         # KITE_API_KEY/SECRET/USER_ID/PASSWORD/TOTP_KEY,
-                     # KITE_REDIRECT_URL, DASHBOARD_URL
+$EDITOR config.ini   # [broker] name = kotak, plus [kotak] if not using .env
+$EDITOR .env         # KOTAK_CONSUMER_KEY, KOTAK_MOBILE_NUMBER, KOTAK_UCC,
+                     # KOTAK_MPIN, KOTAK_TOTP_KEY, DASHBOARD_URL
+                     # Zerodha instead: KITE_API_KEY/SECRET/USER_ID/PASSWORD/TOTP_KEY
 
 # 3. Run the dashboard locally
 .venv/bin/uvicorn backend.main:app --reload --port 8000        # backend
@@ -80,8 +81,8 @@ Top-level Python entry points (most are CLI scripts):
 | `core/screen_pairs.py` | Engle-Granger cointegration screen on NIFTY-50 stock futures |
 | `market_data/fetch_historical_data.py` / `market_data/fetch_bars.py` / `market_data/fetch_bhavcopy.py` / `market_data/fetch_bhavcopy_eq.py` / `market_data/fetch_fii_dii.py` | Data ingestion (option chains, 30-min bars, F&O bhavcopy, EQ bhavcopy, FII/DII cash flows) |
 | `core/market_profile.py` | TPO / value-area computation (pure, no I/O) |
-| `core/kite_auth.py` | Headless Zerodha TOTP login (the dashboard uses OAuth instead — see below) |
-| `core/broker/` | Broker adapter factory (`broker.name` in config.ini): Zerodha, Kotak Neo, Groww/Dhan (Groww/Dhan refuse until live-wired) |
+| `core/broker/` | Broker adapter. Kotak Neo is the default; Zerodha Kite when `name = zerodha`. Groww/Dhan refuse until live-wired |
+| `core/kite_auth.py` | Headless Zerodha TOTP login, used only when `broker.name = zerodha` |
 | `core/greeks_engine.py` / `core/risk_analyzer.py` / `core/trade_proposer.py` | Greeks, Taleb-style risk tooling, proposal generation |
 | `research/analyze_rv_iv_regime.py` / `core/variance_pnl_gate.py` | RV/IV regime gating |
 | `sweep_*.py` | Focused parameter grid runners |
@@ -109,14 +110,15 @@ pull from.
 
 ## Broker adapter
 
-See [`docs/broker.md`](docs/broker.md) for the toggle, Kotak Neo setup
-(consumer key / TOTP / MPIN), and what still stays on Kite.
+See [`docs/broker.md`](docs/broker.md). Kotak Neo is the primary broker
+(consumer key / TOTP / MPIN). Zerodha Kite is selected with
+`[broker] name = zerodha`. Market-data download CLIs still use Kite.
 
-Trading login and orders go through `core.broker.get_trading_client`,
-selected by `[broker] name` in `config.ini` (`zerodha` default; `kotak`
-is a complete trading surface; `groww` / `dhan` refuse until live-wired).
+Trading login and orders go through `core.broker.get_trading_client`.
+A missing `[broker]` name resolves to `kotak`. `groww` / `dhan` refuse
+until live-wired.
 
-## Two auth paths, one token cache (Zerodha)
+## Zerodha auth (only when `broker.name = zerodha`)
 
 Kite has two ways in, and this repo uses both when `broker.name = zerodha`:
 
@@ -144,7 +146,7 @@ This README is a map. The detailed docs are:
 | --- | --- |
 | Docs index (per-strategy + per-cron deep-dives) | [`docs/README.md`](docs/README.md) |
 | System topology, subsystems, data flow | [`docs/architecture.md`](docs/architecture.md) |
-| Broker toggle (Zerodha / Kotak Neo / Groww / Dhan) | [`docs/broker.md`](docs/broker.md) |
+| Broker toggle (Kotak Neo primary; Zerodha / Groww / Dhan) | [`docs/broker.md`](docs/broker.md) |
 | Taleb's framework: shadow gamma, rehedging rules, Indian-market adaptations | [`docs/strategies/taleb_framework.md`](docs/strategies/taleb_framework.md) |
 | Autoresearch loop: mutation strategy, hold-out, safety rails | [`docs/research/autoresearch_pattern.md`](docs/research/autoresearch_pattern.md) |
 | The hedger as a packaged "skill" + Taleb compliance checklist | [`SKILL.md`](SKILL.md) |

@@ -3,7 +3,8 @@
 Headless runners keep using `KiteAuthManager` (TOTP screen-scrape).
 The dashboard keeps using `backend.kite_oauth` (browser redirect).
 Both still share `.kite_session.json`. This adapter is the factory's
-Zerodha leaf so `broker.name = zerodha` is the default, not a special case.
+Zerodha leaf. Kotak Neo is the default; `broker.name = zerodha` selects
+this one.
 """
 from __future__ import annotations
 
