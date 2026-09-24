@@ -1,3 +1,16 @@
+# Kotak Neo named as this system's broker — 2026-09-24
+
+The default was already `kotak`. Operator-facing text still said live
+orders, the dashboard login, and the portfolio note go through Kite.
+Those now name Kotak Neo as the default and "the configured broker"
+where the same sentence covers Zerodha too. `kite_auth`, `kite_oauth`,
+and the market-data CLIs stay on Kite Connect. `loop_engine`'s host
+engine is `broker_engine` (it calls `get_trading_client`).
+
+- [x] Runner help and docstrings
+- [x] Portfolio note, halt copy, architecture diagram, VPS login steps
+- [x] `kite_engine` → `broker_engine`
+
 # Kotak prod login host + limits POST — 2026-09-24
 
 The 2026-09-14 adapter logged in against `gw-napi.kotaksecurities.com`

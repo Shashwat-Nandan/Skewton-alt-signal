@@ -28,7 +28,7 @@ export function LoginCard({ auth }: { auth?: AuthStatus }) {
       if (!login_url) {
         throw new Error("Broker did not return an OAuth URL");
       }
-      // Hard navigate — Kite will redirect back to backend /auth/callback,
+      // Hard navigate — Zerodha Kite will redirect back to backend /auth/callback,
       // which will then redirect us back to "/" with ?login=success.
       window.location.assign(login_url);
     } catch (e) {

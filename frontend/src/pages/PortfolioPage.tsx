@@ -32,7 +32,7 @@ function deltaCell(n: number | null | undefined) {
 
 export function PortfolioPage() {
   // Gate polling to market hours (mirrors PositionsPage): each poll hits the
-  // backend's live Kite calls (ltp + positions), so a tab left open overnight
+  // backend's live broker calls (ltp + positions), so a tab left open overnight
   // must NOT hammer the API off-hours.
   const marketOpen = isMarketHoursIST();
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
@@ -179,7 +179,7 @@ export function PortfolioPage() {
               </TableHeader>
               <TableBody>
                 {data.broker_net.map((p, i) => (
-                  // key by symbol+exchange+index: Kite's net book can list the
+                  // key by symbol+exchange+index: the broker net book can list the
                   // same tradingsymbol on two exchanges (NSE/BSE), so the
                   // symbol alone is not unique.
                   <TableRow key={`${p.tradingsymbol}-${p.exchange}-${i}`}>

@@ -2815,9 +2815,9 @@ class TalebKarpathyStrategy(BaseStrategy):
 
         Performance: this is called every flat-book scan_and_propose
         tick. We BATCH the option-chain quotes into a single
-        kite.quote([...]) call so a 40-strike weekly costs one REST
-        request, not 40 — Kite Connect's documented quote limit is
-        ~3/sec, so per-strike iteration would breach the rate limit
+        client.quote([...]) call so a 40-strike weekly costs one REST
+        request, not 40 — the broker rate limit is a few requests a
+        second, so per-strike iteration would breach the rate limit
         within seconds and the swallowed exceptions would make the
         gate silently inert (review-fix #6).
         """
@@ -2833,7 +2833,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         except Exception:
             return 50.0
 
-        # Single batched quote() for the whole chain. Kite returns a
+        # Single batched quote() for the whole chain. The broker returns a
         # dict keyed by the same symbol string we passed in; missing
         # keys (illiquid strikes, no trade today) simply don't appear
         # in the result. The single network call avoids the per-strike

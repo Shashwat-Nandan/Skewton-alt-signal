@@ -37,9 +37,9 @@ Kalman-specific vs the static runner:
 paper/signals only. --mode live is intentionally unsupported here (the strategy
 raises NotImplementedError) until the forward test validates an edge.
 
-CANNOT be verified live in CI (no Kite session); smoke-test on the host. NOTE:
-do not run a fresh Kite login while the live static runner is active — reuse the
-cached session (see tasks/lessons.md / memory).
+CANNOT be verified live in CI (no broker session); smoke-test on the host. NOTE:
+do not run a fresh broker login while the live static runner is active — reuse the
+cached session (see tasks/lessons.md / memory). Kotak Neo is the default.
 """
 from __future__ import annotations
 
@@ -761,7 +761,7 @@ def main() -> int:
 
     # Hard-stop guard BEFORE auth. A post-15:30 invocation — e.g. an evening
     # `systemctl enable --now` catch-up fire (timer is Persistent=true) — must
-    # exit WITHOUT a fresh Kite login, which would otherwise invalidate the
+    # exit WITHOUT a fresh broker login, which would otherwise invalidate the
     # cached session the live runner reuses (no-auth-while-live-runner). The
     # session-timing checks after setup repeat this for the normal pre-open path.
     now0 = datetime.now()

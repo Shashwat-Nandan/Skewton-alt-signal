@@ -15,7 +15,7 @@ import {
 
 /**
  * Dashboard password gate. This is the FIRST thing a visitor sees — even
- * before the Kite OAuth login. The session cookie issued on success is
+ * before the broker login (Kotak Neo by default). The session cookie issued on success is
  * what every subsequent request rides on; mid-session expiry returns
  * the user here via the global 401 handler in main.tsx.
  */

@@ -47,11 +47,11 @@ the same hardening pair_trading went through (see
 
 | Scan | Timer | Wall clock | Purpose | Persistent= |
 |---|---|---|---|---|
-| open | `equity-swing-open.timer` | Mon–Fri 09:30 IST | Exits only; reads live Kite quote for today's intraday view | true |
+| open | `equity-swing-open.timer` | Mon–Fri 09:30 IST | Exits only; reads a live broker quote for today's intraday view | true |
 | close | `equity-swing-close.timer` | Mon–Fri 18:30 IST | Entries + exits + fills + state persist | true |
 
 Open-scan rationale (line 280 of `runners/run_equity_swing.py`): 09:30 is 15
-minutes after the bell, giving Kite spot quotes time to settle. Open
+minutes after the bell, giving broker spot quotes time to settle. Open
 scan only does exits because bhavcopy hasn't published yet — entries
 must wait for the close scan's full feature compute.
 

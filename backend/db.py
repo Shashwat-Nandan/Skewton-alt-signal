@@ -9,7 +9,7 @@ WAL mode is enabled so the FastAPI tick loop can keep writing while the
 HTTP layer reads (e.g. /runs/{id} polling at 2s).
 
 Recovery model: a backend restart kills every in-memory strategy tick
-loop. We have no way to safely resume those (positions, kite session,
+loop. We have no way to safely resume those (positions, broker session,
 greeks state are all gone). On startup mark_orphan_runs_stopped() flips
 any RUNNING/STOPPING rows to STOPPED with an explanatory error so the
 dashboard shows them honestly as terminated.

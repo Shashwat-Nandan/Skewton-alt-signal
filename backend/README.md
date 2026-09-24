@@ -71,8 +71,9 @@ changes (signature mismatch).
 
 ## Kite Connect setup (Zerodha only)
 
-The dashboard uses the **OAuth redirect flow**, not the headless TOTP path
-that the VPS daemon uses. Register a Kite Connect app once:
+When `[broker] name = zerodha`, the dashboard uses the **OAuth redirect
+flow**, not the headless TOTP path that the Zerodha daemon uses. Kotak Neo
+(the default) does not use this section. Register a Kite Connect app once:
 
 1. Go to <https://developers.kite.trade/> and create a new app.
 2. Set the **redirect URL** to exactly:

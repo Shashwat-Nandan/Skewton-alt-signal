@@ -31,7 +31,7 @@ class BrokerAdapter(ABC):
     def login(self) -> Any:
         """Authenticate and return a Kite-shaped trading client.
 
-        Runners pass the return value into strategies as `kite`.
+        Runners pass the return value into strategies as `client`.
         """
 
     @abstractmethod

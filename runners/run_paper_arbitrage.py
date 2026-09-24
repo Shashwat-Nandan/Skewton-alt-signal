@@ -520,7 +520,8 @@ def main():
     parser.add_argument("--mode", choices=["paper", "live", "signals"],
                         default="paper",
                         help="Execution mode. paper (default): mock fills. "
-                             "live: real money via Kite — requires "
+                             "live: real money via the configured broker "
+                             "(Kotak Neo by default) — requires "
                              "ALLOW_LIVE_MODE=true AND "
                              "--i-understand-this-is-real-money AND "
                              "--max-daily-loss-inr > 0. signals: basis JSONL "

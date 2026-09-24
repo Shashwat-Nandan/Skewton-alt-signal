@@ -16,7 +16,7 @@ Stage map for this pilot:
                      inline HALT_ALL / HALT_NEW_ENTRIES still live in the runner.
 
 The maker+execute engine is dependency-injected so the orchestration logic is
-CI-testable without a Kite session: `kite_engine` runs the real runner on the
+CI-testable without a broker session: `broker_engine` runs the real runner on the
 host; `dry_run_engine` returns a synthetic outcome touching nothing.
 """
 from __future__ import annotations
@@ -55,8 +55,8 @@ class SessionOutcome:
 # ──────────────────────────────────────────────────────────────────────────
 # Engines (stages 1 + 2 + 4) — injected so the orchestration is testable
 # ──────────────────────────────────────────────────────────────────────────
-def kite_engine(today: Optional[date] = None) -> SessionOutcome:  # pragma: no cover
-    """Run the real kalman-trend paper runner (needs a cached Kite session).
+def broker_engine(today: Optional[date] = None) -> SessionOutcome:  # pragma: no cover
+    """Run the real kalman-trend paper runner (needs a cached broker session).
 
     Reuses the existing runner verbatim and reads back its EOD sidecar so the
     orchestrator can write the result into STATE.md. Never fresh-logs-in (the
@@ -219,7 +219,7 @@ class LoopOrchestrator:
 
     # -- the loop --------------------------------------------------------------
     def run_session(
-        self, engine: Callable[..., SessionOutcome] = kite_engine, today: Optional[date] = None
+        self, engine: Callable[..., SessionOutcome] = broker_engine, today: Optional[date] = None
     ) -> SessionOutcome:
         """One full pass through the five stages, with memory threaded around it.
 
@@ -262,7 +262,7 @@ def main() -> int:  # pragma: no cover
 
     ap = argparse.ArgumentParser(description="kalman_trend loop orchestrator")
     ap.add_argument("--dry-run", action="store_true",
-                    help="run the no-Kite stand-in engine (CI/local smoke)")
+                    help="run the no-broker stand-in engine (CI/local smoke)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -272,7 +272,7 @@ def main() -> int:  # pragma: no cover
         checker = None                      # no data access in the offline smoke
     else:
         from loop_engine.checker import default_kalman_trend_checker
-        engine = kite_engine
+        engine = broker_engine
         checker = default_kalman_trend_checker()
     outcome = LoopOrchestrator(checker=checker).run_session(engine=engine)
     return outcome.exit_code

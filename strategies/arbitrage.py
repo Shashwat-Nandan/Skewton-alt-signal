@@ -1257,7 +1257,7 @@ class ArbitrageStrategy(BaseStrategy):
             next_q = quotes.get(f"NFO:{nxt['tradingsymbol']}") if nxt else None
 
             # Spot is published on every futures quote as `last_price` for the
-            # underlying via Kite's `ohlc` field — simplest is to read from a
+            # underlying via the quote's `ohlc` field — simplest is to read from a
             # parallel cash-segment quote, falling back to the near future's
             # implied spot if the cash quote isn't available.
             spot = self._safe_spot(sym)
