@@ -152,7 +152,7 @@ def make_strategy(
 ) -> CalendarMeanReversionStrategy:
     s = CalendarMeanReversionStrategy.__new__(CalendarMeanReversionStrategy)
     # Parent (ArbitrageStrategy) attributes — keep in sync with backtest_arbitrage.make_strategy.
-    s.kite = kite
+    s.client = kite
     s.config = configparser.ConfigParser()
     s.config_path = "config.ini"
     s.mode = "paper"

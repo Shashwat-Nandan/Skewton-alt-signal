@@ -72,7 +72,7 @@ def _strategy_entry_z_default() -> float:
     configparser.ConfigParser.read = fake_read
     try:
         s = KalmanPairStrategy(
-            kite=None, mode="paper", symbol_a="PA", symbol_b="PB",
+            client=None, mode="paper", symbol_a="PA", symbol_b="PB",
             tradingsymbol_a="PA_FUT", tradingsymbol_b="PB_FUT",
             lot_size_a=50, lot_size_b=50, training_a=pa, training_b=pb,
             model="basic", quote_fn=lambda ts: None)

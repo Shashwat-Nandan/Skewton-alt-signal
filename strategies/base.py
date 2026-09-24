@@ -72,11 +72,11 @@ class BaseStrategy(ABC):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
     ):
-        self.kite = kite
+        self.client = client
         self.config = configparser.ConfigParser()
         self.config.read(config_path)
         self.config_path = config_path

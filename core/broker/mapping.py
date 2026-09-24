@@ -70,7 +70,7 @@ def kotak_segment(exchange: str) -> str:
         ) from e
 
 
-def kite_exchange_from_segment(exchange_segment: str) -> str:
+def strategy_exchange_from_segment(exchange_segment: str) -> str:
     key = (exchange_segment or "").strip().lower()
     try:
         return KOTAK_SEGMENT_TO_KITE_EXCHANGE[key]
@@ -114,7 +114,7 @@ def kotak_status(ord_st: str) -> str:
     return KOTAK_STATUS_TO_KITE.get(key, "PENDING")
 
 
-def kite_to_kotak_tradingsymbol(exchange: str, tradingsymbol: str) -> str:
+def strategy_to_kotak_tradingsymbol(exchange: str, tradingsymbol: str) -> str:
     """Translate a Kite tradingsymbol into Kotak Neo's.
 
     Cash: RELIANCE → RELIANCE-EQ (the scrip master's pTrdSymbol).
@@ -134,8 +134,8 @@ def kite_to_kotak_tradingsymbol(exchange: str, tradingsymbol: str) -> str:
     return symbol
 
 
-def kotak_to_kite_tradingsymbol(exchange_segment: str, tradingsymbol: str) -> str:
-    """Inverse of kite_to_kotak_tradingsymbol, used when instruments()
+def kotak_to_strategy_tradingsymbol(exchange_segment: str, tradingsymbol: str) -> str:
+    """Inverse of strategy_to_kotak_tradingsymbol, used when instruments()
     returns Kotak-native rows and strategies expect Kite names."""
     symbol = (tradingsymbol or "").strip()
     seg = (exchange_segment or "").strip().lower()

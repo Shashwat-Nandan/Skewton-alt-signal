@@ -91,7 +91,7 @@ class KalmanPairStrategy(BaseStrategy):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
         *,
@@ -108,7 +108,7 @@ class KalmanPairStrategy(BaseStrategy):
         quote_fn: Optional[Callable[[str], Optional[float]]] = None,
         clock: Optional[Callable[[], datetime]] = None,
     ):
-        super().__init__(kite, config_path=config_path, mode=mode)
+        super().__init__(client, config_path=config_path, mode=mode)
         cfg = (
             dict(self.config["kalman_pair_trading"])
             if self.config.has_section("kalman_pair_trading")

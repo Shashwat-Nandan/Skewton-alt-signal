@@ -237,8 +237,8 @@ class ShortCallEarningsStrategy(BaseStrategy):
         "allow_min_one_lot": 0,         # 0 = SKIP when one lot exceeds 1R
     }
 
-    def __init__(self, kite, config_path: str = "config.ini", mode: Optional[str] = None):
-        super().__init__(kite, config_path, mode)
+    def __init__(self, client, config_path: str = "config.ini", mode: Optional[str] = None):
+        super().__init__(client, config_path, mode)
         if self.mode == "live":
             raise NotImplementedError(
                 "short_call_earnings is PAPER/SIGNALS ONLY. The backtest shows no "

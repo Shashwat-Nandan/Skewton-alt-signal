@@ -313,7 +313,7 @@ def reconcile_with_broker(strategy, mode: str, log: logging.Logger) -> None:
         log.info("Broker reconciliation skipped (mode=%s)", mode)
         return
     try:
-        broker_positions = strategy.kite.positions().get("net", []) or []
+        broker_positions = strategy.client.positions().get("net", []) or []
     except Exception as e:
         log.exception("kite.positions() failed: %s", e)
         raise RuntimeError(
@@ -549,11 +549,12 @@ def main():
                              "touches HALT_ARBITRAGE_DAILY_LOSS — entries "
                              "suspend, exits continue, persists across "
                              "restarts. 0 disables (not recommended for live).")
-    parser.add_argument("--kite-rate-per-sec", type=float, default=8.0,
-                        dest="kite_rate_per_sec",
+    parser.add_argument("--broker-rate-per-sec", "--kite-rate-per-sec",
+                        type=float, default=8.0, dest="broker_rate_per_sec",
                         help="Token-bucket refill rate (req/s). Kite's ceiling "
                              "is 10/s; default 8 leaves headroom. (default: 8)")
-    parser.add_argument("--kite-burst", type=int, default=8, dest="kite_burst",
+    parser.add_argument("--broker-burst", "--kite-burst",
+                        type=int, default=8, dest="broker_burst",
                         help="Token-bucket burst size. (default: 8)")
     parser.add_argument("--force", action="store_true",
                         help="Run even on weekends/holidays (testing only)")
@@ -617,21 +618,21 @@ def main():
     log.info("=" * 60)
 
     from core.broker import get_trading_client
-    from core.kite_throttle import KiteRateLimiter, throttle_kite
+    from core.broker_throttle import BrokerRateLimiter, throttle_broker
 
     log.info("Authenticating...")
     kite = get_trading_client(CONFIG_PATH)
-    kite_limiter = KiteRateLimiter(
-        rate_per_sec=args.kite_rate_per_sec, burst=args.kite_burst,
+    kite_limiter = BrokerRateLimiter(
+        rate_per_sec=args.broker_rate_per_sec, burst=args.broker_burst,
     )
-    kite = throttle_kite(kite, kite_limiter)
+    kite = throttle_broker(kite, kite_limiter)
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
     log.info("Kite throttle armed: rate=%.1f req/s, burst=%d",
-             args.kite_rate_per_sec, args.kite_burst)
+             args.broker_rate_per_sec, args.broker_burst)
 
     from strategies.arbitrage import ArbitrageStrategy
-    strategy = ArbitrageStrategy(kite=kite, config_path=CONFIG_PATH, mode=args.mode)
+    strategy = ArbitrageStrategy(client=kite, config_path=CONFIG_PATH, mode=args.mode)
     # Per-instance CLI overrides (post-init mutation, same pattern as pairs).
     strategy.max_leg_notional = args.max_leg_notional
     strategy.lots_per_leg = args.lots_per_leg

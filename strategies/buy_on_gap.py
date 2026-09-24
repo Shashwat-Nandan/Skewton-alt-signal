@@ -181,8 +181,8 @@ class BuyOnGapStrategy(BaseStrategy):
                                                 # statutory intraday charges come from core.costs
     }
 
-    def __init__(self, kite, config_path: str = "config.ini", mode: Optional[str] = None):
-        super().__init__(kite, config_path, mode)
+    def __init__(self, client, config_path: str = "config.ini", mode: Optional[str] = None):
+        super().__init__(client, config_path, mode)
 
         if self.mode == "live":
             raise NotImplementedError(

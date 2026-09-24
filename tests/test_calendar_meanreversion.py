@@ -47,7 +47,7 @@ def _make_strategy(
 ) -> CalendarMeanReversionStrategy:
     s = CalendarMeanReversionStrategy.__new__(CalendarMeanReversionStrategy)
     # Parent attributes (subset that the inherited methods touch).
-    s.kite = MagicMock()
+    s.client = MagicMock()
     s.config = MagicMock()
     s.config_path = "config.ini"
     s.mode = mode

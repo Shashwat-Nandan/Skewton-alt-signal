@@ -78,7 +78,7 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
         universe: Optional[List[str]] = None,
@@ -89,7 +89,7 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
     ):
         # Initialize parent ([arbitrage] section, instrument cache, etc.).
         # Then disable the parent's calendar arm — we replace it wholesale.
-        super().__init__(kite, config_path=config_path, mode=mode, universe=universe)
+        super().__init__(client, config_path=config_path, mode=mode, universe=universe)
         self.disable_calendar = True
 
         cfg = (

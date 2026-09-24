@@ -167,7 +167,7 @@ def build_strategies(pairs: pd.DataFrame, panel: pd.DataFrame, nfo: List[dict],
             continue
         try:
             s = KalmanPairStrategy(
-                kite=kite, config_path=config_path, mode="paper",
+                client=kite, config_path=config_path, mode="paper",
                 symbol_a=a, symbol_b=b,
                 tradingsymbol_a=fa["tradingsymbol"], tradingsymbol_b=fb["tradingsymbol"],
                 lot_size_a=fa["lot_size"], lot_size_b=fb["lot_size"],
@@ -780,9 +780,9 @@ def main() -> int:
     config_path = _write_config(args)
 
     from core.broker import get_trading_client
-    from core.kite_throttle import KiteRateLimiter, throttle_kite
-    kite = throttle_kite(
-        get_trading_client(CONFIG_PATH), KiteRateLimiter(rate_per_sec=8.0, burst=8),
+    from core.broker_throttle import BrokerRateLimiter, throttle_broker
+    kite = throttle_broker(
+        get_trading_client(CONFIG_PATH), BrokerRateLimiter(rate_per_sec=8.0, burst=8),
     )
     prof = kite.profile()
     log.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])

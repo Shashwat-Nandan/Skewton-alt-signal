@@ -37,13 +37,13 @@ from .errors import (
 )
 from .kotak_instruments import match_scrip_url, parse_scrip_csv
 from .mapping import (
-    kite_exchange_from_segment,
-    kite_to_kotak_tradingsymbol,
+    strategy_exchange_from_segment,
+    strategy_to_kotak_tradingsymbol,
     kotak_order_type,
     kotak_segment,
     kotak_side,
     kotak_status,
-    kotak_to_kite_tradingsymbol,
+    kotak_to_strategy_tradingsymbol,
     neo_index_quote_token,
 )
 
@@ -363,7 +363,7 @@ class KotakNeoClient:
             "qt": str(int(quantity)),
             "rt": validity or "DAY",
             "tp": _fmt_price(trigger_price),
-            "ts": kite_to_kotak_tradingsymbol(exchange, tradingsymbol),
+            "ts": strategy_to_kotak_tradingsymbol(exchange, tradingsymbol),
             "tt": kotak_side(transaction_type),
             "ig": str(tag or "")[:20],
             "os": "NEOTRADEAPI",
@@ -449,7 +449,7 @@ class KotakNeoClient:
                 out[key] = {"last_price": ltp}
                 if isinstance(row, dict) and row.get("ohlc"):
                     out[key]["ohlc"] = row["ohlc"]
-                depth = _kite_depth(row.get("depth")) if isinstance(row, dict) else None
+                depth = _order_book_depth(row.get("depth")) if isinstance(row, dict) else None
                 if depth:
                     out[key]["depth"] = depth
         return out
@@ -1042,9 +1042,9 @@ def _kotak_position_row(row: dict) -> dict:
         quantity = int(net_direct or 0)
     seg = row.get("exSeg") or row.get("exch") or ""
     trd = row.get("trdSym") or row.get("tradingsymbol") or ""
-    exchange = kite_exchange_from_segment(seg) if seg else ""
+    exchange = strategy_exchange_from_segment(seg) if seg else ""
     tradingsymbol = (
-        kotak_to_kite_tradingsymbol(seg, trd) if trd else ""
+        kotak_to_strategy_tradingsymbol(seg, trd) if trd else ""
     )
     return {
         "tradingsymbol": tradingsymbol,
@@ -1084,7 +1084,7 @@ def _empty_kotak_book(payload: dict) -> bool:
     return code == 5203 or msg == "no data"
 
 
-def _kite_depth(depth) -> Optional[dict]:
+def _order_book_depth(depth) -> Optional[dict]:
     """Kotak depth → Kite `{buy,sell}[{price,quantity,orders}]` numbers."""
     if not isinstance(depth, dict):
         return None

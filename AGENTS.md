@@ -29,7 +29,7 @@ style preferences; they are the reason we can run unattended.
    not shortcut, skip, or fake this progression.
 4. **Never weaken a safety guard to "make it run."** The market-hours gate
    (09:15–15:30 IST), the `--force` requirement, position/exposure limits, throttle
-   (`core/kite_throttle.py`), and any kill-switch exist on purpose. If a guard blocks
+   (`core/broker_throttle.py`), and any kill-switch exist on purpose. If a guard blocks
    you, the guard is working — do not delete or bypass it; ask.
 5. **Money-affecting changes require human review** via `CODEOWNERS` — no
    self-merge. This covers `strategies/`, `signal_plane/`, `loop_engine/`,
@@ -87,7 +87,7 @@ uv pip compile requirements-dev.in --generate-hashes --output-file requirements-
 - `frontend/` — React/Vite/TS dashboard SPA (`taleb-karpathy-dashboard`).
 - `strategies/`, `signal_plane/`, `loop_engine/` — the trading brain (money-affecting).
 - `runners/` — headless daemons/entry points (paper, pairs, arbitrage, equity swing, autoresearch). Money-affecting.
-- `core/` — shared engines & broker I/O: `broker` (adapter factory: zerodha/kotak/groww/dhan), `greeks_engine`, `risk_analyzer`, `market_profile`, `regime_classifier`, `runner_common`, `screen_pairs`, `data_cache_io`, `kite_auth`, `kite_throttle`.
+- `core/` — shared engines & broker I/O: `broker` (adapter factory: zerodha/kotak/groww/dhan), `greeks_engine`, `risk_analyzer`, `market_profile`, `regime_classifier`, `runner_common`, `screen_pairs`, `data_cache_io`, `kite_auth`, `broker_throttle`.
 - `market_data/` — market-data acquisition (`fetch_*`, `tick_capture`, `tape_to_parquet`) plus `holidays.csv`.
 - `research/` — backtests, parameter sweeps, optimizers and validators. Never on a live path.
 - `scripts/` — operational one-shots (scoreboard, decay ledger, verify, feature logging, reports).

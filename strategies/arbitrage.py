@@ -173,12 +173,12 @@ class ArbitrageStrategy(BaseStrategy):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
         universe: Optional[List[str]] = None,
     ):
-        super().__init__(kite, config_path=config_path, mode=mode)
+        super().__init__(client, config_path=config_path, mode=mode)
 
         cfg = (
             dict(self.config["arbitrage"])
@@ -729,7 +729,7 @@ class ArbitrageStrategy(BaseStrategy):
         stop the book from trading.
 
         There is no refresh-and-retry on a TokenException, unlike
-        pair_trading: this strategy has no _try_refresh_kite, and
+        pair_trading: this strategy has no _try_refresh_broker, and
         run_paper_arbitrage authenticates once at startup with no refresh path
         of its own. A token that dies mid-session therefore disarms this gate
         for the rest of the session — bounded, because the same dead token
@@ -737,7 +737,7 @@ class ArbitrageStrategy(BaseStrategy):
         the day the runner grows one (Rule 7: one convention, not two).
         """
         try:
-            margins = self.kite.margins()
+            margins = self.client.margins()
             equity = margins["equity"]
             if not isinstance(equity, dict):
                 raise TypeError("equity blob is not a dict")
@@ -803,7 +803,7 @@ class ArbitrageStrategy(BaseStrategy):
             for p in proposals
         ]
         try:
-            basket = self.kite.basket_order_margins(params, consider_positions=True)
+            basket = self.client.basket_order_margins(params, consider_positions=True)
             netted = float(basket["final"]["total"])
             per_leg = [float(o["total"]) for o in (basket.get("orders") or [])
                        if isinstance(o, dict) and o.get("total") is not None]
@@ -1401,7 +1401,7 @@ class ArbitrageStrategy(BaseStrategy):
         if self._instrument_cache is not None:
             return self._instrument_cache
         try:
-            self._instrument_cache = self.kite.instruments("NFO") or []
+            self._instrument_cache = self.client.instruments("NFO") or []
         except Exception as e:
             logger.warning("instruments('NFO') failed: %s", e)
             self._instrument_cache = []
@@ -1662,14 +1662,14 @@ class ArbitrageStrategy(BaseStrategy):
 
     def _safe_quote(self, keys: List[str]) -> Dict[str, dict]:
         try:
-            return self.kite.quote(keys) or {}
+            return self.client.quote(keys) or {}
         except Exception as e:
             logger.warning("quote(%s) failed: %s", keys, e)
             return {}
 
     def _safe_spot(self, symbol: str) -> Optional[float]:
         try:
-            q = self.kite.quote([f"NSE:{symbol}"]) or {}
+            q = self.client.quote([f"NSE:{symbol}"]) or {}
             row = q.get(f"NSE:{symbol}")
             if row and row.get("last_price"):
                 return float(row["last_price"])
@@ -2298,20 +2298,20 @@ class ArbitrageStrategy(BaseStrategy):
         # executor's confirmed COMPLETE.
         executor = self._order_executor()
         # Rebind in case the runner swapped the kite client (token refresh).
-        executor.kite = self.kite
+        executor.client = self.client
         return executor.execute(prop)
 
     def _order_executor(self):
         # Lazy so __new__-bypass tests and paper/signals runs never build it.
         if getattr(self, "_live_order_executor", None) is None:
-            from .order_executor import KiteOrderExecutor
+            from .order_executor import OrderExecutor
             try:
                 lpp = self.config.getfloat(
                     "strategy", "limit_protection_pct", fallback=0.25)
             except Exception:
                 lpp = 0.25
-            self._live_order_executor = KiteOrderExecutor(
-                self.kite,
+            self._live_order_executor = OrderExecutor(
+                self.client,
                 order_tag=lambda p: (
                     f"arb-{self._symbol_from_tradingsymbol(p.tradingsymbol)}"
                 ),

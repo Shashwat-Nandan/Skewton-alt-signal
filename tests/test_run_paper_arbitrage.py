@@ -86,7 +86,7 @@ class _FakeStrategy:
     name = "arbitrage"
 
     def __init__(self):
-        self.kite = MagicMock()
+        self.client = MagicMock()
         self.state = SimpleNamespace(
             open_calendars={}, last_basis_snapshot=[],
             realized_pnl=0.0, unrealized_pnl=0.0,
@@ -113,7 +113,7 @@ class TestReconcileWithBroker:
         strat = _FakeStrategy()
         # No broker call should happen in paper mode.
         arb.reconcile_with_broker(strat, "paper", _log())
-        strat.kite.positions.assert_not_called()
+        strat.client.positions.assert_not_called()
 
     def test_live_mismatch_refuses_to_start(self):
         strat = _FakeStrategy()
@@ -121,7 +121,7 @@ class TestReconcileWithBroker:
             "AAA": self._trade([self._leg("AAA26APRFUT", -1, 100)])
         }
         # Broker reports a DIFFERENT share count for the leg.
-        strat.kite.positions.return_value = {
+        strat.client.positions.return_value = {
             "net": [{"exchange": "NFO", "tradingsymbol": "AAA26APRFUT", "quantity": 0}]
         }
         with pytest.raises(RuntimeError, match="reconciliation FAILED"):
@@ -133,7 +133,7 @@ class TestReconcileWithBroker:
             "AAA": self._trade([self._leg("AAA26APRFUT", -1, 100)])
         }
         # Broker agrees: -1 lot * 100 = -100 shares.
-        strat.kite.positions.return_value = {
+        strat.client.positions.return_value = {
             "net": [{"exchange": "NFO", "tradingsymbol": "AAA26APRFUT", "quantity": -100}]
         }
         arb.reconcile_with_broker(strat, "live", _log())  # no raise

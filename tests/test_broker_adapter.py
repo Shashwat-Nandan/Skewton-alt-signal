@@ -27,12 +27,12 @@ from core.broker import (
 from core.broker.kotak import KotakNeoClient, _extract_ltp, normalize_kotak_mobile
 from core.broker.kotak_instruments import match_scrip_url, parse_scrip_csv
 from core.broker.mapping import (
-    kite_exchange_from_segment,
-    kite_to_kotak_tradingsymbol,
+    strategy_exchange_from_segment,
+    strategy_to_kotak_tradingsymbol,
     kotak_segment,
     kotak_side,
     kotak_status,
-    kotak_to_kite_tradingsymbol,
+    kotak_to_strategy_tradingsymbol,
     neo_index_quote_token,
 )
 
@@ -142,27 +142,27 @@ class TestMapping:
             kotak_segment("NYSE")
 
     def test_cash_symbol_gets_eq_suffix(self):
-        assert kite_to_kotak_tradingsymbol("NSE", "RELIANCE") == "RELIANCE-EQ"
-        assert kite_to_kotak_tradingsymbol("NSE", "RELIANCE-EQ") == "RELIANCE-EQ"
+        assert strategy_to_kotak_tradingsymbol("NSE", "RELIANCE") == "RELIANCE-EQ"
+        assert strategy_to_kotak_tradingsymbol("NSE", "RELIANCE-EQ") == "RELIANCE-EQ"
 
     def test_option_symbol_is_sent_as_the_scrip_master_names_it(self):
         # Prod nse_fo.csv (2026-09-24) uses the Kite suffix. The older
         # C-before-strike form is not in that file; sending it would
         # place a symbol the master does not list.
-        assert kite_to_kotak_tradingsymbol("NFO", "NIFTY25SEP25000CE") == "NIFTY25SEP25000CE"
-        assert kite_to_kotak_tradingsymbol("NFO", "NIFTY26O1928100CE") == "NIFTY26O1928100CE"
-        assert kite_to_kotak_tradingsymbol("NFO", "BANKNIFTY25SEP52000PE") == (
+        assert strategy_to_kotak_tradingsymbol("NFO", "NIFTY25SEP25000CE") == "NIFTY25SEP25000CE"
+        assert strategy_to_kotak_tradingsymbol("NFO", "NIFTY26O1928100CE") == "NIFTY26O1928100CE"
+        assert strategy_to_kotak_tradingsymbol("NFO", "BANKNIFTY25SEP52000PE") == (
             "BANKNIFTY25SEP52000PE"
         )
 
     def test_option_round_trip(self):
         kite = "NIFTY25SEP25000CE"
-        kotak = kite_to_kotak_tradingsymbol("NFO", kite)
-        assert kotak_to_kite_tradingsymbol("nse_fo", kotak) == kite
+        kotak = strategy_to_kotak_tradingsymbol("NFO", kite)
+        assert kotak_to_strategy_tradingsymbol("nse_fo", kotak) == kite
 
     def test_futures_symbol_passes_through(self):
-        assert kite_to_kotak_tradingsymbol("NFO", "TCS26JULFUT") == "TCS26JULFUT"
-        assert kotak_to_kite_tradingsymbol("nse_fo", "TCS26JULFUT") == "TCS26JULFUT"
+        assert strategy_to_kotak_tradingsymbol("NFO", "TCS26JULFUT") == "TCS26JULFUT"
+        assert kotak_to_strategy_tradingsymbol("nse_fo", "TCS26JULFUT") == "TCS26JULFUT"
 
     def test_side_and_status(self):
         assert kotak_side("BUY") == "B"
@@ -172,8 +172,8 @@ class TestMapping:
         assert kotak_status("rejected") == "REJECTED"
 
     def test_segment_round_trip(self):
-        assert kite_exchange_from_segment("nse_fo") == "NFO"
-        assert kite_exchange_from_segment("nse_cm") == "NSE"
+        assert strategy_exchange_from_segment("nse_fo") == "NFO"
+        assert strategy_exchange_from_segment("nse_cm") == "NSE"
 
     def test_index_spot_is_not_eq_suffix(self):
         assert neo_index_quote_token("NSE", "NIFTY 50") == ("nse_cm", "Nifty 50")
@@ -737,7 +737,7 @@ class TestOrderExecutorAcceptsBrokerTokenError:
 
     def test_place_order_token_error_refreshes_once(self):
         from core.trade_proposer import TradeProposal
-        from strategies.order_executor import KiteOrderExecutor
+        from strategies.order_executor import OrderExecutor
 
         class Fake:
             VARIETY_REGULAR = "regular"
@@ -773,8 +773,8 @@ class TestOrderExecutorAcceptsBrokerTokenError:
             transaction_type="BUY", iv=0.15, bid_ask_spread_pct=0.5,
             margin_required=15000,
         )
-        result = KiteOrderExecutor(
-            stale, order_tag="t", kite_refresh=lambda: fresh,
+        result = OrderExecutor(
+            stale, order_tag="t", broker_refresh=lambda: fresh,
             poll_timeout_s=0.05, poll_interval_s=0.01,
         ).execute(prop)
         assert result["status"] == "COMPLETE"
@@ -831,7 +831,7 @@ class TestKotakScripMaster:
         assert opt["strike"] == 25000.0
         assert opt["expiry"] == date(2026, 6, 30)
         assert opt["exchange"] == "NFO"
-        assert kite_to_kotak_tradingsymbol("NFO", opt["tradingsymbol"]) == (
+        assert strategy_to_kotak_tradingsymbol("NFO", opt["tradingsymbol"]) == (
             "NIFTY25SEP25000CE"
         )
 

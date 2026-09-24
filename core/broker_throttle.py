@@ -1,16 +1,17 @@
-"""Token-bucket throttler for the Kite Connect SDK.
+"""Token-bucket throttler for a broker client.
 
-Kite's published per-key ceiling is 10 req/s; sustained excess gets 429s
-that downstream code interprets as "quote failed" → no z-score → no
-trade. H14 from the live-readiness audit: with 12 pairs clustered at
-second-0 of each minute issuing 2 quote calls each plus per-symbol
-instrument lookups, a real session crosses the ceiling routinely.
+The bucket wraps the same method names on whichever client the runner
+holds (Zerodha Kite or Kotak Neo). Kite's published per-key ceiling is
+10 req/s; sustained excess gets 429s that downstream code interprets as
+"quote failed" → no z-score → no trade. H14 from the live-readiness
+audit: with 12 pairs clustered at second-0 of each minute issuing 2
+quote calls each plus per-symbol instrument lookups, a real session
+crosses that ceiling routinely.
 
-The throttler wraps named methods on a KiteConnect instance with a
-shared token bucket. Default is 8 req/s with a burst of 8 — leaves
-headroom for the dashboard process and retry storms. Calls block on the
-bucket rather than raising; out-of-band 429s only show up when the
-ceiling itself moves (broker-side incident, not our problem).
+Default is 8 req/s with a burst of 8 — leaves headroom for the
+dashboard process and retry storms. Calls block on the bucket rather
+than raising; out-of-band 429s only show up when the ceiling itself
+moves (broker-side incident, not our problem).
 
 Threading model: the bucket uses a single Lock around the token-count
 update; the sleep happens OUTSIDE the lock so other threads can drain
@@ -66,7 +67,7 @@ DEFAULT_BURST = 8
 SLOW_WAIT_LOG_THRESHOLD_S = 0.5
 
 
-class KiteRateLimiter:
+class BrokerRateLimiter:
     """Thread-safe token bucket. acquire() blocks until a token is free."""
 
     def __init__(
@@ -106,7 +107,7 @@ class KiteRateLimiter:
                     self._tokens -= 1.0
                     if total_wait >= SLOW_WAIT_LOG_THRESHOLD_S:
                         logger.info(
-                            "kite throttle: waited %.2fs for a token "
+                            "broker throttle: waited %.2fs for a token "
                             "(rate=%.1f/s, burst=%d)",
                             total_wait, self._rate, self._burst,
                         )
@@ -119,29 +120,29 @@ class KiteRateLimiter:
             total_wait += wait
 
 
-def throttle_kite(
-    kite, limiter: KiteRateLimiter,
+def throttle_broker(
+    client, limiter: BrokerRateLimiter,
     methods: Iterable[str] = DEFAULT_THROTTLED_METHODS,
 ):
-    """Monkey-patch each named method on `kite` so it awaits a token
+    """Monkey-patch each named method on `client` so it awaits a token
     before delegating to the original. Idempotent: repeated application
     sees the `__throttled__` flag and skips.
 
-    Returns `kite` for chaining. Methods that don't exist on the
-    instance are silently skipped (KiteConnect surface evolves; we don't
+    Returns `client` for chaining. Methods that don't exist on the
+    instance are silently skipped (the broker surface evolves; we don't
     want to crash a runner because a method was renamed)."""
     for name in methods:
-        original = getattr(kite, name, None)
+        original = getattr(client, name, None)
         if not callable(original):
             continue
         if getattr(original, "__throttled__", False):
             continue
         wrapped = _make_throttled(original, limiter)
-        setattr(kite, name, wrapped)
-    return kite
+        setattr(client, name, wrapped)
+    return client
 
 
-def _make_throttled(original, limiter: KiteRateLimiter):
+def _make_throttled(original, limiter: BrokerRateLimiter):
     def wrapper(*args, **kwargs):
         limiter.acquire()
         return original(*args, **kwargs)

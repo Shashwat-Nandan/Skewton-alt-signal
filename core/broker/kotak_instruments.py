@@ -25,7 +25,7 @@ from datetime import date, datetime, timezone
 from typing import Iterable, Optional
 
 from .errors import BrokerOrderError
-from .mapping import kotak_to_kite_tradingsymbol
+from .mapping import kotak_to_strategy_tradingsymbol
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ def match_scrip_url(file_paths: Iterable[str], segment: str) -> str:
     return hits[0]
 
 
-def parse_scrip_csv(text: str, kite_exchange: str) -> list[dict]:
+def parse_scrip_csv(text: str, strategy_exchange: str) -> list[dict]:
     """Parse a Neo scrip-master CSV into Kite-shaped instrument dicts.
 
     Rows we cannot classify (no tradingsymbol, no FUT/CE/PE/EQ type, or
@@ -103,7 +103,7 @@ def parse_scrip_csv(text: str, kite_exchange: str) -> list[dict]:
     rows: list[dict] = []
     skipped = 0
     for raw in reader:
-        mapped = scrip_row_to_kite(raw, kite_exchange)
+        mapped = scrip_row_to_instrument(raw, strategy_exchange)
         if mapped is None:
             skipped += 1
             continue
@@ -111,12 +111,12 @@ def parse_scrip_csv(text: str, kite_exchange: str) -> list[dict]:
     if skipped:
         logger.info(
             "Kotak scrip-master %s: kept %d rows, skipped %d unusable",
-            kite_exchange, len(rows), skipped,
+            strategy_exchange, len(rows), skipped,
         )
     return rows
 
 
-def scrip_row_to_kite(raw: dict, kite_exchange: str) -> Optional[dict]:
+def scrip_row_to_instrument(raw: dict, strategy_exchange: str) -> Optional[dict]:
     row = _norm_row(raw)
     kotak_symbol = _first(row, "pTrdSymbol", "pScripRefKey", "pSymbolName")
     if not kotak_symbol:
@@ -126,9 +126,9 @@ def scrip_row_to_kite(raw: dict, kite_exchange: str) -> Optional[dict]:
     if inst_type is None:
         return None
     segment = _first(row, "pExchSeg") or KITE_EXCHANGE_TO_SEGMENT.get(
-        kite_exchange.upper(), ""
+        strategy_exchange.upper(), ""
     )
-    tradingsymbol = kotak_to_kite_tradingsymbol(segment, kotak_symbol)
+    tradingsymbol = kotak_to_strategy_tradingsymbol(segment, kotak_symbol)
     expiry = _parse_expiry(row)
     if inst_type in ("FUT", "CE", "PE") and expiry is None:
         return None
@@ -141,8 +141,8 @@ def scrip_row_to_kite(raw: dict, kite_exchange: str) -> Optional[dict]:
         lot = lot or 1
     tick = _parse_tick(_first(row, "dTickSize"))
     token = _parse_int(_first(row, "pSymbol")) or 0
-    exchange = kite_exchange.upper()
-    kite_segment = _kite_segment(exchange, inst_type)
+    exchange = strategy_exchange.upper()
+    segment_code = _instrument_segment(exchange, inst_type)
     return {
         "instrument_token": token,
         "exchange_token": token,
@@ -154,7 +154,7 @@ def scrip_row_to_kite(raw: dict, kite_exchange: str) -> Optional[dict]:
         "tick_size": tick,
         "lot_size": lot,
         "instrument_type": inst_type,
-        "segment": kite_segment,
+        "segment": segment_code,
         "exchange": exchange,
     }
 
@@ -304,7 +304,7 @@ def _parse_int(raw) -> Optional[int]:
         return None
 
 
-def _kite_segment(exchange: str, inst_type: str) -> str:
+def _instrument_segment(exchange: str, inst_type: str) -> str:
     if inst_type in ("CE", "PE"):
         return f"{exchange}-OPT"
     if inst_type == "FUT":

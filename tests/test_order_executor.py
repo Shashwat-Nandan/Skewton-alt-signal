@@ -17,7 +17,7 @@ that protect real money:
 """
 
 from strategies.order_executor import (
-    KiteOrderExecutor,
+    OrderExecutor,
     _NetworkException,
     _OrderException,
     _TokenException,
@@ -79,7 +79,7 @@ def _executor(kite, **kwargs):
     kwargs.setdefault("order_tag", "test-tag")
     kwargs.setdefault("poll_timeout_s", 0.05)
     kwargs.setdefault("poll_interval_s", 0.01)
-    return KiteOrderExecutor(kite, **kwargs)
+    return OrderExecutor(kite, **kwargs)
 
 
 class TestCompleteFill:
@@ -255,11 +255,11 @@ class TestPlaceExceptionTaxonomy:
     def test_token_exception_refreshes_and_retries_once(self):
         stale = FakeKite(place_raises=[_TokenException("expired")])
         fresh = FakeKite()
-        ex = _executor(stale, kite_refresh=lambda: fresh)
+        ex = _executor(stale, broker_refresh=lambda: fresh)
         result = ex.execute(_prop())
         assert result["status"] == "COMPLETE"
         assert len(fresh.placed) == 1
-        assert ex.kite is fresh  # rebound for subsequent calls
+        assert ex.client is fresh  # rebound for subsequent calls
 
 
 class TestValidation:

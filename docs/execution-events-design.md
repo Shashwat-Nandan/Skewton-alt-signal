@@ -58,7 +58,7 @@ messages are immutable; consumers never re-forward). Own versioned schema
 
 ### event ↔ executor-outcome mapping
 
-`KiteOrderExecutor` (`strategies/order_executor.py`) returns
+`OrderExecutor` (`strategies/order_executor.py`) returns
 `{order_id, status, filled_lots, average_price, mode, [error]}`; every
 terminal outcome maps to exactly one event:
 
@@ -127,6 +127,6 @@ pass `"execution"`. Backward-compatible, inert for signals. `FileBus` needs
    vs one unified stream. This overturns/keeps the documented signal↔OMS
    boundary.
 2. **Emit locus:** caller-side (recommended, executor untouched) vs an
-   injected emitter inside `KiteOrderExecutor`.
+   injected emitter inside `OrderExecutor`.
 3. **Scope of Phase B:** start with `pair_trading` only (the sole
    publish-wired strategy), or all five at once (bigger money-path surface).

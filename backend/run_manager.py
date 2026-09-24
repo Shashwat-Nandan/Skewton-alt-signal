@@ -96,7 +96,7 @@ class RunManager:
     # ── Lifecycle ──
 
     def _build_strategy(
-        self, strategy_name: str, mode: str, params: Dict[str, Any], kite,
+        self, strategy_name: str, mode: str, params: Dict[str, Any], client,
     ) -> BaseStrategy:
         # Sync and potentially SLOW: pair strategies seed spread history
         # from the bhavcopy archive and fetch the NFO instruments dump in
@@ -110,7 +110,7 @@ class RunManager:
         # the form override beats the config default.
         max_leg = params.get("max_leg_notional")
         strategy = strategy_cls(
-            kite=kite,
+            client=client,
             config_path=str(get_settings().config_path),
             mode=mode,
             **kwargs,
@@ -124,13 +124,13 @@ class RunManager:
         return strategy
 
     async def create_run(
-        self, strategy_name: str, mode: str, params: Dict[str, Any], kite,
+        self, strategy_name: str, mode: str, params: Dict[str, Any], client,
     ) -> Run:
         # Construction happens in a worker thread so a slow __init__ can't
         # freeze every other dashboard request; task creation stays on the
         # loop thread (asyncio.create_task requires it).
         strategy = await asyncio.to_thread(
-            self._build_strategy, strategy_name, mode, params, kite,
+            self._build_strategy, strategy_name, mode, params, client,
         )
 
         run = Run(

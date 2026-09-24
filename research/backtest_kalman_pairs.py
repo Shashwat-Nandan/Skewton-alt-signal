@@ -147,7 +147,7 @@ def run_replay(symbol_a, symbol_b, lot_a, lot_b,
     cur = [test_dates[0]]
     try:
         strat = KalmanPairStrategy(
-            kite=None, config_path=config_path, mode="paper",
+            client=None, config_path=config_path, mode="paper",
             symbol_a=symbol_a, symbol_b=symbol_b,
             tradingsymbol_a=ts_a, tradingsymbol_b=ts_b,
             lot_size_a=lot_a, lot_size_b=lot_b,
@@ -224,7 +224,7 @@ def run_replay_5min(symbol_a, symbol_b, lot_a, lot_b, train_a, train_b, bars,
     cur = [bars.index[0].to_pydatetime()]
     try:
         strat = KalmanPairStrategy(
-            kite=None, config_path=config_path, mode="paper",
+            client=None, config_path=config_path, mode="paper",
             symbol_a=symbol_a, symbol_b=symbol_b,
             tradingsymbol_a=ts_a, tradingsymbol_b=ts_b,
             lot_size_a=lot_a, lot_size_b=lot_b,

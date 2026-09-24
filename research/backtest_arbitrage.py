@@ -283,7 +283,7 @@ def make_strategy(
     dividend_yields: Optional[Dict[str, float]] = None,
 ) -> ArbitrageStrategy:
     s = ArbitrageStrategy.__new__(ArbitrageStrategy)
-    s.kite = kite
+    s.client = kite
     s.config = configparser.ConfigParser()
     s.config_path = "config.ini"
     s.mode = "paper"

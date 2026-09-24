@@ -30,7 +30,7 @@ class _NullKite:
 
 
 def _strategy():
-    s = BuyOnGapStrategy(kite=_NullKite(), config_path="/dev/null", mode="paper")
+    s = BuyOnGapStrategy(client=_NullKite(), config_path="/dev/null", mode="paper")
     return s
 
 

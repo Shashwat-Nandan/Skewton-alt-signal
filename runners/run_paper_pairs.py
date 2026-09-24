@@ -350,7 +350,7 @@ def select_pairs(top: int, log: logging.Logger,
 def build_strategies(
     pairs: pd.DataFrame, args, kite, config_path: str, log: logging.Logger,
     *, nfo_instruments: Optional[List[dict]] = None,
-    kite_refresh=None,
+    broker_refresh=None,
     book_notional_fn=None,
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
@@ -363,14 +363,14 @@ def build_strategies(
         a, b, beta = row["symbol_a"], row["symbol_b"], float(row["hedge_ratio"])
         try:
             s = PairTradingStrategy(
-                kite=kite,
+                client=kite,
                 config_path=config_path,
                 mode=args.mode,
                 symbol_a=a,
                 symbol_b=b,
                 hedge_ratio=beta,
                 nfo_instruments=nfo_instruments,
-                kite_refresh=kite_refresh,
+                broker_refresh=broker_refresh,
                 book_notional_fn=book_notional_fn,
                 spread_panel=spread_panel,
                 signal_publisher=signal_publisher,
@@ -794,7 +794,7 @@ def build_orphan_strategies(
     prior_state: Dict[str, Dict], matched_keys: set,
     args, kite, config_path: str, log: logging.Logger,
     *, nfo_instruments: Optional[List[dict]] = None,
-    kite_refresh=None,
+    broker_refresh=None,
     book_notional_fn=None,
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
@@ -821,10 +821,10 @@ def build_orphan_strategies(
             sa, sb = pair[0], pair[1]
             saved_beta = float(blob["hedge_ratio"])
             s = PairTradingStrategy(
-                kite=kite, config_path=config_path, mode=args.mode,
+                client=kite, config_path=config_path, mode=args.mode,
                 symbol_a=sa, symbol_b=sb, hedge_ratio=saved_beta,
                 nfo_instruments=nfo_instruments,
-                kite_refresh=kite_refresh,
+                broker_refresh=broker_refresh,
                 book_notional_fn=book_notional_fn,
                 spread_panel=spread_panel,
                 signal_publisher=signal_publisher,
@@ -1066,20 +1066,20 @@ def main():
                              "sizing is --lots-per-leg 1; this flag exists so a "
                              "typo (e.g. --lots-per-leg 100) cannot silently "
                              "deploy a 100× larger book.")
-    parser.add_argument("--kite-rate-per-sec", type=float, default=8.0,
-                        dest="kite_rate_per_sec",
-                        help="Token-bucket refill rate (req/s) for the kite "
+    parser.add_argument("--broker-rate-per-sec", "--kite-rate-per-sec",
+                        type=float, default=8.0, dest="broker_rate_per_sec",
+                        help="Token-bucket refill rate (req/s) for the broker "
                              "client. Kite's per-key ceiling is 10/s; we "
                              "default 2 below to leave headroom for retries "
                              "and the dashboard process sharing the key. "
                              "Calls block on the bucket — never 429. "
                              "(default: 8.0)")
-    parser.add_argument("--kite-burst", type=int, default=8,
-                        dest="kite_burst",
+    parser.add_argument("--broker-burst", "--kite-burst",
+                        type=int, default=8, dest="broker_burst",
                         help="Token-bucket burst size. The first N≤burst "
                              "calls after idle pass through without "
                              "throttling; sustained pressure throttles to "
-                             "--kite-rate-per-sec. (default: 8)")
+                             "--broker-rate-per-sec. (default: 8)")
     parser.add_argument("--stop-cooldown-minutes", type=int, default=60,
                         dest="stop_cooldown_minutes",
                         help="After a STOP-OUT exit, refuse re-entry on the "
@@ -1317,17 +1317,17 @@ def main():
     # X26MAYFUT: Unknown Content-Type (text/html ... 502: Bad gateway)"
     # which is the upstream reaction. Calls block on the bucket; they
     # don't fail.
-    from core.kite_throttle import KiteRateLimiter, throttle_kite
-    kite_limiter = KiteRateLimiter(
-        rate_per_sec=args.kite_rate_per_sec, burst=args.kite_burst,
+    from core.broker_throttle import BrokerRateLimiter, throttle_broker
+    kite_limiter = BrokerRateLimiter(
+        rate_per_sec=args.broker_rate_per_sec, burst=args.broker_burst,
     )
-    kite = throttle_kite(kite, kite_limiter)
+    kite = throttle_broker(kite, kite_limiter)
 
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
     log.info(
         "Kite throttle armed: rate=%.1f req/s, burst=%d",
-        args.kite_rate_per_sec, args.kite_burst,
+        args.broker_rate_per_sec, args.broker_burst,
     )
 
     # H19: prefetch the ~150k-row NFO instruments dump once and inject it
@@ -1349,9 +1349,9 @@ def main():
     # re-authenticate (re-uses cached refresh path if available, else full
     # TOTP login), then re-wraps with the same throttler so the strategies
     # don't bypass H14 after a refresh.
-    def _refresh_kite():
+    def _refresh_broker():
         fresh = broker.refresh()
-        return throttle_kite(fresh, kite_limiter)
+        return throttle_broker(fresh, kite_limiter)
 
     # H13: closure summing open-leg notional, called by each strategy before
     # it generates entry proposals.
@@ -1443,7 +1443,7 @@ def main():
     strategies = build_strategies(
         pairs, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
-        kite_refresh=_refresh_kite,
+        broker_refresh=_refresh_broker,
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,
@@ -1455,7 +1455,7 @@ def main():
     orphans = build_orphan_strategies(
         prior_state, matched_keys, args, kite, config_path, log,
         nfo_instruments=nfo_instruments,
-        kite_refresh=_refresh_kite,
+        broker_refresh=_refresh_broker,
         book_notional_fn=book_notional_fn,
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,

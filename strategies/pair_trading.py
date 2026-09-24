@@ -266,19 +266,19 @@ class PairTradingStrategy(BaseStrategy):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
         symbol_a: Optional[str] = None,
         symbol_b: Optional[str] = None,
         hedge_ratio: Optional[float] = None,
         nfo_instruments: Optional[List[dict]] = None,
-        kite_refresh: Optional[Callable[[], object]] = None,
+        broker_refresh: Optional[Callable[[], object]] = None,
         book_notional_fn: Optional[Callable[[], float]] = None,
         spread_panel: Optional[pd.DataFrame] = None,
         signal_publisher=None,
     ):
-        super().__init__(kite, config_path=config_path, mode=mode)
+        super().__init__(client, config_path=config_path, mode=mode)
 
         # Issue #90: optional signal_plane.SignalPublisher. When wired (the
         # persistent runner's --publish-signals), every book-mutating
@@ -470,7 +470,7 @@ class PairTradingStrategy(BaseStrategy):
         # throttle/retry wrappers). On TokenException mid-session, the
         # live-path call sites use this to refresh the token once before
         # giving up. None → no refresh (calls fail loud, same as pre-H8).
-        self._kite_refresh = kite_refresh
+        self._broker_refresh = broker_refresh
         # H13: callback returning the current Σ open_notional across ALL
         # paper/live runners' state files. None → cross-runner exposure
         # cap disabled. self.max_book_notional is the cap; if 0/unset the
@@ -1199,7 +1199,7 @@ class PairTradingStrategy(BaseStrategy):
             return self._nfo_instruments_cache
         if not retry:
             try:
-                self._nfo_instruments_cache = self.kite.instruments("NFO") or []
+                self._nfo_instruments_cache = self.client.instruments("NFO") or []
             except Exception as e:
                 logger.warning("instruments('NFO') failed: %s", e)
                 return []
@@ -1207,7 +1207,7 @@ class PairTradingStrategy(BaseStrategy):
         last_exc: Optional[Exception] = None
         for attempt in range(max_retries):
             try:
-                result = self.kite.instruments("NFO") or []
+                result = self.client.instruments("NFO") or []
                 self._nfo_instruments_cache = result
                 if attempt > 0:
                     logger.info(
@@ -1877,14 +1877,14 @@ class PairTradingStrategy(BaseStrategy):
     def _get_last_price(self, tradingsymbol: str) -> Optional[float]:
         key = f"NFO:{tradingsymbol}"
         try:
-            quote = self.kite.quote([key])
+            quote = self.client.quote([key])
             return float(quote[key]["last_price"])
         except _TOKEN_ERRORS as e:
             # H8: token expired mid-session. Refresh once and retry.
-            if not self._try_refresh_kite("quote", tradingsymbol, e):
+            if not self._try_refresh_broker("quote", tradingsymbol, e):
                 return None
             try:
-                quote = self.kite.quote([key])
+                quote = self.client.quote([key])
                 return float(quote[key]["last_price"])
             except Exception as e2:
                 logger.critical(
@@ -1902,16 +1902,16 @@ class PairTradingStrategy(BaseStrategy):
         # Transient margins() failure → True (let order flow; C2 reversal
         # handles any post-fact margin reject).
         try:
-            margins = self.kite.margins()
+            margins = self.client.margins()
         except _TOKEN_ERRORS as e:
-            if not self._try_refresh_kite("margins", "entry_precheck", e):
+            if not self._try_refresh_broker("margins", "entry_precheck", e):
                 logger.warning(
                     "%s/%s: margins() raised TokenException with no refresh — "
                     "proceeding without margin precheck", self.symbol_a, self.symbol_b,
                 )
                 return True
             try:
-                margins = self.kite.margins()
+                margins = self.client.margins()
             except Exception as e2:
                 logger.warning(
                     "%s/%s: margins() failed after token refresh (%s) — "
@@ -2019,7 +2019,7 @@ class PairTradingStrategy(BaseStrategy):
         ]
 
         def _quote() -> float:
-            basket = self.kite.basket_order_margins(params, consider_positions=True)
+            basket = self.client.basket_order_margins(params, consider_positions=True)
             # max(initial, final): legs are placed sequentially, so the peak
             # (pre-netting-benefit) requirement must clear, not just the
             # settled basket figure.
@@ -2036,7 +2036,7 @@ class PairTradingStrategy(BaseStrategy):
             # (2026-06-17 concurrent-login incident class) would silently
             # degrade the gate to the understated Σ estimate — the exact
             # 2026-07-13 failure this precheck exists to prevent.
-            if not self._try_refresh_kite("basket_order_margins", "entry_precheck", e):
+            if not self._try_refresh_broker("basket_order_margins", "entry_precheck", e):
                 logger.warning(
                     "%s/%s: basket_order_margins TokenException, no refresh — "
                     "falling back to Σ estimate ₹%.0f",
@@ -2078,26 +2078,26 @@ class PairTradingStrategy(BaseStrategy):
         )
         return required
 
-    def _try_refresh_kite(self, op: str, ctx: str, err: Exception) -> bool:
+    def _try_refresh_broker(self, op: str, ctx: str, err: Exception) -> bool:
         # H8: refresh the kite client via the runner-supplied callback.
         # Returns True if a fresh client is now bound, False if no callback
         # was provided or the refresh itself failed (caller MUST handle
         # the failure path — typically by returning a FAILED order or None).
-        if self._kite_refresh is None:
+        if self._broker_refresh is None:
             logger.error(
-                "TokenException during %s (%s) but no kite_refresh callback "
+                "TokenException during %s (%s) but no broker_refresh callback "
                 "is configured — cannot recover: %s", op, ctx, err,
             )
             return False
         try:
-            self.kite = self._kite_refresh()
+            self.client = self._broker_refresh()
             logger.warning(
                 "Token refreshed mid-session after %s on %s: %s", op, ctx, err,
             )
             return True
         except Exception as e:
             logger.critical(
-                "kite_refresh callback failed during %s (%s): original=%s "
+                "broker_refresh callback failed during %s (%s): original=%s "
                 "refresh_err=%s", op, ctx, err, e,
             )
             return False
@@ -2264,21 +2264,21 @@ class PairTradingStrategy(BaseStrategy):
 
     def _order_executor(self):
         # Audit 2.2: delegate live order placement to the shared
-        # KiteOrderExecutor (place -> poll-until-terminal -> cancel /
+        # OrderExecutor (place -> poll-until-terminal -> cancel /
         # partial-reverse, marketable LIMIT). The executor was ported FROM
         # this strategy so semantics are identical; pair keeps the
         # surrounding M-B5 backoff (gate below + _track_place_order_outcome),
         # H15 margin precheck, and C2 batch reversal. Lazy so __new__-bypass
         # tests and paper/signals runs never construct it.
         if getattr(self, "_live_order_executor", None) is None:
-            from .order_executor import KiteOrderExecutor
-            self._live_order_executor = KiteOrderExecutor(
-                self.kite,
+            from .order_executor import OrderExecutor
+            self._live_order_executor = OrderExecutor(
+                self.client,
                 order_tag=self._order_tag,
                 limit_protection_pct=self.limit_protection_pct,
                 exchange="NFO",
                 get_instruments=self._get_nfo_instruments,
-                kite_refresh=self._kite_refresh,
+                broker_refresh=self._broker_refresh,
             )
         return self._live_order_executor
 
@@ -2304,7 +2304,7 @@ class PairTradingStrategy(BaseStrategy):
                     "mode": "live"}
         executor = self._order_executor()
         # Rebind in case the runner swapped the kite client (token refresh).
-        executor.kite = self.kite
+        executor.client = self.client
         return executor.execute(prop)
 
     def _track_place_order_outcome(self, result: Dict) -> None:

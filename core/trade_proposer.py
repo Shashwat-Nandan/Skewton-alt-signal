@@ -81,8 +81,8 @@ class TradeProposer:
     #     against a Rs 300k cap.
     _MULTI_EXPIRY_STRUCTURES = frozenset({"calendar_short_front"})
 
-    def __init__(self, kite, config_path: str = "config.ini"):
-        self.kite = kite
+    def __init__(self, client, config_path: str = "config.ini"):
+        self.client = client
         self.config = configparser.ConfigParser()
         self.config.read(config_path)
         self.underlying = self.config["strategy"]["underlying"]
@@ -646,7 +646,7 @@ class TradeProposer:
     def _get_quote(self, tradingsymbol: str) -> Optional[dict]:
         """Fetch live quote for a symbol."""
         try:
-            quote = self.kite.quote([f"NFO:{tradingsymbol}"])
+            quote = self.client.quote([f"NFO:{tradingsymbol}"])
             return quote[f"NFO:{tradingsymbol}"]
         except Exception as e:
             logger.warning("Quote fetch failed for %s: %s", tradingsymbol, e)
