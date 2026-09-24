@@ -1,3 +1,37 @@
+# Kotak prod login host + limits POST — 2026-09-24
+
+The 2026-09-14 adapter logged in against `gw-napi.kotaksecurities.com`
+(now NXDOMAIN) and read limits with GET (trade host returns 404). A
+read-only prod probe showed TOTP+MPIN succeeds on
+`https://mis.kotaksecurities.com`, a bare 10-digit mobile is rejected,
+and `POST {baseUrl}/quick/user/limits` with form `jData` returns `Net`.
+
+- [x] Login host is `mis.kotaksecurities.com`
+- [x] 10-digit mobile is prefixed with `+91` before the login POST
+- [x] `limits()` is that POST, with no `sId` query
+- [x] `.env` beside `config.ini` is loaded by the adapter (dashboard
+      does not call `load_dotenv`). A Trade token is cached only after
+      `limits()` succeeds.
+- [x] Read-only adapter login against the creds in `.env` (no orders).
+      `margins()` returned a numeric `Net`. Session file mode 0600.
+- [x] Place, cancel, order history, and check-margin post `jData`.
+      Check-margin uses `exSeg`/`prc`/`tok` and the gate reads `ordMrgn`.
+      Quotes request `all`. Empty positions (`stCode` 5203) is an empty
+      book. Scrip CSVs are fetched without the consumer-key header.
+      Option symbols are sent as the scrip master spells them.
+
+`tests/test_broker_adapter.py`: 53 passed. `ruff check` clean on the
+touched Python. `config.ini` on this host (gitignored) has
+`[broker] name = kotak`, so a runner started here authenticates to Kotak.
+
+Read-only prod check 2026-09-24 (no order placed): positions on an empty
+book returns `[]`; `instruments("NFO")` is 81275 rows; the front NIFTY
+future quotes with a real book; `basket_order_margins` for one lot
+returns a positive `ordMrgn`. All 81275 scrip symbols round-trip into
+the `ts` we would send. Kotak has no basket endpoint, so a multi-leg
+margin is the sum of per-leg checks (`initial == final`), not Kite's
+spread-netted figure.
+
 # Broker adapter (Zerodha / Kotak Neo / Groww / Dhan) — 2026-09-14
 
 Toggle the live broker from config instead of hard-wiring Zerodha Kite.

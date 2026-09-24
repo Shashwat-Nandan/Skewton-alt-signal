@@ -10,8 +10,10 @@ off for stock options (Kotak-neo-api-v2#67). Prefer the date embedded in
 `pScripRefKey` (e.g. INFY30JUN26660.00PE → 2026-06-30). If the date
 fields land in 2010–2019, add 10 years rather than silently skipping.
 
-Tradingsymbols are converted to Kite form so `place_order` can run them
-back through `kite_to_kotak_tradingsymbol` without double-mangling.
+Tradingsymbols are published in the form the scrip master uses.
+`place_order` sends that string back unchanged. The older
+C-before-strike names are still read (a position row can carry one)
+and are not what we write.
 """
 from __future__ import annotations
 

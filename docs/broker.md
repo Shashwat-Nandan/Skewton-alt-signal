@@ -25,7 +25,8 @@ directly. Switching those is a later increment.
 2. Same dashboard: **TOTP Registration**. Save the authenticator seed
    (`totp_key`). UCC is on the profile screen; MPIN is the existing
    6-digit trading PIN.
-3. In `config.ini` (or `KOTAK_*` env vars):
+3. In `config.ini`, or in `KOTAK_*` variables in the `.env` next to that
+   file (the adapter loads it; a process env var still wins):
 
    ```ini
    [broker]
@@ -42,6 +43,17 @@ directly. Switching those is a later increment.
 
    Only `prod` is wired. `environment = uat` fails at adapter construct
    (UAT uses different login hosts/paths and must not silently hit prod).
+   Prod login is `https://mis.kotaksecurities.com`
+   (`login/1.0/tradeApiLogin`, then `tradeApiValidate`). The retired
+   `gw-napi` host does not resolve. `mobile_number` is `+91` plus 10
+   digits; a bare 10-digit number is prefixed before the login POST.
+   `profile()` and `margins()` read `POST {baseUrl}/quick/user/limits`
+   with form field `jData` (`seg`/`exch`/`prod` = `ALL`). A GET of that
+   path is 404. Place, cancel, order history, and check-margin are the
+   same `jData` form. Check-margin uses `exSeg`/`prc`/`tok` and the
+   gate reads `ordMrgn` (`reqdMrgn` is the cash shortfall, 0 when the
+   order is funded). Quotes ask for `all`, so the book is on the quote.
+   An empty positions book is `stCode` 5203, not an error.
 4. Paper-trade a full session (`runners/run_paper*.py`) before anyone
    considers live. Dashboard live mode stays 403.
 
