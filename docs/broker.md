@@ -16,8 +16,10 @@ A missing `[broker]` section resolves to `kotak`. Unknown names fail
 loud — they do not fall through to another broker. A host that should
 stay on Kite must set `name = zerodha`.
 
-Market-data CLIs (`market_data/fetch_*`, tick capture) still use Kite
-directly. Switching those is a later increment.
+Market-data CLIs (`market_data/fetch_*`, tick capture) use
+`get_trading_client` / `get_market_client`, so this host's
+`[broker] name = kotak` is the session they open. Tick capture on Kotak
+polls quotes. `name = zerodha` keeps the KiteTicker socket.
 
 ## Kotak Neo (primary)
 

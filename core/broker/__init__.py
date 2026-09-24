@@ -17,7 +17,13 @@ from .errors import (
     BrokerOrderError,
     BrokerTokenError,
 )
-from .factory import SUPPORTED, get_broker, get_trading_client, read_broker_name
+from .factory import (
+    SUPPORTED,
+    get_broker,
+    get_market_client,
+    get_trading_client,
+    read_broker_name,
+)
 
 __all__ = [
     "BrokerAdapter",
@@ -30,6 +36,7 @@ __all__ = [
     "BrokerTokenError",
     "SUPPORTED",
     "get_broker",
+    "get_market_client",
     "get_trading_client",
     "read_broker_name",
 ]

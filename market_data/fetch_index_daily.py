@@ -8,10 +8,11 @@ that was TOUCHED intrabar from one the close merely crossed (#122).
 Feeds the Kalman trend-following correctness gate (`research/validate_kalman_trend.py`)
 and backtest, which read `data_cache/<SYMBOL>_daily.{parquet,csv}`. Indices (NIFTY,
 BANKNIFTY, …) are spot series — there is no F&O bhavcopy underlying for BANKNIFTY
-cached, so pull them from Kite `historical_data` at the 'day' interval.
+cached, so pull them from the configured broker's `historical_data`
+at the 'day' interval. Kotak Neo is the default.
 
-Run on the HOST (a valid Kite session is required). It reuses the cached session
-via `KiteAuthManager`; do NOT trigger a fresh login while a live runner is active
+Run on the HOST (a cached broker session is required). Do NOT trigger a
+fresh login while a live runner is active
 (token invalidation) — run it in a quiet window or reuse the active session.
 
 Usage (on host):
@@ -28,8 +29,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from core.broker import get_market_client
 from core.data_cache_io import write_table
-from core.kite_auth import KiteAuthManager
+from market_data.history_limits import HISTORICAL_CHUNK_DAYS as _INTERVAL_CHUNK_DAYS
 
 CACHE = Path("data_cache")
 
@@ -42,10 +44,6 @@ NSE_INDEX_NAME = {
     "MIDCPNIFTY": "NIFTY MID SELECT",
     "NIFTYNXT50": "NIFTY NEXT 50",
 }
-
-# Kite caps `historical_data('day')` at ~2000 days per request; chunk to be safe.
-_CHUNK_DAYS = 1800
-
 
 def resolve_index_token(kite, symbol: str, nse_symbol: str | None) -> int:
     """Find the NSE instrument token for an index. Tries the explicit
@@ -70,13 +68,6 @@ def resolve_index_token(kite, symbol: str, nse_symbol: str | None) -> int:
         f"could not resolve an NSE index token for {symbol!r} "
         f"(tried {candidates}). Pass the exact name with --nse-symbol. "
         f"Some NSE index names: {indices[:25]}")
-
-
-# Kite caps history per request by interval; chunk under the cap.
-_INTERVAL_CHUNK_DAYS = {
-    "day": 1800, "minute": 55, "3minute": 90, "5minute": 90,
-    "10minute": 90, "15minute": 180, "30minute": 180, "60minute": 360,
-}
 
 
 def fetch_candles(kite, token: int, from_date: date, to_date: date,
@@ -115,7 +106,7 @@ def fetch_candles(kite, token: int, from_date: date, to_date: date,
                          float(c["low"]), float(c["close"])))
         cur = chunk_end + timedelta(days=1)
     if not rows:
-        raise ValueError("Kite returned no candles for the requested range")
+        raise ValueError("Broker returned no candles for the requested range")
     col = "date" if is_daily else "datetime"
     df = (pd.DataFrame(rows, columns=[col, "open", "high", "low", "close"])
           .drop_duplicates(col).sort_values(col).reset_index(drop=True))
@@ -139,9 +130,6 @@ def main() -> int:
     ap.add_argument("--output", default=None, help="override output path")
     args = ap.parse_args()
 
-    # Load KITE_* credentials from .env in-process, as the other fetch scripts do
-    # (market_data/fetch_historical_data.py / market_data/fetch_bars.py) — KiteAuthManager reads them from
-    # the environment.
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -152,7 +140,9 @@ def main() -> int:
         print(f"from-date {from_d} must be before to-date {to_d}", file=sys.stderr)
         return 2
 
-    kite = KiteAuthManager(args.config).get_kite()
+    # Cache only. A fresh login here would kick a live runner off its session.
+    kite = get_market_client(args.config, cached_only=True)
+    kite.profile()
     token = resolve_index_token(kite, args.symbol, args.nse_symbol)
     df = fetch_candles(kite, token, from_d, to_d, args.interval)
 

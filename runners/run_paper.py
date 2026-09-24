@@ -4,7 +4,7 @@ Paper-Trading Runner
 ====================
 Unattended intraday loop:
   - Refuses to run on weekends or dates in holidays.csv
-  - Authenticates (TOTP auto-login via kite_auth)
+  - Authenticates via the configured broker (Kotak Neo by default)
   - Restores any prior-session open position from
     data_cache/taleb_paper_state.json
   - Blocks until 09:15 IST, ticks until 15:25 IST

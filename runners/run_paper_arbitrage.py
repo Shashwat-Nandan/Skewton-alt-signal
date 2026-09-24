@@ -552,8 +552,8 @@ def main():
                              "restarts. 0 disables (not recommended for live).")
     parser.add_argument("--broker-rate-per-sec", "--kite-rate-per-sec",
                         type=float, default=8.0, dest="broker_rate_per_sec",
-                        help="Token-bucket refill rate (req/s). Kite's ceiling "
-                             "is 10/s; default 8 leaves headroom. (default: 8)")
+                        help="Token-bucket refill rate (req/s). Default 8 leaves "
+                             "headroom under a 10/s ceiling. (default: 8)")
     parser.add_argument("--broker-burst", "--kite-burst",
                         type=int, default=8, dest="broker_burst",
                         help="Token-bucket burst size. (default: 8)")
@@ -629,7 +629,7 @@ def main():
     kite = throttle_broker(kite, kite_limiter)
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
-    log.info("Kite throttle armed: rate=%.1f req/s, burst=%d",
+    log.info("Broker throttle armed: rate=%.1f req/s, burst=%d",
              args.broker_rate_per_sec, args.broker_burst)
 
     from strategies.arbitrage import ArbitrageStrategy

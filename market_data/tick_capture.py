@@ -41,10 +41,6 @@ from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from pathlib import Path
 
-from kiteconnect import KiteTicker
-
-from core.kite_auth import KiteAuthManager
-
 IST = timezone(timedelta(hours=5, minutes=30))
 REPO = Path(__file__).resolve().parent.parent
 LOG_DIR = REPO / "logs"
@@ -225,6 +221,67 @@ def on_error(ws, code, reason):
     _LOG.error("WebSocket error: code=%s reason=%s", code, reason)
 
 
+def _quote_pairs(tokens, sym_map):
+    spots = set(SPOT_DISPLAY_SYMBOLS.values())
+    pairs = []
+    for tok in tokens:
+        sym = sym_map[tok]
+        exch = "NSE" if sym in spots else "NFO"
+        pairs.append((tok, f"{exch}:{sym}"))
+    return pairs
+
+
+def _poll_quotes(client, pairs):
+    """One quote pass. A missing LTP splits the batch so one strike
+    does not drop the rest of the book."""
+    try:
+        quoted = client.quote([key for _, key in pairs]) or {}
+    except Exception as e:
+        if len(pairs) == 1:
+            _LOG.warning("quote failed for %s: %s", pairs[0][1], e)
+            return []
+        mid = len(pairs) // 2
+        return _poll_quotes(client, pairs[:mid]) + _poll_quotes(client, pairs[mid:])
+    now = datetime.now(IST).isoformat()
+    ts_recv_ns = time.time_ns()
+    rows = []
+    for tok, key in pairs:
+        q = quoted.get(key) or {}
+        last = q.get("last_price")
+        if last is None:
+            continue
+        rows.append({
+            "instrument_token": tok,
+            "tradingsymbol": _TOKEN_TO_SYMBOL.get(tok, "?"),
+            "last_price": last,
+            "ohlc": q.get("ohlc"),
+            "depth": q.get("depth"),
+            "exchange_timestamp": now,
+            "ts_recv_ns": ts_recv_ns,
+            "feed": "kotak_quote",
+        })
+    return rows
+
+
+def _run_quote_poll(client, tokens, sym_map):
+    """Poll the broker quote API until 15:30 IST and append one record
+    per instrument per pass. This is the Kotak tape. It is not the
+    KiteTicker FULL-mode socket."""
+    global _TICK_COUNT
+    pairs = _quote_pairs(tokens, sym_map)
+    _LOG.info("Quote poll of %d instruments until cutoff.", len(pairs))
+    while time.time() < _STOP_EPOCH:
+        rows = _poll_quotes(client, pairs)
+        if rows:
+            with _OUT_LOCK:
+                for row in rows:
+                    _OUT_FILE.write(json.dumps(_serialise(row), default=str) + "\n")
+                    _TICK_COUNT += 1
+                _OUT_FILE.flush()
+        time.sleep(2)
+    _LOG.info("Quote poll finished. %d records.", _TICK_COUNT)
+
+
 def main():
     global _OUT_FILE, _LOG, _STOP_EPOCH, _SUBSCRIBE_TOKENS, _TOKEN_TO_SYMBOL
 
@@ -273,8 +330,9 @@ def main():
         return 0
 
     _LOG.info("Authenticating...")
-    auth = KiteAuthManager("config.ini")
-    kite = auth.get_kite()
+    from core.broker import get_trading_client, read_broker_name
+    kite = get_trading_client("config.ini")
+    broker_name = read_broker_name("config.ini")
     prof = kite.profile()
     _LOG.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
 
@@ -296,6 +354,8 @@ def main():
 
     header = {
         "_session_start": datetime.now(IST).isoformat(),
+        "broker": broker_name,
+        "feed": "kite_ticker" if broker_name == "zerodha" else "kotak_quote",
         "strikes_each_side": args.strikes_each_side,
         "instruments": [{"token": t, "tradingsymbol": _TOKEN_TO_SYMBOL[t]}
                         for t in tokens],
@@ -305,9 +365,24 @@ def main():
 
     cutoff = datetime.now(IST).replace(hour=15, minute=30, second=0, microsecond=0)
     _STOP_EPOCH = cutoff.timestamp()
-    _LOG.info("WebSocket session will run until %s IST", cutoff.isoformat())
+    _LOG.info("Capture will run until %s IST", cutoff.isoformat())
 
-    ticker = KiteTicker(api_key=auth.api_key, access_token=auth._access_token)
+    if broker_name != "zerodha":
+        _LOG.info(
+            "Broker is %s. Capturing quotes by polling the trade API.",
+            broker_name,
+        )
+        _run_quote_poll(kite, tokens, sym_map)
+        with _OUT_LOCK:
+            try:
+                _OUT_FILE.flush()
+                _OUT_FILE.close()
+            except Exception:
+                pass
+        return 0
+
+    from kiteconnect import KiteTicker
+    ticker = KiteTicker(api_key=kite.api_key, access_token=kite.access_token)
     ticker.on_ticks = on_ticks
     ticker.on_connect = on_connect
     ticker.on_close = on_close

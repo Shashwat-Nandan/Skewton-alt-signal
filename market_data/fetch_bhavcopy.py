@@ -108,8 +108,9 @@ def trading_days(from_date: datetime, to_date: datetime, holidays: set) -> List[
 
 def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
     """When NSE bhavcopy hasn't been published yet for `target_date` AND
-    `target_date` is today, fall back to Kite historical_data to fetch
-    today's front-month STF closes for the NIFTY-50 universe.
+    `target_date` is today, fall back to the configured broker's
+    historical_data for today's front-month STF closes. Kotak Neo is
+    the default. The function name stays so existing callers keep working.
 
     Returns a UDiFF-shaped frame containing only STF rows (no IDO rows —
     so the IV-history side of the bhavcopy pipeline still treats today
@@ -118,24 +119,22 @@ def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
     rows it needs to include today in tonight's cointegration screen.
 
     Returns None on any failure (auth, instrument lookup, no rows) so
-    the caller falls through to the pre-Kite-fallback "today missing"
-    behaviour.
+    the caller falls through to the "today missing" behaviour.
 
     Rate-limit budget: ~50 NIFTY-50 STF contracts × 1 historical_data
-    call each ≈ 17s at Kite's 3 req/sec.
+    call each, paced at ~3 req/sec.
     """
     try:
-        from core.kite_auth import KiteAuthManager
+        from core.broker import get_trading_client
         from core.screen_pairs import NIFTY_50
     except Exception as e:
-        logger.warning("Kite fallback unavailable (import failed): %s", e)
+        logger.warning("Broker fallback unavailable (import failed): %s", e)
         return None
 
     try:
-        auth = KiteAuthManager("config.ini")
-        kite = auth.get_kite()
+        kite = get_trading_client("config.ini")
     except Exception as e:
-        logger.warning("Kite auth failed for today-fallback: %s — "
+        logger.warning("Broker auth failed for today-fallback: %s — "
                        "leaving today as missing", e)
         return None
 
@@ -161,7 +160,7 @@ def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
     if df.empty:
         return None
     front = df.loc[df.groupby("name")["expiry_date"].idxmin()]
-    logger.info("Kite fallback: fetching today's close for %d front-month STF(s)...",
+    logger.info("Broker fallback: fetching today's close for %d front-month STF(s)...",
                 len(front))
 
     rows = []

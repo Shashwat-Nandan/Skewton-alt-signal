@@ -111,10 +111,7 @@ class TestBuildTodayStfsViaKite:
             ("INFY", front, 1002, 400),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
-        auth_mock = MagicMock()
-        auth_mock.get_kite.return_value = kite
-
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+        with patch("core.broker.get_trading_client", return_value=kite), \
              patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
             df = _build_today_stfs_via_kite(today)
 
@@ -138,9 +135,7 @@ class TestBuildTodayStfsViaKite:
             ("RELIANCE", far, 1003, 250),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00, 1003: 1340.00})
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+        with patch("core.broker.get_trading_client", return_value=kite), \
              patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
             df = _build_today_stfs_via_kite(today)
 
@@ -158,9 +153,7 @@ class TestBuildTodayStfsViaKite:
             ("RELIANCE", future, 1002, 250),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00})
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+        with patch("core.broker.get_trading_client", return_value=kite), \
              patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
             df = _build_today_stfs_via_kite(today)
 
@@ -170,15 +163,14 @@ class TestBuildTodayStfsViaKite:
     def test_auth_failure_returns_none(self, today):
         """Auth failure must not crash — just degrade to current
         no-bhavcopy behaviour."""
-        with patch("core.kite_auth.KiteAuthManager",
+        with patch("core.broker.get_trading_client",
                    side_effect=RuntimeError("totp expired")):
             assert _build_today_stfs_via_kite(today) is None
 
     def test_instruments_failure_returns_none(self, today):
         kite = MagicMock()
         kite.instruments.side_effect = RuntimeError("kite api down")
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock):
+        with patch("core.broker.get_trading_client", return_value=kite):
             assert _build_today_stfs_via_kite(today) is None
 
     def test_no_nifty50_futures_returns_none(self, today):
@@ -187,8 +179,7 @@ class TestBuildTodayStfsViaKite:
         None rather than synthesise an empty frame that downstream consumers
         would misinterpret as "no data today"."""
         kite = _mk_kite(instruments_list=[], candle_close_by_token={})
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock):
+        with patch("core.broker.get_trading_client", return_value=kite):
             assert _build_today_stfs_via_kite(today) is None
 
     def test_individual_historical_data_failure_is_skipped_not_fatal(self, today, expiries):
@@ -207,9 +198,7 @@ class TestBuildTodayStfsViaKite:
             return [{"date": today, "open": 1450, "high": 1450,
                      "low": 1450, "close": 1450, "volume": 0}]
         kite.historical_data.side_effect = _hist
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+        with patch("core.broker.get_trading_client", return_value=kite), \
              patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
             df = _build_today_stfs_via_kite(today)
 
@@ -288,11 +277,10 @@ class TestDownloadBhavcopyFallback:
         cache should be written with a sentinel marker."""
         instruments = _instruments_for([("RELIANCE", expiries[0], 1001, 250)])
         kite = _mk_kite(instruments, {1001: 1327.00})
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
 
         s = self._stub_404_session()
         yyyymmdd = today.strftime("%Y%m%d")
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+        with patch("core.broker.get_trading_client", return_value=kite), \
              patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
             out = _download_bhavcopy(today, s)
 
@@ -375,8 +363,7 @@ class TestSynthCsvIsScreenerCompatible:
             ("INFY", expiries[0], 1002, 400),
         ])
         kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
-        auth_mock = MagicMock(); auth_mock.get_kite.return_value = kite
-        with patch("core.kite_auth.KiteAuthManager", return_value=auth_mock), \
+        with patch("core.broker.get_trading_client", return_value=kite), \
              patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
             df = _build_today_stfs_via_kite(today)
         assert df is not None

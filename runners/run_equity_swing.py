@@ -514,7 +514,7 @@ def main() -> int:
         prof = kite.profile()
         log.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
     except Exception as e:
-        log.warning("Kite auth failed (%s) — continuing in degraded mode", e)
+        log.warning("Broker auth failed (%s) — continuing in degraded mode", e)
         class _NullKite:
             pass
         kite = _NullKite()

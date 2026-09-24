@@ -52,32 +52,35 @@ from core.data_cache_io import read_table, write_table  # noqa: E402
 logger = logging.getLogger("fetch_5min_stf")
 
 KITE_RATE_LIMIT_DELAY = 0.35      # ~3 req/s, matches market_data/fetch_bars.py
-KITE_CHUNK_DAYS = 55              # under the 60-day per-request intraday cap
 OUT_DIR = HERE / "data_cache" / "stf_5min"
 CSV_HEADER = ["date", "open", "high", "low", "close", "volume", "contract"]
 
 
-def get_cached_kite(config_path: str):
-    """Return a KiteConnect using ONLY the cached session. Aborts (SystemExit)
-    if there is no valid cached token — never triggers the login flow."""
-    from dotenv import load_dotenv
-    load_dotenv(HERE / ".env")        # KITE_* into env for the SDK (no secrets printed)
-    from core.kite_auth import KiteAuthManager
+def get_cached_client(config_path: str):
+    """Return the configured broker's client from the session cache only.
 
-    auth = KiteAuthManager(config_path)
-    if not auth._load_cached_token():
-        logger.error("ABORT: no cached Kite token (%s). Refusing to fresh-login.",
-                     KiteAuthManager.TOKEN_CACHE_FILE)
-        raise SystemExit(2)
-    auth.kite.set_access_token(auth._access_token)
+    Aborts if there is no valid cached token. A fresh login can invalidate
+    the session a live runner is holding. Kotak Neo is the default.
+    """
+    from dotenv import load_dotenv
+    load_dotenv(HERE / ".env")
+    from core.broker import get_market_client
+    from core.broker.errors import BrokerAuthError
+
     try:
-        prof = auth.kite.profile()    # server-side validity check
+        client = get_market_client(config_path, cached_only=True)
+    except BrokerAuthError as e:
+        logger.error("ABORT: %s", e)
+        raise SystemExit(2) from e
+    try:
+        prof = client.profile()
     except Exception as e:
-        logger.error("ABORT: cached token rejected by Kite (%s). Refusing to "
-                     "fresh-login — run where the live session is cached.", e)
-        raise SystemExit(3)
-    logger.info("Reusing cached session: %s (%s)", prof["user_name"], prof["user_id"])
-    return auth.kite
+        logger.error(
+            "ABORT: cached session rejected (%s). Refusing to fresh-login.", e,
+        )
+        raise SystemExit(3) from e
+    logger.info("Reusing cached session: %s (%s)", prof.get("user_name"), prof.get("user_id"))
+    return client
 
 
 def front_month_contract(nfo_instruments, symbol: str) -> Optional[Dict]:
@@ -117,17 +120,19 @@ def _as_date(v):
 
 def fetch_5min_contract(kite, token: int, days: int) -> Tuple[List[dict], int]:
     """5-minute candles for ONE contract token over the last `days`, chunked under
-    the Kite 60-day cap. continuous=False (per-contract; Kite rejects continuous
-    intraday). Returns (candles, n_failed_chunks): a failed chunk leaves a HOLE in
+    the broker's per-request cap (Kotak allows 30 days of 5-minute candles).
+    continuous=False (per-contract). Returns (candles, n_failed_chunks): a failed chunk leaves a HOLE in
     the series, so the caller must surface a non-zero failure count rather than
     treat a partial fetch as complete (Rule 12)."""
     to_d = datetime.now()
     from_d = to_d - timedelta(days=days)
     out: List[dict] = []
     failed = 0
+    from market_data.history_limits import chunk_days
+    span = chunk_days("5minute")
     cur = from_d
     while cur < to_d:
-        chunk_end = min(cur + timedelta(days=KITE_CHUNK_DAYS), to_d)
+        chunk_end = min(cur + timedelta(days=span), to_d)
         try:
             candles = kite.historical_data(
                 token, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"),
@@ -289,7 +294,7 @@ def main() -> int:
         from core.screen_pairs import NIFTY_50
         symbols = list(NIFTY_50)
 
-    kite = get_cached_kite(args.config)
+    kite = get_cached_client(args.config)
     out_dir = Path(args.out_dir)
     # Fetch the NFO instrument master ONCE (it's multi-MB) and resolve every
     # front-month token from it, rather than re-downloading it per symbol.

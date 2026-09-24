@@ -1,3 +1,24 @@
+# Market-data downloads follow the configured broker — 2026-09-24
+
+This host has `[broker] name = kotak` and a Kotak session, and no Kite
+session. The runners already call `get_trading_client`. The download
+scripts still opened `KiteAuthManager`, so a fetch on this host could
+not log in.
+
+- [x] `fetch_bars`, `fetch_historical_data`, `fetch_index_daily`,
+      `fetch_5min_stf`, and the bhavcopy today-fallback use the
+      configured broker. Cached-only paths still refuse a fresh login.
+- [x] Historical chunks use Kotak's caps (5-minute: 29 days, daily: 179).
+- [x] `bars` update re-resolves the symbol so a stored Kite token is
+      not sent to Kotak.
+- [x] NSE/BSE instrument dumps gain NIFTY 50 / NIFTY BANK / SENSEX when
+      the scrip master omits them. Historical sends the index name.
+- [x] Tick capture on Kotak polls quotes. Zerodha keeps KiteTicker.
+- [x] Read-only on this host, cached session, no order: NFO 81275 rows,
+      NIFTY 50 quote token present, one front-future 5-minute window
+      returned candles, and the index daily window returned candles.
+      The quote poll was not left running (market was closed).
+
 # Kotak Neo named as this system's broker — 2026-09-24
 
 The default was already `kotak`. Operator-facing text still said live

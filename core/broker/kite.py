@@ -40,6 +40,17 @@ class ZerodhaKiteAdapter(BrokerAdapter):
         # is intentional: the cached token file is the source of truth.
         return self.login()
 
+    def cached_client(self) -> Optional[Any]:
+        from core.kite_auth import KiteAuthManager
+
+        auth = KiteAuthManager(self.config_path)
+        if not auth._load_cached_token():
+            return None
+        auth.kite.set_access_token(auth._access_token)
+        self._auth = auth
+        self._client = auth.kite
+        return auth.kite
+
     def logout(self) -> None:
         # Headless cache. Dashboard OAuth logout is backend.kite_oauth
         # (core must not import backend).

@@ -25,7 +25,11 @@ from core.broker import (
     read_broker_name,
 )
 from core.broker.kotak import KotakNeoClient, _extract_ltp, normalize_kotak_mobile
-from core.broker.kotak_instruments import match_scrip_url, parse_scrip_csv
+from core.broker.kotak_instruments import (
+    ensure_index_rows,
+    match_scrip_url,
+    parse_scrip_csv,
+)
 from core.broker.mapping import (
     strategy_exchange_from_segment,
     strategy_to_kotak_tradingsymbol,
@@ -182,6 +186,23 @@ class TestMapping:
         assert neo_index_quote_token("NSE", "NIFTY 50") == ("nse_cm", "Nifty 50")
         assert neo_index_quote_token("NSE", "NIFTY BANK") == ("nse_cm", "Nifty Bank")
         assert neo_index_quote_token("NSE", "RELIANCE") is None
+
+    def test_cash_master_gains_index_spots_the_csv_omits(self):
+        """Downloaders resolve NIFTY 50 from instruments("NSE"). The cash
+        scrip master has no index row, so the adapter adds one whose
+        quote_token is the name historical_data sends on the wire."""
+        rows = ensure_index_rows([{
+            "tradingsymbol": "RELIANCE",
+            "instrument_token": 2885,
+        }], "NSE")
+        by_name = {r["tradingsymbol"]: r for r in rows}
+        assert by_name["NIFTY 50"]["quote_token"] == "Nifty 50"
+        assert by_name["NIFTY 50"]["instrument_token"] < 0
+        assert "NIFTY 50" not in {
+            r["tradingsymbol"] for r in ensure_index_rows(
+                [{"tradingsymbol": "NIFTY 50", "instrument_token": 1}], "NSE",
+            ) if r["instrument_token"] < 0
+        }
 
 
 class TestKotakClient:
@@ -550,6 +571,35 @@ class TestKotakClient:
         params = client.session.get.call_args.kwargs["params"]
         assert params["interval"] == "5min"
         assert params["neosymbol"] == "nse_fo|12346"
+        assert params["fromdate"] == "2026-08-01"
+        assert params["todate"] == "2026-08-20"
+        assert "from_date" not in params
+
+    def test_historical_data_sends_index_name_not_the_sentinel_token(self):
+        """Index spots are not a numeric pSymbol. The sentinel token stays
+        inside the process; the wire token is the index name."""
+        client = self._client()
+        client._instruments_by_exchange["NSE"] = ensure_index_rows([], "NSE")
+        client._instruments_by_exchange["NFO"] = []
+        client._instruments_by_exchange["BFO"] = []
+        client._instruments_by_exchange["BSE"] = []
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "data": {"candles": [
+                ["2026-08-20T00:00:00+0530", 1, 2, 0.5, 1.5, 0, 0],
+            ]},
+        }
+        client.session.get.return_value = resp
+        nifty = next(
+            r["instrument_token"] for r in client.instruments("NSE")
+            if r["tradingsymbol"] == "NIFTY 50"
+        )
+        rows = client.historical_data(nifty, date(2026, 8, 1), date(2026, 8, 20), "day")
+        assert rows[0]["close"] == 1.5
+        params = client.session.get.call_args.kwargs["params"]
+        assert params["neosymbol"] == "nse_cm|Nifty 50"
+        assert params["interval"] == "D"
         url = client.session.get.call_args[0][0]
         assert url.startswith("https://mis.kotaksecurities.com/")
         assert "market-data/1.0/historical/details" in url

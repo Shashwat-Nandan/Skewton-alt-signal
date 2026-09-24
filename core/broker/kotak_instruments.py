@@ -83,6 +83,44 @@ def match_scrip_url(file_paths: Iterable[str], segment: str) -> str:
     return hits[0]
 
 
+# Index spots are quoted by name (nse_cm|Nifty 50), and the cash scrip
+# master often has no row for them. Downloaders look the name up in
+# instruments("NSE") and then pass instrument_token to historical_data.
+# A negative token cannot collide with a Kotak pSymbol. quote_token is
+# what historical_data sends on the wire.
+_INDEX_ROWS = (
+    ("NSE", "NIFTY 50", "NIFTY", "Nifty 50", -900001),
+    ("NSE", "NIFTY BANK", "BANKNIFTY", "Nifty Bank", -900002),
+    ("BSE", "SENSEX", "SENSEX", "SENSEX", -900003),
+)
+
+
+def ensure_index_rows(rows: list[dict], exchange: str) -> list[dict]:
+    """Append index spots the scrip master did not carry."""
+    have = {r.get("tradingsymbol") for r in rows}
+    out = list(rows)
+    exch = (exchange or "").strip().upper()
+    for row_exch, tradingsymbol, name, quote_token, token in _INDEX_ROWS:
+        if row_exch != exch or tradingsymbol in have:
+            continue
+        out.append({
+            "instrument_token": token,
+            "exchange_token": token,
+            "tradingsymbol": tradingsymbol,
+            "name": name,
+            "last_price": 0.0,
+            "expiry": None,
+            "strike": 0.0,
+            "tick_size": 0.05,
+            "lot_size": 1,
+            "instrument_type": "INDEX",
+            "segment": "INDICES",
+            "exchange": exch,
+            "quote_token": quote_token,
+        })
+    return out
+
+
 def parse_scrip_csv(text: str, strategy_exchange: str) -> list[dict]:
     """Parse a Neo scrip-master CSV into Kite-shaped instrument dicts.
 

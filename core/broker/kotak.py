@@ -35,7 +35,7 @@ from .errors import (
     BrokerOrderError,
     BrokerTokenError,
 )
-from .kotak_instruments import match_scrip_url, parse_scrip_csv
+from .kotak_instruments import ensure_index_rows, match_scrip_url, parse_scrip_csv
 from .mapping import (
     strategy_exchange_from_segment,
     strategy_to_kotak_tradingsymbol,
@@ -483,19 +483,23 @@ class KotakNeoClient:
         (`5minute`); mapped to Neo's (`5min`).
         """
         del continuous, oi
-        token = str(int(instrument_token))
-        _row, exch = self._row_for_token(int(instrument_token))
+        row, exch = self._row_for_token(int(instrument_token))
+        # Index rows carry quote_token ("Nifty 50"). A numeric pSymbol
+        # is the token for everything else.
+        token = str(row.get("quote_token") or int(instrument_token))
         seg = kotak_segment(exch)
         neo_iv = _KITE_INTERVAL_TO_NEO.get((interval or "").strip())
         if not neo_iv:
             raise BrokerOrderError(
                 f"No Kotak interval for Kite interval {interval!r}."
             )
+        # The live query names are fromdate/todate. from_date is rejected
+        # as a missing parameter.
         params = {
             "neosymbol": f"{seg}|{token}",
             "interval": neo_iv,
-            "from_date": _fmt_day(from_date),
-            "to_date": _fmt_day(to_date),
+            "fromdate": _fmt_day(from_date),
+            "todate": _fmt_day(to_date),
         }
         url = f"{self.login_base}/{_PATHS['historical_data']}"
         try:
@@ -538,7 +542,7 @@ class KotakNeoClient:
             return cached
         segment = kotak_segment(exch)
         text = self._scrip_csv_text(segment)
-        rows = parse_scrip_csv(text, exch)
+        rows = ensure_index_rows(parse_scrip_csv(text, exch), exch)
         if not rows:
             raise BrokerOrderError(
                 f"Kotak scrip-master for {exch} ({segment}) parsed to 0 rows. "

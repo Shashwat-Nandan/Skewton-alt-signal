@@ -1,5 +1,7 @@
 """
-Kite-driven 30-minute bar ingestion for the Market Profile feature.
+30-minute bar ingestion for the Market Profile feature.
+
+Uses the configured broker (Kotak Neo by default).
 
 Modes
 -----
@@ -11,10 +13,8 @@ Modes
 
 Sources
 -------
-  --source kite       (default) kite.historical_data per symbol.
-                      Kite's intraday history is typically capped to a few
-                      months for most accounts — keep it running daily and
-                      the corpus grows forward.
+  The configured broker's historical_data per symbol (Kotak Neo by
+  default). Keep the daily update running; the corpus grows forward.
 
 Universe
 --------
@@ -40,7 +40,8 @@ from backend import db as backend_db
 logger = logging.getLogger(__name__)
 
 KITE_RATE_LIMIT_DELAY = 0.35     # 3 req/s leaves margin
-KITE_CHUNK_DAYS = 55             # under the 60-day per-request cap
+# 30-minute candles: under both Kite's ~60-day cap and Kotak's 90-day cap.
+KITE_CHUNK_DAYS = 55
 
 # Default universe = NIFTY 50. We deliberately don't pull this from a
 # Kite call — `screen_pairs.NIFTY_50` is the canonical list used elsewhere
@@ -93,7 +94,7 @@ def fetch_30min_bars(
 ) -> List[Tuple[str, float, float, float, float, int]]:
     """
     Pull 30-min OHLCV between [from_date, to_date], chunking under the
-    Kite 60-day request limit. Returns a list of tuples ready for
+    broker's per-request limit. Returns a list of tuples ready for
     `bars_db.insert_bars`.
     """
     rows: List[Tuple[str, float, float, float, float, int]] = []
@@ -108,7 +109,7 @@ def fetch_30min_bars(
                 "30minute",
             )
         except Exception as e:
-            logger.warning("Kite fetch failed for token %d %s→%s: %s",
+            logger.warning("historical fetch failed for token %d %s→%s: %s",
                            instrument_token, cur.date(), chunk_end.date(), e)
             candles = []
 
@@ -159,16 +160,39 @@ def cmd_update(kite) -> None:
     """
     Incremental: for every symbol in bars_universe, fetch from the last
     stored bar (+1 minute, to avoid re-pulling it) up to now.
+
+    The stored instrument_token belongs to whichever broker wrote it.
+    Re-resolve from the current master so a Kite token is not sent to Kotak.
     """
     universe = bars_db.list_universe()
     if not universe:
         logger.warning("bars_universe is empty — run --backfill first.")
         return
 
+    resolved = {
+        sym: (token, name)
+        for sym, token, name in resolve_nse_symbols(
+            kite, [row["symbol"] for row in universe],
+        )
+    }
     now = datetime.now()
     for row in universe:
         sym = row["symbol"]
-        token = int(row["instrument_token"])
+        stored = int(row["instrument_token"])
+        if sym not in resolved:
+            logger.error(
+                "%s is in bars_universe but not in the current broker's NSE master. Skipping.",
+                sym,
+            )
+            continue
+        token, name = resolved[sym]
+        if token != stored:
+            logger.warning(
+                "%s instrument_token changed %s -> %s under the current broker. "
+                "New bars are stored under %s. Bars under %s are left in place.",
+                sym, stored, token, token, stored,
+            )
+            bars_db.upsert_universe(sym, token, "NSE", name)
         latest = bars_db.latest_bar_ts(token, 30)
 
         if latest:
@@ -229,7 +253,7 @@ def main() -> int:
     p.add_argument("--universe-csv", type=str, default=None,
                    help="Path to a newline-separated symbol file (alternative to --symbols).")
     p.add_argument("--config", type=str, default="config.ini",
-                   help="config.ini for KiteAuthManager.")
+                   help="config.ini. [broker] name selects the session (kotak by default).")
     args = p.parse_args()
 
     # Resolve universe
@@ -246,9 +270,8 @@ def main() -> int:
             return 1
 
     # Auth + DB
-    from core.kite_auth import KiteAuthManager
-    auth = KiteAuthManager(args.config)
-    kite = auth.get_kite()
+    from core.broker import get_trading_client
+    kite = get_trading_client(args.config)
     profile = kite.profile()
     logger.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
 

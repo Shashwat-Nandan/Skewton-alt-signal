@@ -1069,7 +1069,7 @@ def main():
     parser.add_argument("--broker-rate-per-sec", "--kite-rate-per-sec",
                         type=float, default=8.0, dest="broker_rate_per_sec",
                         help="Token-bucket refill rate (req/s) for the broker "
-                             "client. Kite's per-key ceiling is 10/s; we "
+                             "client. A 10/s ceiling is the planning number; we "
                              "default 2 below to leave headroom for retries "
                              "and the dashboard process sharing the key. "
                              "Calls block on the bucket — never 429. "
@@ -1327,7 +1327,7 @@ def main():
     profile = kite.profile()
     log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
     log.info(
-        "Kite throttle armed: rate=%.1f req/s, burst=%d",
+        "Broker throttle armed: rate=%.1f req/s, burst=%d",
         args.broker_rate_per_sec, args.broker_burst,
     )
 
@@ -1346,9 +1346,9 @@ def main():
         )
         nfo_instruments = None
 
-    # H8: closure for mid-session token refresh. Calls auth.get_kite() to
-    # re-authenticate (re-uses cached refresh path if available, else full
-    # TOTP login), then re-wraps with the same throttler so the strategies
+    # H8: closure for mid-session token refresh. broker.refresh()
+    # re-authenticates (cached session if it is still valid, else a full
+    # login), then re-wraps with the same throttler so the strategies
     # don't bypass H14 after a refresh.
     def _refresh_broker():
         fresh = broker.refresh()

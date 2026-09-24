@@ -437,7 +437,7 @@ Groww/Dhan are registered and refuse at `login()`. Operator setup is in
 | Source | Endpoint / file | Used by |
 |---|---|---|
 | Configured broker (Kotak Neo by default) | `client.quote()`, `instruments()`, `historical_data()`, `place_order()` | Runners and the dashboard |
-| Kite Connect REST | same methods, via `core/kite_auth.py` | `market_data/fetch_*` and tick capture, and runners when `broker.name = zerodha` |
+| Configured broker | `historical_data` / `instruments` / `quote` via `get_trading_client` | `market_data/fetch_*`, tick capture, and the runners. Kotak Neo is the default. Zerodha keeps KiteTicker for the live tape |
 | NSE F&O bhav copy (UDiFF) | `archives.nseindia.com/...BhavCopy_NSE_FO_*.csv.zip` | `market_data/fetch_bhavcopy.py`, `core/screen_pairs.py` |
 | Local cached CSVs | `data_cache/NIFTY_*.csv` (intraday option chain), `data_cache/bhavcopy_raw/*.csv` (EOD) | Backtests, screener, autoresearch |
 

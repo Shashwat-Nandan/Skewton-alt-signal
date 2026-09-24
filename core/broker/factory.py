@@ -15,7 +15,7 @@ from typing import Any
 
 from .base import BrokerAdapter
 from .dhan import DhanAdapter
-from .errors import BrokerConfigError
+from .errors import BrokerAuthError, BrokerConfigError
 from .groww import GrowwAdapter
 from .kite import ZerodhaKiteAdapter
 from .kotak import KotakNeoAdapter
@@ -67,6 +67,25 @@ def get_broker(config_path: str = "config.ini") -> BrokerAdapter:
 def get_trading_client(config_path: str = "config.ini") -> Any:
     """Authenticate the configured broker; return a Kite-shaped client.
 
-    Drop-in replacement for `KiteAuthManager(path).get_kite()` in runners.
+    Drop-in replacement for `KiteAuthManager(path).get_kite()` in runners
+    and in the market-data downloaders. Kotak Neo is the default.
     """
     return get_broker(config_path).login()
+
+
+def get_market_client(config_path: str = "config.ini", *, cached_only: bool = False) -> Any:
+    """Client for a market-data download.
+
+    cached_only returns the session file and does not start a login.
+    A fresh login can invalidate the token a live runner is holding.
+    """
+    broker = get_broker(config_path)
+    if not cached_only:
+        return broker.login()
+    client = broker.cached_client()
+    if client is None:
+        raise BrokerAuthError(
+            f"No cached {broker.display_name} session. "
+            "Refusing to fresh-login from a market-data download."
+        )
+    return client
