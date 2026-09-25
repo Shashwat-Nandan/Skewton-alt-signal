@@ -1,3 +1,29 @@
+# Calendar mean-reversion gates — 2026-09-25
+
+The review found entry and exit holes. The August full-archive NO-GO
+stands; these stops are so a later run cannot open a spread the cost
+model already says cannot pay for itself.
+
+- [x] Expected reversion to the exit band must clear the parent's
+      `calendar_cost_hurdle_mult` × four-leg futures fees, plus
+      `calendar_crossing_mult` × the quoted round trip.
+- [x] Near and next lot sizes must match.
+- [x] Untrusted book/print mixes do not enter, do not converge, and
+      are not written into the rolling spread history. Expiry, max-hold,
+      and the stop still run. A missing snapshot warns once.
+- [x] Stop/converge context stays until the fill closes the spread,
+      and it is in the state blob.
+- [x] Max-hold counts weekday sessions. A Friday entry is one session
+      old on Monday.
+- [x] The backtest CLI defaults match the class (1.5σ, shorts only,
+      volume floor 1,000). The harness says the fill is the close.
+
+`tests/test_calendar_meanreversion.py`: 36 passed, 2 skipped (index
+panel needs the bhavcopy). `ruff check` clean on the touched files.
+Post-hurdle replay on the 152-session host archive (2026-09-30): 18
+calendars, gross ₹21,997, costs ₹23,051, net −₹1,053, max drawdown
+−₹9,782. Still net-negative on a same-close fill.
+
 # Kotak cached-session probe must not TOTP on transport failure — 2026-09-25
 
 A limits() check of `.kotak_session.json` that timed out or got HTTP

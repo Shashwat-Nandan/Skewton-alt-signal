@@ -13,9 +13,9 @@ What's different from `research/backtest_arbitrage.py`:
   * The `--compare-vs-arbitrage` flag runs the (post-fix) ArbitrageStrategy
     on the same panel and prints both summaries side by side.
 
-Each tick = one trading day. EOD limitation matches the parent harness; for
-this strategy it's actually appropriate — Varsity's signal originates on the
-close and is intended to be acted on at the next open.
+Each tick = one trading day, decided and filled at that day's close.
+The bhavcopy has no open, so this is close-to-close. It is not a
+next-open fill and it does not exercise an intraday runner.
 
 Usage:
     python -m research.backtest_calendar_meanreversion
@@ -136,17 +136,17 @@ def make_strategy(
     risk_free_rate: float = 0.07,
     dividend_yield: float = 0.0,
     lookback_days: int = 200,
-    entry_n_sd: float = 1.0,
+    entry_n_sd: float = 1.5,
     exit_n_sd: float = 0.25,
     stop_loss_n_sd: float = 0.5,
     max_hold_days: int = 3,
     require_dte_near_le: int = 7,
     min_history: int = 60,
-    min_avg_volume: int = 100_000,
+    min_avg_volume: int = 1_000,
     max_open: int = 5,
     lots_per_leg: int = 1,
-    max_leg_notional: Optional[float] = 500_000,
-    allow_long: bool = True,
+    max_leg_notional: Optional[float] = None,
+    allow_long: bool = False,
     allow_short: bool = True,
     dividend_yields: Optional[Dict[str, float]] = None,
 ) -> CalendarMeanReversionStrategy:
@@ -196,6 +196,11 @@ def make_strategy(
     s.mr_max_leg_notional = max_leg_notional
     s.allow_long = allow_long
     s.allow_short = allow_short
+    # Parent __init__ reads these from [arbitrage]. This builder skips
+    # __init__, so pin the same production defaults or _build_entry
+    # AttributeErrors and the fee hurdle silently disappears.
+    s.calendar_cost_hurdle_mult = 2.0
+    s.calendar_crossing_mult = 0.0
     s._spread_history = dict(spread_history)
     s._volume_history = dict(volume_history)
     s._last_history_date = {}
@@ -210,18 +215,18 @@ def make_strategy(
 def run_backtest(
     panel: pd.DataFrame,
     *,
-    entry_n_sd: float = 1.0,
+    entry_n_sd: float = 1.5,
     exit_n_sd: float = 0.25,
     stop_loss_n_sd: float = 0.5,
     max_hold_days: int = 3,
     require_dte_near_le: int = 7,
     min_history: int = 60,
-    min_avg_volume: int = 100_000,
+    min_avg_volume: int = 1_000,
     lookback_days: int = 200,
     max_open: int = 5,
     lots_per_leg: int = 1,
-    max_leg_notional: Optional[float] = 500_000,
-    allow_long: bool = True,
+    max_leg_notional: Optional[float] = None,
+    allow_long: bool = False,
     allow_short: bool = True,
 ) -> dict:
     universe = sorted(panel["symbol"].unique().tolist())
@@ -346,8 +351,10 @@ def print_report(result: dict, args, label: str = "Mean-rev calendar") -> None:
     print(f"  entry_n_sd={args.entry_n_sd}  exit_n_sd={args.exit_n_sd} "
           f"stop_n_sd={args.stop_loss_n_sd}  max_hold={args.max_hold}d  "
           f"dte_near≤{args.require_dte_near_le}d")
+    cap = ("none" if args.max_leg_notional is None
+           else f"₹{args.max_leg_notional:,.0f}")
     print(f"  min_history={args.min_history}  min_avg_volume={args.min_avg_volume:,} "
-          f"lookback={args.lookback_days}d  lots={args.lots_per_leg}  cap=₹{args.max_leg_notional:,.0f}")
+          f"lookback={args.lookback_days}d  lots={args.lots_per_leg}  cap={cap}")
     print(f"  allow_long={args.allow_long}  allow_short={args.allow_short}")
     print("=" * 95)
     print(f"  Days replayed:        {result['n_days']}")
@@ -429,19 +436,19 @@ def main() -> int:
     p = argparse.ArgumentParser(description="EOD bhavcopy backtest for the Varsity-style mean-rev calendar")
     p.add_argument("--universe", type=str, default=None,
                    help="Comma-separated underlyings. Default: every STF in the bhavcopy archive.")
-    p.add_argument("--entry-n-sd", type=float, default=1.0, dest="entry_n_sd")
+    p.add_argument("--entry-n-sd", type=float, default=1.5, dest="entry_n_sd")
     p.add_argument("--exit-n-sd", type=float, default=0.25, dest="exit_n_sd")
     p.add_argument("--stop-loss-n-sd", type=float, default=0.5, dest="stop_loss_n_sd")
     p.add_argument("--max-hold", type=int, default=3, dest="max_hold")
     p.add_argument("--require-dte-near-le", type=int, default=7, dest="require_dte_near_le")
     p.add_argument("--min-history", type=int, default=60, dest="min_history")
-    p.add_argument("--min-avg-volume", type=int, default=100_000, dest="min_avg_volume")
+    p.add_argument("--min-avg-volume", type=int, default=1_000, dest="min_avg_volume")
     p.add_argument("--lookback-days", type=int, default=200, dest="lookback_days")
     p.add_argument("--lots-per-leg", type=int, default=1, dest="lots_per_leg")
     p.add_argument("--max-open", type=int, default=5, dest="max_open")
-    p.add_argument("--max-leg-notional", type=float, default=500_000, dest="max_leg_notional")
+    p.add_argument("--max-leg-notional", type=float, default=None, dest="max_leg_notional")
     p.add_argument("--allow-long", type=lambda v: str(v).lower() in ("true", "1", "yes"),
-                   default=True, dest="allow_long")
+                   default=False, dest="allow_long")
     p.add_argument("--allow-short", type=lambda v: str(v).lower() in ("true", "1", "yes"),
                    default=True, dest="allow_short")
     p.add_argument("--from", type=str, default=None, dest="date_from",
