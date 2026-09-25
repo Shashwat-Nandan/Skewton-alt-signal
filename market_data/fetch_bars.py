@@ -36,6 +36,7 @@ from typing import Iterable, List, Tuple
 
 from backend import bars as bars_db
 from backend import db as backend_db
+from market_data.history_limits import chunk_days
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,58 @@ def cmd_backfill(kite, symbols: List[str], days: int) -> None:
                     len(rows), new_n, total_n)
 
 
+def _adopt_new_token(kite, sym: str, stored: int, token: int, name: str, now: datetime) -> bool:
+    """Point `bars_universe` at `token` only after that token has 30-min bars.
+
+    Readers follow `bars_universe.instrument_token`. Repointing first makes
+    `latest_bar_ts` miss the existing series, so the refill is one chunk
+    (~55 days) and the old rows are never read again. On a token change,
+    copy the stored series onto the new id (same cash prices) and only
+    then repoint. When there is nothing to copy, backfill within the
+    30-minute cap and repoint only if that stored rows. A failed backfill
+    leaves the universe on `stored`.
+
+    Returns True when the caller should run the incremental fetch.
+    Returns False when the symbol was skipped or the backfill already
+    covered the window.
+    """
+    if token == stored:
+        return True
+    copied = bars_db.copy_bars(stored, token, 30)
+    if bars_db.count_bars(token, 30) == 0:
+        backfill_days = chunk_days("30minute")
+        backfill_from = now - timedelta(days=backfill_days)
+        logger.warning(
+            "%s instrument_token changed %s -> %s and neither token has bars. "
+            "Backfilling %d days before repointing the universe.",
+            sym, stored, token, backfill_days,
+        )
+        rows = fetch_30min_bars(kite, token, backfill_from, now)
+        inserted = bars_db.insert_bars(token, 30, rows)
+        if inserted == 0 or bars_db.count_bars(token, 30) == 0:
+            logger.error(
+                "%s token change %s -> %s: backfill stored no bars. "
+                "Leaving bars_universe on %s.",
+                sym, stored, token, stored,
+            )
+            return False
+        bars_db.upsert_universe(sym, token, "NSE", name)
+        bars_db.mark_updated(sym)
+        logger.info(
+            "%s universe now points at %s after a %d-day backfill (%d bars).",
+            sym, token, backfill_days, inserted,
+        )
+        return False
+    bars_db.upsert_universe(sym, token, "NSE", name)
+    bars_db.mark_updated(sym)
+    logger.warning(
+        "%s instrument_token changed %s -> %s. Copied %d bars onto %s "
+        "before repointing the universe.",
+        sym, stored, token, copied, token,
+    )
+    return True
+
+
 def cmd_update(kite) -> None:
     """
     Incremental: for every symbol in bars_universe, fetch from the last
@@ -163,6 +216,7 @@ def cmd_update(kite) -> None:
 
     The stored instrument_token belongs to whichever broker wrote it.
     Re-resolve from the current master so a Kite token is not sent to Kotak.
+    The universe row keeps the old token until the new token has bars.
     """
     universe = bars_db.list_universe()
     if not universe:
@@ -186,13 +240,8 @@ def cmd_update(kite) -> None:
             )
             continue
         token, name = resolved[sym]
-        if token != stored:
-            logger.warning(
-                "%s instrument_token changed %s -> %s under the current broker. "
-                "New bars are stored under %s. Bars under %s are left in place.",
-                sym, stored, token, token, stored,
-            )
-            bars_db.upsert_universe(sym, token, "NSE", name)
+        if not _adopt_new_token(kite, sym, stored, token, name, now):
+            continue
         latest = bars_db.latest_bar_ts(token, 30)
 
         if latest:

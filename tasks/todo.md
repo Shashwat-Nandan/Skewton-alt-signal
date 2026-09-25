@@ -1,3 +1,35 @@
+# Review fixes: instrument identity after the Kotak default — 2026-09-25
+
+Pending review on PR #4. The daily bars job was repointing
+`bars_universe` at a Kotak `pSymbol` before any bars existed under that
+id, so the first `--update` kept ~55 days and orphaned the Kite-token
+history. A Kotak tick tape stored those same `pSymbol`s and
+`load_captured_tape` joined them to the Kite instruments CSV, dropping
+option and future legs. README, the config template, and the VPS
+go-live note still said downloaders stay on Kite.
+
+- [x] On a token change, copy the stored 30-min bars onto the new id
+      and only then repoint. If there is nothing to copy, backfill
+      within the 30-minute cap and leave the old id in place when that
+      backfill stores nothing.
+- [x] Instrument masters are stamped with the broker. A tape joins only
+      a same-broker master. Kotak replays resolve strike/expiry/lot from
+      `tradingsymbol`. A Kotak tape with only a Kite master fails loud.
+      Parquet archives keep the broker stamp.
+- [x] README, `config_template.ini`, and `deploy/VPS_DEPLOYMENT.md` say
+      downloaders and tick capture follow `[broker] name`.
+
+`ruff check .` clean. New tests cover the copy, the failed backfill,
+the cross-broker refusal, and the parquet broker stamp.
+`tests/test_tape_parquet.py` and the zstd archive replay still pass.
+The full local suite cannot collect: this venv is missing statsmodels,
+jsonschema, pyarrow, and cmaes (pre-existing). Of the tests that ran,
+1779 passed; the failures are those missing imports, not these edits.
+
+`--backfill` still repoints before the fetch. The 16:30 timer runs
+`--update`, which is the path that was dropping history. A manual
+backfill is still an explicit refill, not a copy.
+
 # Market-data downloads follow the configured broker — 2026-09-24
 
 This host has `[broker] name = kotak` and a Kotak session, and no Kite
@@ -24,8 +56,9 @@ not log in.
 The default was already `kotak`. Operator-facing text still said live
 orders, the dashboard login, and the portfolio note go through Kite.
 Those now name Kotak Neo as the default and "the configured broker"
-where the same sentence covers Zerodha too. `kite_auth`, `kite_oauth`,
-and the market-data CLIs stay on Kite Connect. `loop_engine`'s host
+where the same sentence covers Zerodha too. `kite_auth` and
+`kite_oauth` stay on Kite Connect. Market-data CLIs follow
+`[broker] name` (see the 2026-09-25 section). `loop_engine`'s host
 engine is `broker_engine` (it calls `get_trading_client`).
 
 - [x] Runner help and docstrings

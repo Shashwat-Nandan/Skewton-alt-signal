@@ -636,7 +636,7 @@ Kotak Neo is the default (`[broker] name = kotak`):
 - DDPI (digital POA) configured if you intend to sell options short intraday — without it short orders may be blocked at the broker.
 - Trade API consumer key, TOTP seed, UCC, and MPIN in `.env` (`KOTAK_*`) or `[kotak]`. Mobile is `+91` plus 10 digits.
 
-A host that stays on Zerodha (`name = zerodha`) also needs a paid Kite Connect subscription and the `KITE_*` credentials. Market-data download CLIs still call Kite Connect either way.
+A host that stays on Zerodha (`name = zerodha`) also needs a paid Kite Connect subscription and the `KITE_*` credentials. Downloaders and tick capture use the same `[broker] name`: Kotak Neo is the default, so a Zerodha host must set `name = zerodha` for both orders and market data.
 
 ### 7.3 Re-review the rails before flipping
 

@@ -120,6 +120,10 @@ def _write_json_0600(path: Path, payload: dict) -> None:
 class KotakNeoClient:
     """KiteConnect-shaped client backed by Kotak Neo REST."""
 
+    # Stamped onto instrument-master CSVs so a replay will not join this
+    # client's pSymbols to a Kite dump that shares the filename date.
+    broker_name = "kotak"
+
     VARIETY_REGULAR = "regular"
     PRODUCT_NRML = "NRML"
     PRODUCT_CNC = "CNC"

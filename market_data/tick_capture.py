@@ -352,6 +352,8 @@ def main():
     _OUT_FILE = out_path.open("a", buffering=1)
     _LOG.info("Writing ticks to %s", out_path)
 
+    # `broker` selects the instrument master at replay. A Kotak tape
+    # joined to a Kite CSV drops every option and future leg.
     header = {
         "_session_start": datetime.now(IST).isoformat(),
         "broker": broker_name,

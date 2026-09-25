@@ -112,7 +112,9 @@ pull from.
 
 See [`docs/broker.md`](docs/broker.md). Kotak Neo is the primary broker
 (consumer key / TOTP / MPIN). Zerodha Kite is selected with
-`[broker] name = zerodha`. Market-data download CLIs still use Kite.
+`[broker] name = zerodha`. Downloaders (`fetch_*`) and tick capture use
+that same setting: Kotak Neo by default, and `name = zerodha` on a
+Zerodha host for both orders and market data.
 
 Trading login and orders go through `core.broker.get_trading_client`.
 A missing `[broker]` name resolves to `kotak`. `groww` / `dhan` refuse

@@ -303,23 +303,62 @@ def generate_synthetic_data(
     return pd.DataFrame(rows)
 
 
-def _find_instruments_csv(date_iso: str, underlying: str = "NIFTY") -> Optional[Path]:
-    """Locate the data_cache/instruments_<UNDERLYING>_<YYYYMMDD>.csv whose
-    date is closest to (and ≤) the requested session date. The instrument
-    master is what we join JSONL tick rows against to recover
-    strike/expiry/lot_size — none of which the ticks themselves carry."""
+_INSTRUMENT_BROKERS = {"kotak", "zerodha", "groww", "dhan"}
+# Tapes written before the header carried `broker` are KiteTicker sessions.
+_LEGACY_TAPE_BROKER = "zerodha"
+
+
+def _instruments_file_broker(path: Path) -> str:
+    """Broker tag on an instruments CSV.
+
+    `instruments_NIFTY_kotak_20260925.csv` is Kotak.
+    `instruments_NIFTY_20260925.csv` is a legacy Kite dump (no tag).
+    The date is always the last component, so the tag is the one before it.
+    """
+    parts = path.stem.split("_")
+    if len(parts) >= 4 and parts[-1].isdigit() and parts[-2] in _INSTRUMENT_BROKERS:
+        return parts[-2]
+    return _LEGACY_TAPE_BROKER
+
+
+def _tape_broker(header: dict) -> str:
+    """Broker that captured this tape. Missing field means a pre-Kotak Kite tape.
+
+    An unknown value fails loud: guessing would join the wrong master and
+    drop or mis-label the option book.
+    """
+    raw = header.get("broker")
+    if raw is None or str(raw).strip() == "":
+        return _LEGACY_TAPE_BROKER
+    name = str(raw).strip().lower()
+    if name not in {"zerodha", "kotak"}:
+        raise ValueError(
+            f"Tape broker {raw!r} is not zerodha or kotak. "
+            "Refusing to guess which instrument master to join."
+        )
+    return name
+
+
+def _find_instruments_csv(
+    date_iso: str, underlying: str = "NIFTY", broker: str = _LEGACY_TAPE_BROKER,
+) -> Optional[Path]:
+    """Locate the instruments CSV for this session's broker.
+
+    Prefer the newest file dated on or before the session, then a later
+    file of the SAME broker. A file from another broker is never a
+    fallback: Kotak pSymbols do not match Kite instrument tokens, and a
+    numeric collision would label the leg with the wrong strike.
+    """
     target = date_iso.replace("-", "")
     cache = Path("data_cache")
     if not cache.exists():
         return None
-    pattern = f"instruments_{underlying}_*.csv"
-    candidates = sorted(cache.glob(pattern))
-    # Prefer the most recent file on or before target date.
-    on_or_before = [p for p in candidates if p.stem.split("_")[-1] <= target]
+    candidates = sorted(cache.glob(f"instruments_{underlying}_*.csv"))
+    same = [p for p in candidates if _instruments_file_broker(p) == broker]
+    on_or_before = [p for p in same if p.stem.split("_")[-1] <= target]
     if on_or_before:
         return on_or_before[-1]
-    # Fall back to the closest-dated file (may be later than target).
-    return candidates[-1] if candidates else None
+    return same[-1] if same else None
 
 
 def _tape_path(date_iso: str) -> Path:
@@ -440,6 +479,24 @@ def _tape_depth_select_exprs() -> List[str]:
 _TAPE_MAX_OBJECT_SIZE = 33_554_432
 
 
+def _parquet_broker(con, tick_path: Path) -> Optional[str]:
+    """Broker column on a parquet tape, or None when the archive predates it."""
+    present = {
+        r[0] for r in con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)", [str(tick_path)],
+        ).fetchall()
+    }
+    if "broker" not in present:
+        return None
+    got = con.execute(
+        "SELECT broker FROM read_parquet(?) WHERE broker IS NOT NULL LIMIT 1",
+        [str(tick_path)],
+    ).fetchone()
+    if not got or got[0] is None:
+        return None
+    return str(got[0])
+
+
 def _read_tape_header(tick_path: Path) -> dict:
     """First line of the tape (the session header), parsed. For a .zst
     archive, `zstd -t` integrity-checks the WHOLE file first: DuckDB's
@@ -456,7 +513,9 @@ def _read_tape_header(tick_path: Path) -> dict:
     Parquet tapes carry no header line — the token→symbol map is rebuilt
     from the retained `tradingsymbol` column (every tick carries it, spot
     included), returning the same {"instruments": [...]} shape the JSONL
-    header does. So load_captured_tape's consumer is format-agnostic."""
+    header does. Archives written after the broker stamp also carry a
+    `broker` column; older parquet has none and is a Kite tape.
+    load_captured_tape's consumer is format-agnostic."""
     import json
     import subprocess
     if tick_path.suffix == ".parquet":
@@ -469,11 +528,15 @@ def _read_tape_header(tick_path: Path) -> dict:
                 "WHERE instrument_token IS NOT NULL AND tradingsymbol IS NOT NULL",
                 [str(tick_path)],
             ).fetchall()
+            broker = _parquet_broker(con, tick_path)
         finally:
             con.close()
-        return {"instruments": [
+        header = {"instruments": [
             {"token": int(tok), "tradingsymbol": sym} for tok, sym in rows
         ]}
+        if broker:
+            header["broker"] = broker
+        return header
     if tick_path.suffix == ".zst":
         probe = subprocess.run(
             ["zstd", "-t", str(tick_path)],
@@ -521,25 +584,16 @@ def load_captured_tape(
         timestamp, symbol, underlying_price, strike, option_type,
         expiry, last_price, bid, ask, lot_size, iv
 
-    Raises FileNotFoundError if either the tick file or the instruments
-    master is absent — fail loud rather than silently degrade (Rule 12)."""
+    Raises FileNotFoundError if either the tick file or a same-broker
+    instruments master is absent — fail loud rather than silently
+    degrade (Rule 12). A Kotak tape will not join a Kite master."""
 
     # Resolve the tape BEFORE the instrument-master lookup so a missing
     # session is attributed to the missing session — the master error's
     # remediation (fetch instruments) would be wrong, and the master is a
-    # multi-MB read that shouldn't run first.
+    # multi-MB read that shouldn't run first. The header is next: its
+    # broker chooses which master is legal to join.
     tick_path = _tape_path(date_iso)
-
-    instr_csv = _find_instruments_csv(date_iso, underlying)
-    if instr_csv is None:
-        raise FileNotFoundError(
-            f"No data_cache/instruments_{underlying}_*.csv found — "
-            "the JSONL ticks lack expiry/strike metadata and need the "
-            "instrument master to enrich. Run python -m market_data.fetch_historical_data "
-            "or similar to refresh the cache."
-        )
-    instr = pd.read_csv(instr_csv)
-    instr = instr.set_index("instrument_token")
 
     # Header line (token → tradingsymbol map, used for the spot token
     # which isn't in the NFO instrument master) is read directly — a
@@ -555,6 +609,18 @@ def load_captured_tape(
             "stream is unresolvable and the whole replay would carry NaN "
             "underlying_price (Rule 12: fail here, not there)"
         )
+    broker = _tape_broker(header)
+    instr_csv = _find_instruments_csv(date_iso, underlying, broker)
+    if instr_csv is None:
+        raise FileNotFoundError(
+            f"No data_cache/instruments_{underlying}_*.csv for broker "
+            f"{broker!r} covering {date_iso}. Refusing to join a different "
+            "broker's master — Kotak pSymbols do not match Kite instrument "
+            "tokens, and a collision would label the leg with the wrong "
+            "strike. Run python -m market_data.fetch_historical_data with "
+            f"[broker] name = {broker} so it writes a same-broker master."
+        )
+    instr = pd.read_csv(instr_csv)
     header_token_to_symbol = {}
     for entry in header["instruments"]:
         header_token_to_symbol[int(entry["token"])] = entry["tradingsymbol"]
@@ -646,16 +712,44 @@ def load_captured_tape(
     # Join the NFO instrument master for strike/expiry/lot_size on
     # derivatives, then patch the spot token (which lives on NSE and
     # isn't in the NFO master) from the JSONL session header.
-    enriched = df.join(
-        instr[["tradingsymbol", "name", "expiry", "strike", "lot_size", "instrument_type"]],
-        on="instrument_token", how="left",
-    )
+    # Zerodha tapes join on instrument_token (the Kite id both sides
+    # share). Kotak tapes join on tradingsymbol: the poll records a
+    # pSymbol, which is not the token in a Kite CSV, and the header
+    # already maps every subscribed token to the scrip-master symbol.
     spot_display_symbol = _INDEX_SPOT_SYMBOLS.get(
         underlying, f"NSE:{underlying}",
     ).split(":", 1)[-1]
-    is_spot = enriched["tradingsymbol"].isna() & enriched["instrument_token"].map(
-        lambda t: header_token_to_symbol.get(int(t)) == spot_display_symbol
-    )
+    meta_cols = ["name", "expiry", "strike", "lot_size", "instrument_type"]
+    if broker == "kotak":
+        df = df.copy()
+        df["tradingsymbol"] = df["instrument_token"].map(
+            lambda t: header_token_to_symbol.get(int(t))
+        )
+        by_symbol = (
+            instr.dropna(subset=["tradingsymbol"])
+            .drop_duplicates("tradingsymbol")
+            .set_index("tradingsymbol")
+        )
+        enriched = df.join(by_symbol[meta_cols], on="tradingsymbol", how="left")
+        is_spot = enriched["instrument_token"].map(
+            lambda t: header_token_to_symbol.get(int(t)) == spot_display_symbol
+        )
+        derivative = ~is_spot
+        if bool(derivative.any()) and bool(enriched.loc[derivative, "instrument_type"].isna().all()):
+            raise RuntimeError(
+                f"ticks-{date_iso}: Kotak tape joined 0 derivative legs to "
+                f"{instr_csv.name} by tradingsymbol. Refusing a spot-only "
+                "replay (Rule 12)."
+            )
+    else:
+        instr = instr.set_index("instrument_token")
+        enriched = df.join(
+            instr[["tradingsymbol", *meta_cols]],
+            on="instrument_token", how="left",
+        )
+        is_spot = enriched["tradingsymbol"].isna() & enriched["instrument_token"].map(
+            lambda t: header_token_to_symbol.get(int(t)) == spot_display_symbol
+        )
     enriched.loc[is_spot, "tradingsymbol"] = spot_display_symbol
     enriched.loc[is_spot, "name"] = underlying
     enriched.loc[is_spot, "instrument_type"] = "IDX"
@@ -783,7 +877,14 @@ def convert_tape_to_parquet(date_iso: str, ticks_dir: Optional[Path] = None) -> 
 
     read_columns = {**_TAPE_PARQUET_COLUMNS, "depth": _TAPE_DEPTH_READ_TYPE}
     cols_sql = ", ".join(f"{k}: '{v}'" for k, v in read_columns.items())
-    select_sql = ", ".join([*_TAPE_PARQUET_COLUMNS, *_tape_depth_select_exprs()])
+    # The JSONL header is not a tick row, so the broker stamp has to be
+    # copied on as a constant or the parquet archive loses it the moment
+    # retention deletes the raw file. _tape_broker only returns zerodha
+    # or kotak, so the literal is not caller-controlled SQL.
+    broker = _tape_broker(_read_tape_header(raw))
+    select_sql = ", ".join(
+        [f"'{broker}' AS broker", *_TAPE_PARQUET_COLUMNS, *_tape_depth_select_exprs()]
+    )
 
     con = duckdb.connect()
     try:
