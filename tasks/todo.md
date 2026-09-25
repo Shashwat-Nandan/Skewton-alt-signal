@@ -1,3 +1,29 @@
+# Kotak cached-session probe must not TOTP on transport failure — 2026-09-25
+
+A limits() check of `.kotak_session.json` that timed out or got HTTP
+429 was treated as a dead Trade token. `login()` then ran TOTP+MPIN,
+which replaces the shared token. Quotes (consumer key only) keep
+working; `positions()` fails reconciliation and the runner halts.
+The 09:10–09:18 stagger is unchanged: several units must still not
+TOTP-login at the same moment on a real rejection.
+
+- [x] Timeout, 429, and 5xx on the cached probe raise
+      `BrokerNetworkError`, leave `.kotak_session.json` untouched, and
+      do not call `tradeApiLogin`.
+- [x] HTTP 403 on that probe still re-logins and replaces the cache
+      only after the new token can read limits.
+- [x] Dashboard `POST /auth/login` returns 502 on that transport
+      error. The detail carries the broker message.
+
+`ruff check .` clean. `tests/test_broker_adapter.py` and
+`tests/test_backend.py`: 83 passed. Wider run, ignoring the four
+signal-plane files this venv cannot collect (`jsonschema` missing):
+2040 passed, 9 skipped. The 9 failures are `ModuleNotFoundError: cmaes`
+inside `research/optimize_kalman_trend.py`. `pre-commit` and `gitleaks`
+are not installed on this host. No live login and no order. The
+running pair-paper unit was not restarted; it keeps the process it
+already authenticated.
+
 # Review fixes: instrument identity after the Kotak default — 2026-09-25
 
 Pending review on PR #4. The daily bars job was repointing

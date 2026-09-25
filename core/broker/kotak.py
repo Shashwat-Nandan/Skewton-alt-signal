@@ -819,11 +819,23 @@ class KotakNeoAdapter(BrokerAdapter):
         if self._load_cached(client):
             try:
                 client.profile()
-                logger.info("Using cached Kotak Neo session for %s", client.ucc)
+            except (BrokerTokenError, BrokerAuthError) as e:
+                # 403 / auth failure: this Trade token is dead, so TOTP
+                # login is the recovery. Timeout, 429, and 5xx are
+                # BrokerNetworkError and must propagate. A new TOTP
+                # login replaces the shared token in .kotak_session.json
+                # and invalidates every other process still holding it.
+                # Quotes keep working (consumer key only); positions()
+                # then fails reconciliation and the runner halts.
+                logger.warning(
+                    "Cached Kotak session rejected (%s); re-login", e,
+                )
+            else:
+                logger.info(
+                    "Using cached Kotak Neo session for %s", client.ucc,
+                )
                 self._client = client
                 return client
-            except (BrokerTokenError, BrokerAuthError, BrokerNetworkError) as e:
-                logger.warning("Cached Kotak session invalid (%s); re-login", e)
         self._perform_login(client)
         self._client = client
         return client

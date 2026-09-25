@@ -12,6 +12,7 @@ from core.broker import get_broker, read_broker_name
 from core.broker.errors import (
     BrokerAuthError,
     BrokerConfigError,
+    BrokerNetworkError,
     BrokerNotImplementedError,
 )
 
@@ -130,7 +131,9 @@ def headless_login():
         adapter.login()
     except BrokerNotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
-    except (BrokerConfigError, BrokerAuthError) as e:
+    except (BrokerConfigError, BrokerAuthError, BrokerNetworkError) as e:
+        # Timeout and 429 stay 502. login() raises BrokerNetworkError
+        # for those and leaves the shared Trade token in place.
         logger.exception("Headless broker login failed")
         raise HTTPException(status_code=502, detail=str(e))
     return {"status": "ok", "broker": name, "display_name": display}
