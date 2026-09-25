@@ -13,10 +13,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from core.broker import (
     BrokerAuthError,
     BrokerConfigError,
+    BrokerNetworkError,
     BrokerNotImplementedError,
     BrokerOrderError,
     BrokerTokenError,
@@ -781,6 +783,106 @@ class TestKotakAdapterLogin:
         assert client is not None
         assert client.trade_token == "cached-jwt"
         assert get_broker(cfg).cached_client() is not None
+
+    def _write_cached_session(self, tmp_path: Path) -> None:
+        (tmp_path / ".kotak_session.json").write_text(json.dumps({
+            "trade_token": "cached-jwt",
+            "sid": "sid-cached",
+            "server_id": "E43",
+            "base_url": "https://e43.kotaksecurities.com",
+            "ucc": "ABC123",
+            "greeting_name": "Ada",
+            "timestamp": "2099-01-01T00:00:00",
+        }))
+
+    @pytest.mark.parametrize("status", [429, 500])
+    def test_cached_session_transport_failure_does_not_relogin(
+        self, tmp_path, monkeypatch, status,
+    ):
+        # A 429 or 5xx on the limits probe is not a dead Trade token.
+        # TOTP login would replace .kotak_session.json and invalidate
+        # every other process still holding that token. Quotes keep
+        # answering on the consumer key; positions() then fails
+        # reconciliation and the runner halts.
+        cfg = self._kotak_ini(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        self._write_cached_session(tmp_path)
+
+        def fake_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = status
+            resp.text = "unavailable"
+            resp.json.return_value = {"message": "unavailable"}
+            return resp
+
+        with patch("core.broker.kotak.requests.Session") as sess_cls:
+            sess_cls.return_value.request.side_effect = fake_request
+            with pytest.raises(BrokerNetworkError):
+                get_broker(cfg).login()
+            urls = [c[0][1] for c in sess_cls.return_value.request.call_args_list]
+        assert urls and not any("tradeApiLogin" in u for u in urls)
+        cache = json.loads((tmp_path / ".kotak_session.json").read_text())
+        assert cache["trade_token"] == "cached-jwt"
+
+    def test_cached_session_timeout_does_not_relogin(self, tmp_path, monkeypatch):
+        cfg = self._kotak_ini(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        self._write_cached_session(tmp_path)
+
+        with patch("core.broker.kotak.requests.Session") as sess_cls:
+            sess_cls.return_value.request.side_effect = requests.Timeout("timed out")
+            with pytest.raises(BrokerNetworkError, match="timed out"):
+                get_broker(cfg).login()
+            assert sess_cls.return_value.request.call_count == 1
+        cache = json.loads((tmp_path / ".kotak_session.json").read_text())
+        assert cache["trade_token"] == "cached-jwt"
+
+    def test_cached_session_403_still_relogins(self, tmp_path, monkeypatch):
+        # A 403 is the broker rejecting the Trade token. Recovery is a
+        # new TOTP login, and the cache updates only after limits()
+        # succeeds on that new token.
+        cfg = self._kotak_ini(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        self._write_cached_session(tmp_path)
+        limits_calls = {"n": 0}
+
+        def fake_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "tradeApiLogin" in url:
+                resp.json.return_value = {
+                    "data": {
+                        "token": "view-jwt", "sid": "sid-1",
+                        "ucc": "ABC123", "greetingName": "Ada", "kType": "View",
+                    }
+                }
+            elif "tradeApiValidate" in url:
+                resp.json.return_value = {
+                    "data": {
+                        "token": "trade-jwt", "sid": "sid-2",
+                        "hsServerId": "E43",
+                        "baseUrl": "https://e43.kotaksecurities.com",
+                        "ucc": "ABC123", "greetingName": "Ada", "kType": "Trade",
+                    }
+                }
+            else:
+                limits_calls["n"] += 1
+                if limits_calls["n"] == 1:
+                    resp.status_code = 403
+                    resp.json.return_value = {
+                        "error": [{"message": "invalid session"}],
+                    }
+                else:
+                    resp.json.return_value = {"stat": "Ok", "data": {}}
+            return resp
+
+        with patch("core.broker.kotak.requests.Session") as sess_cls:
+            sess_cls.return_value.request.side_effect = fake_request
+            client = get_broker(cfg).login()
+        assert client.trade_token == "trade-jwt"
+        cache = json.loads((tmp_path / ".kotak_session.json").read_text())
+        assert cache["trade_token"] == "trade-jwt"
+        assert limits_calls["n"] == 2
 
 
 class TestOrderExecutorAcceptsBrokerTokenError:
