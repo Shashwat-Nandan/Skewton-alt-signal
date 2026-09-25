@@ -1,3 +1,27 @@
+# Calendar mean-reversion gates — 2026-09-25
+
+The review found entry and exit holes. The August full-archive NO-GO
+stands; these stops are so a later run cannot open a spread the cost
+model already says cannot pay for itself.
+
+- [x] Expected reversion to the exit band must clear the parent's
+      `calendar_cost_hurdle_mult` × four-leg futures fees, plus
+      `calendar_crossing_mult` × the quoted round trip.
+- [x] Near and next lot sizes must match.
+- [x] Untrusted book/print mixes do not enter, do not converge, and
+      are not written into the rolling spread history. Expiry, max-hold,
+      and the stop still run. A missing snapshot warns once.
+- [x] Stop/converge context stays until the fill closes the spread,
+      and it is in the state blob.
+- [x] Max-hold counts weekday sessions. A Friday entry is one session
+      old on Monday.
+- [x] The backtest CLI defaults match the class (1.5σ, shorts only,
+      volume floor 1,000). The harness says the fill is the close.
+
+`tests/test_calendar_meanreversion.py`: 36 passed, 2 skipped (index
+panel needs the bhavcopy). `ruff check` clean on the touched files.
+The 149-day archive was not re-run after the fee hurdle.
+
 # Review fixes: instrument identity after the Kotak default — 2026-09-25
 
 Pending review on PR #4. The daily bars job was repointing

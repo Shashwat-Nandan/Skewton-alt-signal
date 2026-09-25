@@ -15,9 +15,12 @@ Entry:
   spread < lower  → LONG_CALENDAR   (SELL F_curr + BUY F_next)
 
 Exit (whichever fires first):
-  CONVERGE — spread back inside ±exit_n_sd · sd of mean (Varsity's primary)
+  CONVERGE — spread back inside ±exit_n_sd · sd of mean (Varsity's primary).
+             Suppressed when the two legs are not priced on a comparable
+             basis; EXPIRY, MAX_HOLD, and STOP still run.
   STOP     — adverse move past entry ± stop_loss_n_sd · sd
-  MAX_HOLD — held_days ≥ max_hold_days (Varsity says 1-2 days typical)
+  MAX_HOLD — weekday sessions since entry ≥ max_hold_days. A Friday entry
+             is still one session old on Monday.
   EXPIRY   — dte_near ≤ 1 (cash-settlement risk)
 
 Entry filters:
@@ -27,17 +30,18 @@ Entry filters:
   - one open trade per symbol           (inherited)
   - notional cap                        (inherited)
 
-Inherits the trade lifecycle (CalendarTrade/CalendarLeg, _apply_fill,
-_make_fut_proposal, _paper_execute / _live_execute) from ArbitrageStrategy
-unmodified — that code carries the post-review fixes for prefix-collision
-symbol routing and per-trade realized_pnl accounting.
+Inherits the trade lifecycle (CalendarTrade/CalendarLeg,
+_make_fut_proposal, _paper_execute / _live_execute) from ArbitrageStrategy.
+`_apply_fill` is the parent's, then drops entry context once the spread
+is actually closed. Entry context is part of the serialized state so a
+restart can still converge or stop.
 """
 from __future__ import annotations
 
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from core.trade_proposer import TradeProposal
@@ -175,6 +179,11 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
                 continue
             if symbol in self.state.open_calendars:
                 continue
+            # Same rule as the parent calendar: a book on one leg and a
+            # print on the other inverts the spread. Entries wait. Exits
+            # of a position already on are handled in check_and_rehedge.
+            if not snap.get("pricing_trusted", True):
+                continue
             # Expiry-window gate (Varsity: signals cluster around expiry).
             if snap["dte_near"] > self.require_dte_near_le:
                 continue
@@ -248,22 +257,36 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
         snapshots = {s["symbol"]: s for s in self._observe_universe()}
         self._update_unrealized(snapshots)
         proposals: List[TradeProposal] = []
+        # A fill that closed the spread drops the trade before the next
+        # check. Context for a symbol that is no longer open is stale.
+        for sym in list(self._entry_context):
+            if sym not in self.state.open_calendars:
+                self._entry_context.pop(sym, None)
 
         for symbol, trade in list(self.state.open_calendars.items()):
             snap = snapshots.get(symbol)
             if snap is None:
+                # Parent warns here. This override used to `continue`
+                # silently, so an open spread with no quote was not
+                # evaluated for expiry, max-hold, or the stop.
+                if symbol not in self._unpriced_open_warned:
+                    self._unpriced_open_warned.add(symbol)
+                    logger.warning(
+                        "OPEN CALENDAR %s has no snapshot — it is NOT being "
+                        "evaluated for EXPIRY / MAX_HOLD / STOP this "
+                        "session. Check that its futures are still listed.",
+                        symbol,
+                    )
                 continue
 
             # Force-exit one bar before near-month settlement.
             if snap.get("near") is not None and snap["dte_near"] is not None and snap["dte_near"] <= 1:
                 proposals.extend(self._build_calendar_exit(trade, snap, "EXPIRY"))
-                self._cleanup_entry_context(symbol)
                 continue
 
-            held_days = (self._clock() - trade.entry_time).total_seconds() / 86400.0
-            if held_days >= self.mr_max_hold_days:
+            held_sessions = self._held_weekday_sessions(trade.entry_time, self._clock())
+            if held_sessions >= self.mr_max_hold_days:
                 proposals.extend(self._build_calendar_exit(trade, snap, "MAX_HOLD"))
-                self._cleanup_entry_context(symbol)
                 continue
 
             # Mean-revert / stop gates require a current spread + entry context.
@@ -272,8 +295,8 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
             spread_now = snap["next_price"] - snap["near_price"]
             ctx = self._entry_context.get(symbol)
             if ctx is None:
-                # Lost context (process restart with open trade in state).
-                # Fall back to held-only — MAX_HOLD will eventually fire.
+                # Lost context (state written before this field existed).
+                # MAX_HOLD and EXPIRY above still fire.
                 continue
 
             mean = ctx["entry_mean"]
@@ -281,28 +304,60 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
             entry_spread = ctx["entry_spread"]
             position = ctx["position"]
 
-            # CONVERGE — primary exit per Varsity ("collapse to mean").
-            if abs(spread_now - mean) <= self.exit_n_sd * sd:
+            # CONVERGE reads the same spread the entry gate refuses to
+            # trust. A mixed book/print must not close a spread that has
+            # not converged. Context stays until the fill actually removes
+            # the trade — a rejected exit has to be able to fire again.
+            trusted = snap.get("pricing_trusted", True)
+            if trusted and abs(spread_now - mean) <= self.exit_n_sd * sd:
                 proposals.extend(self._build_calendar_exit(trade, snap, "CONVERGE"))
-                self._cleanup_entry_context(symbol)
                 continue
+            if not trusted and symbol not in self._untrusted_converge_warned:
+                self._untrusted_converge_warned.add(symbol)
+                logger.warning(
+                    "%s calendar: CONVERGE suppressed — the legs are not "
+                    "priced on a comparable basis (%s/%s). EXPIRY / "
+                    "MAX_HOLD / STOP still apply.",
+                    symbol, snap.get("near_basis"), snap.get("next_basis"),
+                )
 
             # STOP — adverse move past entry ± stop_loss_n_sd · sd.
+            # Runs on an untrusted print too: a wide book must not trap
+            # a spread that has already moved through the stop.
             stop_distance = self.stop_loss_n_sd * sd
             if position == "SHORT_CALENDAR":
                 # Entered short expecting spread to fall; stop if it rose further.
                 if spread_now > entry_spread + stop_distance:
                     proposals.extend(self._build_calendar_exit(trade, snap, "STOP"))
-                    self._cleanup_entry_context(symbol)
                     continue
             else:
                 # LONG_CALENDAR — entered expecting spread to rise; stop if it fell further.
                 if spread_now < entry_spread - stop_distance:
                     proposals.extend(self._build_calendar_exit(trade, snap, "STOP"))
-                    self._cleanup_entry_context(symbol)
                     continue
 
         return proposals
+
+    @staticmethod
+    def _held_weekday_sessions(entry: datetime, now: datetime) -> int:
+        """Weekday dates strictly after `entry`'s date, through `now`.
+
+        Calendar seconds made a Friday entry three days old on Monday and
+        fired MAX_HOLD after one session. NSE holidays still count; this
+        only stops the weekend from consuming the hold.
+        """
+        d0 = entry.date()
+        d1 = now.date()
+        if d1 <= d0:
+            return 0
+        n = 0
+        d = d0
+        one = timedelta(days=1)
+        while d < d1:
+            d += one
+            if d.weekday() < 5:
+                n += 1
+        return n
 
     # ══════════════════════════════════════════════════════════
     # ENTRY / FILTER HELPERS
@@ -317,6 +372,19 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
         nxt = snap["next"]
         symbol = snap["symbol"]
 
+        # Parent refuses this. NSE revises single-stock lot size per expiry,
+        # so near and next can differ. One lot of each is then an outright
+        # stub, not a spread.
+        near_lot = int(near["lot_size"])
+        next_lot = int(nxt["lot_size"])
+        if near_lot != next_lot:
+            logger.warning(
+                "%s mean-rev calendar: near/next lot sizes differ (%d vs %d) "
+                "— skipping to avoid an un-offset outright stub",
+                symbol, near_lot, next_lot,
+            )
+            return []
+
         if self.mr_max_leg_notional:
             one_lot_near = snap["near_price"] * int(near["lot_size"])
             one_lot_next = snap["next_price"] * int(nxt["lot_size"])
@@ -326,6 +394,47 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
                     symbol, max(one_lot_near, one_lot_next), self.mr_max_leg_notional,
                 )
                 return []
+
+        # Rupee hurdle inherited from the parent calendar. The points the
+        # exit band can still harvest, times shares, must clear
+        # calendar_cost_hurdle_mult × the four-leg fee (and
+        # calendar_crossing_mult × the quoted round-trip spread). A 1.5σ
+        # print on a one-rupee spread does not pay STT.
+        expected = self._expected_reversion_rupees(spread_now, stats, near_lot)
+        from strategies.taleb_karpathy import estimate_transaction_cost
+        fee_cost = sum(
+            estimate_transaction_cost(px, self.mr_lots_per_leg, near_lot, side, "FUT")
+            for px in (snap["near_price"], snap["next_price"])
+            for side in ("BUY", "SELL")
+        )
+        crossing = self._expected_crossing_cost(
+            snap, self.mr_lots_per_leg, near_lot, next_lot,
+        )
+        if self.calendar_crossing_mult > 0 and crossing <= 0:
+            if symbol not in self._crossing_unmeasurable_warned:
+                self._crossing_unmeasurable_warned.add(symbol)
+                logger.warning(
+                    "%s mean-rev calendar: crossing charge is armed "
+                    "(calendar_crossing_mult=%g) but neither leg has a usable "
+                    "book, so crossing is unmeasurable — the fee hurdle still "
+                    "applies.",
+                    symbol, self.calendar_crossing_mult,
+                )
+        if self.calendar_cost_hurdle_mult > 0 or self.calendar_crossing_mult > 0:
+            required = (
+                self.calendar_cost_hurdle_mult * fee_cost
+                + self.calendar_crossing_mult * crossing
+            )
+            if expected < required:
+                logger.info(
+                    "%s mean-rev calendar: expected reversion ₹%.0f < ₹%.0f "
+                    "(%.2fx fees ₹%.0f + %.2fx crossing ₹%.0f) — skipping",
+                    symbol, expected, required,
+                    self.calendar_cost_hurdle_mult, fee_cost,
+                    self.calendar_crossing_mult, crossing,
+                )
+                return []
+        self.state.pending_expected_harvest[symbol] = expected
 
         rationale = (
             f"{position} on {symbol} (mean-rev): spread={spread_now:.2f} "
@@ -400,6 +509,11 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
             symbol = snap["symbol"]
             if snap.get("near_price") is None or snap.get("next_price") is None:
                 continue
+            # A mixed book/print is not a spread we will trade. Leaving it
+            # out of the rolling mean keeps one bad open from shifting the
+            # band for the next 200 sessions.
+            if not snap.get("pricing_trusted", True):
+                continue
             if self._last_history_date.get(symbol) == today:
                 continue
             spread = float(snap["next_price"]) - float(snap["near_price"])
@@ -415,8 +529,58 @@ class CalendarMeanReversionStrategy(ArbitrageStrategy):
                 del hist[: len(hist) - cap]
             self._last_history_date[symbol] = today
 
+    def _expected_reversion_rupees(
+        self, spread_now: float, stats: _SpreadStats, lot_size: int,
+    ) -> float:
+        """Rupees if the spread moves from here to the exit band.
+
+        The trade is closed at ±exit_n_sd, not at the mean, so the
+        harvest is the points outside that band. One point of spread is
+        one rupee per share on the pair of futures.
+        """
+        band = self.exit_n_sd * stats.sd
+        points = max(abs(spread_now - stats.mean) - band, 0.0)
+        return points * self.mr_lots_per_leg * lot_size
+
     def _cleanup_entry_context(self, symbol: str) -> None:
         self._entry_context.pop(symbol, None)
+
+    def _apply_fill(self, prop: TradeProposal, result=None) -> None:
+        # Drop the stop/converge memory only once the spread is actually
+        # gone. Clearing it when the exit is proposed left a rejected
+        # order with no STOP and no CONVERGE until max-hold.
+        symbol = self._symbol_from_tradingsymbol(prop.tradingsymbol)
+        super()._apply_fill(prop, result)
+        if symbol not in self.state.open_calendars:
+            self._cleanup_entry_context(symbol)
+
+    def serialize_state(self) -> dict:
+        blob = super().serialize_state()
+        blob["mean_rev_entry_context"] = {
+            sym: {
+                "entry_spread": float(ctx["entry_spread"]),
+                "entry_mean": float(ctx["entry_mean"]),
+                "entry_sd": float(ctx["entry_sd"]),
+                "position": ctx["position"],
+            }
+            for sym, ctx in self._entry_context.items()
+            if sym in self.state.open_calendars
+        }
+        return blob
+
+    def restore_state(self, blob: dict) -> None:
+        super().restore_state(blob)
+        raw = blob.get("mean_rev_entry_context") or {}
+        self._entry_context = {}
+        for sym, ctx in raw.items():
+            if sym not in self.state.open_calendars:
+                continue
+            self._entry_context[sym] = {
+                "entry_spread": float(ctx["entry_spread"]),
+                "entry_mean": float(ctx["entry_mean"]),
+                "entry_sd": float(ctx["entry_sd"]),
+                "position": ctx["position"],
+            }
 
     # ══════════════════════════════════════════════════════════
     # HISTORY SEEDING (LIVE MODE)
