@@ -195,3 +195,31 @@ def count_bars(instrument_token: int, interval_minutes: int) -> int:
         (int(instrument_token), int(interval_minutes)),
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def copy_bars(src_token: int, dst_token: int, interval_minutes: int) -> int:
+    """Copy one interval's OHLCV from `src_token` onto `dst_token`.
+
+    A broker switch changes the instrument id, not the cash prices. The
+    copy keeps that history readable under the new id. INSERT OR IGNORE
+    so a retry does not duplicate rows. Returns how many rows were newly
+    stored under `dst_token`.
+    """
+    src_token = int(src_token)
+    dst_token = int(dst_token)
+    interval_minutes = int(interval_minutes)
+    if src_token == dst_token:
+        return 0
+    conn = db.get_conn()
+    before = count_bars(dst_token, interval_minutes)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO bars
+            (instrument_token, interval_minutes, ts, open, high, low, close, volume)
+        SELECT ?, interval_minutes, ts, open, high, low, close, volume
+          FROM bars
+         WHERE instrument_token = ? AND interval_minutes = ?
+        """,
+        (dst_token, src_token, interval_minutes),
+    )
+    return count_bars(dst_token, interval_minutes) - before

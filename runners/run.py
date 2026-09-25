@@ -2,7 +2,7 @@
 """
 Taleb Dynamic Hedger — Main Runner
 ===================================
-Authenticates with Kite, initializes the hedger, and starts the autoresearch loop.
+Authenticates with the configured broker (Kotak Neo by default), initializes the hedger, and starts the autoresearch loop.
 Usage: python -m runners.run
 """
 
@@ -28,7 +28,7 @@ CONFIG_PATH = "config.ini"
 
 
 def main():
-    # ── Step 1: Authenticate with Kite ──
+    # ── Step 1: Authenticate with the configured broker ──
     logger.info("=" * 60)
     logger.info("TALEB DYNAMIC HEDGER — Starting Up")
     logger.info("=" * 60)

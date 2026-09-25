@@ -262,7 +262,7 @@ def _halt_status(data_cache: Path) -> HaltStatus:
             "SILENT_FAIL_ma_momentum — the heartbeat tripped (every quote "
             "failing) and the runner EXITED. Entries are not merely halted: "
             "nothing is managing an open position either. Investigate the "
-            "runner and the Kite session, then `rm "
+            "runner and the broker session, then `rm "
             "data_cache/SILENT_FAIL_ma_momentum`."
         )
     return HaltStatus(entries_halted=halted, reasons=reasons,

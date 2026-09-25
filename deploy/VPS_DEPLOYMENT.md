@@ -46,7 +46,7 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `fetch-bars.service`          | Oneshot, ~1–4 min             | Runs `deploy/run_daily_bars_update.sh` — incremental 30-min bars for Market Profile  |
 | `dashboard-backend.service`   | Long-running, restart=always  | `uvicorn backend.main:app` on 127.0.0.1:8000 — see [section 10](#10-strategy-dashboard) |
 
-The daily timer never collides with the weekly one (different days). The headless paper/autoresearch jobs authenticate inside the Python process via TOTP (`core/kite_auth.py`); the dashboard backend uses the OAuth redirect flow instead and stores its token in the same `.kite_session.json` cache.
+The daily timer never collides with the weekly one (different days). Headless jobs and the dashboard both authenticate through the configured broker. Kotak Neo (the default) is headless TOTP+MPIN and caches `.kotak_session.json`. Zerodha (`[broker] name = zerodha`) still uses `core/kite_auth.py` for the daemon and Kite OAuth for the dashboard, sharing `.kite_session.json`.
 
 ---
 
@@ -54,7 +54,7 @@ The daily timer never collides with the weekly one (different days). The headles
 
 ### 2.1 Pick a host
 
-Any small Linux VPS in or near India is fine. The hot path is intraday tick polling against `api.kite.trade`, so latency matters more than CPU. A 2 vCPU / 2 GB box in `ap-south-1` is plenty. The user account that runs the units does **not** need root after install.
+Any small Linux VPS in or near India is fine. The hot path is intraday tick polling against the configured broker (Kotak Neo's trade host by default), so latency matters more than CPU. A 2 vCPU / 2 GB box in `ap-south-1` is plenty. The user account that runs the units does **not** need root after install.
 
 ### 2.2 Clone and create the venv
 
@@ -80,14 +80,15 @@ These are intentionally **gitignored** (see `.gitignore`). Copy them in by hand 
 
 ```bash
 cp config_template.ini config.ini
-$EDITOR config.ini       # fill api_key / api_secret / totp_key / user_id / password
-$EDITOR .env             # KITE_API_KEY / KITE_API_SECRET / KITE_TOTP_KEY / KITE_USER_ID / KITE_PASSWORD
+$EDITOR config.ini       # [broker] name = kotak (the default). name = zerodha selects Kite
+$EDITOR .env             # KOTAK_CONSUMER_KEY / KOTAK_MOBILE_NUMBER / KOTAK_UCC / KOTAK_MPIN / KOTAK_TOTP_KEY
+                         # Zerodha instead: KITE_API_KEY / KITE_API_SECRET / KITE_TOTP_KEY / KITE_USER_ID / KITE_PASSWORD
 chmod 600 .env config.ini
 ```
 
-The Kite session cache (`.kite_session.json`) is created on first auth and refreshed automatically — leave it alone.
+The Kotak session cache (`.kotak_session.json`) is created on first auth and refreshed automatically — leave it alone. A Zerodha host uses `.kite_session.json` the same way.
 
-> **TOTP, not interactive 2FA.** `core/kite_auth.py:169` generates the TOTP code from `KITE_TOTP_KEY` (the seed Kite gives you when you enable 2FA). This is what makes unattended daily login possible. Verify the seed once with `oathtool` or the Kite app before relying on the timer.
+> **TOTP, not interactive 2FA.** Kotak Neo (the default) logs in with `KOTAK_TOTP_KEY` plus MPIN. On Zerodha, `core/kite_auth.py` generates the TOTP code from `KITE_TOTP_KEY`. Either way the daily timer can log in unattended. Verify the seed once before relying on the timer.
 
 ### 2.4 Holidays
 
@@ -324,7 +325,7 @@ To make the A/B a clean same-pairs comparison against the **persistent** live bo
 .venv/bin/python -m research.validate_kalman_filter        # Phase-0 correctness gate, exits 0
 ```
 
-The runner itself has **no `--dry-run`** (unlike buy-on-gap) — `build_strategies` needs the live NFO instrument dump + bhavcopy panel, so the runner can only start with a Kite session. It is **paper-only and places no orders**, so the first scheduled paper session *is* the live smoke-test (money-safe; the only real risk is the TOTP collision the evening-install avoids). Watch the first session:
+The runner itself has **no `--dry-run`** (unlike buy-on-gap) — `build_strategies` needs the live NFO instrument dump + bhavcopy panel, so the runner can only start with a broker session (Kotak Neo by default). It is **paper-only and places no orders**, so the first scheduled paper session *is* the live smoke-test (money-safe; the only real risk is the TOTP collision the evening-install avoids). Watch the first session:
 
 ```bash
 journalctl -u kalman-pairs-paper.service -f        # live journal
@@ -627,12 +628,15 @@ Do not flip to live until **all** of these are true:
 
 If any of these are not true, stay in paper.
 
-### 7.2 Kite account prerequisites
+### 7.2 Broker account prerequisites
 
-- F&O segment activated and active SPAN + ELM margin sufficient for `max_positions × position_size_pct × total_capital` plus a buffer.
+Kotak Neo is the default (`[broker] name = kotak`):
+
+- F&O segment activated and margin sufficient for `max_positions × position_size_pct × total_capital` plus a buffer.
 - DDPI (digital POA) configured if you intend to sell options short intraday — without it short orders may be blocked at the broker.
-- Kite Connect API subscription active (paid).
-- TOTP 2FA enrolled with a seed you control (already required for paper).
+- Trade API consumer key, TOTP seed, UCC, and MPIN in `.env` (`KOTAK_*`) or `[kotak]`. Mobile is `+91` plus 10 digits.
+
+A host that stays on Zerodha (`name = zerodha`) also needs a paid Kite Connect subscription and the `KITE_*` credentials. Downloaders and tick capture use the same `[broker] name`: Kotak Neo is the default, so a Zerodha host must set `name = zerodha` for both orders and market data.
 
 ### 7.3 Re-review the rails before flipping
 
@@ -662,7 +666,7 @@ The paper runner deliberately refuses to start in live mode (`runners/run_paper.
        return 2
    ```
 
-   Keep everything else. The hedger already routes orders correctly: `dynamic_hedger.py:668` dispatches to `_paper_execute` or `_live_execute` based on `trading_mode`, and `_live_execute` (line 1195) is the path that calls `kite.place_order`. No other code change is required.
+   Keep everything else. The hedger already routes orders correctly: `dynamic_hedger.py:668` dispatches to `_paper_execute` or `_live_execute` based on `trading_mode`, and `_live_execute` (line 1195) is the path that calls the trading client's `place_order`. No other code change is required.
 
 2. **Flip the mode** in `config.ini`:
 
@@ -787,7 +791,7 @@ Verify the gates by running the unit manually first (do NOT wait for the timer):
 - [ ] `--top 1` (single pair only — not the production 12) so a blow-up affects one pair.
 - [ ] `--lots-per-leg 1` (lowest possible position size).
 - [ ] `--max-leg-notional 100000` (₹1 lakh per leg — about one lot of any NIFTY-50 STF). The runner will skip pairs whose notional exceeds this; that's the desired behaviour.
-- [ ] Only ONE runner live: disable `pair-paper-persistent.timer` for the cutover week. Two concurrent runners share the Kite session and would double per-symbol concentration.
+- [ ] Only ONE runner live: disable `pair-paper-persistent.timer` for the cutover week. Two concurrent runners share the broker session and would double per-symbol concentration.
 
 #### Kill-switch dry-run (mandatory)
 
@@ -1124,10 +1128,10 @@ will either fail outright or come up frozen.
 
 ## 9. Security notes
 
-- `.env`, `config.ini`, `.kite_session.json`, and `best_params.json` are all gitignored. Confirm with `git check-ignore -v <file>` before any commit.
+- `.env`, `config.ini`, `.kotak_session.json`, `.kite_session.json`, and `best_params.json` are all gitignored. Confirm with `git check-ignore -v <file>` before any commit.
 - Set `chmod 600` on `.env` and `config.ini`. The systemd hardening directives in both `.service` files (`ProtectSystem=strict`, scoped `ReadWritePaths`, `NoNewPrivileges`) limit blast radius if the Python process is compromised, but the secrets themselves still need filesystem ACLs.
 - Run the VPS with an unprivileged user (the units expect `User=taleb`). The user only needs read-write on the project directory.
-- Outbound: only `api.kite.trade` and `kite.zerodha.com` are required. Inbound: nothing — neither service listens on a port.
+- Outbound: Kotak Neo (`mis.kotaksecurities.com` and the trade host returned at login) plus, for market-data CLIs and a Zerodha host, `api.kite.trade` and `kite.zerodha.com`. Inbound: nothing — neither service listens on a port.
 
 ---
 
@@ -1145,10 +1149,17 @@ boot). A backend restart marks any in-flight runs as `STOPPED` with an
 explanatory error; their historical proposals and P&L history remain
 queryable through the SPA.
 
-### 10.1 Kite Connect OAuth app
+### 10.1 Broker login
 
-The dashboard uses Kite's OAuth redirect flow (distinct from the TOTP
-screen-scrape that the headless services use). One-time setup:
+Kotak Neo (the default) logs in on the host. Put `KOTAK_CONSUMER_KEY`,
+`KOTAK_MOBILE_NUMBER`, `KOTAK_UCC`, `KOTAK_MPIN`, and `KOTAK_TOTP_KEY` in
+the `.env` next to `config.ini` (`[broker] name = kotak`). The dashboard
+button POSTs `/api/auth/login`. MPIN never goes through the browser.
+Session cache: `.kotak_session.json`.
+
+Zerodha (`[broker] name = zerodha`) uses Kite's OAuth redirect, distinct
+from the headless TOTP path `core/kite_auth.py` uses for that broker's
+runners. One-time setup:
 
 1. Sign in at <https://developers.kite.trade/> and create a new app.
 2. Set **Redirect URL** to *exactly* the URL nginx will serve, e.g.:
@@ -1241,16 +1252,17 @@ the certificate paths.
 
 1. Open `https://dashboard.example.com/` — you should see the login
    card.
-2. Click **Login with Kite** — redirects to `kite.zerodha.com`, you
-   enter credentials + 2FA, and Kite redirects back to your callback.
+2. Click **Login with Kotak Securities Neo**. The button uses the
+   configured broker's name. Kotak signs in on the server. With
+   `name = zerodha` the button redirects to `kite.zerodha.com`.
 3. Pick a strategy + mode (signals or paper) + start.
 4. The run page should poll every 2s and show ticks accumulating.
 
-If `/api/auth/login` fails with `KITE_API_KEY is not set`, the systemd unit
-isn't reading `.env` — check the `EnvironmentFile=` line in
-`dashboard-backend.service` matches your repo path. If the redirect
-back from Kite errors with "redirect URI mismatch", the URL in the
-Kite app console must match `KITE_REDIRECT_URL` byte-for-byte.
+If Kotak login fails, check `KOTAK_*` in `.env` and that
+`dashboard-backend.service` `EnvironmentFile=` points at that file. A
+Zerodha host that fails with `KITE_API_KEY is not set` has the same
+`EnvironmentFile=` problem. A Kite "redirect URI mismatch" means the
+URL in the Kite app console must match `KITE_REDIRECT_URL` byte-for-byte.
 
 ### 10.6 Operations
 

@@ -276,11 +276,11 @@ class TalebKarpathyStrategy(BaseStrategy):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
     ):
-        super().__init__(kite, config_path=config_path, mode=mode)
+        super().__init__(client, config_path=config_path, mode=mode)
 
         # Market-hours gate uses naive datetime.now() against 09:15-15:30,
         # which silently breaks if TZ is not Asia/Kolkata (e.g. a redeploy
@@ -291,7 +291,7 @@ class TalebKarpathyStrategy(BaseStrategy):
 
         self.greeks = GreeksEngine(risk_free_rate=0.065)
         self.risk = RiskAnalyzer(self.greeks)
-        self.proposer = TradeProposer(kite, config_path)
+        self.proposer = TradeProposer(client, config_path)
         self.state = HedgeState()
 
         # ── Tunable parameters (autoresearch can modify) ──
@@ -1761,7 +1761,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         last_exc: Optional[Exception] = None
         for attempt in range(max_retries):
             try:
-                result = self.kite.instruments("NFO") or []
+                result = self.client.instruments("NFO") or []
                 if attempt > 0:
                     logger.info(
                         "instruments('NFO') succeeded on retry #%d", attempt,
@@ -1923,7 +1923,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         price = 0.0
         spread = 0.0
         try:
-            q = self.kite.quote([f"NFO:{symbol}"])
+            q = self.client.quote([f"NFO:{symbol}"])
             quote_data = q[f"NFO:{symbol}"]
             price = quote_data["last_price"]
             bid = quote_data.get("depth", {}).get("buy", [{}])[0].get("price", 0)
@@ -2427,7 +2427,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         if self._cached_lot_size:
             return self._cached_lot_size
         try:
-            instruments = self.kite.instruments("NFO")
+            instruments = self.client.instruments("NFO")
             df = pd.DataFrame(instruments)
             match = df[(df["name"] == self.underlying) & (df["instrument_type"].isin(["CE", "PE"]))]
             if not match.empty:
@@ -2450,7 +2450,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         if self._cached_futures_symbol:
             return self._cached_futures_symbol
         try:
-            instruments = self.kite.instruments("NFO")
+            instruments = self.client.instruments("NFO")
             df = pd.DataFrame(instruments)
             futs = df[(df["name"] == self.underlying) & (df["instrument_type"] == "FUT")]
             futs = futs.sort_values("expiry")
@@ -2506,7 +2506,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         # than a skipped tick. (_get_spot_price parses outside its try; that
         # is the older shape, not one to copy onto a money-affecting mark.)
         try:
-            q = self.kite.quote([key])
+            q = self.client.quote([key])
             if not q or key not in q or not q[key].get("last_price"):
                 self._note_futures_failure(
                     "Futures quote returned no usable price for %s (got keys=%s).",
@@ -2582,7 +2582,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         """
         sym = self._spot_quote_key()
         try:
-            q = self.kite.quote([sym])
+            q = self.client.quote([sym])
         except Exception as e:
             logger.warning("Spot quote raised for %s: %s: %s",
                            sym, type(e).__name__, e)
@@ -2633,7 +2633,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         falling back to nearest if neither has an ATM CE/PE pair).
         """
         try:
-            instruments = self.kite.instruments("NFO")
+            instruments = self.client.instruments("NFO")
             df = pd.DataFrame(instruments)
             df = df[df["name"] == self.underlying]
             df = df[df["instrument_type"].isin(["CE", "PE"])]
@@ -2744,7 +2744,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             return None
         try:
             symbol = atm_ce.iloc[0]["tradingsymbol"]
-            q = self.kite.quote([f"NFO:{symbol}"])
+            q = self.client.quote([f"NFO:{symbol}"])
             atm_price = q[f"NFO:{symbol}"]["last_price"]
             expiry_str = str(atm_ce.iloc[0]["expiry"])
             T = time_to_expiry(expiry_str, self._clock())
@@ -2815,9 +2815,9 @@ class TalebKarpathyStrategy(BaseStrategy):
 
         Performance: this is called every flat-book scan_and_propose
         tick. We BATCH the option-chain quotes into a single
-        kite.quote([...]) call so a 40-strike weekly costs one REST
-        request, not 40 — Kite Connect's documented quote limit is
-        ~3/sec, so per-strike iteration would breach the rate limit
+        client.quote([...]) call so a 40-strike weekly costs one REST
+        request, not 40 — the broker rate limit is a few requests a
+        second, so per-strike iteration would breach the rate limit
         within seconds and the swallowed exceptions would make the
         gate silently inert (review-fix #6).
         """
@@ -2833,7 +2833,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         except Exception:
             return 50.0
 
-        # Single batched quote() for the whole chain. Kite returns a
+        # Single batched quote() for the whole chain. The broker returns a
         # dict keyed by the same symbol string we passed in; missing
         # keys (illiquid strikes, no trade today) simply don't appear
         # in the result. The single network call avoids the per-strike
@@ -2847,7 +2847,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             return 50.0
         symbols = [f"NFO:{s}" for s in relevant["tradingsymbol"]]
         try:
-            quotes = self.kite.quote(symbols) or {}
+            quotes = self.client.quote(symbols) or {}
         except Exception as e:
             logger.warning(
                 "Skew batch quote failed (%s: %s) — returning neutral 50.0",
@@ -3403,7 +3403,7 @@ class TalebKarpathyStrategy(BaseStrategy):
             self._stale_marks = {}
         for pos in self.state.positions:
             try:
-                q = self.kite.quote([f"{self.exchange}:{pos.tradingsymbol}"])
+                q = self.client.quote([f"{self.exchange}:{pos.tradingsymbol}"])
                 pos.current_price = q[list(q.keys())[0]]["last_price"]
                 self._stale_marks.pop(pos.tradingsymbol, None)
                 self._consecutive_quote_failures = 0
@@ -3466,7 +3466,7 @@ class TalebKarpathyStrategy(BaseStrategy):
         # executor's confirmed COMPLETE.
         executor = self._order_executor()
         # Rebind in case the runner swapped the kite client (token refresh).
-        executor.kite = self.kite
+        executor.client = self.client
         return executor.execute(proposal)
 
     def _order_executor(self):
@@ -3474,14 +3474,14 @@ class TalebKarpathyStrategy(BaseStrategy):
         # it (and it isn't an __init__ attr the backtest bootstrap must
         # mirror).
         if getattr(self, "_live_order_executor", None) is None:
-            from .order_executor import KiteOrderExecutor
+            from .order_executor import OrderExecutor
             try:
                 lpp = self.config.getfloat(
                     "strategy", "limit_protection_pct", fallback=0.25)
             except Exception:
                 lpp = 0.25
-            self._live_order_executor = KiteOrderExecutor(
-                self.kite,
+            self._live_order_executor = OrderExecutor(
+                self.client,
                 order_tag=f"taleb-{self.underlying}",
                 limit_protection_pct=lpp,
                 exchange=self.exchange,

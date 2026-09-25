@@ -27,7 +27,7 @@ VALID_MODES = ("signals", "paper", "live")
 
 # Pre-submit fat-finger / NaN-Inf guard. Spot-band and per-strategy notional
 # checks live in the risk-gate path; this is the floor of last resort before
-# kite.place_order. Bounds chosen so any real Indian equity-derivatives order
+# client.place_order. Bounds chosen so any real Indian equity-derivatives order
 # passes; obvious-broken values are rejected.
 # Min length 2: NSE has genuine 2-char equity symbols (e.g. LT = Larsen &
 # Toubro). The earlier 3-char floor silently rejected them pre-submit, dropping
@@ -72,11 +72,11 @@ class BaseStrategy(ABC):
 
     def __init__(
         self,
-        kite,
+        client,
         config_path: str = "config.ini",
         mode: Optional[ExecutionMode] = None,
     ):
-        self.kite = kite
+        self.client = client
         self.config = configparser.ConfigParser()
         self.config.read(config_path)
         self.config_path = config_path

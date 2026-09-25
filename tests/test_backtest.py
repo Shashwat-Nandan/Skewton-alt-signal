@@ -99,7 +99,7 @@ class TestMockKite:
         data = generate_synthetic_data(days=1, ticks_per_day=3, lot_size=65)
         kite = MockKite(data, "NIFTY")
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite, h.state = kite, HedgeState()
+        h.client, h.state = kite, HedgeState()
         h.underlying, h.exchange = "NIFTY", "NFO"
         h._cached_lot_size, h._cached_futures_symbol = 65, None
         spot = kite.quote(["NSE:NIFTY"])["NSE:NIFTY"]["last_price"]

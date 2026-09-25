@@ -66,35 +66,35 @@ _ORDER_ERRORS = (_OrderException, BrokerOrderError)
 logger = logging.getLogger(__name__)
 
 
-class KiteOrderExecutor:
+class OrderExecutor:
     """One instance per strategy; holds no position state, only the
     instruments-dump tick-size cache.
 
     order_tag: str, or callable(prop) -> str for per-proposal tags
-        (kite truncates at 20 chars; we truncate defensively too).
-    get_instruments: callable returning kite.instruments("NFO") rows, used
+        (brokers truncate tags at 20 chars; we truncate defensively too).
+    get_instruments: callable returning instruments("NFO") rows, used
         for tick-size lookup. Called at most once per executor lifetime
         (the dump is static intraday); failures fall back to the 0.05 NSE
         F&O default. Stock-futures ticks can differ post the 2024 NSE
         cash-alignment circular, hence the lookup matters for arbitrage.
-    kite_refresh: callable() -> fresh kite client (H8). On TokenException
-        the executor rebinds self.kite from it and retries the failed call
+    broker_refresh: callable() -> fresh broker client (H8). On TokenException
+        the executor rebinds self.client from it and retries the failed call
         exactly once; without it a TokenException fails the order.
     """
 
-    def __init__(self, kite, *, order_tag,
+    def __init__(self, client, *, order_tag,
                  limit_protection_pct: float = 0.25,
                  exchange: str = "NFO",
                  get_instruments: Optional[Callable[[], List[dict]]] = None,
-                 kite_refresh: Optional[Callable[[], object]] = None,
+                 broker_refresh: Optional[Callable[[], object]] = None,
                  poll_timeout_s: float = 10.0,
                  poll_interval_s: float = 1.0):
-        self.kite = kite
+        self.client = client
         self._order_tag = order_tag
         self.limit_protection_pct = float(limit_protection_pct)
         self.exchange = exchange
         self._get_instruments = get_instruments
-        self._kite_refresh = kite_refresh
+        self._broker_refresh = broker_refresh
         self.poll_timeout_s = poll_timeout_s
         self.poll_interval_s = poll_interval_s
         self._tick_cache: Dict[str, float] = {}
@@ -106,23 +106,23 @@ class KiteOrderExecutor:
         tag = self._order_tag(prop) if callable(self._order_tag) else self._order_tag
         return str(tag)[:20]
 
-    def _try_refresh_kite(self, op: str, ctx: str, err: Exception) -> bool:
-        # H8: refresh the kite client via the host-supplied callback.
-        if self._kite_refresh is None:
+    def _try_refresh_broker(self, op: str, ctx: str, err: Exception) -> bool:
+        # H8: refresh the broker client via the host-supplied callback.
+        if self._broker_refresh is None:
             logger.error(
-                "TokenException during %s (%s) but no kite_refresh callback "
+                "TokenException during %s (%s) but no broker_refresh callback "
                 "is configured — cannot recover: %s", op, ctx, err,
             )
             return False
         try:
-            self.kite = self._kite_refresh()
+            self.client = self._broker_refresh()
             logger.warning(
                 "Token refreshed mid-session after %s on %s: %s", op, ctx, err,
             )
             return True
         except Exception as e:
             logger.critical(
-                "kite_refresh callback failed during %s (%s): original=%s "
+                "broker_refresh callback failed during %s (%s): original=%s "
                 "refresh_err=%s", op, ctx, err, e,
             )
             return False
@@ -130,13 +130,13 @@ class KiteOrderExecutor:
     def _get_last_price(self, tradingsymbol: str) -> Optional[float]:
         key = f"{self.exchange}:{tradingsymbol}"
         try:
-            quote = self.kite.quote([key])
+            quote = self.client.quote([key])
             return float(quote[key]["last_price"])
         except _TOKEN_ERRORS as e:
-            if not self._try_refresh_kite("quote", tradingsymbol, e):
+            if not self._try_refresh_broker("quote", tradingsymbol, e):
                 return None
             try:
-                quote = self.kite.quote([key])
+                quote = self.client.quote([key])
                 return float(quote[key]["last_price"])
             except Exception as e2:
                 logger.critical(
@@ -215,18 +215,18 @@ class KiteOrderExecutor:
         )
 
         def _do_place():
-            return self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR, exchange=self.exchange,
+            return self.client.place_order(
+                variety=self.client.VARIETY_REGULAR, exchange=self.exchange,
                 tradingsymbol=prop.tradingsymbol,
                 transaction_type=(
-                    self.kite.TRANSACTION_TYPE_BUY if prop.transaction_type == "BUY"
-                    else self.kite.TRANSACTION_TYPE_SELL
+                    self.client.TRANSACTION_TYPE_BUY if prop.transaction_type == "BUY"
+                    else self.client.TRANSACTION_TYPE_SELL
                 ),
                 quantity=abs(prop.quantity) * prop.lot_size,
-                product=self.kite.PRODUCT_NRML,
-                order_type=self.kite.ORDER_TYPE_LIMIT,
+                product=self.client.PRODUCT_NRML,
+                order_type=self.client.ORDER_TYPE_LIMIT,
                 price=limit_price,
-                validity=self.kite.VALIDITY_DAY,
+                validity=self.client.VALIDITY_DAY,
                 tag=self._tag_for(prop),
             )
 
@@ -237,7 +237,7 @@ class KiteOrderExecutor:
             # place_order call exactly once. A second failure is CRITICAL
             # and the order is reported FAILED — the caller's reversal
             # logic handles any already-filled sibling leg.
-            if not self._try_refresh_kite("place_order", prop.tradingsymbol, e):
+            if not self._try_refresh_broker("place_order", prop.tradingsymbol, e):
                 return {"order_id": None, "status": "FAILED",
                         "filled_lots": 0, "average_price": 0.0,
                         "error": f"place_order: token-expired ({e})",
@@ -303,7 +303,7 @@ class KiteOrderExecutor:
         status_message = ""
         while time.monotonic() < deadline:
             try:
-                history = self.kite.order_history(order_id)
+                history = self.client.order_history(order_id)
                 latest = history[-1] if history else {}
                 final_status = latest.get("status", "PENDING")
                 filled_qty = int(latest.get("filled_quantity", 0))
@@ -366,8 +366,8 @@ class KiteOrderExecutor:
         else:
             # Still open at timeout: best-effort cancel so it doesn't fill late.
             try:
-                self.kite.cancel_order(
-                    variety=self.kite.VARIETY_REGULAR, order_id=order_id,
+                self.client.cancel_order(
+                    variety=self.client.VARIETY_REGULAR, order_id=order_id,
                 )
                 logger.warning(
                     "Order %s cancelled after %.1fs (last status=%s)",
@@ -394,21 +394,21 @@ class KiteOrderExecutor:
         # before reopen.
         reverse_type = "SELL" if prop.transaction_type == "BUY" else "BUY"
         reverse_side = (
-            self.kite.TRANSACTION_TYPE_SELL if reverse_type == "SELL"
-            else self.kite.TRANSACTION_TYPE_BUY
+            self.client.TRANSACTION_TYPE_SELL if reverse_type == "SELL"
+            else self.client.TRANSACTION_TYPE_BUY
         )
         try:
-            reverse_id = self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR, exchange=self.exchange,
+            reverse_id = self.client.place_order(
+                variety=self.client.VARIETY_REGULAR, exchange=self.exchange,
                 tradingsymbol=prop.tradingsymbol,
                 transaction_type=reverse_side,
                 quantity=filled_shares,
-                product=self.kite.PRODUCT_NRML,
-                order_type=self.kite.ORDER_TYPE_LIMIT,
+                product=self.client.PRODUCT_NRML,
+                order_type=self.client.ORDER_TYPE_LIMIT,
                 price=self._protective_limit_price(
                     prop.tradingsymbol, reverse_type, prop.price,
                 ),
-                validity=self.kite.VALIDITY_DAY,
+                validity=self.client.VALIDITY_DAY,
                 tag=self._tag_for(prop),
             )
             logger.warning(

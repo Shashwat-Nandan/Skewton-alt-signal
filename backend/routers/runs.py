@@ -85,7 +85,7 @@ async def create_run(req: CreateRunRequest):
 
     manager = get_run_manager()
     try:
-        run = await manager.create_run(req.strategy, req.mode, req.params, kite=kite)
+        run = await manager.create_run(req.strategy, req.mode, req.params, client=kite)
     except Exception:
         # Don't echo the underlying exception — kiteconnect errors can
         # carry URL/API-key fragments that don't belong in client bodies.

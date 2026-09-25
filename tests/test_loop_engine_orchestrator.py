@@ -218,7 +218,7 @@ def test_no_session_status_skips_the_checker(tmp_path):
 
 
 def test_dry_run_engine_touches_no_kite_and_zeroes_pnl():
-    """The CI/local engine must run without a Kite session and report a zeroed,
+    """The CI/local engine must run without a broker session and report a zeroed,
     well-formed EOD so the orchestration path is exercisable offline."""
     outcome = dry_run_engine(today=date(2026, 6, 28))
     assert outcome.status == "dry_run"

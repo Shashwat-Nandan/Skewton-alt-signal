@@ -1,7 +1,7 @@
 """backend/routers/portfolio.py — live-augmented cross-strategy exposure.
 
 Each test encodes a behaviour the /api/portfolio/exposure endpoint must
-guarantee: it degrades to the offline delta-1 view with NO Kite session
+guarantee: it degrades to the offline delta-1 view with NO broker session
 (never 401s), and when a session exists it adds net option delta (from a
 live spot via the greeks engine) + broker truth — without ever
 double-counting the futures hedge or under-reporting on a quote failure.
@@ -54,6 +54,13 @@ def _write_taleb_state(cache_dir, underlying_suffix, positions, futures_hedge_de
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     from tests._helpers import login_client
+    from backend.settings import get_settings
+    # Portfolio tests patch the Zerodha session. Pin that broker so the
+    # Kotak default does not skip kite_oauth.
+    cfg = tmp_path / "zerodha.ini"
+    cfg.write_text("[broker]\nname = zerodha\n")
+    monkeypatch.setenv("CONFIG_PATH", str(cfg))
+    get_settings.cache_clear()
     db.reset_for_tests(tmp_path / "test.db")
     cache = tmp_path / "data_cache"
     cache.mkdir()
@@ -64,6 +71,7 @@ def client(tmp_path, monkeypatch):
     c._cache = cache  # stash for tests to seed state
     yield c
     db.reset_for_tests(None)
+    get_settings.cache_clear()
 
 
 def _short_straddle():
@@ -80,7 +88,7 @@ def _short_straddle():
 
 class TestOfflineDegrade:
     def test_no_session_returns_delta1_only_never_401(self, client, monkeypatch):
-        """No cached Kite session must NOT 401 — the exposure tab stays useful
+        """No cached broker session must NOT 401 — the exposure tab stays useful
         signed-out, showing the offline delta-1 view with option delta null."""
         monkeypatch.setattr(pf_router.kite_oauth, "get_authenticated_kite", lambda: None)
         _write_taleb_state(client._cache, "", _short_straddle(), futures_hedge_delta=-30.0)

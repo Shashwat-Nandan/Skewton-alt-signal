@@ -56,7 +56,7 @@ workstream — it constrains the architecture from line one.
   registration matrix `strategies × brokers`. A strategy cannot go live on a
   broker until its algo ID exists there.
 - **Unique algo ID on every order.** The `order_tag` plumbing in
-  `strategies/order_executor.py` (`KiteOrderExecutor.order_tag`) is the hook —
+  `strategies/order_executor.py` (`OrderExecutor.order_tag`) is the hook —
   it must carry the registered algo ID, not just a strategy name. Broker
   truncates tags (~20 chars); design the ID scheme around that now.
 - **Static IP** for the execution plane (SEBI/exchange requirement for
@@ -205,7 +205,7 @@ Three nested object types:
 | `side` | enum | ✓ | `BUY \| SELL`. |
 | `ratio` | int ≥ 1 | ✓ | Relative weight within the structure (e.g. backspread `1:2`, calendar `1:1`). Per-user sizing multiplies all ratios by one structure multiplier (§7.3). |
 | `quantity_lots` | int ≥ 1 | ✓ | The master's *realized* lots. **Reference only** — the OMS recomputes per user from `sizing` × `ratio`. Carried for audit/baseline. |
-| `order_type` | enum | ✓ | `MARKET \| LIMIT \| MARKETABLE_LIMIT \| SL \| SL_M` (§4.8). Strategies should prefer `MARKETABLE_LIMIT` (matches `KiteOrderExecutor`'s proven fill model). |
+| `order_type` | enum | ✓ | `MARKET \| LIMIT \| MARKETABLE_LIMIT \| SL \| SL_M` (§4.8). Strategies should prefer `MARKETABLE_LIMIT` (matches `OrderExecutor`'s proven fill model). |
 | `limit_price` | number | cond | Required for `LIMIT`; for `MARKETABLE_LIMIT` it's the protection cap (else OMS derives from `±limit_protection_pct`). |
 | `trigger_price` | number | cond | Required for `SL`/`SL_M`. |
 | `product` | enum | ✓ | Normalized horizon: `INTRADAY \| OVERNIGHT \| DELIVERY`. OMS maps to each broker's MIS/NRML/CNC. |
@@ -717,7 +717,7 @@ on a user's account, they hold **naked directional risk**. Required:
   them (varies — §8).
 - Where not supported, **leg-failure unwind:** if any leg fails to fill within
   the signal's tolerance, auto-reverse the filled legs and mark
-  `REJECTED(leg_failure)`. Reuse the `KiteOrderExecutor` contract philosophy:
+  `REJECTED(leg_failure)`. Reuse the `OrderExecutor` contract philosophy:
   *"COMPLETE is the only status on which a caller may mutate state"* —
   anything else triggers cancel/reverse. Generalize that across brokers.
 
@@ -770,7 +770,7 @@ Per-broker landmines to budget for:
 - **Symbology:** instrument tokens, expiry/strike formatting, lot sizes — map
   per broker, refresh daily.
 
-**Reuse:** `KiteOrderExecutor`'s marketable-LIMIT place→poll-until-terminal→
+**Reuse:** `OrderExecutor`'s marketable-LIMIT place→poll-until-terminal→
 cancel/reverse loop is the proven template for the Kite adapter; generalize its
 contract into the interface.
 
@@ -1014,7 +1014,7 @@ A senior reviewer's "did you actually handle…" list. Each maps to a section.
 
 ## 18. Tech stack (recommendation, not prescription)
 
-- **Signal plane:** keep Python (reuse strategies, `KiteOrderExecutor`, the
+- **Signal plane:** keep Python (reuse strategies, `OrderExecutor`, the
   FastAPI backend as operator console).
 - **Bus:** Redpanda/Kafka or NATS JetStream (durable, ordered, replayable);
   Redis Streams acceptable for MVP.

@@ -37,9 +37,9 @@ Kalman-specific vs the static runner:
 paper/signals only. --mode live is intentionally unsupported here (the strategy
 raises NotImplementedError) until the forward test validates an edge.
 
-CANNOT be verified live in CI (no Kite session); smoke-test on the host. NOTE:
-do not run a fresh Kite login while the live static runner is active — reuse the
-cached session (see tasks/lessons.md / memory).
+CANNOT be verified live in CI (no broker session); smoke-test on the host. NOTE:
+do not run a fresh broker login while the live static runner is active — reuse the
+cached session (see tasks/lessons.md / memory). Kotak Neo is the default.
 """
 from __future__ import annotations
 
@@ -167,7 +167,7 @@ def build_strategies(pairs: pd.DataFrame, panel: pd.DataFrame, nfo: List[dict],
             continue
         try:
             s = KalmanPairStrategy(
-                kite=kite, config_path=config_path, mode="paper",
+                client=kite, config_path=config_path, mode="paper",
                 symbol_a=a, symbol_b=b,
                 tradingsymbol_a=fa["tradingsymbol"], tradingsymbol_b=fb["tradingsymbol"],
                 lot_size_a=fa["lot_size"], lot_size_b=fb["lot_size"],
@@ -761,7 +761,7 @@ def main() -> int:
 
     # Hard-stop guard BEFORE auth. A post-15:30 invocation — e.g. an evening
     # `systemctl enable --now` catch-up fire (timer is Persistent=true) — must
-    # exit WITHOUT a fresh Kite login, which would otherwise invalidate the
+    # exit WITHOUT a fresh broker login, which would otherwise invalidate the
     # cached session the live runner reuses (no-auth-while-live-runner). The
     # session-timing checks after setup repeat this for the normal pre-open path.
     now0 = datetime.now()
@@ -780,9 +780,9 @@ def main() -> int:
     config_path = _write_config(args)
 
     from core.broker import get_trading_client
-    from core.kite_throttle import KiteRateLimiter, throttle_kite
-    kite = throttle_kite(
-        get_trading_client(CONFIG_PATH), KiteRateLimiter(rate_per_sec=8.0, burst=8),
+    from core.broker_throttle import BrokerRateLimiter, throttle_broker
+    kite = throttle_broker(
+        get_trading_client(CONFIG_PATH), BrokerRateLimiter(rate_per_sec=8.0, burst=8),
     )
     prof = kite.profile()
     log.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])

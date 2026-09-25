@@ -45,7 +45,7 @@ class TestSignConvention:
 
     def test_all_proposals_have_positive_quantity(self, mock_kite, sample_chain):
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
 
@@ -70,7 +70,7 @@ class TestSignConvention:
 
     def test_buy_proposals_have_buy_type(self, mock_kite, sample_chain):
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
 
@@ -94,7 +94,7 @@ class TestStraddleOnly:
     def test_proposer_generates_only_long_straddle(self, mock_kite, sample_chain):
         """No wings: structure must be exactly 2 long legs (ATM CE + ATM PE)."""
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
 
@@ -143,7 +143,7 @@ class TestCalendarShortFront:
 
     def test_two_expiry_chain_unblocks_calendar(self, mock_kite, two_expiry_chain):
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
         # Front IV rich → calendar prefers to short the front.
@@ -187,7 +187,7 @@ class TestCalendarShortFront:
         still correctly returns [] (the single-expiry guard is the
         path that used to fire universally before Phase 3.2)."""
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
         proposer._get_quote = lambda sym: {"last_price": 200,
@@ -211,7 +211,7 @@ class TestBackspreadSizing:
     def _build_proposer(self, mock_kite, atm_price, otm_price):
         from datetime import datetime
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
         # Anchor _clock before the fixture's 2026-04-03 expiry so
@@ -384,7 +384,7 @@ class TestSingleExpiryPinning:
                               "sell": [{"price": px * 1.005}]}}
 
         proposer = TradeProposer.__new__(TradeProposer)
-        proposer.kite = mock_kite
+        proposer.client = mock_kite
         proposer.underlying = "NIFTY"
         proposer.config = MagicMock()
         proposer._clock = lambda: now

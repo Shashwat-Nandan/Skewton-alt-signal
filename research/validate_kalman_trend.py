@@ -67,9 +67,9 @@ def load_daily_closes(symbol: str) -> tuple[list, np.ndarray]:
 
     raise FileNotFoundError(
         f"no daily data for {symbol}: expected {simple}. On the HOST (where a "
-        f"live Kite session exists) fetch it, e.g.\n"
-        f"    python -c \"from kite_auth import KiteAuthManager; import pandas as pd; \"\n"
-        f"      # kite.historical_data(<{symbol} index token>, from, to, 'day') -> "
+        f"broker session exists) fetch it, e.g.\n"
+        f"    python -m market_data.fetch_index_daily --symbol {symbol}\n"
+        f"      # historical_data(<{symbol} index token>, from, to, 'day') -> "
         f"date,close -> {simple}\"\n"
         f"then re-run this gate. (A fresh login must not run while a live runner "
         f"is active — reuse the cached session.)")

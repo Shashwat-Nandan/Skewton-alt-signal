@@ -69,7 +69,7 @@ class BuyOnGapBacktester:
         class _NullKite:
             pass
         self.strategy = BuyOnGapStrategy(
-            kite=_NullKite(), config_path="/dev/null", mode="paper",
+            client=_NullKite(), config_path="/dev/null", mode="paper",
         )
         if params_overrides:
             self.strategy.params.update(params_overrides)

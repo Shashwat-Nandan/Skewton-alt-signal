@@ -5,7 +5,7 @@ Equity-swing scan runner — invoked twice daily by systemd timers.
 Two scan kinds, both run by the same script with ``--scan {open|close}``:
 
   open  -- fires shortly after market open (09:30 IST). Refreshes the
-           panel (live spot via Kite quote for today, daily bars from
+           panel (live spot via the configured broker for today, daily bars from
            the last bhavcopy ingest), runs SL/target checks against
            today's intraday levels we can observe, scans for new
            setups using yesterday's close as the indicator anchor.
@@ -514,7 +514,7 @@ def main() -> int:
         prof = kite.profile()
         log.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
     except Exception as e:
-        log.warning("Kite auth failed (%s) — continuing in degraded mode", e)
+        log.warning("Broker auth failed (%s) — continuing in degraded mode", e)
         class _NullKite:
             pass
         kite = _NullKite()

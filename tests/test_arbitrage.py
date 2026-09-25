@@ -38,7 +38,7 @@ def _make_strategy(
     universe=None,
 ) -> ArbitrageStrategy:
     s = ArbitrageStrategy.__new__(ArbitrageStrategy)
-    s.kite = MagicMock()
+    s.client = MagicMock()
     s.config = MagicMock()
     s.config_path = "config.ini"
     s.mode = mode
@@ -1204,7 +1204,7 @@ class TestLiveStatusHandling:
 
     def test_live_execute_delegates_to_shared_executor(self):
         # Audit 1.2 step 2: the refusal is gone — _live_execute hands the
-        # proposal to the shared KiteOrderExecutor and rebinds the kite
+        # proposal to the shared OrderExecutor and rebinds the kite
         # client so a runner-side token refresh propagates.
         from unittest.mock import MagicMock
         s = _make_strategy(mode="live")
@@ -1217,20 +1217,20 @@ class TestLiveStatusHandling:
         prop = self._leg_prop()
         result = s._live_execute(prop)
         executor.execute.assert_called_once_with(prop)
-        assert executor.kite is s.kite
+        assert executor.client is s.client
         assert result["status"] == "COMPLETE"
 
     def test_order_executor_wiring(self):
         # The lazily-built executor carries arbitrage's identity: per-
         # symbol tags via _symbol_from_tradingsymbol, NFO, the cached
         # instruments dump, and the 0.25 default pad.
-        from strategies.order_executor import KiteOrderExecutor
+        from strategies.order_executor import OrderExecutor
         s = _make_strategy(mode="live")
         # the fixture's config is a MagicMock; emulate "no override in
         # config.ini" so the 0.25 fallback is what's under test
         s.config.getfloat = lambda *a, fallback=None: fallback
         ex = s._order_executor()
-        assert isinstance(ex, KiteOrderExecutor)
+        assert isinstance(ex, OrderExecutor)
         assert ex._tag_for(self._leg_prop()) == "arb-AAA"
         assert ex.exchange == "NFO"
         assert ex.limit_protection_pct == 0.25
@@ -1350,7 +1350,7 @@ class TestReview20260711:
     def test_entry_min_dte_computed_from_max_hold(self):
         # Real __init__ wiring (the fixture bypasses it): the window must
         # follow max_hold so shortening the hold widens the entry window.
-        s = ArbitrageStrategy(kite=MagicMock(), config_path="/dev/null", mode="paper")
+        s = ArbitrageStrategy(client=MagicMock(), config_path="/dev/null", mode="paper")
         assert s.calendar_entry_min_dte == max(
             s.calendar_min_dte_near, s.calendar_max_holding_days + 2)
 
@@ -1636,13 +1636,13 @@ class TestDepthLogging:
         # End-to-end through the real _observe_universe_uncached: the depth
         # kite.quote() already returns was being thrown away here.
         s = _make_strategy(mode="paper", universe=["AAA"])
-        s.kite.instruments.return_value = [
+        s.client.instruments.return_value = [
             {"name": "AAA", "tradingsymbol": "AAA26APRFUT", "instrument_type": "FUT",
              "expiry": date(2026, 4, 28), "lot_size": 100, "segment": "NFO-FUT"},
             {"name": "AAA", "tradingsymbol": "AAA26MAYFUT", "instrument_type": "FUT",
              "expiry": date(2026, 5, 26), "lot_size": 100, "segment": "NFO-FUT"},
         ]
-        s.kite.quote.side_effect = lambda keys: {
+        s.client.quote.side_effect = lambda keys: {
             "NSE:AAA": {"last_price": 99.5},
             "NFO:AAA26APRFUT": _quote(99.9, 100.1, 100.0),
             "NFO:AAA26MAYFUT": _quote(100.7, 101.3, 101.0),
@@ -1919,16 +1919,16 @@ class TestMarginPrecheck:
 
     def test_batch_is_refused_when_the_broker_cannot_fund_it(self):
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(50_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._basket(70_000))
+        s.client.margins = MagicMock(return_value=self._margins(50_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._basket(70_000))
         s.execute_proposals(self._props())
         assert s._live_execute.placed == [], "nothing may be placed"
         assert s.state.open_calendars == {}
 
     def test_batch_proceeds_when_funded(self):
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(500_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._basket(70_000))
+        s.client.margins = MagicMock(return_value=self._margins(500_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._basket(70_000))
         s.execute_proposals(self._props())
         assert len(s.state.open_calendars["AAA"].legs) == 2
 
@@ -1937,8 +1937,8 @@ class TestMarginPrecheck:
         # has to clear. Taking `final` alone would wave through a batch that
         # rejects on leg 2.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(100_000))
-        s.kite.basket_order_margins = MagicMock(return_value={
+        s.client.margins = MagicMock(return_value=self._margins(100_000))
+        s.client.basket_order_margins = MagicMock(return_value={
             "initial": {"total": 200_000}, "final": {"total": 70_000}})
         s.execute_proposals(self._props())
         assert s._live_execute.placed == []
@@ -1948,8 +1948,8 @@ class TestMarginPrecheck:
         # the estimate would place a batch the account cannot fund — the whole
         # reason this calls basket_order_margins.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(100_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._basket(200_000))
+        s.client.margins = MagicMock(return_value=self._margins(100_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._basket(200_000))
         s.execute_proposals(self._props())
         assert s._live_execute.placed == []
 
@@ -1957,14 +1957,14 @@ class TestMarginPrecheck:
         # Don't-block-on-flake (pair_trading H15): the reversal is the backstop
         # for a post-fact reject; a broken margins() must not halt trading.
         s = self._live()
-        s.kite.margins = MagicMock(side_effect=RuntimeError("net down"))
+        s.client.margins = MagicMock(side_effect=RuntimeError("net down"))
         s.execute_proposals(self._props())
         assert len(s.state.open_calendars["AAA"].legs) == 2
 
     def test_basket_flake_falls_back_to_the_estimate(self):
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(30_000))
-        s.kite.basket_order_margins = MagicMock(side_effect=RuntimeError("boom"))
+        s.client.margins = MagicMock(return_value=self._margins(30_000))
+        s.client.basket_order_margins = MagicMock(side_effect=RuntimeError("boom"))
         s.execute_proposals(self._props())
         # Σ estimate ₹40k × headroom is NOT applied to the fallback, but ₹40k
         # already exceeds ₹30k available → refused rather than placed blind.
@@ -1974,15 +1974,15 @@ class TestMarginPrecheck:
         # Zeroed totals from a degraded RMS response would pass any gate
         # trivially; trusting them would book a phantom-zero requirement.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(30_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._basket(0))
+        s.client.margins = MagicMock(return_value=self._margins(30_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._basket(0))
         s.execute_proposals(self._props())
         assert s._live_execute.placed == []
 
     def test_paper_never_calls_the_broker(self):
         s = _make_strategy(mode="paper")
-        s.kite.margins = MagicMock(side_effect=AssertionError("paper called margins()"))
-        s.kite.basket_order_margins = MagicMock(
+        s.client.margins = MagicMock(side_effect=AssertionError("paper called margins()"))
+        s.client.basket_order_margins = MagicMock(
             side_effect=AssertionError("paper called basket_order_margins()"))
         s.execute_proposals(self._props())
         assert len(s.state.open_calendars["AAA"].legs) == 2
@@ -1991,10 +1991,10 @@ class TestMarginPrecheck:
         # We already own the position; refusing to exit on a margin reading
         # would trap the book in a trade it has decided to leave.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(500_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._basket(70_000))
+        s.client.margins = MagicMock(return_value=self._margins(500_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._basket(70_000))
         s.execute_proposals(self._props())
-        s.kite.margins = MagicMock(side_effect=AssertionError("exit was prechecked"))
+        s.client.margins = MagicMock(side_effect=AssertionError("exit was prechecked"))
         s.execute_proposals([_leg("AAA", "APR", "SELL"), _leg("AAA", "MAY", "BUY")])
         assert s.state.open_calendars == {}
 
@@ -2029,8 +2029,8 @@ class TestMarginPrecheckReviewFixes:
         # netted requirement, defeating the calendar benefit the basket call
         # exists to capture.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(150_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.client.margins = MagicMock(return_value=self._margins(150_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._calendar_basket())
         s.execute_proposals(self._props())
         assert len(s.state.open_calendars["AAA"].legs) == 2
 
@@ -2039,15 +2039,15 @@ class TestMarginPrecheckReviewFixes:
         # basket figure (₹33.3k) would fit — gating on `final` alone would
         # place a batch whose leg 1 rejects.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(90_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.client.margins = MagicMock(return_value=self._margins(90_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._calendar_basket())
         s.execute_proposals(self._props())
         assert s._live_execute.placed == []
 
     def test_missing_per_leg_totals_fall_back_to_the_conservative_shape(self):
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(150_000))
-        s.kite.basket_order_margins = MagicMock(return_value={
+        s.client.margins = MagicMock(return_value=self._margins(150_000))
+        s.client.basket_order_margins = MagicMock(return_value={
             "initial": {"total": 207_159}, "final": {"total": 33_284}})
         s.execute_proposals(self._props())
         assert s._live_execute.placed == [], \
@@ -2062,28 +2062,28 @@ class TestMarginPrecheckReviewFixes:
         # yet reflect the first — the exact mid-batch reject this gate exists
         # to prevent.
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(150_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.client.margins = MagicMock(return_value=self._margins(150_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._calendar_basket())
         s.execute_proposals(self._props("AAA") + self._props("BBB"))
         assert "AAA" in s.state.open_calendars
         assert "BBB" not in s.state.open_calendars
-        assert s.kite.margins.call_count == 1, "balance must be read once per call"
+        assert s.client.margins.call_count == 1, "balance must be read once per call"
 
     def test_both_batches_pass_when_the_balance_actually_covers_them(self):
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(500_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.client.margins = MagicMock(return_value=self._margins(500_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._calendar_basket())
         s.execute_proposals(self._props("AAA") + self._props("BBB"))
         assert len(s.state.open_calendars) == 2
 
     def test_no_broker_call_at_all_when_the_tick_is_exits_only(self):
         s = self._live()
-        s.kite.margins = MagicMock(return_value=self._margins(500_000))
-        s.kite.basket_order_margins = MagicMock(return_value=self._calendar_basket())
+        s.client.margins = MagicMock(return_value=self._margins(500_000))
+        s.client.basket_order_margins = MagicMock(return_value=self._calendar_basket())
         s.execute_proposals(self._props())
-        s.kite.margins.reset_mock()
+        s.client.margins.reset_mock()
         s.execute_proposals([_leg("AAA", "APR", "SELL"), _leg("AAA", "MAY", "BUY")])
-        assert s.kite.margins.call_count == 0
+        assert s.client.margins.call_count == 0
 
 
 class TestUnwindRowDirection:
@@ -2176,8 +2176,8 @@ class TestUniverseResolution:
 
     def test_missing_symbol_is_named_in_a_warning(self, caplog):
         s = _make_strategy(mode="paper", universe=["AAA", "DELISTED"])
-        s.kite.instruments.return_value = self._instruments(["AAA"])
-        s.kite.quote.return_value = {}
+        s.client.instruments.return_value = self._instruments(["AAA"])
+        s.client.quote.return_value = {}
         with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
             s._observe_universe_uncached()
         assert any("DELISTED" in r.getMessage() for r in caplog.records), \
@@ -2187,16 +2187,16 @@ class TestUniverseResolution:
         # Operator decision 2026-09-09: warn everywhere, refuse nowhere. A
         # delisting must not stop the book managing what it already holds.
         s = _make_strategy(mode="paper", universe=["AAA", "DELISTED"])
-        s.kite.instruments.return_value = self._instruments(["AAA"])
-        s.kite.quote.return_value = {}
+        s.client.instruments.return_value = self._instruments(["AAA"])
+        s.client.quote.return_value = {}
         s._observe_universe_uncached()          # must not raise
 
     def test_warned_once_per_session_not_once_per_tick(self, caplog):
         # The scan runs every few seconds all session; a per-tick warning would
         # bury the thing it is trying to surface.
         s = _make_strategy(mode="paper", universe=["AAA", "DELISTED"])
-        s.kite.instruments.return_value = self._instruments(["AAA"])
-        s.kite.quote.return_value = {}
+        s.client.instruments.return_value = self._instruments(["AAA"])
+        s.client.quote.return_value = {}
         with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
             for _ in range(5):
                 s._observe_universe_uncached()
@@ -2205,8 +2205,8 @@ class TestUniverseResolution:
 
     def test_a_fully_resolvable_universe_is_silent(self, caplog):
         s = _make_strategy(mode="paper", universe=["AAA"])
-        s.kite.instruments.return_value = self._instruments(["AAA", "EXTRA"])
-        s.kite.quote.return_value = {}
+        s.client.instruments.return_value = self._instruments(["AAA", "EXTRA"])
+        s.client.quote.return_value = {}
         with caplog.at_level(_logging.WARNING, logger="strategies.arbitrage"):
             s._observe_universe_uncached()
         assert not [r for r in caplog.records if "universe" in r.getMessage()]
@@ -2249,15 +2249,15 @@ class TestOpenCalendarStaysObservable:
     def test_the_scan_covers_held_symbols_outside_the_universe(self):
         s = _make_strategy(mode="paper", universe=["BBB"])
         self._open_calendar(s, symbol="AAA")
-        s.kite.instruments.return_value = []
+        s.client.instruments.return_value = []
         scanned = []
         # _observe_universe_uncached iterates the union; with no instruments it
         # returns early, so assert on the union it builds rather than output.
-        s.kite.instruments.return_value = [
+        s.client.instruments.return_value = [
             {"name": n, "tradingsymbol": f"{n}26APRFUT", "instrument_type": "FUT",
              "expiry": date(2026, 4, 28), "lot_size": 100, "segment": "NFO-FUT"}
             for n in ("AAA", "BBB")]
-        s.kite.quote.side_effect = lambda keys: scanned.extend(keys) or {}
+        s.client.quote.side_effect = lambda keys: scanned.extend(keys) or {}
         s._observe_universe_uncached()
         assert any("AAA" in k for k in scanned), \
             "the held symbol must be quoted even though it left the universe"
@@ -2323,7 +2323,7 @@ class TestPriceFromTheBook:
         s = _make_strategy(mode="paper", universe=["GRASIM"],
                            calendar_entry_annual=0.05)
         s.calendar_cost_hurdle_mult = 0.0
-        s.kite.instruments.return_value = [
+        s.client.instruments.return_value = [
             {"name": "GRASIM", "tradingsymbol": "GRASIM26SEPFUT",
              "instrument_type": "FUT", "expiry": date(2026, 9, 29),
              "lot_size": 250, "segment": "NFO-FUT"},
@@ -2332,7 +2332,7 @@ class TestPriceFromTheBook:
              "lot_size": 250, "segment": "NFO-FUT"},
         ]
         s._clock = lambda: datetime(2026, 9, 9, 11, 0)   # 20d / 48d to expiry
-        s.kite.quote.side_effect = lambda keys: {
+        s.client.quote.side_effect = lambda keys: {
             "NSE:GRASIM": {"last_price": 3300.0},
             "NFO:GRASIM26SEPFUT": near,
             "NFO:GRASIM26OCTFUT": far,
@@ -2414,14 +2414,14 @@ class TestUnformedBookGates:
         s = _make_strategy(mode="paper", universe=list(universe),
                            calendar_entry_annual=0.05)
         s.calendar_cost_hurdle_mult = 0.0
-        s.kite.instruments.return_value = [
+        s.client.instruments.return_value = [
             {"name": "AAA", "tradingsymbol": "AAA26SEPFUT", "instrument_type": "FUT",
              "expiry": date(2026, 9, 29), "lot_size": 250, "segment": "NFO-FUT"},
             {"name": "AAA", "tradingsymbol": "AAA26OCTFUT", "instrument_type": "FUT",
              "expiry": date(2026, 10, 27), "lot_size": 250, "segment": "NFO-FUT"},
         ]
         s._clock = lambda: datetime(2026, 9, 11, 9, 15)
-        s.kite.quote.side_effect = lambda keys: {
+        s.client.quote.side_effect = lambda keys: {
             "NSE:AAA": {"last_price": 3300.0},
             "NFO:AAA26SEPFUT": near, "NFO:AAA26OCTFUT": far,
         }
@@ -2564,7 +2564,7 @@ class TestUnformedBookGates:
         # — and mis-reporting it burns the once-per-session warning that a
         # genuine bookless leg later in the day would need.
         s = self._strategy(near=self._q(3310.0, 3308.2, 3311.1), far=None)
-        s.kite.quote.side_effect = lambda keys: {
+        s.client.quote.side_effect = lambda keys: {
             "NSE:AAA": {"last_price": 3300.0},
             "NFO:AAA26SEPFUT": self._q(3310.0, 3308.2, 3311.1),
         }

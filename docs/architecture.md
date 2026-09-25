@@ -3,12 +3,12 @@
 ## 1. What this is
 
 A single repository running **two parallel systems** against the same
-configured broker account (Zerodha Kite by default; Kotak Neo via
-`[broker] name = kotak` in `config.ini` — see `core/broker/`):
+configured broker account (Kotak Neo by default; Zerodha Kite when
+`[broker] name = zerodha` — see `core/broker/`):
 
 1. **Headless paper/live-trading + autoresearch daemons.** Run on a VPS under
    `systemd`. Authenticate via the broker adapter (`core.broker.get_trading_client`;
-   Zerodha still uses TOTP in `core/kite_auth.py`) and run one strategy per
+   Kotak Neo by default, Zerodha TOTP in `core/kite_auth.py` when selected) and run one strategy per
    timer-driven runner through the trading session: Taleb-Karpathy
    (`runners/run_paper.py`), pair trading (`runners/run_paper_pairs.py` — a baseline and a
    persistent system, the latter with a real-money `pair-paper-persistent-live`
@@ -18,8 +18,8 @@ configured broker account (Zerodha Kite by default; Kotak Neo via
    Going live is documented in `deploy/VPS_DEPLOYMENT.md` §7 (least-privilege
    user migration in §6.5).
 2. **Browser dashboard.** A FastAPI backend + React SPA. Authenticates via
-   the configured broker (Kite OAuth when `broker.name = zerodha`; server-side
-   TOTP+MPIN when `kotak`). Lets a user pick a strategy (Taleb-Karpathy, Pair
+   the configured broker (Kotak Neo server-side TOTP+MPIN by default; Kite
+   OAuth when `broker.name = zerodha`). Lets a user pick a strategy (Taleb-Karpathy, Pair
    Trading, Arbitrage, or Equity Swing), pick a mode (signals-only or paper),
    and watch live signals / trades / P&L. Live trading from the dashboard is
    unconditionally rejected.
@@ -90,11 +90,11 @@ queue, no broker, no shared object between them — only the filesystem.
        │   └─ pair_trading.py   │   │   ─ pnl_snapshots                    │
        └────────────┬───────────┘   └──────────────────────────────────────┘
                     │
-                    │ kite.quote / kite.place_order
+                    │ client.quote / client.place_order
                     ▼
               ┌──────────────────────────┐
-              │  api.kite.trade          │
-              │  (Zerodha Kite Connect)  │
+              │  Configured broker       │
+              │  Kotak Neo by default    │
               └──────────────────────────┘
 
 
@@ -217,7 +217,7 @@ That's it. The dashboard discovers it automatically; no other wiring.
 |---|---|---|---|
 | `signals` | `_emit_signal` per proposal → JSONL append + INFO log | No | No |
 | `paper` | Mock fill (`_paper_execute`) → log line + state update (positions, P&L, costs) | Yes | No |
-| `live` | `_live_execute` → `kite.place_order(...)` returning a `PENDING` order_id; state updated on assumed fill | Yes | **Yes** |
+| `live` | `_live_execute` → `client.place_order(...)` returning a `PENDING` order_id; state updated on assumed fill | Yes | **Yes** |
 
 The dashboard's `POST /api/runs` rejects `live`; the daemon path uses `paper`.
 `live` is only reachable today by the (deliberately separate) `run_live.py`
@@ -303,12 +303,13 @@ SPA — the run is just terminal.
 |---|---|---|---|
 | `GET` | `/` | — | `{name, version, live_mode_enabled}` |
 | `GET` | `/api/auth/status` | — | `AuthStatus` (authenticated + profile) |
-| `GET` | `/api/auth/login` | — | `{login_url}` (SPA `window.location.assign`s) |
-| `GET` | `/api/auth/callback` | `request_token`, `status` (from Kite) | 302 → `{DASHBOARD_URL}/?login=success` |
-| `POST` | `/api/auth/logout` | — | `{status: "ok"}`, clears `.kite_session.json` |
+| `GET` | `/api/auth/login` | — | Kotak Neo (default): `{login_url: null, login_style: headless}`. Zerodha: `{login_url}` the SPA navigates to |
+| `POST` | `/api/auth/login` | — | Kotak Neo headless TOTP+MPIN from host config. Zerodha returns 400 (use GET) |
+| `GET` | `/api/auth/callback` | `request_token`, `status` (Zerodha Kite) | 302 → `{DASHBOARD_URL}/?login=success` |
+| `POST` | `/api/auth/logout` | — | `{status: "ok"}`, clears the configured broker's session cache |
 | `GET` | `/api/strategies` | — | `[{name, description, params}]` |
 | `GET` | `/api/strategies/{name}/params` | — | `[ParamSpec]` (form schema) |
-| `POST` | `/api/runs` | `{strategy, mode, params}` | `RunSummary`, 201. 400 unknown strategy, 403 live mode, 401 no Kite session, 500 strategy init failure |
+| `POST` | `/api/runs` | `{strategy, mode, params}` | `RunSummary`, 201. 400 unknown strategy, 403 live mode, 401 no broker session, 500 strategy init failure |
 | `GET` | `/api/runs` | — | `[RunSummary]` (live + DB historical, merged) |
 | `GET` | `/api/runs/{id}` | — | `RunDetail` (summary + signals + trades + pnl_history from DB) |
 | `POST` | `/api/runs/{id}/stop` | — | `RunSummary`, status flips to STOPPING then STOPPED |
@@ -410,8 +411,12 @@ useEffect:
 `[broker] name` in `config.ini` selects the adapter (`core.broker`). Runners
 always call `get_trading_client`. The dashboard dispatches on `login_style`.
 
-**Zerodha** (`name = zerodha`, default) still has two flows sharing
-`.kite_session.json`:
+**Kotak Neo** (`name = kotak`, the default) is headless TOTP+MPIN only
+(`core/broker/kotak.py`). Cache: `.kotak_session.json` (mode 0600). The
+dashboard button POSTs `/api/auth/login` using host `config.ini` — MPIN
+never goes through the browser. Only `environment = prod` is wired.
+
+**Zerodha** (`name = zerodha`) has two flows sharing `.kite_session.json`:
 
 | | TOTP path | OAuth path |
 |---|---|---|
@@ -419,11 +424,6 @@ always call `get_trading_client`. The dashboard dispatches on `login_style`.
 | Inputs | `KITE_USER_ID`, `KITE_PASSWORD`, `KITE_TOTP_KEY` | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` |
 | Mechanism | `core/kite_auth.py` POST `/api/login` + `/api/twofa` | Browser redirect to Kite; `/api/auth/callback` exchanges `request_token` |
 | Token validity | ~24h (expires ~06:00 IST next day) | Same |
-
-**Kotak Neo** (`name = kotak`) is headless TOTP+MPIN only
-(`core/broker/kotak.py`). Cache: `.kotak_session.json` (mode 0600). The
-dashboard button POSTs `/api/auth/login` using host `config.ini` — MPIN
-never goes through the browser. Only `environment = prod` is wired.
 
 Groww/Dhan are registered and refuse at `login()`. Operator setup is in
 [`broker.md`](./broker.md).
@@ -436,7 +436,8 @@ Groww/Dhan are registered and refuse at `login()`. Operator setup is in
 
 | Source | Endpoint / file | Used by |
 |---|---|---|
-| Kite Connect REST | `kite.quote()`, `kite.instruments()`, `kite.historical_data()`, `kite.place_order()` | All live-data paths |
+| Configured broker (Kotak Neo by default) | `client.quote()`, `instruments()`, `historical_data()`, `place_order()` | Runners and the dashboard |
+| Configured broker | `historical_data` / `instruments` / `quote` via `get_trading_client` | `market_data/fetch_*`, tick capture, and the runners. Kotak Neo is the default. Zerodha keeps KiteTicker for the live tape |
 | NSE F&O bhav copy (UDiFF) | `archives.nseindia.com/...BhavCopy_NSE_FO_*.csv.zip` | `market_data/fetch_bhavcopy.py`, `core/screen_pairs.py` |
 | Local cached CSVs | `data_cache/NIFTY_*.csv` (intraday option chain), `data_cache/bhavcopy_raw/*.csv` (EOD) | Backtests, screener, autoresearch |
 
@@ -547,14 +548,14 @@ the trade log.
 | `timestamp` | TEXT | NOT NULL | ISO-8601 of when the executor recorded the proposal (not the strategy's ideal tick time). |
 | `kind` | TEXT | NOT NULL | `"ENTRY"` (from `scan_and_propose`) \| `"REHEDGE"` (from `check_and_rehedge`). |
 | `source` | TEXT | NOT NULL | `"signal"` (signals mode) \| `"trade"` (paper or live). Drives the n_signals/n_trades counter and the SPA tab the row appears in. |
-| `tradingsymbol` | TEXT | NOT NULL | Kite tradingsymbol (e.g. `NIFTY26APR22000CE`, `RELIANCE26APRFUT`). |
+| `tradingsymbol` | TEXT | NOT NULL | Tradingsymbol (e.g. `NIFTY26APR22000CE`, `RELIANCE26APRFUT`). Kotak sends the scrip-master spelling. |
 | `transaction_type` | TEXT | NOT NULL | `"BUY"` or `"SELL"`. |
 | `quantity` | INTEGER | NOT NULL | In lots, always positive; direction is in `transaction_type`. |
 | `lot_size` | INTEGER | NOT NULL | Captured at proposal time so historical rows are interpretable even if the broker changes lot size later. |
 | `price` | REAL | NOT NULL | Limit price the strategy proposed. |
 | `rationale` | TEXT | nullable | Strategy-supplied explanation surfaced in the SPA's "Rationale" column. |
-| `status` | TEXT | nullable | `"COMPLETE"` (paper) \| `"PENDING"` (live, returned by `kite.place_order`) \| `"FAILED"` (live error) \| `"SIGNAL_LOGGED"` (signals). |
-| `order_id` | TEXT | nullable | Kite order id (live), `PAPER-<epoch>` (paper), or `SIGNAL-<epoch>` (signals). |
+| `status` | TEXT | nullable | `"COMPLETE"` (paper) \| `"PENDING"` (live, returned by `place_order`) \| `"FAILED"` (live error) \| `"SIGNAL_LOGGED"` (signals). |
+| `order_id` | TEXT | nullable | Broker order id (live), `PAPER-<epoch>` (paper), or `SIGNAL-<epoch>` (signals). |
 | `mode` | TEXT | nullable | Echoes the `mode` the strategy was constructed with. Mostly redundant with `runs.mode` but useful for direct queries. |
 
 Index: `idx_proposals_run_id ON (run_id, id)`. Every API query is "all
@@ -728,10 +729,10 @@ Two independent stacks under `systemd`:
                           └───────────────────────────────────────────┘
 
 (public)  ──▶  nginx ──┬──▶ frontend/dist (static)
-                       └──▶ 127.0.0.1:8000 (FastAPI) ── shared ──▶ Kite Connect
+                       └──▶ 127.0.0.1:8000 (FastAPI) ── shared ──▶ Kotak Neo
                                                                      ▲
                                                                      │
-                          taleb-hedger ─ runners/run_paper.py ────────────────┘
+                          taleb-hedger ─ runners/run_paper.py ─────────────┘
                                           (independent process,
                                            authenticates via TOTP)
 ```

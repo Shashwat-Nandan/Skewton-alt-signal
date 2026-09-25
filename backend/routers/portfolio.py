@@ -11,7 +11,7 @@ the two things that need live data and therefore cannot live in the CLI:
     per-strategy state so divergence is visible.
 
 Read-only: no orders, ever (the dashboard never trades — AGENTS.md). When no
-Kite session is cached it **degrades gracefully** to the exact offline
+broker session is cached it **degrades gracefully** to the exact offline
 delta-1 view (option delta null, broker section omitted) rather than 401 —
 the exposure tab stays useful signed-out.
 """
@@ -65,7 +65,7 @@ class BrokerPosition(BaseModel):
 
 
 class PortfolioResponse(BaseModel):
-    live: bool                       # True = a Kite session augmented this view
+    live: bool                       # True = a broker session augmented this view
     note: str
     underlyings: List[UnderlyingExposure]
     broker_net: Optional[List[BrokerPosition]]
@@ -155,7 +155,7 @@ def get_portfolio_exposure() -> PortfolioResponse:
     session_present = kite is not None
     broker = _broker_net(kite) if session_present else None
     option_delta = _net_option_delta_by_underlying(kite) if session_present else {}
-    # Kite access tokens expire daily (~06:00 IST) and get_authenticated_kite
+    # Broker access tokens expire daily (~06:00 IST) and get_authenticated_kite
     # does NOT verify — a cached-but-rejected token yields a non-None client
     # whose every call raises. Treat the view as "live" only if a broker call
     # actually succeeded (None = it raised = token bad), so a stale token
@@ -192,10 +192,10 @@ def get_portfolio_exposure() -> PortfolioResponse:
     rows.sort(key=lambda r: -abs(r.net_notional))
 
     if live:
-        note = "live: option delta from Kite spot + broker net joined"
+        note = "live: option delta from broker spot + broker net joined"
     elif session_present:
-        note = ("Kite session present but calls failed (token likely expired "
+        note = ("Broker session present but calls failed (token likely expired "
                 "~06:00 IST) — showing offline delta-1 only")
     else:
-        note = "offline: no Kite session — option delta excluded, delta-1 only"
+        note = "offline: no broker session — option delta excluded, delta-1 only"
     return PortfolioResponse(live=live, note=note, underlyings=rows, broker_net=broker)

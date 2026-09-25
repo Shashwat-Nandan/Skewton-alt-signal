@@ -60,7 +60,7 @@ export function Header() {
   }, [menuOpen]);
 
   // Logout = sign out of the dashboard session (the password gate). The
-  // Kite/broker token expires daily on its own and rarely needs explicit
+  // The broker token expires daily on its own and rarely needs explicit
   // teardown, so we don't surface it here. Invalidating ["session"] kicks
   // App.tsx to the login page.
   const logout = useMutation({

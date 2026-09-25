@@ -7,10 +7,9 @@ order path, expose a *Kite-shaped* client so existing
 working. Vendor quirks (Kotak `nse_fo` vs Kite `NFO`, `B` vs `BUY`) stay
 inside the adapter.
 
-Market-data CLIs (`market_data/fetch_*`, tick capture) are *not* on this
-seam yet — they still use `KiteAuthManager` directly. Switching those is
-a later increment; this one covers login + ordering, which is what a
-broker change actually moves.
+Market-data CLIs (`market_data/fetch_*`, tick capture) use the same
+factory. Kotak Neo is the default. `name = zerodha` keeps Kite Connect,
+including the KiteTicker tape.
 """
 from __future__ import annotations
 
@@ -31,7 +30,7 @@ class BrokerAdapter(ABC):
     def login(self) -> Any:
         """Authenticate and return a Kite-shaped trading client.
 
-        Runners pass the return value into strategies as `kite`.
+        Runners pass the return value into strategies as `client`.
         """
 
     @abstractmethod

@@ -103,7 +103,7 @@ class TestEntryMapping:
         assert "instrument_token" not in json.dumps(record)
 
     def test_marketable_limit_pads_toward_aggressive_side(self):
-        # Mirrors KiteOrderExecutor: BUY pads above reference, SELL below —
+        # Mirrors OrderExecutor: BUY pads above reference, SELL below —
         # a subscriber chasing with the wrong sign would never fill.
         s = _strategy_with_history()
         record = sigmap.build_entry_signal(s, _entry_props(), z=-2.5).to_wire()

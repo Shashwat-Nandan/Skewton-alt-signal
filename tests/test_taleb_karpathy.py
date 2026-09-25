@@ -96,7 +96,7 @@ class TestPositionNetting:
              "tradingsymbol": "NIFTY26403CE22000", "expiry": "2026-04-03"},
         ]
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -179,7 +179,7 @@ class TestFailedOrderGuard:
              "tradingsymbol": "NIFTY26403CE22000", "expiry": "2026-04-03"},
         ]
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "live"  # LIVE mode
         hedger.underlying = "NIFTY"
@@ -238,7 +238,7 @@ class TestFuturesPnL:
     def mock_hedger(self):
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -273,7 +273,7 @@ class TestFuturesPnL:
         # futures contract. Marking against spot here would give 2500 and
         # silently book the 50-pt basis as P&L.
         mock_hedger._cached_futures_symbol = "NIFTY26APRFUT"
-        mock_hedger.kite.quote.return_value = {
+        mock_hedger.client.quote.return_value = {
             "NFO:NIFTY26APRFUT": {"last_price": 22100.0},
         }
         mock_hedger._update_positions_prices(22050.0)
@@ -299,7 +299,7 @@ class TestFuturesHedgeBasisPricing:
     @pytest.fixture
     def h(self):
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = MagicMock()
+        hedger.client = MagicMock()
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -325,7 +325,7 @@ class TestFuturesHedgeBasisPricing:
         return hedger
 
     def _quote_futures(self, h, price, symbol="NIFTY26JULFUT"):
-        h.kite.quote.return_value = {f"NFO:{symbol}": {"last_price": price}}
+        h.client.quote.return_value = {f"NFO:{symbol}": {"last_price": price}}
 
     # ── marking ────────────────────────────────────────────────
 
@@ -372,7 +372,7 @@ class TestFuturesHedgeBasisPricing:
         gates read this number."""
         self._quote_futures(h, self.FUT)
         h._update_positions_prices(self.SPOT)
-        h.kite.quote.side_effect = Exception("feed down")
+        h.client.quote.side_effect = Exception("feed down")
         h._update_positions_prices(self.SPOT)
         assert h.state.unrealized_pnl == pytest.approx(
             (self.FUT - self.VWAP) * self.LOTS * self.LOT
@@ -392,7 +392,7 @@ class TestFuturesHedgeBasisPricing:
         """H-6b guarantee preserved: the flatten price is never 0.0, so
         validate_order's price>0 gate cannot reject an emergency square-off
         just because the feed died."""
-        h.kite.quote.side_effect = Exception("feed down")
+        h.client.quote.side_effect = Exception("feed down")
         props = h._generate_close_all_proposals()
         fut = [p for p in props if p.option_type == "FUT"]
         assert len(fut) == 1
@@ -404,7 +404,7 @@ class TestFuturesHedgeBasisPricing:
         """Refuse rather than guess (H-6c/H-6d): a spot-priced entry VWAP
         would corrupt every later mark on the position. Drift re-proposes
         the hedge on the next tick."""
-        h.kite.quote.side_effect = Exception("feed down")
+        h.client.quote.side_effect = Exception("feed down")
         greeks = MagicMock(net_discrete_delta=-260.0, net_delta=-260.0)
         assert h._generate_hard_delta_proposals(greeks, self.SPOT) == []
 
@@ -424,7 +424,7 @@ class TestFuturesHedgeBasisPricing:
         roll spread as phantom P&L — the same class of error as marking at
         index spot. Mark the contract we actually hold."""
         h._cached_futures_symbol = "NIFTY26AUGFUT"      # front-month rolled
-        h.kite.quote.return_value = {
+        h.client.quote.return_value = {
             "NFO:NIFTY26JULFUT": {"last_price": self.FUT},
             "NFO:NIFTY26AUGFUT": {"last_price": self.FUT + 180.0},
         }
@@ -434,7 +434,7 @@ class TestFuturesHedgeBasisPricing:
             (self.FUT - self.VWAP) * self.LOTS * self.LOT
         )
         # The quote must have been asked for the HELD contract.
-        assert h.kite.quote.call_args[0][0] == ["NFO:NIFTY26JULFUT"]
+        assert h.client.quote.call_args[0][0] == ["NFO:NIFTY26JULFUT"]
 
     def test_fill_binds_contract_and_seeds_mark_then_clears(self, h):
         """The mark is seeded from the fill so a quote outage on the very
@@ -494,7 +494,7 @@ class TestFuturesHedgeBasisPricing:
         fails still marks against a real price, so a large adverse futures
         move remains visible to `_should_exit`."""
         h.state.futures_last_mark = self.VWAP - 100.0      # restored, adverse
-        h.kite.quote.side_effect = Exception("feed down")
+        h.client.quote.side_effect = Exception("feed down")
         h._update_positions_prices(self.SPOT)
         assert h.state.unrealized_pnl == pytest.approx(-100.0 * self.LOTS * self.LOT)
         assert h.state.unrealized_pnl != 0.0
@@ -504,7 +504,7 @@ class TestFuturesHedgeBasisPricing:
     def test_futures_quote_failures_escalate_to_error(self, h, caplog):
         """H-6a: a frozen futures mark feeds the daily-loss breaker, so it
         must not sit at one severity forever."""
-        h.kite.quote.side_effect = Exception("feed down")
+        h.client.quote.side_effect = Exception("feed down")
         for _ in range(4):
             h._futures_mark()
         assert h._consecutive_futures_failures == 4
@@ -524,17 +524,17 @@ class TestFuturesHedgeBasisPricing:
         legs have been re-marked, so a raise leaves a half-updated book with
         total_pnl unset and _should_exit never evaluated."""
         h.state.futures_last_mark = self.FUT
-        h.kite.quote.return_value = payload
+        h.client.quote.return_value = payload
         h._update_positions_prices(self.SPOT)   # must not raise
         assert h.state.unrealized_pnl == pytest.approx(
             (self.FUT - self.VWAP) * self.LOTS * self.LOT
         )
 
     def test_futures_failure_counter_resets_on_recovery(self, h):
-        h.kite.quote.side_effect = Exception("feed down")
+        h.client.quote.side_effect = Exception("feed down")
         h._futures_mark()
         assert h._consecutive_futures_failures == 1
-        h.kite.quote.side_effect = None
+        h.client.quote.side_effect = None
         self._quote_futures(h, self.FUT)
         assert h._futures_mark() == pytest.approx(self.FUT)
         assert h._consecutive_futures_failures == 0
@@ -658,8 +658,8 @@ class TestDailyPnLAggregation:
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
-        hedger.kite = MagicMock()
-        hedger.kite.quote.return_value = {}
+        hedger.client = MagicMock()
+        hedger.client.quote.return_value = {}
         hedger.immutable_params = {"total_capital": 500000}
 
         # Simulate 5 ticks on the same day by bumping realized_pnl each time
@@ -681,8 +681,8 @@ class TestDailyPnLAggregation:
         hedger.underlying = "NIFTY"
         hedger.exchange = "NFO"
         hedger._cached_lot_size = 25
-        hedger.kite = MagicMock()
-        hedger.kite.quote.return_value = {}
+        hedger.client = MagicMock()
+        hedger.client.quote.return_value = {}
         hedger.immutable_params = {"total_capital": 500000}
 
         # Day 1: 2 ticks
@@ -738,7 +738,7 @@ class TestFlatBookPnL:
     def mock_hedger(self):
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -863,7 +863,7 @@ class TestDailyLossStop:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -924,7 +924,7 @@ class TestDrawdownConsistency:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1008,7 +1008,7 @@ class TestConsecutiveLossReset:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1111,7 +1111,7 @@ class TestSameBarRoundTripGuard:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1172,7 +1172,7 @@ class TestPreEntryVegaGate:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1431,7 +1431,7 @@ class TestActivePositionGuard:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger._pre_trade_checks = MagicMock(return_value=True)
@@ -1469,7 +1469,7 @@ class TestMCSizingSubLotGate:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1614,7 +1614,7 @@ class TestPerTradeAttribution:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1809,7 +1809,7 @@ class TestRVIVGate:
         from datetime import datetime
         kite = MagicMock()
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = kite
+        hedger.client = kite
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -1972,7 +1972,7 @@ class TestIVPercentileNotReady:
     def _bare(self):
         from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h.underlying = "NIFTY"
         h._clock = lambda: datetime(2026, 3, 29, 10, 0)
         h._atm_iv_history = []
@@ -2005,7 +2005,7 @@ class TestIVPercentileNotReady:
         """Kite returns no row for the ATM symbol (bucket gap): None, not 50."""
         h = self._bare()
         h._atm_iv_history = [0.15] * 60  # past warmup, so 50 can't come from warmup
-        h.kite.quote = MagicMock(return_value={})  # empty: KeyError path
+        h.client.quote = MagicMock(return_value={})  # empty: KeyError path
         assert h._compute_iv_percentile(self._chain(), 22000.0) is None
 
     def test_missing_atm_ce_returns_none(self):
@@ -2022,7 +2022,7 @@ class TestIVPercentileNotReady:
         """<30 DAILY sessions cannot rank a percentile — None, never 50."""
         h = self._bare()
         h._daily_atm_iv_history = self._pool([0.15] * 5)
-        h.kite.quote = MagicMock(side_effect=self._resolving_quote())
+        h.client.quote = MagicMock(side_effect=self._resolving_quote())
         assert h._compute_iv_percentile(self._chain(), 22000.0) is None
 
     def test_computes_real_percentile_when_ready(self):
@@ -2033,7 +2033,7 @@ class TestIVPercentileNotReady:
         returned 50."""
         h = self._bare()
         h._daily_atm_iv_history = self._pool([0.05] * 40)  # far below solved IV
-        h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
+        h.client.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
         pct = h._compute_iv_percentile(self._chain(), 22000.0)
         assert pct is not None
         assert pct > 50.0  # current IV ranks above a low-vol history
@@ -2052,7 +2052,7 @@ class TestIVPercentileNotReady:
         h = self._bare()
         h._atm_iv_history = [0.01] * 400          # what the OLD code ranked against
         h._daily_atm_iv_history = self._pool([0.90] * 40)  # the real regime
-        h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
+        h.client.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
         pct = h._compute_iv_percentile(self._chain(), 22000.0)
         assert pct is not None
         assert pct < 5.0, f"ranked against intraday ticks, not the daily pool (got {pct})"
@@ -2072,7 +2072,7 @@ class TestIVPercentileNotReady:
         h._daily_atm_iv_history = [
             (clock_date + timedelta(days=i), 0.05) for i in range(40)
         ]
-        h.kite.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
+        h.client.quote = MagicMock(side_effect=self._resolving_quote(price=150.0))
         assert h._compute_iv_percentile(self._chain(), 22000.0) is None
         # One session earlier and it is admitted, proving the boundary is
         # "< today" and not something coarser that drops everything.
@@ -2095,7 +2095,7 @@ class TestIVPercentileNotReady:
 class TestSpotFetch:
     def _bare(self):
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h._consecutive_spot_failures = 0
         return h
 
@@ -2117,19 +2117,19 @@ class TestSpotFetch:
         # bare except that converted it to 0.0. Must now return None.
         h = self._bare()
         h.underlying = "NIFTY"
-        h.kite.quote.return_value = {}
+        h.client.quote.return_value = {}
         assert h._get_spot_price() is None
 
     def test_kite_exception_returns_none(self):
         h = self._bare()
         h.underlying = "NIFTY"
-        h.kite.quote.side_effect = RuntimeError("network down")
+        h.client.quote.side_effect = RuntimeError("network down")
         assert h._get_spot_price() is None
 
     def test_valid_quote_returns_price(self):
         h = self._bare()
         h.underlying = "NIFTY"
-        h.kite.quote.return_value = {"NSE:NIFTY 50": {"last_price": 24119.3}}
+        h.client.quote.return_value = {"NSE:NIFTY 50": {"last_price": 24119.3}}
         assert h._get_spot_price() == 24119.3
 
     def test_check_spot_escalates_to_error_after_5_failures(self, caplog):
@@ -2168,7 +2168,7 @@ class TestSerializeRestore:
         from datetime import datetime
         kite = MagicMock()
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = kite
+        h.client = kite
         h.state = HedgeState()
         h.mode = "paper"
         h.underlying = "NIFTY"
@@ -2277,7 +2277,7 @@ class TestLegsExpireOn:
         from datetime import datetime
         kite = MagicMock()
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = kite
+        h.client = kite
         h.state = HedgeState()
         h.mode = "paper"
         h.underlying = "NIFTY"
@@ -2324,7 +2324,7 @@ class TestLegsExpireOn:
         h = self._mock_hedger()
         h.state.futures_hedge_delta = -75.0
         h.state.futures_lots = -1
-        h.kite.instruments = lambda seg: [
+        h.client.instruments = lambda seg: [
             {"tradingsymbol": "NIFTY26MAYFUT", "expiry": "2026-05-28"},
         ]
         assert h.legs_expire_on(date(2026, 5, 28)) is True
@@ -2348,7 +2348,7 @@ class TestLegsExpireOn:
         def _raise(*a, **k):
             call_count["n"] += 1
             raise RuntimeError("network down")
-        h.kite.instruments = _raise
+        h.client.instruments = _raise
 
         sleeps: list[float] = []
         orig_sleep = tk_mod.time.sleep
@@ -2372,7 +2372,7 @@ class TestLegsExpireOn:
         h = self._mock_hedger()
         h.state.futures_hedge_delta = -75.0
         h.state.futures_lots = -1
-        h.kite.instruments = lambda seg: []
+        h.client.instruments = lambda seg: []
         with pytest.raises(RuntimeError, match="empty list"):
             h.legs_expire_on(date(2026, 5, 19))
 
@@ -2396,7 +2396,7 @@ class TestLegsExpireOn:
         def _explode(*a, **k):
             raise AssertionError("kite.instruments() must not be called "
                                  "when only option legs are held")
-        h.kite.instruments = _explode
+        h.client.instruments = _explode
         assert h.legs_expire_on(date(2026, 5, 19)) is True
 
 
@@ -2409,7 +2409,7 @@ class TestRealizedThetaAccounting:
     def _make_hedger(self, theta_per_day):
         from datetime import datetime
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = MagicMock()
+        hedger.client = MagicMock()
         hedger.state = HedgeState()
         hedger.mode = "paper"
         hedger.underlying = "NIFTY"
@@ -2554,7 +2554,7 @@ class TestAsymmetricRehedgeBand:
     def _make_hedger(self, base_threshold=0.5):
         from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h.state = HedgeState()
         h.mode = "paper"
         h.underlying = "NIFTY"
@@ -2591,7 +2591,7 @@ class TestAsymmetricRehedgeBand:
         h._should_exit = lambda *a: False
         h._get_lot_size = lambda: 75
         h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
-        h.kite.quote = MagicMock(return_value={
+        h.client.quote = MagicMock(return_value={
             "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
         })
         return h
@@ -2672,7 +2672,7 @@ class TestWhalleyWilmottCostGate:
     def _build_hedger(self, cost_hurdle):
         from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h.state = HedgeState()
         h.mode = "paper"
         h.underlying = "NIFTY"
@@ -2708,7 +2708,7 @@ class TestWhalleyWilmottCostGate:
         h._should_exit = lambda *a: False
         h._get_lot_size = lambda: 75
         h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
-        h.kite.quote = MagicMock(return_value={
+        h.client.quote = MagicMock(return_value={
             "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
         })
         pf = MagicMock(
@@ -2778,7 +2778,7 @@ class TestSkewPercentileGate:
     def _make_hedger(self, skew_history, skew_max=80.0):
         from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h.state = HedgeState()
         h.mode = "paper"
         h.underlying = "NIFTY"
@@ -2833,7 +2833,7 @@ class TestSkewPercentileGate:
         from datetime import date  # noqa: F401 — used by helper
         h = self._make_hedger(skew_history=[0.02] * 10)
         chain, qmap = self._chain_with_skewed_quotes(23800, put_iv=0.20, call_iv=0.15)
-        h.kite.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
+        h.client.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
         pct = h._compute_skew_percentile(chain, 23800)
         assert pct == 50.0
 
@@ -2845,7 +2845,7 @@ class TestSkewPercentileGate:
         h = self._make_hedger(skew_history=[0.02 + 0.005 * (i % 5) for i in range(40)])
         # put_iv 0.23, call_iv 0.15 ⇒ current skew = 0.08
         chain, qmap = self._chain_with_skewed_quotes(23800, put_iv=0.23, call_iv=0.15)
-        h.kite.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
+        h.client.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
         pct = h._compute_skew_percentile(chain, 23800)
         # Both append (so length grows to 41) and rank against own history.
         # The exact value depends on bisect, but it must be > 80.
@@ -2858,7 +2858,7 @@ class TestSkewPercentileGate:
         h = self._make_hedger(skew_history=[0.05 + 0.005 * (i % 5) for i in range(40)])
         # put_iv 0.16, call_iv 0.15 ⇒ current skew = 0.01 (mild)
         chain, qmap = self._chain_with_skewed_quotes(23800, put_iv=0.16, call_iv=0.15)
-        h.kite.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
+        h.client.quote = lambda keys: {k: qmap[k] for k in keys if k in qmap}
         pct = h._compute_skew_percentile(chain, 23800)
         assert pct < 20.0, f"Expected low percentile, got {pct}"
 
@@ -2909,7 +2909,7 @@ class TestSkewPercentileGate:
         def fake_quote(symbols):
             call_count["n"] += 1
             return {k: qmap[k] for k in symbols if k in qmap}
-        h.kite.quote = fake_quote
+        h.client.quote = fake_quote
         h._compute_skew_percentile(chain, spot)
         assert call_count["n"] == 1, (
             f"Expected 1 batched quote() call, got {call_count['n']} "
@@ -2968,7 +2968,7 @@ class TestLayeredStructures:
     def _make_hedger(self, max_layers=1, regime=False):
         from datetime import datetime
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h.state = HedgeState()
         h.mode = "paper"
         h._pre_trade_checks = MagicMock(return_value=True)
@@ -3072,7 +3072,7 @@ class TestLayeredStructures:
         h._should_exit = lambda *a: False
         h._get_spot_price = lambda: 23800.0
         h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
-        h.kite.quote = MagicMock(return_value={
+        h.client.quote = MagicMock(return_value={
             "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
         })
         # Leg expires same day → < 1 day to expiry → band tightens.
@@ -3138,7 +3138,7 @@ class TestLayeredStructures:
         h._get_futures_symbol = lambda: "NIFTY26MAYFUT"
         h._get_futures_price = lambda sym: 23800.0
         h._estimate_gamma_scalp_pnl = lambda greeks, spot: 1e9
-        h.kite.quote = MagicMock(return_value={
+        h.client.quote = MagicMock(return_value={
             "NFO:NIFTY26MAYFUT": {"last_price": 23800.0},
         })
         h.state.positions = [
@@ -3400,7 +3400,7 @@ class TestTwoExpiryChain:
         kite = MagicMock()
         kite.instruments.return_value = instruments
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = kite
+        h.client = kite
         h.underlying = "NIFTY"
         h._get_spot_price = MagicMock(return_value=spot)
         h._consecutive_chain_failures = 0
@@ -3483,7 +3483,7 @@ class TestTwoExpiryChain:
             dense_expiry="2026-05-29", sparse_expiry="2026-05-22",
         )
         h = self._make_hedger(instruments)
-        h.kite.instruments.side_effect = RuntimeError("boom")
+        h.client.instruments.side_effect = RuntimeError("boom")
         assert h._get_options_chain().empty
         assert h._consecutive_chain_failures == 1
 
@@ -3676,7 +3676,7 @@ class TestLiveStatusHandling:
 
     def _live_hedger(self):
         hedger = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        hedger.kite = MagicMock()
+        hedger.client = MagicMock()
         hedger.state = HedgeState()
         hedger.mode = "live"
         hedger.underlying = "NIFTY"
@@ -3745,7 +3745,7 @@ class TestLiveStatusHandling:
 
     def test_live_execute_delegates_to_shared_executor(self):
         # Audit 1.2 step 2: the refusal is gone — _live_execute now hands
-        # the proposal to the shared KiteOrderExecutor (place → poll →
+        # the proposal to the shared OrderExecutor (place → poll →
         # cancel/partial-reverse) and rebinds the kite client so a
         # runner-side token refresh propagates.
         h = self._live_hedger()
@@ -3758,17 +3758,17 @@ class TestLiveStatusHandling:
         prop = self._prop()
         result = h._live_execute(prop)
         executor.execute.assert_called_once_with(prop)
-        assert executor.kite is h.kite
+        assert executor.client is h.client
         assert result["status"] == "COMPLETE"
 
     def test_order_executor_wiring(self):
         # The lazily-built executor carries taleb's identity: underlying-
         # tagged orders, the strategy's exchange, instruments-dump tick
         # lookup, and the 0.25 default pad when config has no override.
-        from strategies.order_executor import KiteOrderExecutor
+        from strategies.order_executor import OrderExecutor
         h = self._live_hedger()
         ex = h._order_executor()
-        assert isinstance(ex, KiteOrderExecutor)
+        assert isinstance(ex, OrderExecutor)
         assert ex._tag_for(self._prop()) == "taleb-NIFTY"
         assert ex.exchange == "NFO"
         assert ex.limit_protection_pct == 0.25
@@ -3788,7 +3788,7 @@ class TestMarkingFallbacks:
 
     def _hedger_with_position(self):
         h = TalebKarpathyStrategy.__new__(TalebKarpathyStrategy)
-        h.kite = MagicMock()
+        h.client = MagicMock()
         h.state = HedgeState()
         h.mode = "paper"
         h.underlying = "NIFTY"
@@ -3813,7 +3813,7 @@ class TestMarkingFallbacks:
 
     def test_quote_outage_carries_last_good_mark(self):
         h = self._hedger_with_position()
-        h.kite.quote = MagicMock(side_effect=RuntimeError("exchange feed down"))
+        h.client.quote = MagicMock(side_effect=RuntimeError("exchange feed down"))
         h._record_pnl_snapshot = lambda: None
         h._update_positions_prices(23000.0)
         pos = h.state.positions[0]
@@ -3825,9 +3825,9 @@ class TestMarkingFallbacks:
     def test_quote_recovery_clears_staleness(self):
         h = self._hedger_with_position()
         h._record_pnl_snapshot = lambda: None
-        h.kite.quote = MagicMock(side_effect=RuntimeError("down"))
+        h.client.quote = MagicMock(side_effect=RuntimeError("down"))
         h._update_positions_prices(23000.0)
-        h.kite.quote = MagicMock(return_value={
+        h.client.quote = MagicMock(return_value={
             "NFO:NIFTY26JUN23000PE": {"last_price": 360.0},
         })
         h._update_positions_prices(23000.0)
@@ -3843,7 +3843,7 @@ class TestMarkingFallbacks:
         h.immutable_params["max_daily_loss_pct"] = 1.0   # ₹5,000 on 5L
         h.state.positions[0].current_price = 100.0       # -30,000 unreal
         h._record_pnl_snapshot = lambda: None
-        h.kite.quote = MagicMock(side_effect=RuntimeError("down"))
+        h.client.quote = MagicMock(side_effect=RuntimeError("down"))
         h._update_positions_prices(23000.0)
         h.state._current_day_pnl = h.state.unrealized_pnl
         assert h.state.unrealized_pnl == (100.0 - 300.0) * 2 * 75
@@ -3855,13 +3855,13 @@ class TestMarkingFallbacks:
 
     def test_lot_size_lookup_failure_raises(self):
         h = self._hedger_with_position()
-        h.kite.instruments = MagicMock(side_effect=RuntimeError("api down"))
+        h.client.instruments = MagicMock(side_effect=RuntimeError("api down"))
         with pytest.raises(RuntimeError, match="refusing to size"):
             h._get_lot_size()
 
     def test_lot_size_no_rows_raises(self):
         h = self._hedger_with_position()
-        h.kite.instruments = MagicMock(return_value=[
+        h.client.instruments = MagicMock(return_value=[
             {"name": "OTHER", "instrument_type": "CE", "lot_size": 10,
              "tradingsymbol": "X", "expiry": "2026-06-25"},
         ])
@@ -3870,7 +3870,7 @@ class TestMarkingFallbacks:
 
     def test_futures_symbol_lookup_failure_raises_no_placeholder(self):
         h = self._hedger_with_position()
-        h.kite.instruments = MagicMock(side_effect=RuntimeError("api down"))
+        h.client.instruments = MagicMock(side_effect=RuntimeError("api down"))
         with pytest.raises(RuntimeError, match="NIFTYFUT|futures symbol"):
             h._get_futures_symbol()
 
@@ -4582,8 +4582,8 @@ class TestSoftHedgeDeltaSizing:
             return {keys[0]: {"last_price": px,
                               "depth": {"buy": [{"price": px * 0.99}],
                                         "sell": [{"price": px * 1.01}]}}}
-        h.kite = MagicMock()
-        h.kite.quote = _quote
+        h.client = MagicMock()
+        h.client.quote = _quote
         greeks = SimpleNamespace(net_discrete_delta=-float(net_delta))
         return h, greeks
 
@@ -4638,7 +4638,7 @@ class TestSoftHedgeDeltaSizing:
         """Refuse rather than size it as if it were a future — the same stance
         the futures hedge takes when its price is unusable."""
         h, g = self._h(net_delta=150.0)
-        h.kite.quote = lambda keys: {
+        h.client.quote = lambda keys: {
             keys[0]: {"last_price": 1e6,          # far outside no-arb bounds
                       "depth": {"buy": [{"price": 1.0}], "sell": [{"price": 2.0}]}}
         }
@@ -4662,7 +4662,7 @@ class TestSoftHedgeDeltaSizing:
             "strike": 24000.0, "instrument_type": "PE", "expiry": "2026-09-24",
         }])
         px = h.greeks.bs_price(self.SPOT, 24000.0, self.T, self.IV, "PE")
-        h.kite.quote = lambda keys: {keys[0]: {
+        h.client.quote = lambda keys: {keys[0]: {
             "last_price": px,
             "depth": {"buy": [{"price": px * 0.99}], "sell": [{"price": px * 1.01}]}}}
         out = h._generate_soft_delta_proposals(g, self.SPOT, self.T)

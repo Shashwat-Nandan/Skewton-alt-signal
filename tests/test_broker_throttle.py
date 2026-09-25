@@ -1,4 +1,4 @@
-"""Tests for kite_throttle.KiteRateLimiter and throttle_kite.
+"""Tests for broker_throttle.BrokerRateLimiter and throttle_broker.
 
 The bucket is timing-sensitive, so we use coarse assertions: the wait
 budget is "at least X seconds" rather than exact times, and we rely on
@@ -15,9 +15,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.kite_throttle import (
-    KiteRateLimiter,
-    throttle_kite,
+from core.broker_throttle import (
+    BrokerRateLimiter,
+    throttle_broker,
     DEFAULT_THROTTLED_METHODS,
 )
 
@@ -36,12 +36,12 @@ class FakeClock:
         self.t += s
 
 
-class TestKiteRateLimiterBasics:
+class TestBrokerRateLimiterBasics:
     def test_burst_passes_without_waiting(self):
         """The first N≤burst calls drain the initial bucket — none of
         them should block (exact: zero virtual time elapses)."""
         fc = FakeClock()
-        limiter = KiteRateLimiter(rate_per_sec=2.0, burst=5, clock=fc, sleep=fc.sleep)
+        limiter = BrokerRateLimiter(rate_per_sec=2.0, burst=5, clock=fc, sleep=fc.sleep)
         for _ in range(5):
             assert limiter.acquire() == 0.0
         assert fc.t == 0.0   # no sleeps → virtual clock unmoved
@@ -50,7 +50,7 @@ class TestKiteRateLimiterBasics:
         """After draining the burst, each further call blocks exactly
         1/rate. rate=10/s burst=1: 3 calls → 1 free + 2×0.1s = 0.20s."""
         fc = FakeClock()
-        limiter = KiteRateLimiter(rate_per_sec=10.0, burst=1, clock=fc, sleep=fc.sleep)
+        limiter = BrokerRateLimiter(rate_per_sec=10.0, burst=1, clock=fc, sleep=fc.sleep)
         waits = [limiter.acquire() for _ in range(3)]
         assert waits[0] == 0.0                       # burst token, free
         assert waits[1] == pytest.approx(0.1)        # one refill period
@@ -59,19 +59,19 @@ class TestKiteRateLimiterBasics:
 
     def test_rejects_nonpositive_rate(self):
         with pytest.raises(ValueError):
-            KiteRateLimiter(rate_per_sec=0)
+            BrokerRateLimiter(rate_per_sec=0)
         with pytest.raises(ValueError):
-            KiteRateLimiter(rate_per_sec=-1.0)
+            BrokerRateLimiter(rate_per_sec=-1.0)
 
     def test_rejects_burst_below_one(self):
         with pytest.raises(ValueError):
-            KiteRateLimiter(burst=0)
+            BrokerRateLimiter(burst=0)
 
     def test_thread_safe(self):
         """20 threads each acquiring once on a rate=20/s burst=1 bucket
         should finish in ~1s (19 throttled gaps × 50ms). The lock must
         not deadlock or let two threads consume the same token."""
-        limiter = KiteRateLimiter(rate_per_sec=20.0, burst=1)
+        limiter = BrokerRateLimiter(rate_per_sec=20.0, burst=1)
         results = []
 
         def worker():
@@ -95,9 +95,9 @@ class TestThrottleKite:
         kite.quote = MagicMock(return_value={"x": 1})
         kite.profile = MagicMock(return_value={"user_id": "ZZ"})
         kite.no_such_method = "not callable"  # exercises the skip path
-        limiter = KiteRateLimiter(rate_per_sec=100.0, burst=100)
+        limiter = BrokerRateLimiter(rate_per_sec=100.0, burst=100)
 
-        throttle_kite(kite, limiter, methods=("quote", "profile", "no_such_method"))
+        throttle_broker(kite, limiter, methods=("quote", "profile", "no_such_method"))
         assert getattr(kite.quote, "__throttled__", False) is True
         assert getattr(kite.profile, "__throttled__", False) is True
         # Calls still work and return the original payload.
@@ -105,15 +105,15 @@ class TestThrottleKite:
         assert kite.profile()["user_id"] == "ZZ"
 
     def test_idempotent(self):
-        """Calling throttle_kite twice must not stack two waits per call.
+        """Calling throttle_broker twice must not stack two waits per call.
         Without the __throttled__ guard, the second pass would wrap the
         already-wrapped method and acquire two tokens for every call."""
         kite = MagicMock()
         kite.quote = MagicMock(return_value={})
-        limiter = KiteRateLimiter(rate_per_sec=1.0, burst=1)
+        limiter = BrokerRateLimiter(rate_per_sec=1.0, burst=1)
 
-        throttle_kite(kite, limiter, methods=("quote",))
-        throttle_kite(kite, limiter, methods=("quote",))
+        throttle_broker(kite, limiter, methods=("quote",))
+        throttle_broker(kite, limiter, methods=("quote",))
         first_wrapper = kite.quote
         # No additional wrapping happened — same callable, marked __throttled__.
         assert getattr(first_wrapper, "__throttled__", False) is True
@@ -128,8 +128,8 @@ class TestThrottleKite:
         fc = FakeClock()
         kite = MagicMock()
         kite.quote = MagicMock(return_value={})
-        limiter = KiteRateLimiter(rate_per_sec=10.0, burst=1, clock=fc, sleep=fc.sleep)
-        throttle_kite(kite, limiter, methods=("quote",))
+        limiter = BrokerRateLimiter(rate_per_sec=10.0, burst=1, clock=fc, sleep=fc.sleep)
+        throttle_broker(kite, limiter, methods=("quote",))
 
         for _ in range(3):
             kite.quote(["x"])

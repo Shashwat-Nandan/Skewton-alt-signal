@@ -1,9 +1,9 @@
 """
-Fetch Historical NIFTY Option Chain Data from Zerodha Kite
-==========================================================
-Downloads spot + option chain candles via kite.historical_data(),
-reconstructs the option chain at each timestamp, computes IV,
-and outputs a backtest-compatible DataFrame/CSV.
+Fetch Historical NIFTY Option Chain Data
+========================================
+Downloads spot + option chain candles via the configured broker
+(Kotak Neo by default), reconstructs the option chain at each
+timestamp, computes IV, and outputs a backtest-compatible DataFrame/CSV.
 
 Usage:
   python -m market_data.fetch_historical_data --days 30
@@ -11,8 +11,7 @@ Usage:
   python -m market_data.fetch_historical_data --days 30 --interval 15minute --strikes 10
 
 Requirements:
-  - Valid Kite session (set KITE_API_KEY, KITE_API_SECRET, etc.)
-  - kiteconnect package installed
+  - A broker session. Kotak: KOTAK_* in .env. Zerodha: KITE_* in .env.
 """
 
 import argparse
@@ -27,7 +26,8 @@ import pandas as pd
 
 from core.data_cache_io import write_table
 from core.greeks_engine import implied_volatility_bisect, time_to_expiry
-from core.kite_auth import KiteAuthManager
+from core.broker import get_trading_client
+from market_data.history_limits import chunk_days
 
 logger = logging.getLogger(__name__)
 
@@ -35,21 +35,57 @@ CACHE_DIR = Path("./data_cache")
 RATE_LIMIT_DELAY = 0.35  # seconds between API calls (3 req/s limit)
 
 
+def _client_broker_name(client) -> str:
+    """Broker that produced this client. KiteConnect has no tag; that is Zerodha."""
+    name = getattr(client, "broker_name", None)
+    if name in {"kotak", "zerodha", "groww", "dhan"}:
+        return name
+    return "zerodha"
+
+
+def instruments_cache_path(underlying: str, broker: str, day: Optional[str] = None) -> Path:
+    """Path of the dated NFO master for one broker.
+
+    Zerodha keeps `instruments_{underlying}_{YYYYMMDD}.csv` so existing
+    Kite dumps still resolve. Any other broker is
+    `instruments_{underlying}_{broker}_{YYYYMMDD}.csv` — the date stays
+    the last path component, and the broker tag stops a same-day Kotak
+    fetch from overwriting the Kite file (or the reverse).
+    """
+    day = day or datetime.now().strftime("%Y%m%d")
+    if broker == "zerodha":
+        return CACHE_DIR / f"instruments_{underlying}_{day}.csv"
+    return CACHE_DIR / f"instruments_{underlying}_{broker}_{day}.csv"
+
+
+def _cached_master_matches(df: pd.DataFrame, broker: str) -> bool:
+    """A file with no broker column is a legacy Kite dump."""
+    if "broker" not in df.columns or df.empty:
+        return broker == "zerodha"
+    stamped = str(df["broker"].iloc[0]).strip().lower()
+    return stamped == broker
+
+
 def fetch_instrument_master(kite, underlying: str = "NIFTY") -> pd.DataFrame:
     """
-    Fetch and cache the NFO instrument master.
+    Fetch and cache the NFO instrument master for the client's broker.
     Returns DataFrame with columns: tradingsymbol, instrument_token, name,
-    strike, expiry, instrument_type, lot_size.
+    strike, expiry, instrument_type, lot_size, and broker.
     """
-    cache_file = CACHE_DIR / f"instruments_{underlying}_{datetime.now().strftime('%Y%m%d')}.csv"
+    broker = _client_broker_name(kite)
+    cache_file = instruments_cache_path(underlying, broker)
     if cache_file.exists():
         logger.info("Loading cached instrument master from %s", cache_file)
         df = pd.read_csv(cache_file)
-        df["expiry"] = pd.to_datetime(df["expiry"])
-        df["strike"] = df["strike"].astype(float)
-        return df
+        if _cached_master_matches(df, broker):
+            df["expiry"] = pd.to_datetime(df["expiry"])
+            df["strike"] = df["strike"].astype(float)
+            return df
+        logger.warning(
+            "Cached master %s is not broker %s. Refetching.", cache_file, broker,
+        )
 
-    logger.info("Fetching NFO instrument master...")
+    logger.info("Fetching NFO instrument master (%s)...", broker)
     instruments = kite.instruments("NFO")
     df = pd.DataFrame(instruments)
 
@@ -57,6 +93,7 @@ def fetch_instrument_master(kite, underlying: str = "NIFTY") -> pd.DataFrame:
     df = df[df["name"] == underlying].copy()
     df["expiry"] = pd.to_datetime(df["expiry"])
     df["strike"] = df["strike"].astype(float)
+    df["broker"] = broker
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(cache_file, index=False)
@@ -130,14 +167,14 @@ def fetch_historical_candles(
 ) -> pd.DataFrame:
     """
     Fetch historical OHLCV candles for a single instrument.
-    Handles Kite's 60-day limit per request by chunking.
+    Chunks under the broker's per-request cap for this interval.
     """
     all_candles = []
-    chunk_days = 55  # Stay under 60-day limit
+    span = chunk_days(interval)
 
     current_from = from_date
     while current_from < to_date:
-        current_to = min(current_from + timedelta(days=chunk_days), to_date)
+        current_to = min(current_from + timedelta(days=span), to_date)
 
         try:
             candles = kite.historical_data(
@@ -527,8 +564,7 @@ def main():
     logger.info("Date range: %s to %s", from_date.date(), to_date.date())
 
     # Authenticate
-    auth = KiteAuthManager(args.config)
-    kite = auth.get_kite()
+    kite = get_trading_client(args.config)
     profile = kite.profile()
     logger.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
 

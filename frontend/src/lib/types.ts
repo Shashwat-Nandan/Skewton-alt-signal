@@ -685,7 +685,7 @@ export type BrokerPosition = {
 };
 
 export type PortfolioResponse = {
-  live: boolean;                    // a working Kite session augmented this view
+  live: boolean;                    // a working broker session augmented this view
   note: string;
   underlyings: UnderlyingExposure[];
   broker_net: BrokerPosition[] | null;

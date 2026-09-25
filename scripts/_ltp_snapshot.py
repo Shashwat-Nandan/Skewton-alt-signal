@@ -2,7 +2,7 @@
 Invoked via systemd-run so .env is loaded by systemd, not read by Claude.
 """
 import json
-from core.kite_auth import KiteAuthManager
+from core.broker import get_trading_client
 
 # Open positions (entry data sourced from yesterday's state file + today's journal)
 positions = [
@@ -35,7 +35,7 @@ positions = [
     },
 ]
 
-kite = KiteAuthManager().get_kite()
+kite = get_trading_client("config.ini")
 syms = sorted({l["sym"] for p in positions for l in p["legs"]})
 q = kite.quote(syms)
 ltp = {s: q[s]["last_price"] for s in syms}

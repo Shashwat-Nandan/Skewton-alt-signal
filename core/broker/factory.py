@@ -1,11 +1,11 @@
 """Broker factory — one config key selects the adapter.
 
     [broker]
-    name = zerodha   # kotak | groww | dhan
+    name = kotak   # zerodha | groww | dhan
 
-Missing section / missing file → zerodha, so existing hosts keep working.
-An unknown name fails loud: averaging "whatever we have" onto Kite is
-how an operator who meant Kotak would silently trade the wrong account.
+Kotak Neo is the primary broker. Missing section / missing file → kotak.
+Set name = zerodha to stay on Kite. An unknown name fails loud: it does
+not fall through to another broker.
 """
 from __future__ import annotations
 
@@ -15,12 +15,13 @@ from typing import Any
 
 from .base import BrokerAdapter
 from .dhan import DhanAdapter
-from .errors import BrokerConfigError
+from .errors import BrokerAuthError, BrokerConfigError
 from .groww import GrowwAdapter
 from .kite import ZerodhaKiteAdapter
 from .kotak import KotakNeoAdapter
 
-SUPPORTED = ("zerodha", "kotak", "groww", "dhan")
+SUPPORTED = ("kotak", "zerodha", "groww", "dhan")
+DEFAULT_BROKER = "kotak"
 
 # Aliases operators actually type.
 _ALIASES = {
@@ -35,11 +36,14 @@ _ALIASES = {
 def read_broker_name(config_path: str = "config.ini") -> str:
     path = Path(config_path)
     if not path.exists():
-        return "zerodha"
+        return DEFAULT_BROKER
     cfg = configparser.ConfigParser()
     cfg.read(path)
-    raw = cfg.get("broker", "name", fallback="zerodha") if cfg.has_section("broker") else "zerodha"
-    name = (raw or "zerodha").strip().lower()
+    raw = (
+        cfg.get("broker", "name", fallback=DEFAULT_BROKER)
+        if cfg.has_section("broker") else DEFAULT_BROKER
+    )
+    name = (raw or DEFAULT_BROKER).strip().lower()
     return _ALIASES.get(name, name)
 
 
@@ -63,6 +67,25 @@ def get_broker(config_path: str = "config.ini") -> BrokerAdapter:
 def get_trading_client(config_path: str = "config.ini") -> Any:
     """Authenticate the configured broker; return a Kite-shaped client.
 
-    Drop-in replacement for `KiteAuthManager(path).get_kite()` in runners.
+    Drop-in replacement for `KiteAuthManager(path).get_kite()` in runners
+    and in the market-data downloaders. Kotak Neo is the default.
     """
     return get_broker(config_path).login()
+
+
+def get_market_client(config_path: str = "config.ini", *, cached_only: bool = False) -> Any:
+    """Client for a market-data download.
+
+    cached_only returns the session file and does not start a login.
+    A fresh login can invalidate the token a live runner is holding.
+    """
+    broker = get_broker(config_path)
+    if not cached_only:
+        return broker.login()
+    client = broker.cached_client()
+    if client is None:
+        raise BrokerAuthError(
+            f"No cached {broker.display_name} session. "
+            "Refusing to fresh-login from a market-data download."
+        )
+    return client

@@ -413,8 +413,9 @@ def main():
                              "--kill-max-win-rate. 0 disables.")
     parser.add_argument("--kill-max-win-rate", type=float, default=0.35,
                         help="Win-rate floor for the --kill-min-trades leg.")
-    parser.add_argument("--kite-rate-per-sec", type=float, default=8.0)
-    parser.add_argument("--kite-burst", type=int, default=8)
+    parser.add_argument("--broker-rate-per-sec", "--kite-rate-per-sec",
+                        type=float, default=8.0)
+    parser.add_argument("--broker-burst", "--kite-burst", type=int, default=8)
     parser.add_argument("--force", action="store_true",
                         help="Run even on weekends/holidays (testing only)")
     parser.add_argument("--dry-run", action="store_true",
@@ -495,15 +496,15 @@ def main():
     kite = None
     if not args.dry_run:
         from core.broker import get_trading_client
-        from core.kite_throttle import KiteRateLimiter, throttle_kite
+        from core.broker_throttle import BrokerRateLimiter, throttle_broker
         log.info("Authenticating...")
         kite = get_trading_client(CONFIG_PATH)
-        kite = throttle_kite(kite, KiteRateLimiter(
-            rate_per_sec=args.kite_rate_per_sec, burst=args.kite_burst))
+        kite = throttle_broker(kite, BrokerRateLimiter(
+            rate_per_sec=args.broker_rate_per_sec, burst=args.broker_burst))
         profile = kite.profile()
         log.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
 
-    strategy = BuyOnGapStrategy(kite=kite, config_path=CONFIG_PATH, mode=args.mode)
+    strategy = BuyOnGapStrategy(client=kite, config_path=CONFIG_PATH, mode=args.mode)
     if args.max_positions is not None:
         strategy.params["max_positions"] = args.max_positions
     if args.total_capital is not None:

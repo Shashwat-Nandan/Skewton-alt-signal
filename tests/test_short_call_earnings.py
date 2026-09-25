@@ -34,7 +34,7 @@ def _cfg(tmp_path: Path, **overrides) -> str:
 
 
 def _strategy(tmp_path, **overrides) -> ShortCallEarningsStrategy:
-    return ShortCallEarningsStrategy(kite=None, config_path=_cfg(tmp_path, **overrides),
+    return ShortCallEarningsStrategy(client=None, config_path=_cfg(tmp_path, **overrides),
                                      mode="paper")
 
 
@@ -72,7 +72,7 @@ def test_live_mode_is_refused(tmp_path):
     """Safety rule 3 + the research verdict: this must never reach a broker.
     A regression here would put an unbounded-loss naked short on real money."""
     with pytest.raises(NotImplementedError, match="PAPER/SIGNALS ONLY"):
-        ShortCallEarningsStrategy(kite=None, config_path=_cfg(tmp_path), mode="live")
+        ShortCallEarningsStrategy(client=None, config_path=_cfg(tmp_path), mode="live")
 
 
 def test_sub_1R_config_is_refused(tmp_path):

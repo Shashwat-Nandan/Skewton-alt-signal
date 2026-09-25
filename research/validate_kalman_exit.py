@@ -88,7 +88,7 @@ def replay(a, b, la, lb, tra, trb, bars, exit_z, debounce
     })
     try:
         s = KalmanPairStrategy(
-            kite=None, config_path=cfg, mode="paper", symbol_a=a, symbol_b=b,
+            client=None, config_path=cfg, mode="paper", symbol_a=a, symbol_b=b,
             tradingsymbol_a=ts_a, tradingsymbol_b=ts_b, lot_size_a=la, lot_size_b=lb,
             training_a=tra, training_b=trb, model="momentum", alpha=1e-6,
             quote_fn=lambda t: quote.get(t), clock=lambda: cur[0],

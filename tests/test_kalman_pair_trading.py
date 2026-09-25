@@ -38,7 +38,7 @@ def _make(quote_a=None, quote_b=None, *, mode="paper", model="basic",
     pa, pb = training if training is not None else _training()
     quotes = {"PA_FUT": quote_a, "PB_FUT": quote_b}
     strat = KalmanPairStrategy(
-        kite=None, mode=mode,
+        client=None, mode=mode,
         symbol_a="PA", symbol_b="PB",
         tradingsymbol_a="PA_FUT", tradingsymbol_b="PB_FUT",
         lot_size_a=50, lot_size_b=50,
@@ -535,7 +535,7 @@ def test_paper_mode_requires_notional_cap(monkeypatch):
     pa, pb = _training()
     with pytest.raises(ValueError):
         KalmanPairStrategy(
-            kite=None, mode="paper", symbol_a="PA", symbol_b="PB",
+            client=None, mode="paper", symbol_a="PA", symbol_b="PB",
             tradingsymbol_a="PA_FUT", tradingsymbol_b="PB_FUT",
             lot_size_a=50, lot_size_b=50, training_a=pa, training_b=pb,
             quote_fn=lambda ts: None,

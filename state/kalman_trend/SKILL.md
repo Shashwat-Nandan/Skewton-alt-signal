@@ -17,8 +17,8 @@ to assert alpha.
 ## Rules
 - Paper-only. No live order path; never call broker.send for this strategy.
 - Position size capped per the runner's existing sizing; do not raise it here.
-- Reuse the cached Kite session — never fresh-login while a live runner is active
-  (Zerodha invalidates the prior token and breaks the live pair runner).
+- Reuse the cached broker session (Kotak Neo by default) — never fresh-login while a live runner is active.
+  A new Zerodha login invalidates the prior token and breaks the live pair runner.
 - Honour the shared HALT_ALL / HALT_NEW_ENTRIES kill switches in data_cache/.
 - Checker gate thresholds (Phase 2, deterministic — Rule 5):
   - sharpe_min: 1.5

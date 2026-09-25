@@ -22,7 +22,7 @@ class _ToyStrategy(BaseStrategy):
     def __init__(self):
         # Bypass BaseStrategy.__init__ (it reads config.ini) — we only
         # need attributes to introspect.
-        self.kite = object()
+        self.client = object()
         self.config = object()
         self.mode = "paper"
         self.entry_z = 2.0

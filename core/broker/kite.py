@@ -3,7 +3,8 @@
 Headless runners keep using `KiteAuthManager` (TOTP screen-scrape).
 The dashboard keeps using `backend.kite_oauth` (browser redirect).
 Both still share `.kite_session.json`. This adapter is the factory's
-Zerodha leaf so `broker.name = zerodha` is the default, not a special case.
+Zerodha leaf. Kotak Neo is the default; `broker.name = zerodha` selects
+this one.
 """
 from __future__ import annotations
 
@@ -38,6 +39,17 @@ class ZerodhaKiteAdapter(BrokerAdapter):
         # from cache or a fresh TOTP login. Recreating KiteAuthManager
         # is intentional: the cached token file is the source of truth.
         return self.login()
+
+    def cached_client(self) -> Optional[Any]:
+        from core.kite_auth import KiteAuthManager
+
+        auth = KiteAuthManager(self.config_path)
+        if not auth._load_cached_token():
+            return None
+        auth.kite.set_access_token(auth._access_token)
+        self._auth = auth
+        self._client = auth.kite
+        return auth.kite
 
     def logout(self) -> None:
         # Headless cache. Dashboard OAuth logout is backend.kite_oauth

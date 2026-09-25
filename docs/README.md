@@ -9,8 +9,8 @@ this directory holds the technical specifics.
 - [architecture.md](./architecture.md) — system topology, subsystems
   (paper-trading daemon + dashboard SPA), shared state, process model.
   Start here for the big picture.
-- [broker.md](./broker.md) — broker adapter (`[broker] name`): Zerodha,
-  Kotak Neo (full trading surface), Groww/Dhan refuse-until-wired.
+- [broker.md](./broker.md) — broker adapter. Kotak Neo is the default;
+  Zerodha Kite when `name = zerodha`. Groww/Dhan refuse until wired.
 
 ## Strategies
 

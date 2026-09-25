@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # ── Dashboard session auth ────────────────────────────────────
     # The dashboard is single-operator. Any caller who reaches the API surface
-    # can drive runs against the operator's cached Kite session — so we gate
+    # can drive runs against the operator's cached broker session — so we gate
     # every route behind a password-cookie session (Starlette SessionMiddleware,
     # signed by `dashboard_session_secret`). Both values MUST be set; the
     # backend refuses to boot with either missing.

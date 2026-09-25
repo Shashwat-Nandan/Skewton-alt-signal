@@ -105,7 +105,7 @@ class EquityBacktester:
             pass
         # Strategy in paper mode, in-memory book.
         self.strategy = VarsityEquitySwingStrategy(
-            kite=_NullKite(), config_path="/dev/null", mode="paper",
+            client=_NullKite(), config_path="/dev/null", mode="paper",
         )
         if params_overrides:
             self.strategy.params.update(params_overrides)

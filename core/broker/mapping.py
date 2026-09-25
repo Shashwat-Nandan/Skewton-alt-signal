@@ -70,7 +70,7 @@ def kotak_segment(exchange: str) -> str:
         ) from e
 
 
-def kite_exchange_from_segment(exchange_segment: str) -> str:
+def strategy_exchange_from_segment(exchange_segment: str) -> str:
     key = (exchange_segment or "").strip().lower()
     try:
         return KOTAK_SEGMENT_TO_KITE_EXCHANGE[key]
@@ -114,13 +114,14 @@ def kotak_status(ord_st: str) -> str:
     return KOTAK_STATUS_TO_KITE.get(key, "PENDING")
 
 
-def kite_to_kotak_tradingsymbol(exchange: str, tradingsymbol: str) -> str:
+def strategy_to_kotak_tradingsymbol(exchange: str, tradingsymbol: str) -> str:
     """Translate a Kite tradingsymbol into Kotak Neo's.
 
-    Cash: RELIANCE → RELIANCE-EQ (Kotak requires the series suffix).
-    F&O options: NIFTY25SEP25000CE → NIFTY25SEPC25000 (option letter
-    sits immediately before the strike, CE/PE collapse to C/P).
-    Futures and anything already in Kotak form pass through.
+    Cash: RELIANCE → RELIANCE-EQ (the scrip master's pTrdSymbol).
+    F&O: pass the symbol through. The 2026-09-24 nse_fo master names
+    options the way Kite does (NIFTY26SEP25000CE, NIFTY26O1928100CE),
+    not the older NIFTY25SEPC25000 form. Rewriting CE→C would place a
+    symbol that is not in the master.
     """
     symbol = (tradingsymbol or "").strip()
     if not symbol:
@@ -130,23 +131,11 @@ def kite_to_kotak_tradingsymbol(exchange: str, tradingsymbol: str) -> str:
         if "-" in symbol:
             return symbol
         return f"{symbol}-EQ"
-    if symbol.endswith("CE") or symbol.endswith("PE"):
-        opt = "C" if symbol.endswith("CE") else "P"
-        body = symbol[:-2]
-        i = len(body)
-        while i > 0 and body[i - 1].isdigit():
-            i -= 1
-        if i == 0 or i == len(body):
-            raise BrokerOrderError(
-                f"Cannot split strike out of F&O symbol {tradingsymbol!r} "
-                "for Kotak. Refusing to place."
-            )
-        return body[:i] + opt + body[i:]
     return symbol
 
 
-def kotak_to_kite_tradingsymbol(exchange_segment: str, tradingsymbol: str) -> str:
-    """Inverse of kite_to_kotak_tradingsymbol, used when instruments()
+def kotak_to_strategy_tradingsymbol(exchange_segment: str, tradingsymbol: str) -> str:
+    """Inverse of strategy_to_kotak_tradingsymbol, used when instruments()
     returns Kotak-native rows and strategies expect Kite names."""
     symbol = (tradingsymbol or "").strip()
     seg = (exchange_segment or "").strip().lower()

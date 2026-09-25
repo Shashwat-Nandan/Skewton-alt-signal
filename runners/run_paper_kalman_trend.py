@@ -16,11 +16,11 @@ hourly heartbeat). Own system, no shared mutable state:
   - log   : logs/paper-kalman-trend-<date>.log
 
 The PURE core (bar aggregation, two-book stepping, EOD A/B report) is unit-
-tested; the Kite-wired main() is host-smoke-test-only (no Kite session in CI).
+tested; the broker-wired main() is host-smoke-test-only (no broker session in CI).
 
 NOTE: warmup fits the reduced-Kalman + MA params on recent 5-min history at
-startup. Reuse the cached Kite session — never fresh-login while a live runner is
-active. paper/signals only; no live order path.
+startup. Reuse the cached broker session (Kotak Neo by default) — never
+fresh-login while a live runner is active. paper/signals only; no live order path.
 """
 from __future__ import annotations
 
@@ -287,7 +287,7 @@ def write_eod(books: List[InstrumentBooks], today: date) -> Path:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Kite-wired entrypoint (host smoke-test only — no Kite session in CI)
+# Broker-wired entrypoint (host smoke-test only — no broker session in CI)
 # ──────────────────────────────────────────────────────────────────────────
 def main() -> int:  # pragma: no cover
     import time

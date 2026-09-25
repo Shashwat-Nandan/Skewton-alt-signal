@@ -1,3 +1,106 @@
+# Review fixes: instrument identity after the Kotak default — 2026-09-25
+
+Pending review on PR #4. The daily bars job was repointing
+`bars_universe` at a Kotak `pSymbol` before any bars existed under that
+id, so the first `--update` kept ~55 days and orphaned the Kite-token
+history. A Kotak tick tape stored those same `pSymbol`s and
+`load_captured_tape` joined them to the Kite instruments CSV, dropping
+option and future legs. README, the config template, and the VPS
+go-live note still said downloaders stay on Kite.
+
+- [x] On a token change, copy the stored 30-min bars onto the new id
+      and only then repoint. If there is nothing to copy, backfill
+      within the 30-minute cap and leave the old id in place when that
+      backfill stores nothing.
+- [x] Instrument masters are stamped with the broker. A tape joins only
+      a same-broker master. Kotak replays resolve strike/expiry/lot from
+      `tradingsymbol`. A Kotak tape with only a Kite master fails loud.
+      Parquet archives keep the broker stamp.
+- [x] README, `config_template.ini`, and `deploy/VPS_DEPLOYMENT.md` say
+      downloaders and tick capture follow `[broker] name`.
+
+`ruff check .` clean. New tests cover the copy, the failed backfill,
+the cross-broker refusal, and the parquet broker stamp.
+`tests/test_tape_parquet.py` and the zstd archive replay still pass.
+The full local suite cannot collect: this venv is missing statsmodels,
+jsonschema, pyarrow, and cmaes (pre-existing). Of the tests that ran,
+1779 passed; the failures are those missing imports, not these edits.
+
+`--backfill` still repoints before the fetch. The 16:30 timer runs
+`--update`, which is the path that was dropping history. A manual
+backfill is still an explicit refill, not a copy.
+
+# Market-data downloads follow the configured broker — 2026-09-24
+
+This host has `[broker] name = kotak` and a Kotak session, and no Kite
+session. The runners already call `get_trading_client`. The download
+scripts still opened `KiteAuthManager`, so a fetch on this host could
+not log in.
+
+- [x] `fetch_bars`, `fetch_historical_data`, `fetch_index_daily`,
+      `fetch_5min_stf`, and the bhavcopy today-fallback use the
+      configured broker. Cached-only paths still refuse a fresh login.
+- [x] Historical chunks use Kotak's caps (5-minute: 29 days, daily: 179).
+- [x] `bars` update re-resolves the symbol so a stored Kite token is
+      not sent to Kotak.
+- [x] NSE/BSE instrument dumps gain NIFTY 50 / NIFTY BANK / SENSEX when
+      the scrip master omits them. Historical sends the index name.
+- [x] Tick capture on Kotak polls quotes. Zerodha keeps KiteTicker.
+- [x] Read-only on this host, cached session, no order: NFO 81275 rows,
+      NIFTY 50 quote token present, one front-future 5-minute window
+      returned candles, and the index daily window returned candles.
+      The quote poll was not left running (market was closed).
+
+# Kotak Neo named as this system's broker — 2026-09-24
+
+The default was already `kotak`. Operator-facing text still said live
+orders, the dashboard login, and the portfolio note go through Kite.
+Those now name Kotak Neo as the default and "the configured broker"
+where the same sentence covers Zerodha too. `kite_auth` and
+`kite_oauth` stay on Kite Connect. Market-data CLIs follow
+`[broker] name` (see the 2026-09-25 section). `loop_engine`'s host
+engine is `broker_engine` (it calls `get_trading_client`).
+
+- [x] Runner help and docstrings
+- [x] Portfolio note, halt copy, architecture diagram, VPS login steps
+- [x] `kite_engine` → `broker_engine`
+
+# Kotak prod login host + limits POST — 2026-09-24
+
+The 2026-09-14 adapter logged in against `gw-napi.kotaksecurities.com`
+(now NXDOMAIN) and read limits with GET (trade host returns 404). A
+read-only prod probe showed TOTP+MPIN succeeds on
+`https://mis.kotaksecurities.com`, a bare 10-digit mobile is rejected,
+and `POST {baseUrl}/quick/user/limits` with form `jData` returns `Net`.
+
+- [x] Login host is `mis.kotaksecurities.com`
+- [x] 10-digit mobile is prefixed with `+91` before the login POST
+- [x] `limits()` is that POST, with no `sId` query
+- [x] `.env` beside `config.ini` is loaded by the adapter (dashboard
+      does not call `load_dotenv`). A Trade token is cached only after
+      `limits()` succeeds.
+- [x] Read-only adapter login against the creds in `.env` (no orders).
+      `margins()` returned a numeric `Net`. Session file mode 0600.
+- [x] Place, cancel, order history, and check-margin post `jData`.
+      Check-margin uses `exSeg`/`prc`/`tok` and the gate reads `ordMrgn`.
+      Quotes request `all`. Empty positions (`stCode` 5203) is an empty
+      book. Scrip CSVs are fetched without the consumer-key header.
+      Option symbols are sent as the scrip master spells them.
+
+`tests/test_broker_adapter.py`: 53 passed. `ruff check` clean on the
+touched Python. `config.ini` on this host (gitignored) has
+`[broker] name = kotak`, so a runner started here authenticates to Kotak.
+The checked-in template and a missing `[broker]` name now resolve to
+`kotak` as well. `name = zerodha` is how a host stays on Kite.
+
+Read-only prod check 2026-09-24 (no order placed): positions on an empty
+book returns `[]`; `instruments("NFO")` is 81275 rows; the front NIFTY
+future quotes with a real book; `basket_order_margins` for one lot
+returns a positive `ordMrgn`. All 81275 scrip symbols round-trip into
+the `ts` we would send. Kotak has no basket endpoint, so a multi-leg
+margin is the sum of per-leg checks (`initial == final`), not Kite's
+spread-netted figure.
+
 # Broker adapter (Zerodha / Kotak Neo / Groww / Dhan) — 2026-09-14
 
 Toggle the live broker from config instead of hard-wiring Zerodha Kite.

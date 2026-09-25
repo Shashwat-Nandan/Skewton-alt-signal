@@ -1,5 +1,7 @@
 """
-Kite-driven 30-minute bar ingestion for the Market Profile feature.
+30-minute bar ingestion for the Market Profile feature.
+
+Uses the configured broker (Kotak Neo by default).
 
 Modes
 -----
@@ -11,10 +13,8 @@ Modes
 
 Sources
 -------
-  --source kite       (default) kite.historical_data per symbol.
-                      Kite's intraday history is typically capped to a few
-                      months for most accounts — keep it running daily and
-                      the corpus grows forward.
+  The configured broker's historical_data per symbol (Kotak Neo by
+  default). Keep the daily update running; the corpus grows forward.
 
 Universe
 --------
@@ -36,11 +36,13 @@ from typing import Iterable, List, Tuple
 
 from backend import bars as bars_db
 from backend import db as backend_db
+from market_data.history_limits import chunk_days
 
 logger = logging.getLogger(__name__)
 
 KITE_RATE_LIMIT_DELAY = 0.35     # 3 req/s leaves margin
-KITE_CHUNK_DAYS = 55             # under the 60-day per-request cap
+# 30-minute candles: under both Kite's ~60-day cap and Kotak's 90-day cap.
+KITE_CHUNK_DAYS = 55
 
 # Default universe = NIFTY 50. We deliberately don't pull this from a
 # Kite call — `screen_pairs.NIFTY_50` is the canonical list used elsewhere
@@ -93,7 +95,7 @@ def fetch_30min_bars(
 ) -> List[Tuple[str, float, float, float, float, int]]:
     """
     Pull 30-min OHLCV between [from_date, to_date], chunking under the
-    Kite 60-day request limit. Returns a list of tuples ready for
+    broker's per-request limit. Returns a list of tuples ready for
     `bars_db.insert_bars`.
     """
     rows: List[Tuple[str, float, float, float, float, int]] = []
@@ -108,7 +110,7 @@ def fetch_30min_bars(
                 "30minute",
             )
         except Exception as e:
-            logger.warning("Kite fetch failed for token %d %s→%s: %s",
+            logger.warning("historical fetch failed for token %d %s→%s: %s",
                            instrument_token, cur.date(), chunk_end.date(), e)
             candles = []
 
@@ -155,20 +157,91 @@ def cmd_backfill(kite, symbols: List[str], days: int) -> None:
                     len(rows), new_n, total_n)
 
 
+def _adopt_new_token(kite, sym: str, stored: int, token: int, name: str, now: datetime) -> bool:
+    """Point `bars_universe` at `token` only after that token has 30-min bars.
+
+    Readers follow `bars_universe.instrument_token`. Repointing first makes
+    `latest_bar_ts` miss the existing series, so the refill is one chunk
+    (~55 days) and the old rows are never read again. On a token change,
+    copy the stored series onto the new id (same cash prices) and only
+    then repoint. When there is nothing to copy, backfill within the
+    30-minute cap and repoint only if that stored rows. A failed backfill
+    leaves the universe on `stored`.
+
+    Returns True when the caller should run the incremental fetch.
+    Returns False when the symbol was skipped or the backfill already
+    covered the window.
+    """
+    if token == stored:
+        return True
+    copied = bars_db.copy_bars(stored, token, 30)
+    if bars_db.count_bars(token, 30) == 0:
+        backfill_days = chunk_days("30minute")
+        backfill_from = now - timedelta(days=backfill_days)
+        logger.warning(
+            "%s instrument_token changed %s -> %s and neither token has bars. "
+            "Backfilling %d days before repointing the universe.",
+            sym, stored, token, backfill_days,
+        )
+        rows = fetch_30min_bars(kite, token, backfill_from, now)
+        inserted = bars_db.insert_bars(token, 30, rows)
+        if inserted == 0 or bars_db.count_bars(token, 30) == 0:
+            logger.error(
+                "%s token change %s -> %s: backfill stored no bars. "
+                "Leaving bars_universe on %s.",
+                sym, stored, token, stored,
+            )
+            return False
+        bars_db.upsert_universe(sym, token, "NSE", name)
+        bars_db.mark_updated(sym)
+        logger.info(
+            "%s universe now points at %s after a %d-day backfill (%d bars).",
+            sym, token, backfill_days, inserted,
+        )
+        return False
+    bars_db.upsert_universe(sym, token, "NSE", name)
+    bars_db.mark_updated(sym)
+    logger.warning(
+        "%s instrument_token changed %s -> %s. Copied %d bars onto %s "
+        "before repointing the universe.",
+        sym, stored, token, copied, token,
+    )
+    return True
+
+
 def cmd_update(kite) -> None:
     """
     Incremental: for every symbol in bars_universe, fetch from the last
     stored bar (+1 minute, to avoid re-pulling it) up to now.
+
+    The stored instrument_token belongs to whichever broker wrote it.
+    Re-resolve from the current master so a Kite token is not sent to Kotak.
+    The universe row keeps the old token until the new token has bars.
     """
     universe = bars_db.list_universe()
     if not universe:
         logger.warning("bars_universe is empty — run --backfill first.")
         return
 
+    resolved = {
+        sym: (token, name)
+        for sym, token, name in resolve_nse_symbols(
+            kite, [row["symbol"] for row in universe],
+        )
+    }
     now = datetime.now()
     for row in universe:
         sym = row["symbol"]
-        token = int(row["instrument_token"])
+        stored = int(row["instrument_token"])
+        if sym not in resolved:
+            logger.error(
+                "%s is in bars_universe but not in the current broker's NSE master. Skipping.",
+                sym,
+            )
+            continue
+        token, name = resolved[sym]
+        if not _adopt_new_token(kite, sym, stored, token, name, now):
+            continue
         latest = bars_db.latest_bar_ts(token, 30)
 
         if latest:
@@ -229,7 +302,7 @@ def main() -> int:
     p.add_argument("--universe-csv", type=str, default=None,
                    help="Path to a newline-separated symbol file (alternative to --symbols).")
     p.add_argument("--config", type=str, default="config.ini",
-                   help="config.ini for KiteAuthManager.")
+                   help="config.ini. [broker] name selects the session (kotak by default).")
     args = p.parse_args()
 
     # Resolve universe
@@ -246,9 +319,8 @@ def main() -> int:
             return 1
 
     # Auth + DB
-    from core.kite_auth import KiteAuthManager
-    auth = KiteAuthManager(args.config)
-    kite = auth.get_kite()
+    from core.broker import get_trading_client
+    kite = get_trading_client(args.config)
     profile = kite.profile()
     logger.info("Authenticated as %s (%s)", profile["user_name"], profile["user_id"])
 

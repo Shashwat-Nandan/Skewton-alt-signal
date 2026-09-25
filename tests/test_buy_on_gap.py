@@ -41,7 +41,7 @@ TEST_PARAMS = {
 
 
 def _strategy(params=None):
-    s = BuyOnGapStrategy(kite=_NullKite(), config_path="/dev/null", mode="paper")
+    s = BuyOnGapStrategy(client=_NullKite(), config_path="/dev/null", mode="paper")
     s.params.update(TEST_PARAMS)
     if params:
         s.params.update(params)

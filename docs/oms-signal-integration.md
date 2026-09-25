@@ -184,7 +184,7 @@ The signal plane deliberately does not know your users. Per user, per signal:
   structure isn't expressible at the user's size, skip the WHOLE signal.
 - **Multi-leg atomicity (§7.4):** basket/multi-leg orders where the broker
   supports them; otherwise leg-failure auto-unwind. Adopt the
-  `KiteOrderExecutor` philosophy: **COMPLETE is the only status on which you
+  `OrderExecutor` philosophy: **COMPLETE is the only status on which you
   may mutate state** — PENDING/REJECTED/unknown triggers cancel/reverse, never
   a booked fill.
 - **Risk gate before placement (§7.6):** broker-API margin pre-check (do not

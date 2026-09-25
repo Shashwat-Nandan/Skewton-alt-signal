@@ -2,30 +2,34 @@
 
 Trading login, quotes, positions, margins, historical candles, F&O
 instrument dumps, and live orders go through `core.broker.get_trading_client`,
-selected by `[broker] name` in `config.ini`. Strategies still speak Kite
-vocabulary (`NFO`, `BUY`, `LIMIT`, `NIFTY25SEP25000CE`); each adapter
-translates at the wire.
+selected by `[broker] name` in `config.ini`. Kotak Neo is the primary
+broker. Strategies still pass orders in the shared vocabulary (`NFO`,
+`BUY`, `LIMIT`, `NIFTY26SEP25000CE`); each adapter translates at the wire.
 
 | `name` | Login | Trading surface | Status |
 |---|---|---|---|
-| `zerodha` (default) | Headless TOTP + dashboard OAuth | Kite Connect | Unchanged |
-| `kotak` | Headless TOTP + MPIN (Neo Trade API) | Orders, quotes (`segment\|token` on the gateway), positions, `margins()` / `basket_order_margins()`, historical candles, F&O `instruments()` | Paper first, then live |
+| `kotak` (default) | Headless TOTP + MPIN (Neo Trade API) | Orders, quotes (`segment\|token` on the gateway), positions, `margins()` / `basket_order_margins()`, historical candles, F&O `instruments()` | Primary. Paper before live |
+| `zerodha` | Headless TOTP + dashboard OAuth | Kite Connect | Supported. Set `name = zerodha` |
 | `groww` / `dhan` | Registered in the factory | **Refuse to login/order** | Not live-wired |
 
-Default is `zerodha` so existing hosts do not switch. Unknown names fail
-loud — they do not fall through to Zerodha.
+A missing `[broker]` section resolves to `kotak`. Unknown names fail
+loud — they do not fall through to another broker. A host that should
+stay on Kite must set `name = zerodha`.
 
-Market-data CLIs (`market_data/fetch_*`, tick capture) still use Kite
-directly. Switching those is a later increment.
+Market-data CLIs (`market_data/fetch_*`, tick capture) use
+`get_trading_client` / `get_market_client`, so this host's
+`[broker] name = kotak` is the session they open. Tick capture on Kotak
+polls quotes. `name = zerodha` keeps the KiteTicker socket.
 
-## Switch to Kotak Neo
+## Kotak Neo (primary)
 
 1. In the Neo app/web: **More → Trade API → Generate application**. Copy
    the consumer key.
 2. Same dashboard: **TOTP Registration**. Save the authenticator seed
    (`totp_key`). UCC is on the profile screen; MPIN is the existing
    6-digit trading PIN.
-3. In `config.ini` (or `KOTAK_*` env vars):
+3. In `config.ini`, or in `KOTAK_*` variables in the `.env` next to that
+   file (the adapter loads it; a process env var still wins):
 
    ```ini
    [broker]
@@ -42,6 +46,17 @@ directly. Switching those is a later increment.
 
    Only `prod` is wired. `environment = uat` fails at adapter construct
    (UAT uses different login hosts/paths and must not silently hit prod).
+   Prod login is `https://mis.kotaksecurities.com`
+   (`login/1.0/tradeApiLogin`, then `tradeApiValidate`). The retired
+   `gw-napi` host does not resolve. `mobile_number` is `+91` plus 10
+   digits; a bare 10-digit number is prefixed before the login POST.
+   `profile()` and `margins()` read `POST {baseUrl}/quick/user/limits`
+   with form field `jData` (`seg`/`exch`/`prod` = `ALL`). A GET of that
+   path is 404. Place, cancel, order history, and check-margin are the
+   same `jData` form. Check-margin uses `exSeg`/`prc`/`tok` and the
+   gate reads `ordMrgn` (`reqdMrgn` is the cash shortfall, 0 when the
+   order is funded). Quotes ask for `all`, so the book is on the quote.
+   An empty positions book is `stCode` 5203, not an error.
 4. Paper-trade a full session (`runners/run_paper*.py`) before anyone
    considers live. Dashboard live mode stays 403.
 

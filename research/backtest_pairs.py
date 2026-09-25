@@ -162,7 +162,7 @@ def make_strategy(
     seed_spreads: Optional[List[float]] = None,
 ) -> PairTradingStrategy:
     s = PairTradingStrategy.__new__(PairTradingStrategy)
-    s.kite = kite
+    s.client = kite
     s.config = configparser.ConfigParser()
     s.config_path = "config.ini"
     s.mode = "paper"
@@ -206,7 +206,7 @@ def make_strategy(
     s.exit_debounce_ticks = 1
     s.max_book_notional = None
     s._book_notional_fn = None
-    s._kite_refresh = None
+    s._broker_refresh = None
     s._nfo_instruments_cache = None
     s._holidays_cache = None
     s._pending_exit_reason = None

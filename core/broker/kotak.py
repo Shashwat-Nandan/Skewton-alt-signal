@@ -24,6 +24,7 @@ from urllib.parse import quote as urlquote
 
 import pyotp
 import requests
+from dotenv import load_dotenv
 
 from .base import BrokerAdapter
 from .credentials import reject_placeholders, resolve_credential
@@ -34,21 +35,24 @@ from .errors import (
     BrokerOrderError,
     BrokerTokenError,
 )
-from .kotak_instruments import match_scrip_url, parse_scrip_csv
+from .kotak_instruments import ensure_index_rows, match_scrip_url, parse_scrip_csv
 from .mapping import (
-    kite_exchange_from_segment,
-    kite_to_kotak_tradingsymbol,
+    strategy_exchange_from_segment,
+    strategy_to_kotak_tradingsymbol,
     kotak_order_type,
     kotak_segment,
     kotak_side,
     kotak_status,
-    kotak_to_kite_tradingsymbol,
+    kotak_to_strategy_tradingsymbol,
     neo_index_quote_token,
 )
 
 logger = logging.getLogger(__name__)
 
-LOGIN_BASE = "https://gw-napi.kotaksecurities.com"
+# Prod session host (Kotak Neo SDK SESSION_PROD_BASE_URL). The old
+# gw-napi name is NXDOMAIN; login, quotes, and the scrip master live here.
+# Order/limits calls use the baseUrl returned by totp_validate (e.g. e41).
+LOGIN_BASE = "https://mis.kotaksecurities.com"
 DEFAULT_NEO_FIN_KEY = "neotradeapi"
 TOKEN_CACHE_FILE = ".kotak_session.json"
 
@@ -86,6 +90,27 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_SCRIP_CACHE = _REPO_ROOT / "data_cache" / "kotak_scrip"
 
 
+def normalize_kotak_mobile(mobile_number: str) -> str:
+    """Kotak rejects a bare 10-digit mobile. +91 plus those digits is accepted.
+
+    A number that already starts with + is left alone. 12 digits beginning
+    with 91 get the plus. Anything else fails here, before a login POST.
+    """
+    raw = "".join((mobile_number or "").split())
+    if raw.startswith("+"):
+        return raw
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 10:
+        return "+91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return "+" + digits
+    raise BrokerConfigError(
+        "Kotak mobile_number must be +91 followed by 10 digits. "
+        "A bare 10-digit number is accepted and prefixed; "
+        "Kotak rejects the number without the country code."
+    )
+
+
 def _write_json_0600(path: Path, payload: dict) -> None:
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -94,6 +119,10 @@ def _write_json_0600(path: Path, payload: dict) -> None:
 
 class KotakNeoClient:
     """KiteConnect-shaped client backed by Kotak Neo REST."""
+
+    # Stamped onto instrument-master CSVs so a replay will not join this
+    # client's pSymbols to a Kite dump that shares the filename date.
+    broker_name = "kotak"
 
     VARIETY_REGULAR = "regular"
     PRODUCT_NRML = "NRML"
@@ -137,7 +166,11 @@ class KotakNeoClient:
             "neo-fin-key": self.neo_fin_key,
             "Content-Type": "application/json",
         }
-        body = {"mobileNumber": mobile_number, "ucc": ucc, "totp": totp}
+        body = {
+            "mobileNumber": normalize_kotak_mobile(mobile_number),
+            "ucc": ucc,
+            "totp": totp,
+        }
         data = self._request_json("POST", url, headers=headers, json_body=body)
         inner = _unwrap_data(data)
         self.view_token = inner.get("token")
@@ -217,7 +250,17 @@ class KotakNeoClient:
         }
 
     def limits(self) -> dict:
-        return self._trade_json("GET", _PATHS["limits"])
+        # The trade host 404s a GET of this path, and a POST of the raw
+        # fields does not return Net. LimitsAPI.limit_init posts jData
+        # and does not append sId (the data center is the baseUrl host).
+        return self._trade_json(
+            "POST",
+            _PATHS["limits"],
+            form={
+                "jData": json.dumps({"seg": "ALL", "exch": "ALL", "prod": "ALL"}),
+            },
+            include_server_id=False,
+        )
 
     def margins(self) -> dict:
         """Kite-shaped RMS snapshot from Neo `limits()`.
@@ -265,23 +308,28 @@ class KotakNeoClient:
         total = 0.0
         for p in params:
             token = self._token_for(p["exchange"], p["tradingsymbol"])
+            # MarginAPI field names, not the place-order ones. A live
+            # check-margin rejected es/pr/tk ("please provide valid symbol")
+            # and accepted exSeg/prc/tok. reqdMrgn is the extra cash still
+            # required — it is 0 when the account can fund the order — so
+            # the gate must read ordMrgn, the order's own margin.
             data = self._trade_json(
                 "POST",
                 _PATHS["margin"],
-                form={
-                    "es": kotak_segment(p["exchange"]),
-                    "pr": _fmt_price(p.get("price") or 0),
-                    "pt": kotak_order_type(p.get("order_type") or "LIMIT"),
-                    "pc": p.get("product") or "NRML",
-                    "qt": str(int(p["quantity"])),
-                    "tk": str(token),
-                    "tt": kotak_side(p["transaction_type"]),
-                },
+                form=_jdata_form({
+                    "exSeg": kotak_segment(p["exchange"]),
+                    "prc": _fmt_price(p.get("price") or 0),
+                    "prcTp": kotak_order_type(p.get("order_type") or "LIMIT"),
+                    "prod": p.get("product") or "NRML",
+                    "qty": str(int(p["quantity"])),
+                    "tok": str(token),
+                    "trnsTp": kotak_side(p["transaction_type"]),
+                    "brkName": "KOTAK",
+                    "brnchId": "ONLINE",
+                }),
             )
             inner = _unwrap_data(data)
-            mrgn = _first_float(
-                inner, "reqdMrgn", "ordMrgn", "totMrgnUsd", "mrgnUsd",
-            )
+            mrgn = _first_float(inner, "ordMrgn", "totMrgnUsd", "mrgnUsd")
             if mrgn is None:
                 raise BrokerOrderError(
                     f"Kotak check-margin had no margin figure: {list(inner)[:12]}"
@@ -319,13 +367,15 @@ class KotakNeoClient:
             "qt": str(int(quantity)),
             "rt": validity or "DAY",
             "tp": _fmt_price(trigger_price),
-            "ts": kite_to_kotak_tradingsymbol(exchange, tradingsymbol),
+            "ts": strategy_to_kotak_tradingsymbol(exchange, tradingsymbol),
             "tt": kotak_side(transaction_type),
             "ig": str(tag or "")[:20],
             "os": "NEOTRADEAPI",
         }
+        # Every Neo form POST is jData=JSON. A raw form body 500s; the
+        # same body under jData is the call the trade host accepts.
         data = self._trade_json(
-            "POST", _PATHS["place_order"], form=body, content_type="form"
+            "POST", _PATHS["place_order"], form=_jdata_form(body)
         )
         order_id = _extract_order_id(data)
         if not order_id:
@@ -339,16 +389,16 @@ class KotakNeoClient:
         return self._trade_json(
             "POST",
             _PATHS["cancel_order"],
-            form={"on": str(order_id), "am": "NO"},
-            content_type="form",
+            form=_jdata_form({"on": str(order_id), "am": "NO"}),
         )
 
     def order_history(self, order_id) -> List[dict]:
+        # `on` is the cancel field. History requires nOrdNo; `on` is
+        # rejected as a missing NestOrderNo before the id is looked up.
         data = self._trade_json(
             "POST",
             _PATHS["order_history"],
-            form={"on": str(order_id)},
-            content_type="form",
+            form=_jdata_form({"nOrdNo": str(order_id)}),
         )
         rows = _extract_list(data)
         # Kite's order_history is oldest-first; the executor reads history[-1]
@@ -378,7 +428,8 @@ class KotakNeoClient:
             joined = ",".join(f"{seg}|{tok}" for _, seg, tok in batch)
             path = _PATHS["quotes"].format(
                 neo_symbols=urlquote(joined, safe="|,"),
-                quote_type="ltp",
+                # `ltp` omits the book. Arbitrage prices off depth-1.
+                quote_type="all",
             )
             url = f"{self.login_base}/{path}"
             data = self._request_json(
@@ -402,8 +453,9 @@ class KotakNeoClient:
                 out[key] = {"last_price": ltp}
                 if isinstance(row, dict) and row.get("ohlc"):
                     out[key]["ohlc"] = row["ohlc"]
-                if isinstance(row, dict) and row.get("depth"):
-                    out[key]["depth"] = row["depth"]
+                depth = _order_book_depth(row.get("depth")) if isinstance(row, dict) else None
+                if depth:
+                    out[key]["depth"] = depth
         return out
 
     def ltp(self, keys) -> dict:
@@ -411,7 +463,16 @@ class KotakNeoClient:
         return {k: {"last_price": v["last_price"]} for k, v in quoted.items()}
 
     def positions(self) -> dict:
-        data = self._trade_json("GET", _PATHS["positions"])
+        # An account with no book returns HTTP 200, stat Not_Ok, stCode
+        # 5203, errMsg "No Data". That is an empty book, not a failed
+        # reconciliation — runners halt if positions() raises.
+        data = self._trade_json(
+            "GET", _PATHS["positions"], allow_not_ok=True,
+        )
+        if _empty_kotak_book(data):
+            return {"net": [], "day": []}
+        if _is_not_ok(data):
+            raise BrokerOrderError(_error_message(data) or "Kotak positions failed")
         rows = _extract_list(data)
         net = [_kotak_position_row(r) for r in rows]
         return {"net": net, "day": []}
@@ -426,19 +487,23 @@ class KotakNeoClient:
         (`5minute`); mapped to Neo's (`5min`).
         """
         del continuous, oi
-        token = str(int(instrument_token))
-        _row, exch = self._row_for_token(int(instrument_token))
+        row, exch = self._row_for_token(int(instrument_token))
+        # Index rows carry quote_token ("Nifty 50"). A numeric pSymbol
+        # is the token for everything else.
+        token = str(row.get("quote_token") or int(instrument_token))
         seg = kotak_segment(exch)
         neo_iv = _KITE_INTERVAL_TO_NEO.get((interval or "").strip())
         if not neo_iv:
             raise BrokerOrderError(
                 f"No Kotak interval for Kite interval {interval!r}."
             )
+        # The live query names are fromdate/todate. from_date is rejected
+        # as a missing parameter.
         params = {
             "neosymbol": f"{seg}|{token}",
             "interval": neo_iv,
-            "from_date": _fmt_day(from_date),
-            "to_date": _fmt_day(to_date),
+            "fromdate": _fmt_day(from_date),
+            "todate": _fmt_day(to_date),
         }
         url = f"{self.login_base}/{_PATHS['historical_data']}"
         try:
@@ -481,7 +546,7 @@ class KotakNeoClient:
             return cached
         segment = kotak_segment(exch)
         text = self._scrip_csv_text(segment)
-        rows = parse_scrip_csv(text, exch)
+        rows = ensure_index_rows(parse_scrip_csv(text, exch), exch)
         if not rows:
             raise BrokerOrderError(
                 f"Kotak scrip-master for {exch} ({segment}) parsed to 0 rows. "
@@ -509,9 +574,11 @@ class KotakNeoClient:
             return cache_path.read_text(encoding="utf-8", errors="replace")
         url = self._scrip_file_url(segment)
         try:
-            resp = self.session.get(
-                url, headers=self._scrip_headers(), timeout=120,
-            )
+            # The CSV lives on lapi (object storage). Sending the consumer
+            # key as Authorization makes that host return 400 InvalidArgument.
+            # The file-paths call above already authenticated; the CSV is a
+            # plain GET of the URL it returned.
+            resp = self.session.get(url, timeout=120)
         except requests.RequestException as e:
             raise BrokerNetworkError(
                 f"Kotak scrip-master CSV download failed ({segment}): {e}"
@@ -601,11 +668,11 @@ class KotakNeoClient:
             headers["Content-Type"] = "application/json"
         return headers
 
-    def _trade_url(self, path: str) -> str:
+    def _trade_url(self, path: str, *, include_server_id: bool = True) -> str:
         base = (self.base_url or self.login_base).rstrip("/")
         path = path.lstrip("/")
         url = f"{base}/{path}"
-        if self.server_id:
+        if include_server_id and self.server_id:
             sep = "&" if "?" in url else "?"
             url = f"{url}{sep}sId={urlquote(str(self.server_id))}"
         return url
@@ -618,6 +685,8 @@ class KotakNeoClient:
         form: Optional[dict] = None,
         json_body: Optional[dict] = None,
         content_type: Optional[str] = None,
+        include_server_id: bool = True,
+        allow_not_ok: bool = False,
     ) -> dict:
         if form is not None:
             content_type = "form"
@@ -625,10 +694,11 @@ class KotakNeoClient:
             content_type = content_type or "json"
         return self._request_json(
             method,
-            self._trade_url(path),
+            self._trade_url(path, include_server_id=include_server_id),
             headers=self._trade_headers(content_type),
             form=form,
             json_body=json_body,
+            allow_not_ok=allow_not_ok,
         )
 
     def _request_json(
@@ -639,6 +709,7 @@ class KotakNeoClient:
         headers: dict,
         form: Optional[dict] = None,
         json_body: Optional[dict] = None,
+        allow_not_ok: bool = False,
     ) -> dict:
         try:
             resp = self.session.request(
@@ -673,7 +744,7 @@ class KotakNeoClient:
             raise BrokerOrderError(
                 _error_message(payload) or f"Kotak HTTP {resp.status_code}"
             )
-        if _is_not_ok(payload):
+        if _is_not_ok(payload) and not allow_not_ok:
             raise BrokerOrderError(_error_message(payload) or str(payload))
         return payload
 
@@ -693,6 +764,12 @@ class KotakNeoAdapter(BrokerAdapter):
                 "Copy config_template.ini to config.ini and fill [kotak]."
             )
         config.read(path)
+        # Runners call load_dotenv themselves. The dashboard does not, and
+        # pydantic only maps declared settings, so KOTAK_* in the .env beside
+        # this config.ini would otherwise be invisible and the YOUR_*
+        # placeholders would fail login. A config in another directory does
+        # not pick up the repo .env (tests, and a second book).
+        load_dotenv(path.parent / ".env", override=False)
         self.consumer_key = resolve_credential(
             "KOTAK_CONSUMER_KEY", config, "kotak", "consumer_key"
         )
@@ -731,6 +808,7 @@ class KotakNeoAdapter(BrokerAdapter):
             "mpin": self.mpin,
             "totp_key": self.totp_key,
         })
+        self.mobile_number = normalize_kotak_mobile(self.mobile_number)
         self._client: Optional[KotakNeoClient] = None
         self._cache_path = Path(TOKEN_CACHE_FILE)
 
@@ -794,6 +872,15 @@ class KotakNeoAdapter(BrokerAdapter):
         )
         logger.info("Kotak TOTP accepted; validating MPIN")
         client.totp_validate(self.mpin)
+        try:
+            # A Trade token that cannot read limits is not a session.
+            # Caching it would make the next start look logged in and
+            # then fail on the first margin check.
+            client.profile()
+        except (BrokerTokenError, BrokerOrderError, BrokerNetworkError) as e:
+            raise BrokerAuthError(
+                f"Kotak login did not yield a session that can read limits: {e}"
+            ) from e
         self._save_cache(client)
         logger.info(
             "Authenticated with Kotak Neo as %s (%s)",
@@ -963,9 +1050,9 @@ def _kotak_position_row(row: dict) -> dict:
         quantity = int(net_direct or 0)
     seg = row.get("exSeg") or row.get("exch") or ""
     trd = row.get("trdSym") or row.get("tradingsymbol") or ""
-    exchange = kite_exchange_from_segment(seg) if seg else ""
+    exchange = strategy_exchange_from_segment(seg) if seg else ""
     tradingsymbol = (
-        kotak_to_kite_tradingsymbol(seg, trd) if trd else ""
+        kotak_to_strategy_tradingsymbol(seg, trd) if trd else ""
     )
     return {
         "tradingsymbol": tradingsymbol,
@@ -985,6 +1072,47 @@ def _split_quote_key(key: str) -> tuple[str, str]:
         )
     exchange, symbol = key.split(":", 1)
     return exchange, symbol
+
+
+def _jdata_form(body: dict) -> dict:
+    """Neo form POST body. The trade host 500s a raw field form."""
+    cleaned = {k: v for k, v in body.items() if v is not None}
+    return {"jData": json.dumps(cleaned)}
+
+
+def _empty_kotak_book(payload: dict) -> bool:
+    """True for the no-positions payload (stCode 5203 / errMsg No Data)."""
+    if not isinstance(payload, dict) or not _is_not_ok(payload):
+        return False
+    msg = str(payload.get("errMsg") or payload.get("message") or "").strip().lower()
+    try:
+        code = int(payload.get("stCode"))
+    except (TypeError, ValueError):
+        code = None
+    return code == 5203 or msg == "no data"
+
+
+def _order_book_depth(depth) -> Optional[dict]:
+    """Kotak depth → Kite `{buy,sell}[{price,quantity,orders}]` numbers."""
+    if not isinstance(depth, dict):
+        return None
+    out = {}
+    for side in ("buy", "sell"):
+        levels = []
+        for lvl in depth.get(side) or []:
+            if not isinstance(lvl, dict):
+                continue
+            try:
+                price = float(lvl.get("price") or 0)
+                qty = int(float(lvl.get("quantity") or 0))
+                orders = int(float(lvl.get("orders") or 0))
+            except (TypeError, ValueError):
+                continue
+            levels.append({"price": price, "quantity": qty, "orders": orders})
+        out[side] = levels
+    if not out.get("buy") and not out.get("sell"):
+        return None
+    return out
 
 
 def _fmt_price(price) -> str:
