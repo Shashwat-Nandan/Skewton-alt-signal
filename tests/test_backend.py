@@ -217,6 +217,39 @@ class TestAuth:
         finally:
             get_settings.cache_clear()
 
+    def test_kotak_login_transport_failure_is_502(
+        self, client, tmp_path, monkeypatch,
+    ):
+        # A timeout or 429 on the cached-session probe must reach the
+        # operator as 502. login() raises BrokerNetworkError and leaves
+        # the shared Trade token in place; a 500 would read as a crash.
+        from core.broker.errors import BrokerNetworkError
+
+        cfg = tmp_path / "c.ini"
+        cfg.write_text(
+            "[broker]\nname = kotak\n"
+            "[kotak]\nconsumer_key = real-consumer\n"
+            "mobile_number = +919876543210\n"
+            "ucc = ABC123\nmpin = 654321\n"
+            "totp_key = JBSWY3DPEHPK3PXP\n"
+            "environment = prod\n"
+        )
+        monkeypatch.setenv("CONFIG_PATH", str(cfg))
+        get_settings.cache_clear()
+        try:
+            with patch("backend.routers.auth.get_broker") as gb:
+                adapter = MagicMock()
+                adapter.login.side_effect = BrokerNetworkError(
+                    "Kotak rate-limited (429) on POST https://e43.example/limits"
+                )
+                gb.return_value = adapter
+                r = client.post("/api/auth/login")
+            assert r.status_code == 502
+            assert "429" in r.json()["detail"]
+            adapter.login.assert_called_once_with()
+        finally:
+            get_settings.cache_clear()
+
 
 # ──────────────────────────────────────────────────────────
 # Runs lifecycle
