@@ -3,9 +3,10 @@
 WHY (Rule 9): this job exists because universe decay is invisible at runtime.
 A drift report that reports "no drift" for the wrong reason is worse than no
 report — it converts an unnoticed problem into an actively believed all-clear.
-The Kite-fallback guard below is the whole point: those days carry ONLY the
+The broker-fallback guard below is the whole point: those days carry ONLY the
 NIFTY_50 names, so reconciling the list against one compares the list to
-itself and finds nothing wrong, forever.
+itself and finds nothing wrong, forever. .broker-fallback is the marker new
+writes use; .kite-fallback is the previous name and must still be skipped.
 """
 import logging
 
@@ -15,7 +16,7 @@ import pytest
 from scripts import reconcile_universe as R
 
 
-def _write_day(tmp_path, day, symbols, fallback=False):
+def _write_day(tmp_path, day, symbols, fallback=False, marker=".broker-fallback"):
     rows = [{"FinInstrmTp": "STF", "TckrSymb": s, "XpryDt": "2026-10-27",
              "TradDt": f"{day[:4]}-{day[4:6]}-{day[6:]}", "ClsPric": 100.0}
             for s in symbols]
@@ -25,7 +26,7 @@ def _write_day(tmp_path, day, symbols, fallback=False):
     p = tmp_path / f"bhavcopy_fo_{day}.parquet"
     pd.DataFrame(rows).to_parquet(p)
     if fallback:
-        p.with_suffix(".kite-fallback").touch()
+        p.with_suffix(marker).touch()
     return p
 
 
@@ -34,16 +35,17 @@ def _board(n, prefix="SYM"):
 
 
 class TestFallbackBlindness:
-    def test_a_fallback_day_is_skipped_for_the_day_before(self, tmp_path, caplog):
+    @pytest.mark.parametrize("marker", [".broker-fallback", ".kite-fallback"])
+    def test_a_fallback_day_is_skipped_for_the_day_before(self, tmp_path, caplog, marker):
         # 09-08 is a real fallback day in this repo's archive: 48 underlyings
-        # against 210 the session before.
+        # against 210 the session before. Both marker names are partial boards.
         _write_day(tmp_path, "20260907", _board(150))
-        _write_day(tmp_path, "20260908", _board(48), fallback=True)
+        _write_day(tmp_path, "20260908", _board(48), fallback=True, marker=marker)
         with caplog.at_level(logging.WARNING, logger="reconcile_universe"):
             board, day = R.latest_board(tmp_path)
         assert day == "20260907", "must not reconcile against a filtered day"
         assert len(board) == 150
-        assert any("kite-fallback" in r.getMessage() for r in caplog.records)
+        assert any("broker-fallback" in r.getMessage() for r in caplog.records)
 
     def test_a_short_day_is_skipped_even_without_the_marker(self, tmp_path):
         # A marker file is easy to lose; a silent all-clear is the failure this

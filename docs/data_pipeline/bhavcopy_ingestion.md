@@ -142,6 +142,18 @@ its 508-day rolling panel needs fresh files.
 Same `_download_one` pattern as EQ. Cache at
 `data_cache/bhavcopy_raw/bhavcopy_fo_<yyyymmdd>.parquet` (legacy `.csv` honored).
 
+### Same-day miss
+NSE often 404s today's F&O file before about 18:00 IST. For that date
+only, the fetcher fills front-month stock-future closes from Kotak Neo
+historical data. The call uses the consumer key and does not log in, so
+it does not rewrite `.kotak_session.json`. The frame is the NIFTY-50
+names, not the full board, and the parquet is marked with
+`bhavcopy_fo_<yyyymmdd>.broker-fallback`. The next run retries NSE and,
+on HTTP 200, deletes that marker. A leftover `.kite-fallback` file from
+the previous name is deleted the same way and is still treated as
+non-authoritative. A past date that 404s stays missing. Screens and
+`scripts/reconcile_universe.py` skip either marker.
+
 ### Schema (UDiFF F&O native)
 
 | Column | Notes |
@@ -241,6 +253,7 @@ entries for the current year.
 | Failure | Effect | Recovery |
 |---|---|---|
 | NSE 403 / 503 (Akamai block) | Both fetchers log + retry next timer fire | Investigate dev-IP reputation; production VPS usually fine |
+| Today's F&O file not published yet | Kotak historical fill of NIFTY-50 front futures, `.broker-fallback` marker | Next run after NSE publishes replaces the file and deletes the marker |
 | NSE archive URL changes | All fetches fail | Update `UDIFF_URL` template; NSE has rotated formats historically (legacy → UDiFF in July 2024) |
 | Partial / corrupt download | `BadZipFile` caught at line 113, returns None | Re-fetch on next timer fire |
 | `holidays.csv` out of date | Fetcher attempts downloads on holidays; downstream runners refuse to start | Update `holidays.csv` from NSE annual circular |

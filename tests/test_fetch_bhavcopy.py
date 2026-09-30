@@ -1,19 +1,21 @@
-"""Tests for market_data/fetch_bhavcopy.py — focused on the 2026-05-19 Kite-historical
-fallback for today's missing F&O bhavcopy.
+"""Tests for market_data/fetch_bhavcopy.py — the same-day Kotak historical
+fallback for a missing F&O bhavcopy.
 
 NSE publishes the F&O bhavcopy ~18:00–20:00 IST (sometimes later). The
 weekday screen-pairs.timer fires at 19:00 IST, so on a fast night it tries
 to fetch today's file before NSE has published it (404). The fallback
-synthesises a UDiFF-shaped frame from kite.historical_data so the pair
+synthesises a UDiFF-shaped frame from Kotak historical_data so the pair
 screener sees today's STF closes anyway. These tests pin the contract:
 
   - the synthesised day (cached as parquet) roundtrips through
     screen_pairs.load_front_month_panel
   - the synthesised frame has the columns _parse_udiff_day's required-cols check needs
-  - a Kite-fallback cache is sentinel-marked, so a later run upgrades it
+  - a broker-fallback cache is sentinel-marked, so a later run upgrades it
     once NSE finally publishes
-  - auth/instrument/historical_data failures all degrade to "return None"
+  - a leftover .kite-fallback marker is still non-authoritative
+  - credential/instrument/historical_data failures all degrade to "return None"
     (no crash, same as a genuinely missing bhavcopy)
+  - the client is built from the consumer key and does not call login()
 """
 from __future__ import annotations
 
@@ -29,7 +31,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from market_data import fetch_bhavcopy
-from market_data.fetch_bhavcopy import _build_today_stfs_via_kite, _download_bhavcopy
+from market_data.fetch_bhavcopy import (
+    _build_today_stfs_via_kotak,
+    _download_bhavcopy,
+    _kotak_market_client,
+)
 
 
 # ──────────────────────────────────────────────────────────
@@ -46,7 +52,7 @@ def isolated_raw_dir(tmp_path, monkeypatch):
 @pytest.fixture
 def today():
     """Today's wall-clock date. MUST stay real-now: _download_bhavcopy only
-    fires the Kite fallback when `date == datetime.now().date()` (the fallback
+    fires the Kotak fallback when `date == datetime.now().date()` (the fallback
     is a today-only path), so a pinned past date would silently skip it. Fixture
     contract dates are therefore expressed relative to this (see `expiries`)."""
     return datetime.now().replace(hour=19, minute=0, second=0, microsecond=0)
@@ -56,7 +62,7 @@ def today():
 def expiries(today):
     """Front / mid / far expiry ISO strings, relative to `today`.
 
-    _build_today_stfs_via_kite keeps only `expiry >= today`, so fixture data
+    _build_today_stfs_via_kotak keeps only `expiry >= today`, so fixture data
     must use real-future dates — hardcoded calendar dates made these tests a
     time bomb (issue #41): once the clock passed them, every contract read as
     expired and was dropped, yielding None / empty CSVs."""
@@ -68,19 +74,19 @@ def expiries(today):
     )
 
 
-def _mk_kite(instruments_list, candle_close_by_token):
-    """Build a Mock kite whose instruments('NFO') returns the given list and
+def _mk_client(instruments_list, candle_close_by_token):
+    """Build a Mock client whose instruments('NFO') returns the given list and
     whose historical_data returns a single day-bar with the matching close."""
-    kite = MagicMock()
-    kite.instruments.return_value = instruments_list
+    client = MagicMock()
+    client.instruments.return_value = instruments_list
     def _historical(token, frm, to, interval):
         close = candle_close_by_token.get(int(token))
         if close is None:
             return []
         return [{"date": frm, "open": close, "high": close,
                  "low": close, "close": close, "volume": 0}]
-    kite.historical_data.side_effect = _historical
-    return kite
+    client.historical_data.side_effect = _historical
+    return client
 
 
 def _instruments_for(symbols_with_expiry):
@@ -93,11 +99,34 @@ def _instruments_for(symbols_with_expiry):
     ]
 
 
+def _patch_kotak(client, symbols):
+    """Consumer-key client, no pacing, and the NIFTY-50 filter under test."""
+    return (
+        patch("market_data.fetch_bhavcopy._kotak_market_client", return_value=client),
+        patch("core.screen_pairs.NIFTY_50", symbols),
+        patch("market_data.fetch_bhavcopy.time.sleep"),
+    )
+
+
 # ──────────────────────────────────────────────────────────
-# _build_today_stfs_via_kite
+# _build_today_stfs_via_kotak
 # ──────────────────────────────────────────────────────────
 
-class TestBuildTodayStfsViaKite:
+class TestBuildTodayStfsViaKotak:
+
+    def test_market_client_does_not_login(self):
+        """instruments() and historical_data() need the consumer key.
+        login() rewrites .kotak_session.json and drops a runner that
+        still holds the previous trade token."""
+        with patch("core.broker.kotak.KotakNeoAdapter") as adapter_cls, \
+             patch("core.broker.kotak.KotakNeoClient") as client_cls:
+            adapter_cls.return_value.consumer_key = "ck"
+            adapter_cls.return_value.neo_fin_key = "neotradeapi"
+            got = _kotak_market_client("config.ini")
+        adapter_cls.assert_called_once_with("config.ini")
+        adapter_cls.return_value.login.assert_not_called()
+        client_cls.assert_called_once_with("ck", neo_fin_key="neotradeapi")
+        assert got is client_cls.return_value
 
     def test_returns_csv_with_required_columns(self, today, expiries):
         """Synth frame must carry every column both consumers read:
@@ -110,10 +139,10 @@ class TestBuildTodayStfsViaKite:
             ("RELIANCE", front, 1001, 250),
             ("INFY", front, 1002, 400),
         ])
-        kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
-        with patch("core.broker.get_trading_client", return_value=kite), \
-             patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
-            df = _build_today_stfs_via_kite(today)
+        client = _mk_client(instruments, {1001: 1327.00, 1002: 1450.50})
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE", "INFY"])
+        with p_client, p_names, p_sleep:
+            df = _build_today_stfs_via_kotak(today)
 
         assert df is not None
         required = {"TradDt", "FinInstrmTp", "TckrSymb", "XpryDt", "ClsPric",
@@ -134,10 +163,10 @@ class TestBuildTodayStfsViaKite:
             ("RELIANCE", mid, 1002, 250),
             ("RELIANCE", far, 1003, 250),
         ])
-        kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00, 1003: 1340.00})
-        with patch("core.broker.get_trading_client", return_value=kite), \
-             patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
-            df = _build_today_stfs_via_kite(today)
+        client = _mk_client(instruments, {1001: 1327.00, 1002: 1335.00, 1003: 1340.00})
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE"])
+        with p_client, p_names, p_sleep:
+            df = _build_today_stfs_via_kotak(today)
 
         assert len(df) == 1
         assert df.iloc[0]["XpryDt"] == front
@@ -152,55 +181,57 @@ class TestBuildTodayStfsViaKite:
             ("RELIANCE", past, 1001, 250),
             ("RELIANCE", future, 1002, 250),
         ])
-        kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1335.00})
-        with patch("core.broker.get_trading_client", return_value=kite), \
-             patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
-            df = _build_today_stfs_via_kite(today)
+        client = _mk_client(instruments, {1001: 1327.00, 1002: 1335.00})
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE"])
+        with p_client, p_names, p_sleep:
+            df = _build_today_stfs_via_kotak(today)
 
         assert len(df) == 1
         assert df.iloc[0]["XpryDt"] == future
 
-    def test_auth_failure_returns_none(self, today):
-        """Auth failure must not crash — just degrade to current
-        no-bhavcopy behaviour."""
-        with patch("core.broker.get_trading_client",
-                   side_effect=RuntimeError("totp expired")):
-            assert _build_today_stfs_via_kite(today) is None
+    def test_credential_failure_returns_none(self, today):
+        """A missing Kotak credential must not crash — just degrade to
+        current no-bhavcopy behaviour. login() is not the entry point."""
+        with patch("market_data.fetch_bhavcopy._kotak_market_client",
+                   side_effect=RuntimeError("consumer key missing")):
+            assert _build_today_stfs_via_kotak(today) is None
 
     def test_instruments_failure_returns_none(self, today):
-        kite = MagicMock()
-        kite.instruments.side_effect = RuntimeError("kite api down")
-        with patch("core.broker.get_trading_client", return_value=kite):
-            assert _build_today_stfs_via_kite(today) is None
+        client = MagicMock()
+        client.instruments.side_effect = RuntimeError("scrip master down")
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE"])
+        with p_client, p_names, p_sleep:
+            assert _build_today_stfs_via_kotak(today) is None
 
     def test_no_nifty50_futures_returns_none(self, today):
         """Defensive: if NFO dump has no NIFTY-50 futures (shouldn't happen
         in production but possible during a market structure change), return
         None rather than synthesise an empty frame that downstream consumers
         would misinterpret as "no data today"."""
-        kite = _mk_kite(instruments_list=[], candle_close_by_token={})
-        with patch("core.broker.get_trading_client", return_value=kite):
-            assert _build_today_stfs_via_kite(today) is None
+        client = _mk_client(instruments_list=[], candle_close_by_token={})
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE"])
+        with p_client, p_names, p_sleep:
+            assert _build_today_stfs_via_kotak(today) is None
 
     def test_individual_historical_data_failure_is_skipped_not_fatal(self, today, expiries):
-        """If one symbol's historical_data 5xx's, the rest should still be
+        """If one symbol's historical_data fails, the rest should still be
         fetched — one flaky symbol can't sink the whole synthesis."""
         front = expiries[0]
         instruments = _instruments_for([
             ("RELIANCE", front, 1001, 250),
             ("INFY", front, 1002, 400),
         ])
-        kite = MagicMock()
-        kite.instruments.return_value = instruments
+        client = MagicMock()
+        client.instruments.return_value = instruments
         def _hist(token, *a, **k):
             if int(token) == 1001:
-                raise RuntimeError("kite hiccup")
+                raise RuntimeError("historical hiccup")
             return [{"date": today, "open": 1450, "high": 1450,
                      "low": 1450, "close": 1450, "volume": 0}]
-        kite.historical_data.side_effect = _hist
-        with patch("core.broker.get_trading_client", return_value=kite), \
-             patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
-            df = _build_today_stfs_via_kite(today)
+        client.historical_data.side_effect = _hist
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE", "INFY"])
+        with p_client, p_names, p_sleep:
+            df = _build_today_stfs_via_kotak(today)
 
         assert len(df) == 1
         assert df.iloc[0]["TckrSymb"] == "INFY"
@@ -230,7 +261,7 @@ class TestDownloadBhavcopyFallback:
 
     def test_authoritative_cache_hit_short_circuits(self, isolated_raw_dir, today):
         """If a cached day exists (parquet, or a legacy pre-migration CSV)
-        and there's no sentinel, return it without hitting NSE or Kite."""
+        and there's no sentinel, return it without hitting NSE or Kotak."""
         yyyymmdd = today.strftime("%Y%m%d")
         cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
         cache_file.write_text("TckrSymb,ClsPric\nAUTH,1.0\n")
@@ -272,77 +303,82 @@ class TestDownloadBhavcopyFallback:
         # the str-forcing must hold even for the all-numeric symbol
         assert cached["TckrSymb"].tolist() == ["360ONE", "123"]
 
-    def test_nse_404_today_triggers_kite_fallback(self, isolated_raw_dir, today, expiries):
-        """On NSE 404 for today, the Kite fallback should fire and the
-        cache should be written with a sentinel marker."""
+    def test_nse_404_today_triggers_kotak_fallback(self, isolated_raw_dir, today, expiries):
+        """On NSE 404 for today, the Kotak fallback should fire and the
+        cache should be written with a .broker-fallback marker, not the
+        old .kite-fallback name."""
         instruments = _instruments_for([("RELIANCE", expiries[0], 1001, 250)])
-        kite = _mk_kite(instruments, {1001: 1327.00})
+        client = _mk_client(instruments, {1001: 1327.00})
 
         s = self._stub_404_session()
         yyyymmdd = today.strftime("%Y%m%d")
-        with patch("core.broker.get_trading_client", return_value=kite), \
-             patch("core.screen_pairs.NIFTY_50", ["RELIANCE"]):
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE"])
+        with p_client, p_names, p_sleep:
             out = _download_bhavcopy(today, s)
 
         assert out is not None
         assert "RELIANCE" in set(out["TckrSymb"])
         assert set(out["FinInstrmTp"]) == {"STF"}
-        # Both cache file AND sentinel must exist
         cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.parquet"
-        sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
+        sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.broker-fallback"
+        old = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
         assert cache_file.exists()
-        assert sentinel.exists()
+        assert sentinel.read_text() == "synthesised_via_kotak_historical_data\n"
+        assert not old.exists()
 
-    def test_nse_404_for_past_date_does_not_call_kite(self, isolated_raw_dir):
-        """Backfill of an older missing day must not silently consume the
-        Kite quota — Kite historical for 'last Wednesday' is rarely what we
-        want; bhavcopy is the canonical source for past days."""
+    def test_nse_404_for_past_date_does_not_call_kotak(self, isolated_raw_dir):
+        """Backfill of an older missing day must not silently fill a partial
+        NIFTY-50 board. Bhavcopy is the canonical source for past days."""
         from datetime import timedelta
         past_date = datetime.now() - timedelta(days=7)
         s = self._stub_404_session()
-        with patch("market_data.fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
+        with patch("market_data.fetch_bhavcopy._build_today_stfs_via_kotak") as mock_fallback:
             out = _download_bhavcopy(past_date, s)
         assert out is None
         mock_fallback.assert_not_called()
 
-    def test_sentinel_cache_is_upgraded_when_nse_finally_publishes(
+    def test_both_markers_are_removed_when_nse_finally_publishes(
         self, isolated_raw_dir, today,
     ):
-        """The sentinel forces a fresh NSE attempt on the next run; if NSE
-        now returns 200, the cache is overwritten with the authoritative
-        bhavcopy, the sentinel is removed, and the stale synthetic CSV is
-        removed so it can't shadow the authoritative parquet."""
+        """Either marker forces a fresh NSE attempt. On HTTP 200 the cache
+        is overwritten with the authoritative bhavcopy, both markers are
+        removed, and the stale synthetic CSV cannot shadow the parquet."""
         yyyymmdd = today.strftime("%Y%m%d")
         legacy_csv = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
-        sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
+        kite_marker = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
+        broker_marker = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.broker-fallback"
         legacy_csv.write_text("TckrSymb,ClsPric\nSTALE,0.0\n")
-        sentinel.write_text("synthesised_via_kite_historical_data\n")
+        kite_marker.write_text("synthesised_via_kite_historical_data\n")
+        broker_marker.write_text("synthesised_via_kotak_historical_data\n")
 
         s = self._stub_zip_session(b"TckrSymb,ClsPric\nAUTH,1.0\n")
         out = _download_bhavcopy(today, s)
         assert out.iloc[0]["TckrSymb"] == "AUTH"
         back = pd.read_parquet(isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.parquet")
         assert back.iloc[0]["TckrSymb"] == "AUTH"
-        assert not sentinel.exists()
+        assert not kite_marker.exists()
+        assert not broker_marker.exists()
         assert not legacy_csv.exists()
 
+    @pytest.mark.parametrize("suffix", [".broker-fallback", ".kite-fallback"])
     def test_sentinel_cache_kept_when_nse_still_404(
-        self, isolated_raw_dir, today,
+        self, isolated_raw_dir, today, suffix,
     ):
         """If NSE still 404s, a sentinel-marked cache from an earlier run
-        is returned as-is rather than re-spending Kite quota on the same
-        day's data."""
+        is returned as-is rather than calling Kotak again for the same day.
+        The previous marker name must keep that property too."""
         yyyymmdd = today.strftime("%Y%m%d")
         cache_file = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.csv"
-        sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
-        cache_file.write_text("TckrSymb,ClsPric\nKITE_FB,1.0\n")
-        sentinel.write_text("synthesised_via_kite_historical_data\n")
+        sentinel = isolated_raw_dir / f"bhavcopy_fo_{yyyymmdd}{suffix}"
+        cache_file.write_text("TckrSymb,ClsPric\nKOTAK_FB,1.0\n")
+        sentinel.write_text("synthesised\n")
 
         s = self._stub_404_session()
-        with patch("market_data.fetch_bhavcopy._build_today_stfs_via_kite") as mock_fallback:
+        with patch("market_data.fetch_bhavcopy._build_today_stfs_via_kotak") as mock_fallback:
             out = _download_bhavcopy(today, s)
-        assert out.iloc[0]["TckrSymb"] == "KITE_FB"
+        assert out.iloc[0]["TckrSymb"] == "KOTAK_FB"
         mock_fallback.assert_not_called()
+        s.get.assert_called()
 
 
 # ──────────────────────────────────────────────────────────
@@ -357,18 +393,16 @@ class TestSynthCsvIsScreenerCompatible:
         fallback now writes."""
         from core.screen_pairs import load_front_month_panel
 
-        # Synthesise today's frame via the fallback
         instruments = _instruments_for([
             ("RELIANCE", expiries[0], 1001, 250),
             ("INFY", expiries[0], 1002, 400),
         ])
-        kite = _mk_kite(instruments, {1001: 1327.00, 1002: 1450.50})
-        with patch("core.broker.get_trading_client", return_value=kite), \
-             patch("core.screen_pairs.NIFTY_50", ["RELIANCE", "INFY"]):
-            df = _build_today_stfs_via_kite(today)
+        client = _mk_client(instruments, {1001: 1327.00, 1002: 1450.50})
+        p_client, p_names, p_sleep = _patch_kotak(client, ["RELIANCE", "INFY"])
+        with p_client, p_names, p_sleep:
+            df = _build_today_stfs_via_kotak(today)
         assert df is not None
 
-        # Write into a tmp raw_dir as bhavcopy_fo_YYYYMMDD.parquet (today's date)
         yyyymmdd = today.strftime("%Y%m%d")
         df.to_parquet(tmp_path / f"bhavcopy_fo_{yyyymmdd}.parquet", index=False)
 
