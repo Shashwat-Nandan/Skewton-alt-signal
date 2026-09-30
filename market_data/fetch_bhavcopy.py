@@ -5,8 +5,9 @@ Downloads NSE's free daily F&O bhav copy (UDiFF format) for a date range,
 filters to the chosen underlying (default NIFTY), and reshapes into the same
 CSV schema the backtester already consumes.
 
-Unlike market_data/fetch_historical_data.py (which pulls intraday candles through Kite
-and is limited by the live instrument master), this source has full history
+Unlike market_data/fetch_historical_data.py (which pulls intraday candles through
+the configured broker and is limited by the live instrument master), this source
+has full history
 for all expired strikes. Tradeoff: EOD only — one mark per instrument per
 day — so the output is suited to daily-rebalance regime research and RV/IV
 calibration, not intraday gamma-scalp simulation.
@@ -46,6 +47,11 @@ RAW_DIR = CACHE_DIR / "bhavcopy_raw"
 # _eq_data, _oi_signal, backtest_arbitrage). The parquet day cache must store
 # them as str so those readers see the same dtypes the CSVs gave them.
 RAW_STR_COLS = {"TckrSymb": str, "FinInstrmTp": str, "FinInstrmNm": str}
+# A same-day synthesised file is only the NIFTY-50 front futures, not the
+# full F&O board. New writes use .broker-fallback. .kite-fallback is the
+# previous name; a leftover marker must still force an NSE retry and must
+# still be excluded from screens and the universe reconcile.
+FALLBACK_MARKER_SUFFIXES = (".broker-fallback", ".kite-fallback")
 UDIFF_URL = (
     "https://archives.nseindia.com/content/fo/"
     "BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
@@ -106,11 +112,31 @@ def trading_days(from_date: datetime, to_date: datetime, holidays: set) -> List[
     return days
 
 
-def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
-    """When NSE bhavcopy hasn't been published yet for `target_date` AND
-    `target_date` is today, fall back to the configured broker's
-    historical_data for today's front-month STF closes. Kotak Neo is
-    the default. The function name stays so existing callers keep working.
+def fallback_marker_paths(day_path: Path) -> List[Path]:
+    """Marker files that mean `day_path` was synthesised, not downloaded from NSE."""
+    return [day_path.with_suffix(suffix) for suffix in FALLBACK_MARKER_SUFFIXES]
+
+
+def has_fallback_marker(day_path: Path) -> bool:
+    return any(path.exists() for path in fallback_marker_paths(day_path))
+
+
+def _kotak_market_client(config_path: str = "config.ini"):
+    """Kotak client for a historical download. Consumer key only.
+
+    `instruments()` and `historical_data()` do not use the Trade token.
+    `login()` would rewrite `.kotak_session.json` and drop a runner that
+    still holds the previous token.
+    """
+    from core.broker.kotak import KotakNeoAdapter, KotakNeoClient
+
+    adapter = KotakNeoAdapter(config_path)
+    return KotakNeoClient(adapter.consumer_key, neo_fin_key=adapter.neo_fin_key)
+
+
+def _build_today_stfs_via_kotak(target_date: datetime) -> Optional[pd.DataFrame]:
+    """When NSE has not published `target_date` and that date is today,
+    fill front-month STF closes from Kotak Neo historical data.
 
     Returns a UDiFF-shaped frame containing only STF rows (no IDO rows —
     so the IV-history side of the bhavcopy pipeline still treats today
@@ -118,30 +144,29 @@ def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
     pair screener (screen_pairs.load_front_month_panel) gets the STF
     rows it needs to include today in tonight's cointegration screen.
 
-    Returns None on any failure (auth, instrument lookup, no rows) so
-    the caller falls through to the "today missing" behaviour.
+    Returns None on any failure (credentials, instrument lookup, no rows)
+    so the caller falls through to the "today missing" behaviour.
 
     Rate-limit budget: ~50 NIFTY-50 STF contracts × 1 historical_data
     call each, paced at ~3 req/sec.
     """
     try:
-        from core.broker import get_trading_client
         from core.screen_pairs import NIFTY_50
     except Exception as e:
-        logger.warning("Broker fallback unavailable (import failed): %s", e)
+        logger.warning("Kotak fallback unavailable (import failed): %s", e)
         return None
 
     try:
-        kite = get_trading_client("config.ini")
+        client = _kotak_market_client("config.ini")
     except Exception as e:
-        logger.warning("Broker auth failed for today-fallback: %s — "
+        logger.warning("Kotak market-data client failed for today-fallback: %s — "
                        "leaving today as missing", e)
         return None
 
     try:
-        instruments = kite.instruments("NFO")
+        instruments = client.instruments("NFO")
     except Exception as e:
-        logger.warning("instruments('NFO') failed for today-fallback: %s", e)
+        logger.warning("Kotak instruments('NFO') failed for today-fallback: %s", e)
         return None
 
     if not instruments:
@@ -160,17 +185,17 @@ def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
     if df.empty:
         return None
     front = df.loc[df.groupby("name")["expiry_date"].idxmin()]
-    logger.info("Broker fallback: fetching today's close for %d front-month STF(s)...",
+    logger.info("Kotak fallback: fetching today's close for %d front-month STF(s)...",
                 len(front))
 
     rows = []
     for _, r in front.iterrows():
         try:
-            candles = kite.historical_data(
+            candles = client.historical_data(
                 int(r["instrument_token"]), target, target, "day",
             )
         except Exception as e:
-            logger.warning("historical_data failed for %s: %s — skipping",
+            logger.warning("Kotak historical_data failed for %s: %s — skipping",
                            r["tradingsymbol"], e)
             time.sleep(0.34)
             continue
@@ -191,10 +216,10 @@ def _build_today_stfs_via_kite(target_date: datetime) -> Optional[pd.DataFrame]:
         time.sleep(0.34)
 
     if not rows:
-        logger.warning("Kite fallback produced no STF rows — leaving today missing")
+        logger.warning("Kotak fallback produced no STF rows — leaving today missing")
         return None
 
-    logger.info("Kite fallback synthesised %d STF rows for %s",
+    logger.info("Kotak fallback synthesised %d STF rows for %s",
                 len(rows), target.isoformat())
     return pd.DataFrame(rows).astype({c: t for c, t in RAW_STR_COLS.items()
                                       if c in rows[0]})
@@ -213,17 +238,18 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[pd
     still honored on read). A successful NSE download is authoritative
     and short-circuits all subsequent runs. If NSE 404s for *today* (common
     when run before NSE publishes around 18:00-20:00 IST), falls back to
-    kite.historical_data for STF closes only and marks the cache with a
-    `.kite-fallback` sentinel — subsequent runs will retry NSE first so the
-    cache upgrades to authoritative once NSE publishes.
+    Kotak Neo historical data for STF closes only and marks the cache with
+    a `.broker-fallback` sentinel — subsequent runs will retry NSE first so
+    the cache upgrades to authoritative once NSE publishes. A leftover
+    `.kite-fallback` marker is treated the same way.
     """
     yyyymmdd = date.strftime("%Y%m%d")
     cache_base = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.parquet"
     legacy_csv = cache_base.with_suffix(".csv")
-    sentinel = RAW_DIR / f"bhavcopy_fo_{yyyymmdd}.kite-fallback"
+    sentinel = cache_base.with_suffix(".broker-fallback")
 
     # Authoritative cache hit: real NSE bhavcopy already on disk.
-    if table_exists(cache_base) and not sentinel.exists():
+    if table_exists(cache_base) and not has_fallback_marker(cache_base):
         return _read_raw_day(cache_base)
 
     url = UDIFF_URL.format(yyyymmdd=yyyymmdd)
@@ -243,12 +269,14 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[pd
                     day_df = pd.read_csv(io.BytesIO(zf.read(names[0])),
                                          dtype=RAW_STR_COLS)
                     write_table(day_df, cache_base)
-                    if sentinel.exists():
-                        sentinel.unlink()
+                    removed = [p for p in fallback_marker_paths(cache_base) if p.exists()]
+                    for marker in removed:
+                        marker.unlink()
+                    if removed:
                         # The superseded synthetic CSV would only shadow the
                         # authoritative parquet in tooling that greps *.csv.
                         legacy_csv.unlink(missing_ok=True)
-                        logger.info("Upgraded %s cache from Kite-fallback to "
+                        logger.info("Upgraded %s cache from broker fallback to "
                                     "authoritative NSE bhavcopy", yyyymmdd)
                     return day_df
         except zipfile.BadZipFile:
@@ -260,22 +288,22 @@ def _download_bhavcopy(date: datetime, session: requests.Session) -> Optional[pd
     elif resp is not None and resp.status_code not in (200, 404):
         logger.warning("Unexpected status %d for %s", resp.status_code, yyyymmdd)
 
-    # NSE didn't deliver. If a Kite-fallback cache from an earlier run
-    # exists, use it (avoids re-spending the Kite quota on a re-run for
-    # the same day).
+    # NSE didn't deliver. If a broker-fallback cache from an earlier run
+    # exists, use it (do not call Kotak again for the same day).
     if table_exists(cache_base):
         return _read_raw_day(cache_base)
 
-    # First-time miss on today: try the Kite fallback. Older days that
-    # are genuinely missing get None as before (no point asking Kite for
-    # last week's STF closes — bhavcopy will eventually backfill).
+    # First-time miss on today: Kotak historical closes. Older days that
+    # are genuinely missing stay missing — bhavcopy is the source for
+    # past sessions, and a broker fill of last week would be a partial
+    # NIFTY-50 file wearing an authoritative name.
     if date.date() == datetime.now().date():
-        logger.info("Trying Kite-historical fallback for today's STF closes...")
-        day_df = _build_today_stfs_via_kite(date)
+        logger.info("Trying Kotak historical fallback for today's STF closes...")
+        day_df = _build_today_stfs_via_kotak(date)
         if day_df is not None:
             RAW_DIR.mkdir(parents=True, exist_ok=True)
             write_table(day_df, cache_base)
-            sentinel.write_text("synthesised_via_kite_historical_data\n")
+            sentinel.write_text("synthesised_via_kotak_historical_data\n")
             return day_df
     return None
 

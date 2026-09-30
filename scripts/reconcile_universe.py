@@ -27,18 +27,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.data_cache_io import find_tables, read_table          # noqa: E402
 from core.screen_pairs import NIFTY_50                          # noqa: E402
 from core.universe import SYMBOL_ALIASES, canonical             # noqa: E402
+from market_data.fetch_bhavcopy import has_fallback_marker      # noqa: E402
 
 logger = logging.getLogger("reconcile_universe")
 
 RAW_DIR = Path("data_cache/bhavcopy_raw")
 REPORT_PATH = Path("data_cache/universe_reconcile.json")
 
-# A Kite-fallback day carries only the NIFTY_50 names (fetch_bhavcopy's
-# _build_today_stfs_via_kite filters to them), so reconciling against one would
-# compare the list to itself and report zero drift forever. Detected by the
-# sibling marker file AND by a floor on the underlying count, because a marker
-# is easy to lose and a silent all-clear is the failure this script exists to
-# prevent (Rule 12).
+# A broker-fallback day carries only the NIFTY_50 names (fetch_bhavcopy's
+# _build_today_stfs_via_kotak filters to them), so reconciling against one
+# would compare the list to itself and report zero drift forever. The current
+# marker is .broker-fallback; .kite-fallback is the previous name. Detected
+# by either sibling marker AND by a floor on the underlying count, because a
+# marker is easy to lose and a silent all-clear is the failure this script
+# exists to prevent (Rule 12).
 MIN_BOARD_SIZE = 100
 
 # How old the newest usable bhavcopy may be before its findings stop
@@ -83,8 +85,8 @@ def latest_board(raw_dir: Path = RAW_DIR) -> Tuple[Set[str], str]:
     skipped: List[str] = []
     for path in reversed(files):
         day = "".join(c for c in path.stem if c.isdigit())[-8:]
-        if path.with_suffix(".kite-fallback").exists():
-            skipped.append(f"{day} (kite-fallback marker)")
+        if has_fallback_marker(path):
+            skipped.append(f"{day} (broker-fallback marker)")
             continue
         board = _board_from_file(path)
         if board is None:

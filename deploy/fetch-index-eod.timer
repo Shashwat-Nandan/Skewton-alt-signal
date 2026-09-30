@@ -6,8 +6,8 @@ Documentation=man:systemd.timer(5)
 # 18:15 IST — NSE publishes the F&O UDiFF bhavcopy ~17:30-18:00. 18:15 gives
 # headroom and staggers ~15 min after fetch-bhavcopy-eq (18:00) so the two
 # archive fetches don't race. Running after publish keeps today's data in the
-# public archive, so fetch_bhavcopy never reaches its Kite today-fallback (no
-# login while a live runner is active).
+# public archive, so fetch_bhavcopy never reaches its same-day Kotak
+# fallback (a NIFTY-50-only board instead of the full F&O file).
 OnCalendar=Mon..Fri *-*-* 18:15:00 Asia/Kolkata
 
 # Persistent catch-up: if the VPS was down at 18:15, run when it returns —

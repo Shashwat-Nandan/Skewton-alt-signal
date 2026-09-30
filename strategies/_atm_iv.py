@@ -82,7 +82,7 @@ def _day_frame(path: Path) -> Optional[pd.DataFrame]:
         return None
     missing = [c for c in _REQUIRED if c not in have]
     if missing:
-        # Kite-fallback days carry a reduced schema and no option rows at all.
+        # Broker-fallback days carry a reduced schema and no option rows at all.
         logger.info("skipping %s — missing columns %s", path.name, missing)
         return None
 
