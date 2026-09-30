@@ -7,6 +7,7 @@ without regressions.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -43,6 +44,7 @@ def _make_strategy(
     max_leg_notional=None,
     allow_long: bool = True,
     allow_short: bool = True,
+    cost_hurdle_mult: float = 0.0,
     clock_date: date = date(2026, 4, 17),
 ) -> CalendarMeanReversionStrategy:
     s = CalendarMeanReversionStrategy.__new__(CalendarMeanReversionStrategy)
@@ -87,6 +89,11 @@ def _make_strategy(
     s.mr_max_leg_notional = max_leg_notional
     s.allow_long = allow_long
     s.allow_short = allow_short
+    # Band tests isolate z. Production uses the parent's 2.0 fee hurdle;
+    # TestCostAndLotHurdles turns it on. 0 here means those tests are not
+    # measuring the fee gate.
+    s.calendar_cost_hurdle_mult = cost_hurdle_mult
+    s.calendar_crossing_mult = 0.0
     s._spread_history = dict(spread_history or {})
     s._volume_history = dict(volume_history or {})
     s._last_history_date = {}
@@ -302,6 +309,44 @@ class TestEntry:
         s.scan_and_propose()
         assert len(s._spread_history["AAA"]) == n_before
 
+    def test_fee_hurdle_rejects_a_spread_that_cannot_pay_stt(self):
+        # Mean 1, sd 0.4, spread 1.6. Points outside the 0.25σ band are
+        # 0.5. On lot 100 that is ₹50. Four futures orders cost more
+        # than ₹50, and the inherited hurdle demands twice the fees.
+        s = _make_strategy(cost_hurdle_mult=2.0)
+        self._seed(s)
+        snap = _snap(near_px=100.0, next_px=101.6, lot_size=100)
+        s._observe_universe = lambda: [snap]
+        assert s.scan_and_propose() == []
+
+    def test_fee_hurdle_admits_a_spread_that_clears_twice_the_fees(self):
+        s = _make_strategy(cost_hurdle_mult=2.0)
+        self._seed(s)
+        # Spread of 50 points × lot 100 is thousands of rupees against
+        # a few hundred of fees.
+        snap = _snap(near_px=100.0, next_px=150.0, lot_size=100)
+        s._observe_universe = lambda: [snap]
+        assert len(s.scan_and_propose()) == 2
+
+    def test_unequal_lots_are_skipped(self):
+        s = _make_strategy()
+        self._seed(s)
+        snap = _snap(near_px=100.0, next_px=101.6)
+        snap["next"] = dict(snap["next"], lot_size=200)
+        s._observe_universe = lambda: [snap]
+        assert s.scan_and_propose() == []
+
+    def test_untrusted_prices_do_not_enter(self):
+        s = _make_strategy()
+        self._seed(s)
+        snap = _snap(near_px=100.0, next_px=101.6)
+        snap["pricing_trusted"] = False
+        s._observe_universe = lambda: [snap]
+        n_before = len(s._spread_history["AAA"])
+        assert s.scan_and_propose() == []
+        assert len(s._spread_history["AAA"]) == n_before
+        assert s._spread_history["AAA"][-1][0] == date(2026, 4, 16)
+
 
 # ──────────────────────────────────────────────────────────
 # Exit gates
@@ -342,7 +387,12 @@ class TestExits:
         exits = s.check_and_rehedge()
         assert len(exits) == 2
         assert all("CONVERGE" in p.rationale for p in exits)
-        # Context cleaned up.
+        # Context stays until the fill removes the spread. A rejected
+        # exit has to be able to fire CONVERGE again.
+        assert "AAA" in s._entry_context
+        s._ts_to_name = {"AAA26APRFUT": "AAA", "AAA26MAYFUT": "AAA"}
+        s.execute_proposals(exits)
+        assert "AAA" not in s.state.open_calendars
         assert "AAA" not in s._entry_context
 
     def test_stop_exit_short(self):
@@ -384,10 +434,11 @@ class TestExits:
         assert all("STOP" in p.rationale for p in exits)
 
     def test_max_hold_exit(self):
+        # Wednesday 15 → Friday 17 is two weekday sessions.
         s = _make_strategy(max_hold_days=2,
-                           clock_date=date(2026, 4, 19))
+                           clock_date=date(2026, 4, 17))
         self._seed_open_short(
-            s, entry_time=datetime(2026, 4, 16, 10, 0)
+            s, entry_time=datetime(2026, 4, 15, 10, 0)
         )
         # spread still wide — only the time-based exit can fire.
         snap = _snap(near_px=100.0, next_px=101.6)
@@ -395,6 +446,15 @@ class TestExits:
         exits = s.check_and_rehedge()
         assert len(exits) == 2
         assert all("MAX_HOLD" in p.rationale for p in exits)
+
+    def test_weekend_does_not_consume_the_hold(self):
+        # Friday 17 → Monday 20 is one session. Three calendar days must
+        # not fire a 3-session hold.
+        s = _make_strategy(max_hold_days=3, clock_date=date(2026, 4, 20))
+        self._seed_open_short(s, entry_time=datetime(2026, 4, 17, 10, 0))
+        snap = _snap(near_px=100.0, next_px=101.6)
+        s._observe_universe = lambda: [snap]
+        assert s.check_and_rehedge() == []
 
     def test_expiry_force_exit(self):
         s = _make_strategy()
@@ -404,6 +464,44 @@ class TestExits:
         exits = s.check_and_rehedge()
         assert len(exits) == 2
         assert all("EXPIRY" in p.rationale for p in exits)
+
+    def test_untrusted_prices_do_not_converge(self, caplog):
+        s = _make_strategy(exit_n_sd=0.25)
+        self._seed_open_short(s)
+        snap = _snap(near_px=100.0, next_px=101.05)
+        snap["pricing_trusted"] = False
+        snap["near_basis"] = "book"
+        snap["next_basis"] = "print"
+        s._observe_universe = lambda: [snap]
+        with caplog.at_level(logging.WARNING):
+            assert s.check_and_rehedge() == []
+        assert "AAA" in s._entry_context
+        assert any("CONVERGE suppressed" in r.message for r in caplog.records)
+
+    def test_missing_snapshot_warns_once(self, caplog):
+        s = _make_strategy()
+        self._seed_open_short(s)
+        s._observe_universe = lambda: []
+        with caplog.at_level(logging.WARNING):
+            assert s.check_and_rehedge() == []
+            assert s.check_and_rehedge() == []
+        warnings = [r for r in caplog.records if "no snapshot" in r.message]
+        assert len(warnings) == 1
+
+    def test_entry_context_survives_serialize(self):
+        s = _make_strategy()
+        self._seed_open_short(s)
+        blob = s.serialize_state()
+        fresh = _make_strategy()
+        fresh.restore_state(blob)
+        assert fresh._entry_context["AAA"]["entry_spread"] == 1.6
+        assert fresh._entry_context["AAA"]["position"] == "SHORT_CALENDAR"
+        # A restart can still stop. Entry 1.6, sd 0.4, stop at 1.8.
+        snap = _snap(near_px=100.0, next_px=101.85)
+        fresh._observe_universe = lambda: [snap]
+        exits = fresh.check_and_rehedge()
+        assert len(exits) == 2
+        assert all("STOP" in p.rationale for p in exits)
 
 
 # ──────────────────────────────────────────────────────────
