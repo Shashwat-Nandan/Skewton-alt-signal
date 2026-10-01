@@ -8,6 +8,7 @@ to Kite would trade the wrong account. Fail loud is the contract.
 from __future__ import annotations
 
 import json
+import socket
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -758,7 +759,16 @@ class TestKotakAdapterLogin:
         def fake_request(method, url, **kwargs):
             resp = MagicMock()
             resp.status_code = 200
-            resp.json.return_value = {"stat": "Ok", "data": {}}
+            if "get-client-ip" in url:
+                # Reuse is allowed only when Kotak bound the token to an
+                # IPv4. The order whitelist is that address.
+                resp.json.return_value = {
+                    "data": [{"ip": "94.136.188.224", "time": "t"}],
+                    "stCode": 1000,
+                    "status": "success",
+                }
+            else:
+                resp.json.return_value = {"stat": "Ok", "data": {}}
             return resp
 
         with patch("core.broker.kotak.requests.Session") as sess_cls:
@@ -767,6 +777,7 @@ class TestKotakAdapterLogin:
         assert client.trade_token == "cached-jwt"
         urls = [c[0][1] for c in sess_cls.return_value.request.call_args_list]
         assert not any("tradeApiLogin" in u for u in urls)
+        assert any("get-client-ip" in u for u in urls)
 
     def test_cached_client_does_not_hit_the_network(self, tmp_path, monkeypatch):
         cfg = self._kotak_ini(tmp_path)
@@ -883,6 +894,120 @@ class TestKotakAdapterLogin:
         cache = json.loads((tmp_path / ".kotak_session.json").read_text())
         assert cache["trade_token"] == "trade-jwt"
         assert limits_calls["n"] == 2
+
+    def test_cached_session_bound_to_ipv6_relogins(self, tmp_path, monkeypatch):
+        # 2026-10-01: the IPv4 was already on the Trade API whitelist.
+        # The process preferred AAAA, Kotak bound the token to that
+        # IPv6, and every place_order came back "unauthorized". Limits
+        # still succeed. The token has to be created again from IPv4.
+        cfg = self._kotak_ini(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        self._write_cached_session(tmp_path)
+
+        def fake_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "tradeApiLogin" in url:
+                resp.json.return_value = {
+                    "data": {
+                        "token": "view-jwt", "sid": "sid-1",
+                        "ucc": "ABC123", "greetingName": "Ada", "kType": "View",
+                    }
+                }
+            elif "tradeApiValidate" in url:
+                resp.json.return_value = {
+                    "data": {
+                        "token": "trade-jwt", "sid": "sid-2",
+                        "hsServerId": "E43",
+                        "baseUrl": "https://e43.kotaksecurities.com",
+                        "ucc": "ABC123", "greetingName": "Ada", "kType": "Trade",
+                    }
+                }
+            elif "get-client-ip" in url:
+                resp.json.return_value = {
+                    "data": [{"ip": "2400:d321:2357:7648::1", "time": "t"}],
+                    "stCode": 1000,
+                    "status": "success",
+                }
+            else:
+                resp.json.return_value = {"stat": "Ok", "data": {"Net": "1"}}
+            return resp
+
+        with patch("core.broker.kotak.requests.Session") as sess_cls:
+            sess_cls.return_value.request.side_effect = fake_request
+            client = get_broker(cfg).login()
+        assert client.trade_token == "trade-jwt"
+        cache = json.loads((tmp_path / ".kotak_session.json").read_text())
+        assert cache["trade_token"] == "trade-jwt"
+
+    def test_cached_session_client_ip_timeout_does_not_relogin(
+        self, tmp_path, monkeypatch,
+    ):
+        # get-client-ip is a transport check, like limits(). A timeout
+        # must not replace the shared Trade token.
+        cfg = self._kotak_ini(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        self._write_cached_session(tmp_path)
+
+        def fake_request(method, url, **kwargs):
+            if "get-client-ip" in url:
+                raise requests.Timeout("timed out")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"stat": "Ok", "data": {}}
+            return resp
+
+        with patch("core.broker.kotak.requests.Session") as sess_cls:
+            sess_cls.return_value.request.side_effect = fake_request
+            with pytest.raises(BrokerNetworkError, match="timed out"):
+                get_broker(cfg).login()
+            urls = [c[0][1] for c in sess_cls.return_value.request.call_args_list]
+        assert not any("tradeApiLogin" in u for u in urls)
+        cache = json.loads((tmp_path / ".kotak_session.json").read_text())
+        assert cache["trade_token"] == "cached-jwt"
+
+
+class TestKotakUsesIPv4:
+    def test_order_transport_resolves_ipv4_only(self):
+        # A dual-stack getaddrinfo on this host returns the AAAA first.
+        # Connecting there makes Kotak see an address that is not the
+        # registered static IPv4, and the order is unauthorized.
+        from core.broker.kotak import _IPv4HTTPSConnection
+
+        families = []
+        real_gai = socket.getaddrinfo
+
+        def gai(host, port, family=0, typ=0, proto=0, flags=0):
+            families.append(family)
+            assert family == socket.AF_INET
+            return real_gai("127.0.0.1", port, socket.AF_INET, socket.SOCK_STREAM)
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        sock = None
+        try:
+            with patch("core.broker.kotak.socket.getaddrinfo", gai):
+                conn = _IPv4HTTPSConnection(host="mis.kotaksecurities.com", port=port)
+                sock = conn._new_conn()
+            assert sock.family == socket.AF_INET
+            assert sock.getpeername()[0] == "127.0.0.1"
+        finally:
+            if sock is not None:
+                sock.close()
+            srv.close()
+        assert families == [socket.AF_INET]
+
+    def test_default_client_mounts_the_ipv4_pool(self):
+        from core.broker.kotak import _IPv4HTTPSConnectionPool
+
+        client = KotakNeoClient("consumer-key")
+        pool_cls = client.session.get_adapter(
+            "https://mis.kotaksecurities.com"
+        ).poolmanager.pool_classes_by_scheme["https"]
+        assert pool_cls is _IPv4HTTPSConnectionPool
+        client.session.close()
 
 
 class TestOrderExecutorAcceptsBrokerTokenError:

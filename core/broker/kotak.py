@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 from configparser import ConfigParser
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,12 @@ from urllib.parse import quote as urlquote
 import pyotp
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPSConnection
+from urllib3.connectionpool import HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NameResolutionError, NewConnectionError
+from urllib3.util.connection import _DEFAULT_TIMEOUT as _URLLIB3_DEFAULT_TIMEOUT
+from urllib3.util.timeout import _DEFAULT_TIMEOUT as _TIMEOUT_SENTINEL
 
 from .base import BrokerAdapter
 from .credentials import reject_placeholders, resolve_credential
@@ -49,6 +56,94 @@ from .mapping import (
 
 logger = logging.getLogger(__name__)
 
+
+def _connect_ipv4(host, port, timeout, source_address, socket_options):
+    """Open a TCP socket to an IPv4 address of `host`.
+
+    Kotak's order whitelist is IPv4. This host publishes AAAA records for
+    the trade hosts and prefers them, so a dual-stack connect leaves via
+    IPv6 and place/modify/cancel come back `unauthorized` even when the
+    IPv4 is already registered. Login has to use the same family: the
+    session is bound to the address that created it.
+    """
+    if isinstance(host, str) and host.startswith("["):
+        host = host.strip("[]")
+    err: Optional[OSError] = None
+    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        af, socktype, proto, _canon, sa = res
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if socket_options:
+                for opt in socket_options:
+                    sock.setsockopt(*opt)
+            if timeout is not _URLLIB3_DEFAULT_TIMEOUT and timeout is not _TIMEOUT_SENTINEL:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            err = exc
+            if sock is not None:
+                sock.close()
+    if err is not None:
+        raise err
+    raise OSError(f"no IPv4 address for {host}")
+
+
+class _IPv4HTTPSConnection(HTTPSConnection):
+    def _new_conn(self) -> socket.socket:
+        try:
+            sock = _connect_ipv4(
+                self._dns_host,
+                self.port,
+                self.timeout,
+                self.source_address,
+                self.socket_options,
+            )
+        except socket.gaierror as exc:
+            raise NameResolutionError(self.host, self, exc) from exc
+        except socket.timeout as exc:
+            raise ConnectTimeoutError(
+                self,
+                f"Connection to {self.host} timed out. (connect timeout={self.timeout})",
+            ) from exc
+        except OSError as exc:
+            raise NewConnectionError(
+                self, f"Failed to establish a new connection: {exc}"
+            ) from exc
+        return sock
+
+
+class _IPv4HTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _IPv4HTTPSConnection
+
+
+class _IPv4Adapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+        # The default dict is shared by every PoolManager. Replace it;
+        # mutating the shared one would pin unrelated clients to IPv4.
+        self.poolmanager.pool_classes_by_scheme = {
+            **self.poolmanager.pool_classes_by_scheme,
+            "https": _IPv4HTTPSConnectionPool,
+        }
+
+
+def _ipv4_session() -> requests.Session:
+    session = requests.Session()
+    session.mount("https://", _IPv4Adapter())
+    return session
+
+
+def _is_ipv4(ip: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET, ip)
+    except OSError:
+        return False
+    return True
+
 # Prod session host (Kotak Neo SDK SESSION_PROD_BASE_URL). The old
 # gw-napi name is NXDOMAIN; login, quotes, and the scrip master live here.
 # Order/limits calls use the baseUrl returned by totp_validate (e.g. e41).
@@ -72,6 +167,9 @@ _PATHS = {
     "scrip_master": "script-details/1.0/masterscrip/file-paths",
     "margin": "quick/user/check-margin",
     "historical_data": "market-data/1.0/historical/details",
+    # Reports the address Kotak bound to this Trade token at login.
+    # Not the address of the request that asks.
+    "client_ip": "login/1.0/get-client-ip",
 }
 
 _KITE_INTERVAL_TO_NEO = {
@@ -145,7 +243,9 @@ class KotakNeoClient:
     ):
         self.consumer_key = consumer_key
         self.neo_fin_key = neo_fin_key or DEFAULT_NEO_FIN_KEY
-        self.session = session or requests.Session()
+        # Injected sessions (tests) are left alone. The default must be
+        # IPv4: see _connect_ipv4.
+        self.session = session if session is not None else _ipv4_session()
         self.login_base = login_base.rstrip("/")
         self.scrip_cache_dir = Path(scrip_cache_dir) if scrip_cache_dir else DEFAULT_SCRIP_CACHE
         self.view_token: Optional[str] = None
@@ -214,6 +314,37 @@ class KotakNeoClient:
         if not self.trade_token:
             raise BrokerAuthError("Kotak totp_validate did not return a trade token")
         return data
+
+    def session_bound_ip(self) -> str:
+        """Address Kotak stored when this Trade token was created.
+
+        `login/1.0/get-client-ip` returns that address, not the source of
+        this call. An IPv6 result means place/modify/cancel will be
+        rejected while the whitelist is the host's IPv4.
+        """
+        if not self.trade_token or not self.sid:
+            raise BrokerTokenError("Kotak session has no trade token; login first")
+        url = f"{self.login_base}/{_PATHS['client_ip']}"
+        data = self._request_json(
+            "GET",
+            url,
+            headers={
+                "Authorization": self.consumer_key,
+                "Auth": self.trade_token,
+                "Sid": self.sid,
+                "neo-fin-key": self.neo_fin_key,
+                "accept": "application/json",
+            },
+        )
+        rows = data.get("data") if isinstance(data, dict) else None
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and row.get("ip"):
+                    return str(row["ip"]).strip()
+        raise BrokerOrderError(
+            "Kotak get-client-ip returned no address: "
+            f"{list(data)[:8] if isinstance(data, dict) else type(data).__name__}"
+        )
 
     def restore_session(self, cached: dict) -> None:
         self.trade_token = cached.get("trade_token") or cached.get("access_token")
@@ -819,6 +950,7 @@ class KotakNeoAdapter(BrokerAdapter):
         if self._load_cached(client):
             try:
                 client.profile()
+                bound_ip = client.session_bound_ip()
             except (BrokerTokenError, BrokerAuthError) as e:
                 # 403 / auth failure: this Trade token is dead, so TOTP
                 # login is the recovery. Timeout, 429, and 5xx are
@@ -831,11 +963,23 @@ class KotakNeoAdapter(BrokerAdapter):
                     "Cached Kotak session rejected (%s); re-login", e,
                 )
             else:
-                logger.info(
-                    "Using cached Kotak Neo session for %s", client.ucc,
+                if _is_ipv4(bound_ip):
+                    logger.info(
+                        "Using cached Kotak Neo session for %s (order source %s)",
+                        client.ucc, bound_ip,
+                    )
+                    self._client = client
+                    return client
+                # The token still reads limits. It cannot place: Kotak
+                # bound it to an address that is not the whitelisted
+                # IPv4. Re-login from this IPv4 socket. A transport
+                # error on get-client-ip is BrokerNetworkError and
+                # does not reach here.
+                logger.warning(
+                    "Cached Kotak session is bound to %s, not an IPv4 "
+                    "address. Order APIs would be unauthorized. Re-login.",
+                    bound_ip,
                 )
-                self._client = client
-                return client
         self._perform_login(client)
         self._client = client
         return client
