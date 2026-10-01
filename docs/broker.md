@@ -61,10 +61,17 @@ polls quotes. `name = zerodha` keeps the KiteTicker socket.
    considers live. Dashboard live mode stays 403.
 
 Session cache: `.kotak_session.json` (mode 0600). `login()` reuses
-that file when `limits()` succeeds. A timeout, HTTP 429, or 5xx on
-that check raises `BrokerNetworkError` and does not start TOTP: a new
+that file when `limits()` succeeds and Kotak's `get-client-ip` says
+the token was created from an IPv4 address. Place, modify, and cancel
+are accepted only from the static IPv4 registered under More → Trade
+API, and the token is bound to the address that created it. The
+client opens those sockets with `AF_INET` so a dual-stack host does
+not leave via IPv6 (`unauthorized`, the non-whitelisted-address
+response). A cached token bound to any other address is logged in
+again. A timeout, HTTP 429, or 5xx on the limits or get-client-ip
+check raises `BrokerNetworkError` and does not start TOTP: a new
 Trade token would replace the shared file and invalidate every other
-process still holding it. Re-login runs only when the broker rejects
+process still holding it. Re-login also runs when the broker rejects
 the token (HTTP 403). Scrip-master CSVs: `data_cache/kotak_scrip/`
 (gitignored via `data_cache/`).
 
