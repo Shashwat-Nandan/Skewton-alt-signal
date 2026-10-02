@@ -21,6 +21,9 @@
       settlement takes intrinsic off the 15:00–15:20 spot LTP, not NSE's
       15:00–15:30 average nor the replay's bhavcopy close. Rows carry
       `settle_basis: window_ltp_proxy` and the page marks them.
+- [x] `deploy/dispersion-paper.{service,timer}` + VPS guide §3.5: Mon–Fri
+      14:55 IST, Persistent (safe: no login, exits after 15:30). Files only —
+      NOT installed or enabled on the host; that is a post-merge deploy step.
 - [ ] Follow-up (owner decision): settle on the next session from the
       official bhavcopy close instead of the window LTP. Interacts with
       the missed-settlement path (dte < 0), so it is a design change to a
