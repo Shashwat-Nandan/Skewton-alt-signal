@@ -1,3 +1,149 @@
+# Dispersion dashboard page + second review — 2026-10-02
+
+- [x] `GET /api/dispersion-paper` (read-only, session-gated): each book's
+      open position and closed cycles from its state file, plus the 2-year
+      replay of its running config (Book A, expiry, hedged) from
+      `data_cache/dispersion_cycles_{matched,short_vol}.csv`. A corrupt
+      state file is shown as an error, not an empty book. Open option legs
+      are carried at entry; no option mark is invented.
+- [x] `/dispersion` page: per-book summary, cumulative chart (paper /
+      replay tabs), open-book legs, cycle tables. `npm run build` clean.
+      Not checked in a browser (none on this host).
+- [x] Second review (local changes): one high finding, fixed — a failed
+      state restore made `finally` save never-loaded empty books over both
+      state files. Books are now saved only after every restore succeeds;
+      regression test fails on the old code.
+- `pytest tests/`: 2240 passed, 9 skipped (8 data_cache + fakeredis).
+- [x] Third review (staged changes): two low label findings fixed (banner
+      said every replay was free-float; matched label hard-coded
+      free-float — now the weightings recorded in state are shown, mixed
+      history flagged). Medium finding labelled, NOT fixed: paper
+      settlement takes intrinsic off the 15:00–15:20 spot LTP, not NSE's
+      15:00–15:30 average nor the replay's bhavcopy close. Rows carry
+      `settle_basis: window_ltp_proxy` and the page marks them.
+- [ ] Follow-up (owner decision): settle on the next session from the
+      official bhavcopy close instead of the window LTP. Interacts with
+      the missed-settlement path (dte < 0), so it is a design change to a
+      money path, not a relabel.
+
+# Dispersion parameter tune, 2-year replay — pre-registered 2026-10-02
+
+Owner asked to tune for profit with Jev. Jev (TypeSafe) answers typed
+questions about text; it cannot search a numeric grid, so the tune is plain
+code (Rule 5) and no data was sent to TypeSafe. Research only: neither
+running paper book changes.
+
+Data: `data_cache/research_bhavcopy_raw`, 2024-07-08 → 2026-09-24,
+25 filled monthly cycles. Look-ahead caveats: 2026-10-01 constituent list
+and free-float snapshot applied to every cycle.
+
+Grid (36 replays): variant {short-vol raw/equal, matched/equal,
+matched/free-float} × FLATTEN_DTE {2, 5, 9} × M_RHO_QUANTILE {0.5, 0.8} ×
+coverage {base, wide} (raw: 30% / 50% of weight; matched: 30–40% / 50–60%
+of names). Each replay also yields Book A/B × exit {expiry, flatten} ×
+hedge {none, future}.
+
+Split: train = expiries 2024-08 … 2025-12 (17 cycles); holdout = 2026-01 …
+2026-08 (8 cycles). Selection on train only: highest total net ₹ among
+configs that entered ≥ 8 train cycles; ties → smaller worst cycle loss.
+The one selected config is scored once on holdout and reported as is,
+next to the two running books' fixed configs. Nothing else is read off
+the holdout.
+
+- [x] sweep script + test (`research/sweep_dispersion.py`, 5 tests)
+- [x] run grid (36 replays, 7 workers; output in the session scratchpad)
+- [x] select on train, score holdout once
+- [x] report
+
+## Result
+
+Overlapping 2026 cycles match the `bhavcopy_raw` replay exactly.
+`flatten_dte` and `m_rho_q` do not touch the winner (Book A, expiry exit),
+so they tie; the dimensions that mattered were variant, coverage, hedge.
+
+| config | train 17 cycles | holdout 8 cycles | holdout worst |
+|---|---|---|---|
+| **selected**: matched free-float, 50–60% names, A, expiry, **unhedged** | +₹35.5 L | **+₹51.7 L** (5/8 up) | −₹12.5 L |
+| running `dispersion_paper` (hedged, 30–40%) | −₹98.3 L | −₹18.4 L | −₹18.1 L |
+| running `dispersion_short_vol_paper` (hedged) | −₹3.1 L | +₹9.3 L | −₹2.1 L |
+
+- The winner breaks the paper's delta-hedge rule (§7.6.2.3). Its big
+  months (2025-08, 2026-01/02/06/07) are the months the futures hedge
+  lost ₹9–59 L: the unhedged book is paid by directional moves on net long
+  gamma, not by correlation. Five cycles carry the total.
+- The hedged matched book on paper lost over two years; the hedge itself
+  lost money in most cycles (long single-stock vol, realised < implied).
+- Not adopted. The pinned cuts are unchanged; no paper book changed.
+# PR 9 dispersion — review fixes and Bloch §7.6.5.1 sizing — 2026-10-02
+
+The PR 9 review found four bugs. A read of Bloch (SSRN 2715517) §7.6.5
+found the book is not the paper's trade: the full Nifty straddle is
+short against stock straddles on ~30% of the weight, so it is mostly a
+short-index-vol book. User chose notional matching (§7.6.5.1) and
+free-float weights fetched from NSE.
+
+- [x] Bug 1: a missed settlement skips the new front for good (persisted),
+      not for one 60 s tick.
+- [x] Bug 2: a leg that never had a hedge does not need a futures quote
+      to flatten, so it no longer blocks settlement.
+- [x] Bug 3: `validate_order` accepts half-point strike symbols
+      (`ITC26OCT317.5CE`; 2,005 Kotak F&O symbols carry a `.`).
+- [x] Bug 4: a settlement after expiry marks the expired future at the
+      settlement spot, not the next month's contract.
+- [x] Sizing: covered names are rescaled to 100% of the index notional
+      (ν_i = w_i/W_C · S_I/S_i). Record long/short notional ratio.
+- [x] Gamma attribution weights are the held notional of the long legs;
+      moves and theta use the same calendar step.
+- [x] Weights: `market_data/nifty50_weights.csv` from NSE `ffmc`
+      (01-Oct-2026 16:00 snapshot) + fetcher; strategy and runner use it.
+- [x] Rerun the Mar–Sep 2026 sign check on the new sizing and weights.
+- [x] ruff + full pytest; review section below.
+
+## Review
+
+All in the working tree, uncommitted. `strategies/` and `research/` need
+CODEOWNER review.
+
+- Bugs 1–4: each has a test that fails on 1270a0a and passes now.
+- Sizing: `choose_lots` keeps the 30% gate, then rescales covered names to
+  the index notional. `notional_ratio` is on the book and the closed row;
+  entry warns past ±10%.
+- Attribution: ω̂ is the held basket notional; n and Θ share the calendar
+  step. A variable-shadowing crash was caught by the real replay, not the
+  tests (see lessons).
+- Weights: 50 names, Σ = 1, NSE snapshot 01-Oct-2026 16:00. The fetcher
+  refuses a changed list or a blank ffmc. Runner has `--equal-weight`.
+- Sign check, Book A, hedged, hold to expiry, Mar–Sep 2026 (7 cycles):
+  | sizing | weights | Σ net ₹ | wins |
+  |---|---|---|---|
+  | PR as-is (raw weight) | equal | +1,106,996 | 5/7 |
+  | notional-matched | equal | +291,871 | 3/7 |
+  | notional-matched | free-float | −36,366 | 2/7 |
+  Most of the PR's positive sum was short-index-vol, not dispersion.
+- With free-float weights the 30%-of-weight gate admitted only 4 names
+  (HDFCBANK, ICICIBANK, RELIANCE, BHARTIARTL). Owner decided: gate on
+  30–40% of the name count (15–20 of 50, heaviest kept), per §7.6.2.1.
+  The pinned-cuts test records this as a post-result definitional change,
+  so the rerun below is not out of sample.
+  | gate | weights | names | Σ net ₹ | wins |
+  |---|---|---|---|---|
+  | 30–40% of names | equal | 15–19 | +291,871 | 3/7 (unchanged) |
+  | 30–40% of names | free-float | 15–16 (63–65% wt) | +29,933 | 3/7 |
+  Summed over 7 cycles: diagonal −509k, off-diagonal +2.04M (free-float);
+  costs ≈ 0.98M eat most of it. Seven cycles is still a sign check.
+- Owner asked to revert to the PR 9 sizing because it was more
+  profitable; agreed instead to run both as paper books (option 3).
+  `choose_lots(sizing="raw")` is the PR 9 rule (30% of weight, raw lots,
+  equal weight) and reproduces the PR's replay CSV exactly (40/40 rows,
+  Book A hedged expiry +1,106,996). The runner trades both on one view:
+  `dispersion_paper` (matched, free-float) and
+  `dispersion_short_vol_paper` (raw), each with its own state and EOD
+  file; one book raising does not stop the other. Neither is promoted by
+  the replay; the paper record decides. Smoke run with a fake client:
+  both opened, no order call.
+- `pytest tests/`: 2230 passed, 9 skipped — 8 data_cache plus
+  `fakeredis`, which is in requirements-dev.lock but missing from this
+  venv. ruff clean.
 # Calendar mean-reversion gates — 2026-09-25
 
 The review found entry and exit holes. The August full-archive NO-GO

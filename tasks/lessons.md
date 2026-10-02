@@ -1,5 +1,24 @@
 # Lessons
 
+## Read the whole function's locals before naming a new one in it
+
+- 2026-10-02: the dispersion gamma attribution got a new `held` dict (basket
+  notional) inside `simulate_cycle`, which already used `held` for the
+  futures lots. Every unit test passed — none walked three rows with
+  futures — and the first real replay died with `KeyError: 'NIFTY'`.
+- Takeaway: **grep the enclosing function for a name before introducing
+  it, and run the real CLI once before calling a research change done.**
+  The weekend-step test now carries futures on every row for this reason.
+
+## Scope git commands to your own paths on a shared working tree
+
+- 2026-10-02: a stray `git stash && git stash apply` swept another task's
+  uncommitted edits along with mine. Nothing was lost (tree diffed clean
+  against the stash), but it touched work that was not mine.
+- Takeaway: **on a branch with someone else's uncommitted changes, any
+  stash/checkout must name paths.**
+
+
 ## Answer a "should we ban X" question with the split, not the anecdote
 
 - 2026-08-29: asked whether to stop trading pairs whose legs are both long or

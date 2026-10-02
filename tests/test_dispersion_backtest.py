@@ -37,7 +37,9 @@ from research.backtest_dispersion import (
     M_RHO_MIN_HISTORY,
     M_RHO_QUANTILE,
     MAX_INDEX_LOTS,
+    MAX_COVERED_NAMES,
     MIN_COVERED_WEIGHT,
+    MIN_COVERED_NAMES,
     MIN_SHARED_NAMES,
     MONEYNESS_HI,
     MONEYNESS_LO,
@@ -51,6 +53,7 @@ from research.backtest_dispersion import (
     book_b_open,
     build_cycle_rows,
     choose_lots,
+    notional_ratio,
     dispersion_gamma_pnl,
     exercise_stt,
     future_order_cost,
@@ -90,6 +93,13 @@ def test_registered_cuts_are_not_search_parameters():
     # losing sign check would show up as a change here.
     assert PINNED_OPT_SLIPPAGE == 0.00685
     assert EXERCISE_STT == 0.0015
+    # 2026-10-02: the 30% weight gate became 30–40% of the name count. A
+    # definitional fix to match Bloch §7.6.2.1 ("30% to 40% of the stocks"),
+    # decided by the owner after the free-float rerun admitted 4 names — not
+    # a search. Results after this change are not out of sample.
+    assert MIN_COVERED_NAMES == 0.30
+    assert MAX_COVERED_NAMES == 0.40
+    # The PR 9 rule, kept for the labelled short-vol book (2026-10-02).
     assert MIN_COVERED_WEIGHT == 0.30
     assert MAX_INDEX_LOTS == 200
     assert FLATTEN_DTE == 2
@@ -129,11 +139,15 @@ def test_exercise_stt_is_the_purchasers_only():
     assert exercise_stt(100, 100, 1, 50, side=1) == 0.0
 
 
-def test_sub_lot_weight_stays_in_the_denominator():
-    # Per index lot the heavy name is 40 shares of a 100-share lot, so
-    # three index lots clear one stock lot. The light name is 5 shares
-    # and still floors to zero. GONE has no quote. Covered weight is the
-    # heavy name's 0.40, not 1 and not 0.40/0.45.
+def test_sub_lot_weight_gates_coverage_and_covered_names_match_the_index():
+    # Gate: three weighted names, so ceil(30%) = 1 must be covered. Per
+    # index lot HEAVY is 40 shares of a 100-share lot, so three index lots
+    # clear it. LIGHT is 5 shares and still floors to zero. GONE has no
+    # quote but stays in the name count. Covered weight is HEAVY's 0.40.
+    # Size: Bloch §7.6.5.1 holds the stock baskets at the index notional
+    # (Σ ν_i S_i = S_I). HEAVY carries the whole 3 x 100 x 100 index
+    # notional, 300 shares = 3 lots. Sizing it at its raw 0.40 would leave
+    # 60% of the short index straddle uncovered — a short-vol book.
     sized = choose_lots(
         100.0, 100,
         {"HEAVY": 0.40, "LIGHT": 0.05, "GONE": 0.55},
@@ -143,11 +157,12 @@ def test_sub_lot_weight_stays_in_the_denominator():
     assert sized is not None
     n, lots, covered = sized
     assert n == 3
-    assert lots == {"HEAVY": 1}
+    assert lots == {"HEAVY": 3}
     assert covered == pytest.approx(0.40)
+    assert notional_ratio(100.0, 100, n, {"HEAVY": 100.0}, {"HEAVY": 100}, lots) == pytest.approx(1.0)
 
-    # 0.40 * 65 * 25000 / 1000 = 650 shares, two lots of 250, at one index lot.
-    # The 2% name is 23 shares and is dropped. Its weight is not given away.
+    # Matched, a lone covered name at 65 x 25000 / 1000 = 1625 shares is
+    # 6.5 lots of 250, rounded half up to 7: 1.077x the index notional.
     sized = choose_lots(
         25000.0, 65,
         {"HEAVY": 0.40, "TINY": 0.02},
@@ -157,14 +172,75 @@ def test_sub_lot_weight_stays_in_the_denominator():
     assert sized is not None
     n, lots, covered = sized
     assert n == 1
-    assert lots == {"HEAVY": 2}
-    assert covered == pytest.approx(0.40)
+    assert lots == {"HEAVY": 7}
+    ratio = notional_ratio(25000.0, 65, n, {"HEAVY": 1000.0}, {"HEAVY": 250}, lots)
+    assert ratio == pytest.approx(7 * 250 * 1000 / (65 * 25000))
 
-    # A name that is only 20% of the book never reaches the 30% floor,
-    # however many index lots are used. Do not renormalise it up to 100%.
+
+def test_raw_sizing_is_the_pr9_book_unchanged():
+    # The short-vol book keeps PR 9's rule exactly: smallest n whose covered
+    # WEIGHT reaches 30%, each name at the floor of its raw-weight share, no
+    # rescale. HEAVY clears one lot at 3 index lots and covers 0.40 of the
+    # weight, so it is 1 lot against 3 index lots' notional (0.33x).
+    sized = choose_lots(
+        100.0, 100,
+        {"HEAVY": 0.40, "LIGHT": 0.05, "GONE": 0.55},
+        {"HEAVY": 100.0, "LIGHT": 100.0},
+        {"HEAVY": 100, "LIGHT": 100},
+        sizing="raw",
+    )
+    assert sized == (3, {"HEAVY": 1}, pytest.approx(0.40))
+    assert notional_ratio(100.0, 100, 3, {"HEAVY": 100.0}, {"HEAVY": 100}, {"HEAVY": 1}) == pytest.approx(1 / 3)
+    # A 20% name never reaches 30% of weight under the raw rule.
     assert choose_lots(
-        100.0, 1, {"ONLY": 0.20, "REST": 0.80}, {"ONLY": 100.0}, {"ONLY": 1},
+        100.0, 1, {"ONLY": 0.20, "REST": 0.80}, {"ONLY": 100.0}, {"ONLY": 1}, sizing="raw",
     ) is None
+    with pytest.raises(ValueError, match="sizing"):
+        choose_lots(100.0, 1, {"A": 1.0}, {"A": 100.0}, {"A": 1}, sizing="grid")
+
+
+def test_coverage_counts_names_not_weight():
+    # Bloch §7.6.2.1 buys straddles on 30–40% of the *stocks*. Ten names,
+    # so 3 must be covered and at most 4 are kept. Two quoted names carry
+    # 90% of the weight and still do not open the book: under free-float
+    # weights a weight gate let 4 megacaps stand in for the index.
+    weights = {f"N{i}": 0.01 for i in range(8)}
+    weights.update({"BIG1": 0.46, "BIG2": 0.46})
+    two = {"BIG1": 100.0, "BIG2": 100.0}
+    assert choose_lots(100.0, 1, weights, two, {s: 1 for s in two}) is None
+
+    # All ten quoted, every name clears one lot at once (n = 100). Six
+    # names over the 40% cap are dropped, and the kept four are the
+    # heaviest: BIG1, BIG2, then N0, N1 by symbol among the equal smalls.
+    spots = {s: 100.0 for s in weights}
+    sized = choose_lots(100.0, 1, weights, spots, {s: 1 for s in weights})
+    assert sized is not None
+    n, lots, covered = sized
+    assert n == 100
+    assert set(lots) == {"BIG1", "BIG2", "N0", "N1"}
+    assert covered == pytest.approx(0.94)
+    ratio = notional_ratio(100.0, 1, n, spots, {s: 1 for s in weights}, lots)
+    assert ratio == pytest.approx(1.0, abs=0.02)
+
+
+def test_matched_book_keeps_relative_weights_across_names():
+    # Five names, so 2 must be covered and at most 2 kept. A at 0.30 and B
+    # at 0.15 clear a 10-share lot at one index lot of 90 (27 and 13.5
+    # shares). After the rescale they carry 60 and 30 shares — 2/3 and 1/3
+    # of the index notional: cap-weight proportions survive.
+    sized = choose_lots(
+        100.0, 90,
+        {"A": 0.30, "B": 0.15, "C": 0.20, "D": 0.20, "E": 0.15},
+        {"A": 100.0, "B": 100.0},
+        {"A": 10, "B": 10},
+    )
+    assert sized is not None
+    n, lots, covered = sized
+    assert covered == pytest.approx(0.45)
+    assert n == 1
+    assert lots == {"A": 6, "B": 3}
+    ratio = notional_ratio(100.0, 90, n, {"A": 100.0, "B": 100.0}, {"A": 10, "B": 10}, lots)
+    assert ratio == pytest.approx(1.0)
 
 
 def test_book_b_uses_prior_history_only():
@@ -396,6 +472,30 @@ def test_correlation_term_is_reported_only_on_the_hedged_path():
     assert bare[6] == 0.0 and bare[7] == 0.0
 
 
+def test_a_move_of_exactly_the_implied_size_is_no_gamma_over_a_weekend():
+    # (7.7.30) charges theta against n² - 1. Theta is per calendar day, so
+    # a Friday-to-Monday move of exactly σ·sqrt(3/365) is n = 1 and no
+    # gamma pnl. Standardising on one trading day (sqrt 252) instead calls
+    # that weekend a 2-sigma day and books a diagonal that never happened.
+    iv = 0.2
+    up1 = 100.0 * math.exp(iv * math.sqrt(3 / 365))
+    up2 = up1 * math.exp(iv * math.sqrt(5 / 365))
+    entry = {INDEX: _q(5, 5), "AAA": _q(2, 2)}
+    # Futures on every row: the hedge's held lots and the attribution's
+    # basket notional must not share a name across a three-row walk.
+    futs = {INDEX: (100.0, 1), "AAA": (100.0, 1)}
+    path = [
+        (date(2026, 4, 3), 10, entry, futs, {INDEX: 100.0, "AAA": 100.0}),
+        (date(2026, 4, 6), 7, entry, futs, {INDEX: 100.0, "AAA": up1}),
+        (date(2026, 4, 11), 2, entry, futs, {INDEX: 100.0, "AAA": up2}),
+    ]
+    legs = [_leg(INDEX, -1, iv=iv), _leg("AAA", +1, weight=1.0, iv=iv)]
+    sim = simulate_cycle(legs, path, exit_mode="flatten", hedge=True, rho=0.5, sigma_b=iv)
+    assert sim is not None and sim[-1] == "ok"
+    assert sim[6] == pytest.approx(0.0, abs=1e-9)
+    assert sim[7] == 0.0
+
+
 def _put(books, quotes, spots, day, sym, strike, ce, pe, spot, lot=1):
     books[(day, sym)] = [(float(strike), ce, pe, 1.0, 1.0)]
     quotes[(day, sym, float(strike))] = Quote(ce, pe, spot, lot)
@@ -428,19 +528,20 @@ def test_book_a_stays_short_the_index_when_m_rho_is_above_one():
         quotes=quotes, books=books, futures={}, spot=spots,
     )
     rows = build_cycle_rows(
-        chain, {"AAA": 0.5, "BBB": 0.5}, weighting="equal",
+        chain, {"AAA": 0.25, "BBB": 0.25, "CCC": 0.25, "DDD": 0.25}, weighting="equal",
         index_closes=[], close_dates=[],
     )
     frame = pd.DataFrame([r.__dict__ for r in rows])
     filled = frame[(frame.book == "A") & (frame.exit_mode == "flatten") & (frame.status == "ok")]
     assert len(filled) == 2
     assert (filled.m_rho > 1).all()
-    assert (filled.index_lots == 2).all()
+    # 2 of 4 names must be covered (CCC, DDD unquoted): 4 index lots.
+    assert (filled.index_lots == 4).all()
     assert (filled.n_names == 2).all()
-    assert filled.covered_weight.iloc[0] == pytest.approx(1.0)
-    # Two index lots, exit straddle priced at 2. Stock marks unchanged.
-    entry_px = (entry_i.ce + entry_i.pe) * 2
-    assert filled.premium_pnl.iloc[0] == pytest.approx(entry_px - 4.0)
+    assert filled.covered_weight.iloc[0] == pytest.approx(0.5)
+    # Four index lots, exit straddle priced at 2. Stock marks unchanged.
+    entry_px = (entry_i.ce + entry_i.pe) * 4
+    assert filled.premium_pnl.iloc[0] == pytest.approx(entry_px - 8.0)
     assert (filled.premium_pnl > 0).all()
     assert (filled.exercise_stt == 0).all()
     assert np.allclose(filled.net, filled.premium_pnl + filled.futures_pnl - filled.costs)

@@ -2,10 +2,15 @@
 """
 Hedged hold-to-expiry dispersion — PAPER ONLY.
 
-Forward book for strategies/dispersion_paper.py: sell the Nifty ATM
+Forward books for strategies/dispersion_paper.py. ``dispersion_paper`` is
+the matched book below. ``dispersion_short_vol_paper`` runs beside it on
+the same quotes with the PR 9 sizing (equal weight, 30% of weight covered,
+raw-weight lots, no rescale), which is mostly short index vol; each book
+has its own state and EOD file. The matched book: sell the Nifty ATM
 straddle, buy the same-expiry constituent straddles that clear one lot,
-hedge each straddle with the future at the close, and hold to the expiry
-settlement. The seven-expiry daily sign check is why this book is worth
+sized so the stock straddles carry the index straddle's notional (Bloch
+§7.6.5.1, NSE free-float weights), hedge each straddle with the future at
+the close, and hold to the expiry settlement. The seven-expiry daily sign check is why this book is worth
 watching. It is not a promotion, and this runner has no live mode.
 
 The decision is the cash close, so both the hedge and a new entry run
@@ -55,6 +60,7 @@ from core.runner_common import (
     sleep_until,
 )
 from market_data.fetch_bhavcopy import has_fallback_marker
+from market_data.fetch_index_weights import NIFTY50_WEIGHTS_PATH
 from research.backtest_dispersion import (
     INDEX,
     MAX_INDEX_LOTS,
@@ -75,6 +81,8 @@ LOG_DIR = HERE / "logs"
 DATA_CACHE = HERE / "data_cache"
 RAW_DIR = DATA_CACHE / "bhavcopy_raw"
 STATE_FILE = DATA_CACHE / "dispersion_paper_state.json"
+# The PR 9 sizing, paper-traded beside the matched book on the same quotes.
+SHORT_VOL_STATE_FILE = DATA_CACHE / "dispersion_short_vol_paper_state.json"
 LOCK_FILE = DATA_CACHE / ".dispersion_paper.lock"
 SILENT_FAIL_FLAG = DATA_CACHE / "SILENT_FAIL_dispersion_paper"
 
@@ -120,6 +128,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Index-lot cap when no state file exists. The default "
                         "is the research cap so the paper book stays the book "
                         "that was signed off. A restored state keeps its cap.")
+    p.add_argument("--equal-weight", action="store_true",
+                   help="size off equal weights instead of the NSE free-float "
+                        "snapshot in market_data/nifty50_weights.csv.")
     return p
 
 
@@ -403,28 +414,25 @@ def _build_surface(client, rows, symbol: str, session: date, front: Optional[dat
 
 
 def build_session_view(client, session: date, previous: Optional[date],
-                       universe: Sequence[str], book, min_names: int) -> SessionView:
-    """One close, from the scrip master and quotes.
+                       universe: Sequence[str], books, min_names: int) -> SessionView:
+    """One close, from the scrip master and quotes, shared by every book.
 
-    An open book is quoted on the names it holds (spot and the nearest
-    future). The future may roll to a later contract during the option's
+    ``books`` is each book's open book or None. Open books are quoted on
+    the names they hold (spot and the nearest future). The future may roll to a later contract during the option's
     life; the mark uses that contract's price, which is what the replay did.
     The entry chain is quoted only on a roll with no book open.
     """
     rows = list(client.instruments("NFO"))
     front = front_from_rows(rows, session, universe, min_names)
     need_chain = (
-        book is None
+        any(book is None for book in books)
         and previous is not None
         and front is not None
         and front != previous
     )
-    if book is not None:
-        symbols = [leg.symbol for leg in book.legs]
-    elif need_chain:
-        symbols = [INDEX, *list(universe)]
-    else:
-        symbols = []
+    symbols = [leg.symbol for book in books if book is not None for leg in book.legs]
+    if need_chain:
+        symbols += [INDEX, *list(universe)]
     seen: List[str] = []
     for sym in symbols:
         if sym not in seen:
@@ -456,31 +464,36 @@ def market_client(config_path: str):
     return KotakNeoClient(adapter.consumer_key, neo_fin_key=adapter.neo_fin_key)
 
 
+def _state_file(strategy: DispersionPaperStrategy) -> Path:
+    return SHORT_VOL_STATE_FILE if strategy.sizing == "raw" else STATE_FILE
+
+
 def _load_state(strategy: DispersionPaperStrategy) -> None:
-    if not STATE_FILE.exists():
+    path = _state_file(strategy)
+    if not path.exists():
         return
     try:
-        strategy.load_dict(json.loads(STATE_FILE.read_text()))
+        strategy.load_dict(json.loads(path.read_text()))
     except Exception as e:                                    # noqa: BLE001
         logger.error("state restore FAILED (%s) — refusing to start blind", e)
         raise
     expiry = strategy.book.expiry if strategy.book else None
-    logger.info("restored book expiry=%s closed=%d cap=%d",
-                expiry, len(strategy.closed), strategy.max_index_lots)
+    logger.info("[%s] restored book expiry=%s closed=%d cap=%d",
+                strategy.name, expiry, len(strategy.closed), strategy.max_index_lots)
 
 
 def _save_state(strategy: DispersionPaperStrategy) -> None:
     DATA_CACHE.mkdir(exist_ok=True)
-    durable_write_text(STATE_FILE, json.dumps(strategy.to_dict(), indent=1))
+    durable_write_text(_state_file(strategy), json.dumps(strategy.to_dict(), indent=1))
 
 
 def _write_eod(strategy: DispersionPaperStrategy, today: date) -> None:
     rep = strategy.generate_eod_report()
-    out = DATA_CACHE / f"dispersion_paper_eod_{today:%Y-%m-%d}.json"
+    out = DATA_CACHE / f"{strategy.name}_eod_{today:%Y-%m-%d}.json"
     out.write_text(json.dumps(rep, indent=1, default=str))
     logger.info(
-        "EOD %s: closed=%s cumulative net ₹%+.0f costs ₹%.0f open=%s",
-        today, rep["closed"], rep["cumulative_net"], rep["cumulative_costs"],
+        "[%s] EOD %s: closed=%s cumulative net ₹%+.0f costs ₹%.0f open=%s",
+        strategy.name, today, rep["closed"], rep["cumulative_net"], rep["cumulative_costs"],
         "yes" if rep["open"] else "no",
     )
 
@@ -491,7 +504,7 @@ def main(argv=None) -> int:
     load_dotenv(HERE / ".env")
     os.chdir(HERE)
     today = date.today()
-    strategy: Optional[DispersionPaperStrategy] = None
+    books: List[DispersionPaperStrategy] = []
     code = 0
     try:
         assert_timezone_ist(logger)
@@ -508,12 +521,17 @@ def main(argv=None) -> int:
 
         _lock_fd = acquire_lock(LOCK_FILE, logger, label="dispersion-paper runner")  # noqa: F841
         logger.info("=" * 62)
-        logger.info("DISPERSION PAPER — %s — equal weight, 2026-10-01 Nifty 50 list", today)
+        logger.info(
+            "DISPERSION PAPER — %s — %s weight, 2026-10-01 Nifty 50 list",
+            today, "equal" if args.equal_weight else "free-float",
+        )
         logger.info("Paper fills. A live mode raises before any order.")
         logger.info("Quotes use the consumer key. The trade token stays untouched.")
         logger.info(
-            "Research size: up to %d index lots once covered weight reaches 30%%. "
-            "The book is the size the replay signed off. Mock fills use no margin.",
+            "Two books, up to %d index lots each. dispersion_paper: 30–40%% of names "
+            "covered, carrying the index notional. dispersion_short_vol_paper: the "
+            "PR 9 sizing, equal weight, 30%% of weight, raw lots — net short index "
+            "vol. Mock fills use no margin.",
             args.max_index_lots,
         )
         logger.info("Decision window 15:00–15:20 IST. A loss stays until expiry.")
@@ -542,12 +560,29 @@ def main(argv=None) -> int:
         if args.max_index_lots < 1:
             raise ValueError("max_index_lots must be >= 1")
         client = market_client(args.config)
-        strategy = DispersionPaperStrategy(
-            client, config_path=args.config, mode="paper",
-            max_index_lots=args.max_index_lots,
-        )
-        strategy.log_effective_params()
-        _load_state(strategy)
+        # Two paper books on one set of quotes. The matched book is Bloch
+        # §7.6.5.1. The short-vol book is the PR 9 sizing (equal weight, 30%
+        # of weight, raw lots), kept as its own labelled book — neither one
+        # was chosen over the other on the seven-expiry replay.
+        candidates = [
+            DispersionPaperStrategy(
+                client, config_path=args.config, mode="paper",
+                max_index_lots=args.max_index_lots,
+                weights_path=None if args.equal_weight else NIFTY50_WEIGHTS_PATH,
+            ),
+            DispersionPaperStrategy(
+                client, config_path=args.config, mode="paper",
+                max_index_lots=args.max_index_lots,
+                weights_path=None, sizing="raw",
+            ),
+        ]
+        for strategy in candidates:
+            strategy.log_effective_params()
+            _load_state(strategy)
+        # Only books that restored are saved by `finally`. A failed restore
+        # raises before this line, so no file — the broken one or the
+        # other book's good one — is overwritten with an empty book.
+        books = candidates
         install_signal_handlers(logger)
         heartbeat = HeartbeatTracker(
             threshold=SILENT_FAIL_THRESHOLD, sentinel_path=SILENT_FAIL_FLAG, log=logger,
@@ -564,18 +599,25 @@ def main(argv=None) -> int:
             try:
                 view = build_session_view(
                     client, today, previous, NIFTY50_2026_10_01,
-                    strategy.book, MIN_SHARED_NAMES,
+                    [strategy.book for strategy in books], MIN_SHARED_NAMES,
                 )
-                logger.info(
-                    "close %s previous_front=%s front=%s roll=%s open=%s",
-                    today, view.previous_front, view.front_expiry, view.is_roll,
-                    strategy.book.expiry if strategy.book else None,
-                )
-                strategy.on_close(view)
             except Exception:                                 # noqa: BLE001
-                logger.exception("close failed")
+                logger.exception("close view failed — no book acted")
                 return "error"
-            return "ok"
+            outcome = "ok"
+            # One book failing must not stop the other's hedge or settlement.
+            for strategy in books:
+                try:
+                    logger.info(
+                        "[%s] close %s previous_front=%s front=%s roll=%s open=%s",
+                        strategy.name, today, view.previous_front, view.front_expiry,
+                        view.is_roll, strategy.book.expiry if strategy.book else None,
+                    )
+                    strategy.on_close(view)
+                except Exception:                             # noqa: BLE001
+                    logger.exception("[%s] close failed", strategy.name)
+                    outcome = "error"
+            return outcome
 
         def account(outcome: str) -> None:
             nonlocal code
@@ -604,7 +646,8 @@ def main(argv=None) -> int:
                     )
                     break
                 outcome = one_pass()
-                _save_state(strategy)
+                for strategy in books:
+                    _save_state(strategy)
                 if outcome == "halt":
                     break
                 account(outcome)
@@ -619,7 +662,7 @@ def main(argv=None) -> int:
         logger.info("Interrupted — persisting state and writing the EOD sidecar.")
         code = 130
     finally:
-        if strategy is not None:
+        for strategy in books:
             _save_state(strategy)
             _write_eod(strategy, today)
     return code

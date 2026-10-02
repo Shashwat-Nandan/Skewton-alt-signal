@@ -8,6 +8,7 @@ hedge, or settle a number the replay did not use.
 from __future__ import annotations
 
 import configparser
+import json
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -23,6 +24,9 @@ from research.backtest_dispersion import (
     option_order_cost,
 )
 from runners.run_paper_dispersion import (
+    SHORT_VOL_STATE_FILE,
+    STATE_FILE,
+    _state_file,
     build_parser,
     build_session_view,
     front_from_rows,
@@ -62,10 +66,13 @@ def _cfg(tmp_path) -> str:
 
 def _strategy(tmp_path, **kwargs) -> DispersionPaperStrategy:
     mode = kwargs.pop("mode", "paper")
+    kwargs.setdefault("weights_path", None)
     strat = DispersionPaperStrategy(
         _Boom(), config_path=_cfg(tmp_path), mode=mode, **kwargs,
     )
-    strat.weights = {"AAA": 0.5, "BBB": 0.5}
+    # Four names, two quoted: the 30–40% name gate needs 2 covered and keeps
+    # at most 2, so AAA and BBB are the book and CCC/DDD stay in the count.
+    strat.weights = {"AAA": 0.25, "BBB": 0.25, "CCC": 0.25, "DDD": 0.25}
     return strat
 
 
@@ -114,21 +121,23 @@ def test_non_roll_day_opens_nothing(tmp_path):
 
 
 def test_roll_sells_the_index_and_buys_only_the_sized_names(tmp_path):
-    """Two equal names at the same spot need 2 index lots before one stock
-    lot clears, and that package is the whole book. Costs are the pinned
+    """Four equal names, two quoted, at the same spot: 2 of 4 must be
+    covered, which takes 4 index lots. AAA and BBB then carry the index
+    notional at 2 lots each, and that package is the whole book. Costs are the pinned
     option half-spread plus the entry hedge, not the 5 bp inside core.costs."""
     strat = _strategy(tmp_path)
     strat.on_close(_roll_view())
     book = strat.book
     assert book is not None
-    assert book.index_lots == 2
-    assert book.covered_weight == pytest.approx(1.0)
+    assert book.index_lots == 4
+    assert book.covered_weight == pytest.approx(0.5)
     assert book.weighting == "equal"
+    assert book.notional_ratio == pytest.approx(1.0)
     by_sym = {leg.symbol: leg for leg in book.legs}
     assert set(by_sym) == {"NIFTY", "AAA", "BBB"}
-    assert by_sym["NIFTY"].side == -1 and by_sym["NIFTY"].lots == 2
-    assert by_sym["AAA"].side == 1 and by_sym["AAA"].lots == 1
-    assert by_sym["BBB"].lots == 1
+    assert by_sym["NIFTY"].side == -1 and by_sym["NIFTY"].lots == 4
+    assert by_sym["AAA"].side == 1 and by_sym["AAA"].lots == 2
+    assert by_sym["BBB"].lots == 2
     opt = 0.0
     for leg in book.legs:
         side = "SELL" if leg.side < 0 else "BUY"
@@ -165,9 +174,9 @@ def test_coverage_under_thirty_percent_does_not_open(tmp_path):
 
 
 def test_dropped_name_stays_in_the_weight_denominator(tmp_path):
-    """CCC has weight and no quote. It is not renormalised onto AAA and BBB,
-    so the index lot count is the one choose_lots returns with CCC still in
-    the denominator."""
+    """CCC has weight and no quote. It stays in the coverage gate's
+    denominator, so the index lot count is the one choose_lots returns
+    with CCC still counted."""
     strat = _strategy(tmp_path)
     strat.weights = {"AAA": 0.4, "BBB": 0.4, "CCC": 0.2}
     strat.on_close(_roll_view())
@@ -176,6 +185,41 @@ def test_dropped_name_stays_in_the_weight_denominator(tmp_path):
     assert book.index_lots == 3
     assert book.covered_weight == pytest.approx(0.8)
     assert "CCC" not in {leg.symbol for leg in book.legs}
+    # CCC gates the entry but is not left uncovered in the size: AAA and BBB
+    # are rescaled to the 3-lot index notional (1.5 lots each, rounded half
+    # up to 2). The whole-lot miss is recorded, not hidden.
+    by_sym = {leg.symbol: leg for leg in book.legs}
+    assert by_sym["AAA"].lots == 2 and by_sym["BBB"].lots == 2
+    assert book.notional_ratio == pytest.approx(4 * 100.0 / (3 * 100.0))
+
+
+def test_default_weights_are_the_nse_free_float_snapshot(tmp_path):
+    """Bloch §7.6.5.1 weights by market cap. The default book reads the NSE
+    free-float file and says so. Equal weight is an explicit opt-out."""
+    from research.backtest_dispersion import NIFTY50_2026_10_01
+
+    strat = DispersionPaperStrategy(_Boom(), config_path=_cfg(tmp_path), mode="paper")
+    assert strat.weighting == "free_float"
+    assert set(strat.weights) == set(NIFTY50_2026_10_01)
+    assert sum(strat.weights.values()) == pytest.approx(1.0)
+    assert max(strat.weights.values()) > 2 * min(strat.weights.values())
+    equal = DispersionPaperStrategy(
+        _Boom(), config_path=_cfg(tmp_path), mode="paper", weights_path=None,
+    )
+    assert equal.weighting == "equal"
+
+
+def test_a_weights_file_missing_a_constituent_is_refused(tmp_path):
+    """A partial file would size every other leg off the wrong denominator."""
+    from research.backtest_dispersion import NIFTY50_2026_10_01
+
+    path = tmp_path / "w.csv"
+    names = list(NIFTY50_2026_10_01)[1:]
+    pd.DataFrame({"symbol": names, "weight": [1.0] * len(names)}).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="missing"):
+        DispersionPaperStrategy(
+            _Boom(), config_path=_cfg(tmp_path), mode="paper", weights_path=path,
+        )
 
 
 def test_hedge_lots_match_the_replay_and_the_next_move_is_futures_pnl(tmp_path):
@@ -236,12 +280,12 @@ def test_flat_expiry_settles_intrinsic_and_charges_long_exercise_stt_only(tmp_pa
     assert strat.book is None
     row = strat.closed[-1]
     assert row["status"] == "ok"
-    # Short index: received 20, intrinsic 0. Each long: paid 10, intrinsic 10.
-    # Using the 0.01 floor on the short would book 19.98 instead of 20.
-    assert row["premium_pnl"] == pytest.approx(20.0)
-    stt = exercise_stt(110.0, 100.0, 1, 1, 1) + exercise_stt(110.0, 100.0, 1, 1, 1)
+    # Short index, 4 lots: received 40, intrinsic 0. Each long, 2 lots: paid
+    # 20, intrinsic 20. Using the 0.01 floor on the short would book 39.96.
+    assert row["premium_pnl"] == pytest.approx(40.0)
+    stt = exercise_stt(110.0, 100.0, 2, 1, 1) + exercise_stt(110.0, 100.0, 2, 1, 1)
     assert stt > 0
-    assert exercise_stt(100.0, 100.0, 2, 1, -1) == 0.0
+    assert exercise_stt(100.0, 100.0, 4, 1, -1) == 0.0
     assert row["exercise_stt"] == pytest.approx(stt)
     assert row["costs"] == pytest.approx(before + stt)
     assert row["net"] == pytest.approx(row["premium_pnl"] + row["futures_pnl"] - row["costs"])
@@ -300,6 +344,58 @@ def test_missed_expiry_is_labelled_and_does_not_open_the_next_one(tmp_path):
     assert strat.closed[-1]["status"] == "missed_settlement"
     assert new_expiry.isoformat() not in strat.traded_expiries
     assert not any(row.get("status") == "PAPER_OPEN" for row in out)
+    # The runner ticks every minute through the window and may restart. The
+    # skip has to outlive this call, or the next tick opens the late book.
+    again = strat.on_close(_view(late, _names(), previous=EXPIRY, front=new_expiry))
+    assert strat.book is None
+    assert not any(row.get("status") == "PAPER_OPEN" for row in again)
+    restored = _strategy(tmp_path)
+    restored.load_dict(strat.to_dict())
+    restored.on_close(_view(late, _names(), previous=EXPIRY, front=new_expiry))
+    assert restored.book is None
+
+
+def test_missed_settlement_marks_the_expired_future_at_spot(tmp_path):
+    """After expiry the nearest future is next month's. Its price minus the
+    expired contract's last mark is a calendar spread, not hedge pnl. The
+    expired contract settled at the underlying, the level the options use."""
+    strat = _strategy(tmp_path)
+    strat.on_close(_roll_view())
+    day2 = date(2026, 10, 29)
+    strat.on_close(_view(day2, {sym: _surface(sym, 110.0, 110.0) for sym in NAMES}))
+    held = {sym: pos.lots for sym, pos in strat.book.futures.items()}
+    assert held["NIFTY"] != 0
+    late = date(2026, 11, 25)
+    names = {}
+    for sym in NAMES:
+        surf = _surface(sym, 112.0, 130.0)
+        surf.future_symbol = f"{sym}26DECFUT"
+        names[sym] = surf
+    strat.on_close(_view(late, names, previous=EXPIRY, front=date(2026, 12, 29)))
+    row = strat.closed[-1]
+    assert row["status"] == "missed_settlement"
+    expect = sum(lots * 1 * (112.0 - 110.0) for lots in held.values())
+    assert row["futures_pnl"] == pytest.approx(expect)
+
+
+def test_half_point_strike_symbols_pass_validation():
+    """ITC and POWERGRID list strikes like 317.5. Rejecting the dot rejects
+    the whole open batch on a roll where one of them is ATM."""
+    from core.trade_proposer import TradeProposal
+    from strategies.base import OrderValidationError, validate_order
+
+    def prop(sym):
+        return TradeProposal(
+            tradingsymbol=sym, instrument_token=0, strike=317.5, expiry="2026-10-27",
+            option_type="CE", lot_size=1600, quantity=1, price=5.0,
+            transaction_type="BUY", iv=0.2, bid_ask_spread_pct=0.0, margin_required=0.0,
+        )
+
+    validate_order(prop("ITC26OCT317.5CE"))
+    validate_order(prop("POWERGRID26OCT232.5PE"))
+    for bad in ("ITC.CE", "ITC26OCT317.5", "ITC26OCT317..5CE", "A.5CE.5PE"):
+        with pytest.raises(OrderValidationError):
+            validate_order(prop(bad))
 
 
 def test_missing_settlement_spot_leaves_the_book_open(tmp_path):
@@ -313,15 +409,32 @@ def test_missing_settlement_spot_leaves_the_book_open(tmp_path):
     assert strat.closed == []
 
 
-def test_missing_future_on_expiry_leaves_the_book_open(tmp_path):
-    """A flatten that cannot see the future is not a close."""
+def test_missing_future_on_expiry_leaves_a_hedged_book_open(tmp_path):
+    """A flatten that cannot see the future it holds is not a close."""
     strat = _strategy(tmp_path)
     strat.on_close(_roll_view())
+    day2 = date(2026, 10, 29)
+    strat.on_close(_view(day2, {sym: _surface(sym, 110.0, 110.0) for sym in NAMES}))
+    assert strat.book.futures["AAA"].lots != 0
     names = _names()
     names["AAA"] = _surface("AAA", 100.0, None, strike=100.0)
     strat.on_close(_view(EXPIRY, names))
     assert strat.book is not None
     assert strat.closed == []
+
+
+def test_missing_future_on_a_never_hedged_leg_still_settles(tmp_path):
+    """A leg that holds no future has nothing to flatten. Waiting for its
+    quote would hold the book past expiry and block every later roll."""
+    strat = _strategy(tmp_path)
+    no_fut = _names()
+    no_fut["AAA"] = _surface("AAA", 100.0, None, strike=100.0)
+    strat.on_close(SessionView(ENTRY, PREV, EXPIRY, no_fut))
+    assert strat.book is not None
+    assert strat.book.futures.get("AAA") is None
+    strat.on_close(_view(EXPIRY, dict(no_fut)))
+    assert strat.book is None
+    assert strat.closed[-1]["status"] == "ok"
 
 
 def test_incomplete_straddle_opens_nothing(tmp_path):
@@ -509,7 +622,7 @@ def test_chain_quote_uses_a_positive_last_and_the_future_when_cash_is_missing(ca
 
     with caplog.at_level("WARNING"):
         view = build_session_view(
-            _Client(), session, PREV, ["AAA", "BBB"], book=None, min_names=2,
+            _Client(), session, PREV, ["AAA", "BBB"], books=[None], min_names=2,
         )
     assert view.front_expiry == far
     assert view.is_roll
@@ -522,3 +635,94 @@ def test_chain_quote_uses_a_positive_last_and_the_future_when_cash_is_missing(ca
     assert "NIFTY26NOV200CE" not in asked
     assert any("future price" in rec.message for rec in caplog.records)
     assert INDEX == "NIFTY"
+
+
+def test_short_vol_book_is_the_pr9_sizing_with_its_own_name_and_state(tmp_path):
+    """The raw book sizes each covered name at its raw weight once 30% of
+    the weight is covered. With four equal names (two quoted) that is one
+    lot each against four index lots: half the index notional, so the book
+    is net short index vol by construction — which is why it is labelled
+    and stored apart from the matched book, and gets no match warning."""
+    raw = _strategy(tmp_path, sizing="raw")
+    matched = _strategy(tmp_path)
+    assert raw.name == "dispersion_short_vol_paper"
+    assert matched.name == "dispersion_paper"
+    raw.on_close(_roll_view())
+    matched.on_close(_roll_view())
+    r = {leg.symbol: leg.lots for leg in raw.book.legs}
+    m = {leg.symbol: leg.lots for leg in matched.book.legs}
+    assert r == {"NIFTY": 4, "AAA": 1, "BBB": 1}
+    assert m == {"NIFTY": 4, "AAA": 2, "BBB": 2}
+    assert raw.book.notional_ratio == pytest.approx(0.5)
+    assert matched.book.notional_ratio == pytest.approx(1.0)
+    assert raw.generate_eod_report()["sizing"] == "raw"
+    assert _state_file(raw) == SHORT_VOL_STATE_FILE
+    assert _state_file(matched) == STATE_FILE
+    assert SHORT_VOL_STATE_FILE != STATE_FILE
+    with pytest.raises(ValueError, match="sizing"):
+        _strategy(tmp_path, sizing="grid")
+
+
+def test_one_view_quotes_the_chain_when_either_book_is_flat():
+    """Both books read one view. If one is open and the other flat on a
+    roll, the view must carry the entry chain for the flat one as well as
+    the open book's names, or the flat book silently skips its roll."""
+    from types import SimpleNamespace
+
+    session = date(2026, 10, 28)
+    far = date(2026, 11, 24)
+    rows = []
+    for name in ("NIFTY", "AAA", "BBB"):
+        for kind in ("CE", "PE"):
+            rows.append({"name": name, "instrument_type": kind, "expiry": far,
+                         "strike": 100.0, "tradingsymbol": f"{name}26NOV100{kind}", "lot_size": 1})
+        rows.append({"name": name, "instrument_type": "FUT", "expiry": far, "strike": 0,
+                     "tradingsymbol": f"{name}26NOVFUT", "lot_size": 1})
+
+    class _Client:
+        def instruments(self, exchange=None):
+            return rows
+
+        def quote(self, keys):
+            return {k: {"last_price": 5.0 if k.endswith(("CE", "PE")) else 100.0} for k in keys}
+
+    open_book = SimpleNamespace(legs=[SimpleNamespace(symbol="AAA")])
+    view = build_session_view(
+        _Client(), session, PREV, ["AAA", "BBB"], books=[open_book, None], min_names=2,
+    )
+    assert view.is_roll
+    assert set(view.names) == {"NIFTY", "AAA", "BBB"}
+    assert view.names["BBB"].quotes
+    held_only = build_session_view(
+        _Client(), session, PREV, ["AAA", "BBB"], books=[open_book, open_book], min_names=2,
+    )
+    assert set(held_only.names) == {"AAA"}
+
+
+def test_a_failed_restore_overwrites_neither_state_file(tmp_path, monkeypatch):
+    """The runner refuses to start when a state file will not load. Its
+    `finally` must not then save the empty, never-loaded books over the
+    broken file — or over the other book's good one — or the next run
+    starts clean and forgets a book it never settled."""
+    import runners.run_paper_dispersion as r
+
+    good = tmp_path / "sv.json"
+    broken = tmp_path / "m.json"
+    strat = _strategy(tmp_path, sizing="raw")
+    strat.on_close(_roll_view())
+    good.write_text(json.dumps(strat.to_dict()))
+    broken.write_text('{"book": {"expiry": "2026-11-24"')          # truncated
+    good_before, broken_before = good.read_bytes(), broken.read_bytes()
+
+    monkeypatch.setattr(r, "STATE_FILE", broken)
+    monkeypatch.setattr(r, "SHORT_VOL_STATE_FILE", good)
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(r, "LOCK_FILE", tmp_path / ".lock")
+    monkeypatch.setattr(r, "SILENT_FAIL_FLAG", tmp_path / "SF")
+    monkeypatch.setattr(r, "assert_timezone_ist", lambda log: None)
+    monkeypatch.setattr(r, "previous_front", lambda *a, **k: PREV)
+    monkeypatch.setattr(r, "market_client", lambda cfg: _Boom())
+    with pytest.raises(Exception):
+        r.main(["--force", "--once", "--ignore-entry-window", "--config", _cfg(tmp_path)])
+    assert broken.read_bytes() == broken_before
+    assert good.read_bytes() == good_before

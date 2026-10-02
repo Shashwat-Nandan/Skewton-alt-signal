@@ -13,10 +13,16 @@ expiry). That sample cannot clear the promotion bar of 36 expiries with
 12 held out. ``mode="live"`` raises. This class is not in STRATEGIES, so
 the dashboard cannot start it.
 
-Weights are equal across the Nifty 50 list published 2026-10-01. There
-is no free-float file. Dropped names stay in the weight denominator.
-Index lots scale until covered weight reaches 30%, the same rule as the
-replay, capped at ``max_index_lots``.
+Weights are NSE free-float weights for the Nifty 50 list published
+2026-10-01 (``market_data/nifty50_weights.csv``, a snapshot written by
+``market_data.fetch_index_weights``). ``weights_path=None`` falls back to
+equal weight and labels the book so.
+
+Index lots scale until 30% of the names are covered (at most 40%, the
+heaviest kept; Bloch §7.6.2.1), the same gate as the replay, capped at
+``max_index_lots``. Dropped names stay in that gate's name count. The covered names are then rescaled so the long stock
+straddles carry the index straddle's notional (Bloch §7.6.5.1); the
+long/short notional ratio is recorded on the book.
 """
 from __future__ import annotations
 
@@ -24,25 +30,32 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
 from core.trade_proposer import TradeProposal
+from market_data.fetch_index_weights import NIFTY50_WEIGHTS_PATH
 from research.backtest_dispersion import (
     INDEX,
     MAX_INDEX_LOTS,
     NIFTY50_2026_10_01,
+    SIZINGS,
     choose_lots,
     equal_weights,
     exercise_stt,
     futures_hedge_lots,
     future_order_cost,
+    notional_ratio,
     option_order_cost,
+    read_weights,
     straddle_iv,
     atm_strike,
 )
 from strategies.base import BaseStrategy, validate_order
 
 logger = logging.getLogger(__name__)
+
+SETTLE_BASIS = "window_ltp_proxy"
 
 
 @dataclass
@@ -142,6 +155,7 @@ class OpenBook:
     costs: float
     futures_pnl: float
     last_hedge_session: Optional[date]
+    notional_ratio: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -157,6 +171,7 @@ class OpenBook:
             "last_hedge_session": (
                 self.last_hedge_session.isoformat() if self.last_hedge_session else None
             ),
+            "notional_ratio": self.notional_ratio,
         }
 
     @classmethod
@@ -173,6 +188,7 @@ class OpenBook:
             costs=float(raw["costs"]),
             futures_pnl=float(raw["futures_pnl"]),
             last_hedge_session=date.fromisoformat(last) if last else None,
+            notional_ratio=raw.get("notional_ratio"),
         )
 
 
@@ -182,8 +198,17 @@ class DispersionPaperStrategy(BaseStrategy):
     name = "dispersion_paper"
 
     def __init__(self, client, config_path: str = "config.ini", mode: Optional[str] = None,
-                 max_index_lots: int = MAX_INDEX_LOTS):
+                 max_index_lots: int = MAX_INDEX_LOTS,
+                 weights_path: Optional[Path] = NIFTY50_WEIGHTS_PATH,
+                 sizing: str = "matched"):
         super().__init__(client, config_path, mode)
+        if sizing not in SIZINGS:
+            raise ValueError(f"sizing must be one of {SIZINGS}, got {sizing!r}")
+        # "raw" is the PR 9 sizing, run beside the matched book as its own
+        # labelled short-index-vol book. Its own name keeps its logs apart.
+        self.sizing = sizing
+        if sizing == "raw":
+            self.name = "dispersion_short_vol_paper"
         if self.mode == "live":
             raise NotImplementedError(
                 "dispersion_paper is PAPER/SIGNALS ONLY. The hedged hold-to-expiry "
@@ -193,11 +218,25 @@ class DispersionPaperStrategy(BaseStrategy):
         if max_index_lots < 1:
             raise ValueError("max_index_lots must be >= 1")
         self.max_index_lots = int(max_index_lots)
-        self.weights = equal_weights(NIFTY50_2026_10_01)
+        if weights_path is None:
+            self.weights = equal_weights(NIFTY50_2026_10_01)
+            self.weighting = "equal"
+        else:
+            self.weights = read_weights(Path(weights_path))
+            if set(self.weights) != set(NIFTY50_2026_10_01):
+                raise ValueError(
+                    f"{weights_path} does not cover the 2026-10-01 Nifty 50 list: "
+                    f"missing={sorted(set(NIFTY50_2026_10_01) - set(self.weights))} "
+                    f"extra={sorted(set(self.weights) - set(NIFTY50_2026_10_01))}"
+                )
+            self.weighting = "free_float"
         self.view: Optional[SessionView] = None
         self.book: Optional[OpenBook] = None
         self.closed: List[dict] = []
         self.traded_expiries: set[str] = set()
+        # Fronts given up because a missed settlement spent their roll close.
+        # Persisted: the runner ticks every minute and restarts read state.
+        self.skipped_expiries: set[str] = set()
 
     def set_view(self, view: SessionView) -> None:
         self.view = view
@@ -220,6 +259,8 @@ class DispersionPaperStrategy(BaseStrategy):
                     "missed settlement on %s — leaving the next expiry unopened",
                     view.session,
                 )
+                if view.front_expiry is not None:
+                    self.skipped_expiries.add(view.front_expiry.isoformat())
                 return results
         entries = self.scan_and_propose()
         if entries:
@@ -235,6 +276,10 @@ class DispersionPaperStrategy(BaseStrategy):
         if view.front_expiry.isoformat() in self.traded_expiries:
             logger.info("expiry %s already traded — no second entry", view.front_expiry)
             return []
+        if view.front_expiry.isoformat() in self.skipped_expiries:
+            logger.info("expiry %s skipped after a missed settlement — no late entry",
+                        view.front_expiry)
+            return []
         if (view.front_expiry - view.session).days < 1:
             logger.info("front expiry %s is not ahead of %s — no entry",
                         view.front_expiry, view.session)
@@ -242,7 +287,7 @@ class DispersionPaperStrategy(BaseStrategy):
         built = self._entry_package(view)
         if built is None:
             return []
-        legs, index_lots, covered = built
+        legs, index_lots, covered, ratio = built
         proposals = []
         for leg in legs:
             for opt, px, sym in (("CE", leg.ce, leg.ce_symbol), ("PE", leg.pe, leg.pe_symbol)):
@@ -268,7 +313,8 @@ class DispersionPaperStrategy(BaseStrategy):
                         "pe_symbol": leg.pe_symbol,
                         "index_lots": index_lots,
                         "covered_weight": covered,
-                        "weighting": "equal",
+                        "weighting": self.weighting,
+                        "notional_ratio": ratio,
                     },
                 ))
         return proposals
@@ -331,6 +377,7 @@ class DispersionPaperStrategy(BaseStrategy):
         book = self.book.to_dict() if self.book else None
         return {
             "strategy": self.name,
+            "sizing": self.sizing,
             "mode": self.mode,
             "open": book,
             "closed": len(self.closed),
@@ -343,6 +390,7 @@ class DispersionPaperStrategy(BaseStrategy):
             "book": self.book.to_dict() if self.book else None,
             "closed": self.closed,
             "traded_expiries": sorted(self.traded_expiries),
+            "skipped_expiries": sorted(self.skipped_expiries),
             "max_index_lots": self.max_index_lots,
         }
 
@@ -351,6 +399,7 @@ class DispersionPaperStrategy(BaseStrategy):
         self.book = OpenBook.from_dict(book) if book else None
         self.closed = list(raw.get("closed") or [])
         self.traded_expiries = set(raw.get("traded_expiries") or [])
+        self.skipped_expiries = set(raw.get("skipped_expiries") or [])
         if raw.get("max_index_lots"):
             self.max_index_lots = int(raw["max_index_lots"])
         if self.book is not None:
@@ -400,23 +449,32 @@ class DispersionPaperStrategy(BaseStrategy):
             picked[sym] = (k, q[1], q[2], siv, syms, surface.option_lot, 1, weight)
         sized = choose_lots(
             index.spot, index.option_lot, self.weights, spots, lot_sizes,
-            max_index_lots=self.max_index_lots,
+            max_index_lots=self.max_index_lots, sizing=self.sizing,
         )
         if sized is None:
             logger.info(
-                "covered weight stayed under 30%% at %d index lots — no entry",
-                self.max_index_lots,
+                "[%s] coverage gate not met at %d index lots — no entry",
+                self.name, self.max_index_lots,
             )
             return None
         index_lots, stock_lots, covered = sized
         legs = [_leg_from_pick(INDEX, picked[INDEX], index_lots)]
         for sym, lots in stock_lots.items():
             legs.append(_leg_from_pick(sym, picked[sym], lots))
-        logger.info(
-            "dispersion package expiry %s index_lots=%d names=%d covered=%.2f",
-            view.front_expiry, index_lots, len(stock_lots), covered,
+        ratio = notional_ratio(
+            index.spot, index.option_lot, index_lots, spots, lot_sizes, stock_lots,
         )
-        return legs, index_lots, covered
+        logger.info(
+            "dispersion package expiry %s index_lots=%d names=%d covered=%.2f "
+            "long/short notional=%.3f",
+            view.front_expiry, index_lots, len(stock_lots), covered, ratio or float("nan"),
+        )
+        if self.sizing == "matched" and (ratio is None or abs(ratio - 1.0) > 0.10):
+            logger.warning(
+                "long/short notional %s is more than 10%% off the paper's match — "
+                "whole-lot rounding at %d index lots", ratio, index_lots,
+            )
+        return legs, index_lots, covered, ratio
 
     def _hedge_proposals(self, view: SessionView, flatten: bool) -> Optional[List[TradeProposal]]:
         book = self.book
@@ -428,19 +486,34 @@ class DispersionPaperStrategy(BaseStrategy):
             pos = book.futures.get(leg.symbol)
             held = pos.lots if pos else 0
             if surface is None or not surface.future_price or surface.future_lot <= 0:
-                if held != 0 or flatten:
+                if held != 0:
                     logger.error(
                         "no future for %s while the hedge is %s — not marking this close",
                         leg.symbol, held,
                     )
                     return None
+                # Nothing is held, so a flatten has nothing to trade or mark.
                 logger.info("no future for %s — that straddle stays unhedged this close", leg.symbol)
                 continue
             target = 0 if flatten else futures_hedge_lots(
                 surface.spot, leg.strike, dte, leg.iv, leg.lots, leg.lot_size,
                 leg.side, surface.future_lot,
             )
-            delta = target - held
+            # The held contract is no longer the nearest future only after it
+            # expired (a missed settlement). It settled at the underlying, so
+            # it is marked at spot — the same level the options settle at —
+            # and the new target is a fresh position in the quoted contract.
+            rolled = (
+                pos is not None and held != 0 and bool(surface.future_symbol)
+                and pos.tradingsymbol != surface.future_symbol
+            )
+            if rolled:
+                logger.error(
+                    "%s hedge contract %s expired — marking it at spot %.2f, not %s",
+                    leg.symbol, pos.tradingsymbol, surface.spot, surface.future_symbol,
+                )
+            mark_px = float(surface.spot) if rolled else float(surface.future_price)
+            delta = target if rolled else target - held
             proposals.append(TradeProposal(
                 tradingsymbol=surface.future_symbol or f"{leg.symbol}FUT",
                 instrument_token=0, strike=0.0, expiry=book.expiry.isoformat(),
@@ -456,6 +529,8 @@ class DispersionPaperStrategy(BaseStrategy):
                     "prev_lots": held,
                     "prev_px": None if pos is None else pos.last_px,
                     "price": float(surface.future_price),
+                    "mark_px": mark_px,
+                    "rolled": rolled,
                     "lot_size": surface.future_lot,
                     "tradingsymbol": surface.future_symbol,
                 },
@@ -534,6 +609,7 @@ class DispersionPaperStrategy(BaseStrategy):
             weighting=str(first["weighting"]),
             legs=legs, futures={}, costs=costs, futures_pnl=0.0,
             last_hedge_session=None,
+            notional_ratio=first.get("notional_ratio"),
         )
         self.traded_expiries.add(view.front_expiry.isoformat())
         hedge = self._hedge_proposals(view, flatten=False) or []
@@ -544,9 +620,9 @@ class DispersionPaperStrategy(BaseStrategy):
             if surface is not None and surface.spot > 0:
                 notional += leg.lots * leg.lot_size * surface.spot
         logger.info(
-            "[PAPER OPEN] dispersion expiry %s index_lots=%d names=%d covered=%.2f "
+            "[PAPER OPEN] %s expiry %s index_lots=%d names=%d covered=%.2f "
             "costs=₹%.0f gross_notional=₹%.0f",
-            view.front_expiry, self.book.index_lots, len(legs) - 1,
+            self.name, view.front_expiry, self.book.index_lots, len(legs) - 1,
             self.book.covered_weight, self.book.costs, notional,
         )
         return [{"status": "PAPER_OPEN", "expiry": view.front_expiry.isoformat(),
@@ -564,11 +640,15 @@ class DispersionPaperStrategy(BaseStrategy):
             prev_lots = int(snap["prev_lots"])
             prev_px = snap["prev_px"]
             price = float(snap["price"])
+            mark_px = float(snap.get("mark_px", price))
             lot_size = int(snap["lot_size"])
             target = int(snap["target_lots"])
+            held_pos = book.futures.get(snap["symbol"])
+            held_lot = held_pos.lot_size if held_pos is not None else lot_size
             if prev_px is not None and prev_lots != 0:
-                book.futures_pnl += prev_lots * lot_size * (price - float(prev_px))
-            delta = target - prev_lots
+                book.futures_pnl += prev_lots * held_lot * (mark_px - float(prev_px))
+            # An expired contract settled; only the new target is traded.
+            delta = target if snap.get("rolled") else target - prev_lots
             if delta != 0:
                 side = "BUY" if delta > 0 else "SELL"
                 book.costs += future_order_cost(price, abs(delta), lot_size, side)
@@ -616,6 +696,13 @@ class DispersionPaperStrategy(BaseStrategy):
             "index_lots": book.index_lots,
             "covered_weight": book.covered_weight,
             "weighting": book.weighting,
+            "sizing": self.sizing,
+            "notional_ratio": book.notional_ratio,
+            # Intrinsic is taken off the spot LTP at the 15:00–15:20 pass, not
+            # NSE's settlement (15:00–15:30 average) nor the replay's bhavcopy
+            # close. Labelled so the paper record is not read as the official
+            # settlement (review 2026-10-02).
+            "settle_basis": SETTLE_BASIS,
             "premium_pnl": premium,
             "futures_pnl": book.futures_pnl,
             "costs": costs,
@@ -625,9 +712,9 @@ class DispersionPaperStrategy(BaseStrategy):
         self.closed.append(row)
         self.book = None
         logger.info(
-            "[PAPER SETTLE] dispersion expiry %s status=%s premium=₹%.0f "
+            "[PAPER SETTLE] %s expiry %s status=%s premium=₹%.0f "
             "futures=₹%.0f costs=₹%.0f net=₹%.0f",
-            row["expiry"], row["status"], premium, row["futures_pnl"], costs, net,
+            self.name, row["expiry"], row["status"], premium, row["futures_pnl"], costs, net,
         )
         # `status` on the closed row is the cycle outcome. The fill status
         # stays PAPER_SETTLE so a caller can tell a fill from a rejection.

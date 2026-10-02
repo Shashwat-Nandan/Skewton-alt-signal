@@ -8,6 +8,7 @@ import { ArbitragePage } from "@/pages/ArbitragePage";
 import { BuyOnGapPage } from "@/pages/BuyOnGapPage";
 import { DashboardLoginPage } from "@/pages/DashboardLoginPage";
 import { DeliveryAccumPage } from "@/pages/DeliveryAccumPage";
+import { DispersionPage } from "@/pages/DispersionPage";
 import { ShortCallPage } from "@/pages/ShortCallPage";
 import { EquitySwingPage } from "@/pages/EquitySwingPage";
 import { KalmanPairsPage } from "@/pages/KalmanPairsPage";
@@ -84,6 +85,7 @@ export default function App() {
           <Route path="/equity-swing" element={<EquitySwingPage />} />
           <Route path="/delivery" element={<DeliveryAccumPage />} />
           <Route path="/short-call" element={<ShortCallPage />} />
+          <Route path="/dispersion" element={<DispersionPage />} />
         </Routes>
       </main>
     </div>

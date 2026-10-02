@@ -27,14 +27,19 @@ half-spread hold-to-expiry return:
   flatten exit is a traded close and pays no exercise STT.
 - Delta is hedged with the future. The paper hedges with the stock; the
   stock hedge would be charged delivery STT, which this book does not trade.
-- Whole lots only. Index lots are scaled up to the smallest count whose
-  covered free-float weight is at least 30% (the paper's market practice of
-  holding 30–40% of the names). Weights are not renormalised after a name
-  is dropped.
+- Whole lots only. Index lots are scaled up to the smallest count that
+  covers at least 30% of the names (at most 40%, heaviest kept; §7.6.2.1).
+  Dropped names stay in that gate's name count. Before 2026-10-02 the gate
+  was 30% of weight, which admitted 4 names under free-float weights. The covered names are then rescaled so the stock straddles
+  carry the index straddle's notional (§7.6.5.1, Σ ν_i S_i = S_I); before
+  2026-10-02 they were sized at their raw weight, which left ~70% of the
+  short index straddle uncovered.
 - The constituent list is the Nifty 50 published by NSE Indices on
   2026-10-01. Applied to earlier sessions it is look-ahead for names that
-  joined during the sample. A free-float file was not available from this
-  host; ``--equal-weight`` is an explicit substitute and is labelled as such.
+  joined during the sample. ``--weights market_data/nifty50_weights.csv``
+  is NSE's free-float snapshot of 01-Oct-2026 16:00
+  (``market_data.fetch_index_weights``), applied to every past session;
+  ``--equal-weight`` is an explicit substitute and is labelled as such.
 - The ledger is rupees of premium, hedge, and statutory cost. Margin and
   the risk-free return on margin are not in it. The gamma split is the
   paper's equation (7.7.30) attribution, not cash.
@@ -71,7 +76,15 @@ RISK_FREE = 0.065
 RV_WINDOW = 20
 M_RHO_MIN_HISTORY = 20
 M_RHO_QUANTILE = 0.80
+# Bloch §7.6.2.1: long straddles on 30% to 40% of the stocks in the index.
+# A share of the name count, not of weight (changed 2026-10-02: under
+# free-float weights a 30%-of-weight gate admitted 4 names).
+MIN_COVERED_NAMES = 0.30
+MAX_COVERED_NAMES = 0.40
+# The PR 9 sizing, kept as its own labelled book ("raw"): 30% of weight
+# covered, each name at its raw weight, no rescale. Net short index vol.
 MIN_COVERED_WEIGHT = 0.30
+SIZINGS = ("matched", "raw")
 MAX_INDEX_LOTS = 200
 FLATTEN_DTE = 2
 MONEYNESS_LO = 0.85
@@ -190,11 +203,28 @@ def choose_lots(
     spots: Mapping[str, float],
     lot_sizes: Mapping[str, int],
     max_index_lots: int = MAX_INDEX_LOTS,
+    sizing: str = "matched",
 ) -> Optional[Tuple[int, Dict[str, int], float]]:
-    """Smallest index-lot count whose covered weight reaches the 30% floor.
+    """Index lots and notional-matched stock lots (Bloch §7.6.5.1).
 
-    A name is covered only when its share of ``n`` index lots floors to at
-    least one stock lot. Weights of dropped names stay in the denominator.
+    ``sizing="raw"`` is the PR 9 book instead: the smallest ``n`` whose
+    covered *weight* reaches 30%, each covered name at the floor of its
+    raw-weight share, no rescale. It is short ~70% of the index straddle
+    unhedged by stock straddles, i.e. mostly short index vol.
+
+    The gate (§7.6.2.1, 30–40% of the stocks): ``n`` is the smallest
+    index-lot count at which at least ceil(30%) of the weighted names are
+    covered. A name is covered only when its raw-weight share of ``n``
+    index lots floors to at least one stock lot. Dropped names stay in the
+    name count, so a thin quote cannot pass the gate. When more than
+    ceil(40%) clear, the heaviest-weighted ones are kept (§7.6.2.3).
+
+    The size: the covered names are then rescaled to the whole index,
+    ν_i = (w_i / W_C) · S_I / S_i per index unit, so the long baskets'
+    notional matches the short index straddle's (Σ ν_i S_i = S_I). Without
+    that rescale the book is short 100% of the index straddle against ~30%
+    of long stock straddles: a short-index-vol book, not a dispersion one.
+    ``covered`` is the raw W_C. Lots round half up.
     """
     if index_spot <= 0 or index_lot_size <= 0:
         return None
@@ -207,6 +237,31 @@ def choose_lots(
         per_lot[sym] = w * index_lot_size * index_spot / spot
     if not per_lot:
         return None
+    if sizing == "raw":
+        return _raw_lots(per_lot, weights, lot_sizes, max_index_lots)
+    if sizing != "matched":
+        raise ValueError(f"sizing must be one of {SIZINGS}, got {sizing!r}")
+    universe = sum(1 for w in weights.values() if w > 0)
+    min_names = math.ceil(MIN_COVERED_NAMES * universe - 1e-9)
+    max_names = math.ceil(MAX_COVERED_NAMES * universe - 1e-9)
+    for n in range(1, max_index_lots + 1):
+        cleared = [
+            sym for sym, shares in per_lot.items()
+            if math.floor(shares * n / lot_sizes[sym]) >= 1
+        ]
+        if len(cleared) < min_names:
+            continue
+        keep = sorted(cleared, key=lambda sym: (-weights[sym], sym))[:max_names]
+        covered = sum(weights[sym] for sym in keep)
+        matched = {
+            sym: max(1, math.floor(per_lot[sym] / covered * n / lot_sizes[sym] + 0.5))
+            for sym in keep
+        }
+        return n, matched, covered
+    return None
+
+
+def _raw_lots(per_lot, weights, lot_sizes, max_index_lots):
     for n in range(1, max_index_lots + 1):
         lots: Dict[str, int] = {}
         covered = 0.0
@@ -218,6 +273,21 @@ def choose_lots(
         if covered + 1e-12 >= MIN_COVERED_WEIGHT:
             return n, lots, covered
     return None
+
+
+def notional_ratio(
+    index_spot: float, index_lot_size: int, index_lots: int,
+    spots: Mapping[str, float], lot_sizes: Mapping[str, int], stock_lots: Mapping[str, int],
+) -> Optional[float]:
+    """Long stock-straddle notional over short index-straddle notional.
+
+    1.0 is the paper's match. Whole-lot rounding moves it off 1.
+    """
+    short = index_spot * index_lot_size * index_lots
+    if short <= 0:
+        return None
+    long_ = sum(spots[s] * lot_sizes[s] * k for s, k in stock_lots.items())
+    return long_ / short
 
 
 def atm_strike(spot: float, quotes: Sequence[Tuple[float, float, float, float, float]]) -> Optional[float]:
@@ -393,6 +463,7 @@ class CycleResult:
     off_diagonal: float
     status: str
     weighting: str
+    sizing: str = "matched"
 
 
 def _premium_cash(leg: _Leg, ce: float, pe: float, opening: bool) -> Tuple[float, float]:
@@ -556,22 +627,36 @@ def simulate_cycle(
             sigmas: Dict[str, float] = {}
             weights: Dict[str, float] = {}
             theta_b = 0.0
-            wsum = sum(leg.weight for leg in legs if leg.side > 0)
+            # Calendar days in this step. Theta is per calendar day, so the
+            # move is standardised on the same clock (a weekend is 3 days).
+            step = prev[1] - dte
+            if step <= 0:
+                continue
+            # ω̂_i of (7.7.30) is each long leg's share of the held basket
+            # notional at the start of the step, not the target weight.
+            basket: Dict[str, float] = {}
+            for leg in legs:
+                if leg.side <= 0:
+                    continue
+                a = prev[4].get(leg.symbol) or (prev[2].get(leg.symbol).spot if leg.symbol in prev[2] else None)
+                if a and a > 0:
+                    basket[leg.symbol] = leg.lots * leg.lot_size * a
+            wsum = sum(basket.values())
             for leg in legs:
                 a = prev[4].get(leg.symbol) or (prev[2].get(leg.symbol).spot if leg.symbol in prev[2] else None)
                 b = spots.get(leg.symbol) or (quotes.get(leg.symbol).spot if leg.symbol in quotes else None)
                 if not a or not b or a <= 0 or b <= 0 or leg.iv <= 0:
                     continue
-                move = math.log(b / a) * math.sqrt(252) / leg.iv
+                move = math.log(b / a) / (leg.iv * math.sqrt(step / 365.0))
                 if leg.side < 0:
-                    theta_b = _straddle_theta(b, leg.strike, dte, leg.iv, leg.lots, leg.lot_size)
+                    theta_b = step * _straddle_theta(b, leg.strike, dte, leg.iv, leg.lots, leg.lot_size)
                     continue
-                if wsum <= 0:
+                if wsum <= 0 or leg.symbol not in basket:
                     continue
                 nmove[leg.symbol] = move
-                theta_i[leg.symbol] = _straddle_theta(b, leg.strike, dte, leg.iv, leg.lots, leg.lot_size)
+                theta_i[leg.symbol] = step * _straddle_theta(b, leg.strike, dte, leg.iv, leg.lots, leg.lot_size)
                 sigmas[leg.symbol] = leg.iv
-                weights[leg.symbol] = leg.weight / wsum
+                weights[leg.symbol] = basket[leg.symbol] / wsum
             if theta_i and theta_b != 0.0 and sigma_b > 0:
                 d_pnl, o_pnl = dispersion_gamma_pnl(
                     theta_b, theta_i, weights, sigmas, sigma_b, nmove, rho,
@@ -590,6 +675,7 @@ def build_cycle_rows(
     weighting: str,
     index_closes: Sequence[float],
     close_dates: Sequence[date],
+    sizing: str = "matched",
 ) -> List[CycleResult]:
     """Book A on every roll that can be sized. Book B only when the gate opens.
 
@@ -689,7 +775,7 @@ def build_cycle_rows(
             lots_sz[sym] = qq.lot_size
             ivs[sym] = iv
             strikes[sym] = ks
-        sized = choose_lots(spot_i, q_i.lot_size, weights_n, spots, lots_sz)
+        sized = choose_lots(spot_i, q_i.lot_size, weights_n, spots, lots_sz, sizing=sizing)
         if sized is None:
             for book in ("A", "B"):
                 rows.append(_empty(book, expiry, entry, q_i, rho, iv_i, rv, weighting, "coverage_short"))
@@ -734,6 +820,8 @@ def build_cycle_rows(
                         off_diagonal=off if hedge else 0.0,
                         status=status, weighting=weighting,
                     ))
+    for row in rows:
+        row.sizing = sizing
     return rows
 
 
@@ -941,11 +1029,12 @@ def read_weights(path: Path) -> Dict[str, float]:
     return out
 
 
-def run(chain: Chain, weights: Mapping[str, float], *, weighting: str, index_closes, close_dates) -> pd.DataFrame:
+def run(chain: Chain, weights: Mapping[str, float], *, weighting: str, index_closes, close_dates,
+        sizing: str = "matched") -> pd.DataFrame:
     warn_if_daily()
     rows = build_cycle_rows(
         chain, weights, weighting=weighting,
-        index_closes=index_closes, close_dates=close_dates,
+        index_closes=index_closes, close_dates=close_dates, sizing=sizing,
     )
     return results_frame(rows)
 
@@ -979,6 +1068,9 @@ def main(argv: Optional[Sequence[str]] = None) -> pd.DataFrame:
     p = argparse.ArgumentParser(description="Nifty dispersion books A and B (research only)")
     p.add_argument("--raw-dir", type=Path, default=Path("data_cache/bhavcopy_raw"))
     p.add_argument("--weights", type=Path, default=None, help="CSV with columns symbol,weight")
+    p.add_argument("--sizing", choices=SIZINGS, default="matched",
+                   help="matched: Bloch §7.6.5.1 notional match on 30–40%% of names. "
+                        "raw: the PR 9 short-vol book (30%% of weight, raw lots).")
     p.add_argument("--equal-weight", action="store_true",
                    help="1/N on the 2026-10-01 Nifty 50 list. Not free-float.")
     p.add_argument("--output", type=Path, default=Path("data_cache/dispersion_cycles.csv"))
@@ -997,10 +1089,11 @@ def main(argv: Optional[Sequence[str]] = None) -> pd.DataFrame:
         symbols = NIFTY50_2026_10_01
     else:
         weights = read_weights(args.weights)
-        weighting = "file"
+        weighting = f"file:{args.weights.name}"
         symbols = tuple(weights)
     chain, close_dates, closes = load_chain(args.raw_dir, symbols)
-    df = run(chain, weights, weighting=weighting, index_closes=closes, close_dates=close_dates)
+    df = run(chain, weights, weighting=weighting, index_closes=closes, close_dates=close_dates,
+             sizing=args.sizing)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False)
     logger.info("wrote %s (%d rows)", args.output, len(df))
