@@ -393,6 +393,17 @@ export function DispersionPage() {
         </p>
       </div>
 
+      {data.runner_silent_fail && (
+        <div className="flex items-start gap-2 rounded-md border border-rose-600/50 bg-rose-600/10 p-4 text-sm text-rose-600">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            Runner stopped: every pass in a decision window failed (SILENT_FAIL_dispersion_paper).
+            That window's hedge or settlement may not have happened. Investigate the runner and
+            quotes, then <code>rm data_cache/SILENT_FAIL_dispersion_paper</code>.
+          </span>
+        </div>
+      )}
+
       <div className="flex items-start gap-2 rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
         <Info className="mt-0.5 h-4 w-4 shrink-0" />
         <span>

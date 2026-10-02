@@ -880,4 +880,5 @@ export type DispersionBook = {
 
 export type DispersionResponse = {
   books: DispersionBook[];
+  runner_silent_fail: boolean;
 };

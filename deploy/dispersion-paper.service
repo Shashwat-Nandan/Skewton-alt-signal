@@ -6,8 +6,8 @@ After=network-online.target
 OnFailure=notify-failure@%n.service
 # Cap a crashloop at 5 restarts within 10 minutes — past that systemd gives up
 # and notify-failure@ alerts rather than burning CPU forever. A state file that
-# will not restore makes the runner refuse to start (exit non-zero) without
-# touching either book's state, so a crashloop here is loud, not destructive.
+# will not restore makes the runner refuse to start (exit 1) without touching
+# either book's state; the restarts exhaust the limit before 15:00 and alert.
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -35,6 +35,11 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_dispers
 # after 15:30), which does NOT trigger a restart.
 Restart=on-failure
 RestartSec=30
+# Exit 3 = the heartbeat saw every pass fail (SILENT_FAIL_dispersion_paper is
+# touched). Do not restart: a fresh process resets the count and can reach
+# 15:20 and exit 0 with the window's hedge/settle never done. Failing the
+# unit fires notify-failure@ (runners/run_paper_dispersion.SILENT_FAIL_EXIT).
+RestartPreventExitStatus=3
 TimeoutStartSec=0
 StandardOutput=journal
 StandardError=journal

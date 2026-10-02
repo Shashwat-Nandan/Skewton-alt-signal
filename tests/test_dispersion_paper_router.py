@@ -141,3 +141,10 @@ def test_route_is_behind_the_dashboard_session(tmp_path, cache):
                 "dispersion_paper", "dispersion_short_vol_paper"}
     finally:
         db.reset_for_tests(None)
+
+
+def test_silent_fail_marker_is_reported(cache):
+    """A dead runner must not look like a quiet, healthy book."""
+    assert dr.dispersion_paper().runner_silent_fail is False
+    (cache / "SILENT_FAIL_dispersion_paper").touch()
+    assert dr.dispersion_paper().runner_silent_fail is True

@@ -435,7 +435,16 @@ TZ=Asia/Kolkata .venv/bin/python -m runners.run_paper_dispersion --dry-run --for
 
 **Known limitation:** settlement values each leg's intrinsic off the spot LTP at the 15:00–15:20 pass, not NSE's 15:00–15:30 average. Closed cycles carry `settle_basis: window_ltp_proxy` and the dashboard marks them. A state file that will not restore makes the runner refuse to start without rewriting either book's state; fix or move the file, then `systemctl reset-failed dispersion-paper.service`.
 
-**Dashboard:** restart `dashboard-backend.service` for `/api/dispersion-paper`, and rebuild/redeploy `frontend/dist` for the "Dispersion (paper)" tab (§10). The 2-year replay curves read `data_cache/dispersion_cycles_{matched,short_vol}.csv`; regenerate with `python -m research.backtest_dispersion --raw-dir data_cache/research_bhavcopy_raw` plus `--weights market_data/nifty50_weights.csv --sizing matched` or `--equal-weight --sizing raw`.
+**Dashboard:** restart `dashboard-backend.service` for `/api/dispersion-paper`, and rebuild/redeploy `frontend/dist` for the "Dispersion (paper)" tab (§10). The 2-year replay curves read `data_cache/dispersion_cycles_{matched,short_vol}.csv`; regenerate both (each run needs its own `--output`, or the second overwrites the first and the page reads neither):
+
+```bash
+.venv/bin/python -m research.backtest_dispersion --raw-dir data_cache/research_bhavcopy_raw \
+  --weights market_data/nifty50_weights.csv --sizing matched --output data_cache/dispersion_cycles_matched.csv
+.venv/bin/python -m research.backtest_dispersion --raw-dir data_cache/research_bhavcopy_raw \
+  --equal-weight --sizing raw --output data_cache/dispersion_cycles_short_vol.csv
+```
+
+**Silent failure:** if every pass in the window fails (e.g. a quote outage) the runner touches `data_cache/SILENT_FAIL_dispersion_paper` and exits **3**; the unit does not restart on 3, so it fails and `notify-failure@` alerts. The dashboard shows a red banner while the file exists. Investigate, then `rm data_cache/SILENT_FAIL_dispersion_paper` and `systemctl reset-failed dispersion-paper.service`.
 
 ```bash
 journalctl -u dispersion-paper.service -f

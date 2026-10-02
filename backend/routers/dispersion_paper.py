@@ -120,6 +120,9 @@ class Book(BaseModel):
 
 class DispersionResponse(BaseModel):
     books: List[Book]
+    # SILENT_FAIL_dispersion_paper: every pass in a window failed and the
+    # runner exited 3. The window's hedge/settle may not have happened.
+    runner_silent_fail: bool = False
 
 
 def _summary(cycles: List[Cycle]) -> Summary:
@@ -238,4 +241,5 @@ def dispersion_paper() -> DispersionResponse:
             replay=replay, replay_summary=_summary(replay),
             replay_source=replay_path.name if replay else None,
         ))
-    return DispersionResponse(books=books)
+    silent = (DATA_CACHE / "SILENT_FAIL_dispersion_paper").exists()
+    return DispersionResponse(books=books, runner_silent_fail=silent)

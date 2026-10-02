@@ -726,3 +726,37 @@ def test_a_failed_restore_overwrites_neither_state_file(tmp_path, monkeypatch):
         r.main(["--force", "--once", "--ignore-entry-window", "--config", _cfg(tmp_path)])
     assert broken.read_bytes() == broken_before
     assert good.read_bytes() == good_before
+
+
+def test_silent_fail_exits_with_the_code_the_unit_will_not_restart(tmp_path, monkeypatch):
+    """Every pass failing must end the day as a FAILED unit (so
+    notify-failure@ alerts), not a restart into a fresh heartbeat count that
+    reaches 15:20 and exits 0. The runner's code and the unit's
+    RestartPreventExitStatus must agree, and a crash (1) must still restart."""
+    import re
+    from pathlib import Path
+
+    import runners.run_paper_dispersion as r
+
+    unit = (Path(r.HERE) / "deploy" / "dispersion-paper.service").read_text()
+    prevent = re.search(r"^RestartPreventExitStatus=(.+)$", unit, re.M)
+    assert prevent and prevent.group(1).split() == [str(r.SILENT_FAIL_EXIT)]
+    assert r.SILENT_FAIL_EXIT != 1
+    assert re.search(r"^Restart=on-failure$", unit, re.M)
+
+    class _Down(_Boom):
+        def instruments(self, exchange=None):
+            raise RuntimeError("quote outage")
+
+    monkeypatch.setattr(r, "STATE_FILE", tmp_path / "m.json")
+    monkeypatch.setattr(r, "SHORT_VOL_STATE_FILE", tmp_path / "sv.json")
+    monkeypatch.setattr(r, "DATA_CACHE", tmp_path)
+    monkeypatch.setattr(r, "LOCK_FILE", tmp_path / ".lock")
+    monkeypatch.setattr(r, "SILENT_FAIL_FLAG", tmp_path / "SF")
+    monkeypatch.setattr(r, "SILENT_FAIL_THRESHOLD", 1)
+    monkeypatch.setattr(r, "assert_timezone_ist", lambda log: None)
+    monkeypatch.setattr(r, "previous_front", lambda *a, **k: PREV)
+    monkeypatch.setattr(r, "market_client", lambda cfg: _Down())
+    code = r.main(["--force", "--once", "--ignore-entry-window", "--config", _cfg(tmp_path)])
+    assert code == r.SILENT_FAIL_EXIT
+    assert (tmp_path / "SF").exists()

@@ -85,6 +85,11 @@ STATE_FILE = DATA_CACHE / "dispersion_paper_state.json"
 SHORT_VOL_STATE_FILE = DATA_CACHE / "dispersion_short_vol_paper_state.json"
 LOCK_FILE = DATA_CACHE / ".dispersion_paper.lock"
 SILENT_FAIL_FLAG = DATA_CACHE / "SILENT_FAIL_dispersion_paper"
+# Distinct from a crash (1). deploy/dispersion-paper.service lists it in
+# RestartPreventExitStatus, so systemd marks the unit failed and
+# notify-failure@ fires, instead of restarting into a fresh heartbeat count
+# that can run out the 15:20 window looking healthy (review 2026-10-02).
+SILENT_FAIL_EXIT = 3
 
 ENTRY_WINDOW_START = dtime(15, 0)
 ENTRY_WINDOW_END = dtime(15, 20)
@@ -623,7 +628,7 @@ def main(argv=None) -> int:
             nonlocal code
             if outcome == "error" and heartbeat.record_tick(n_ran=1, n_errored=1):
                 logger.error("silent-fail threshold hit — exiting")
-                code = 1
+                code = SILENT_FAIL_EXIT
             elif outcome == "ok":
                 heartbeat.record_tick(n_ran=1, n_errored=0)
 
