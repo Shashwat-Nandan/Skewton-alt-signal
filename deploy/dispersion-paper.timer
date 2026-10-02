@@ -1,0 +1,21 @@
+[Unit]
+Description=Fire dispersion-paper.service Mon–Fri at 14:55 IST
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# 14:55 IST — five minutes before the 15:00–15:20 decision window the runner
+# acts in; it sleeps to 15:00 on its own. The books are decided at the cash
+# close, so there is nothing to do at the open. No Kite/Kotak login happens
+# (consumer-key quotes only), so no TOTP stagger against the morning units.
+OnCalendar=Mon..Fri *-*-* 14:55:00 Asia/Kolkata
+
+# Catch up a missed fire. Safe: started after 15:30 the runner logs "nothing
+# to do" and exits 0, and on an NSE holiday it no-ops before quoting.
+Persistent=true
+
+RandomizedDelaySec=60
+
+Unit=dispersion-paper.service
+
+[Install]
+WantedBy=timers.target

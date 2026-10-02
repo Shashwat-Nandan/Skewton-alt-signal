@@ -32,7 +32,10 @@ VALID_MODES = ("signals", "paper", "live")
 # Min length 2: NSE has genuine 2-char equity symbols (e.g. LT = Larsen &
 # Toubro). The earlier 3-char floor silently rejected them pre-submit, dropping
 # valid equity orders (caught in the buy_on_gap review 2026-06-19).
-_TRADINGSYMBOL_RE = re.compile(r"^[A-Z0-9&\-]{2,30}$")
+# A dot is allowed only as a half-point option strike (ITC26OCT317.5CE). The
+# 2026-10-01 Kotak F&O master lists 2,005 such symbols, ITC and POWERGRID among
+# them (dispersion review 2026-10-02).
+_TRADINGSYMBOL_RE = re.compile(r"^(?=.{2,30}$)[A-Z0-9&\-]+(?:\.[0-9]+(?:CE|PE))?$")
 _ABS_MAX_LOTS_PER_ORDER = 10000
 _MAX_PRICE_INR = 1_000_000
 

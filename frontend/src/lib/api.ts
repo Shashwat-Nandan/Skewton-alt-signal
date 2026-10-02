@@ -2,6 +2,7 @@ import type {
   ArbitrageResponse,
   AuthStatus,
   BuyOnGapResponse,
+  DispersionResponse,
   EquityPendingEntriesResponse,
   EquityPositionsResponse,
   EquityScansResponse,
@@ -155,6 +156,8 @@ export const api = {
     const qs = q.toString();
     return http<BuyOnGapResponse>(`/buy-on-gap-paper${qs ? `?${qs}` : ""}`);
   },
+
+  dispersionPaper: () => http<DispersionResponse>("/dispersion-paper"),
 
   mpTrend: (params: { days?: number } = {}) => {
     const q = new URLSearchParams();

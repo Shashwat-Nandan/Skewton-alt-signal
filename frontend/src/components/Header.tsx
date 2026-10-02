@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink } from "react-router-dom";
 import {
   LogOut, Menu, X, Activity, BarChart3, Briefcase, CandlestickChart, GitBranch,
-  Layers, LineChart, PackageCheck, Scale, Sigma, TrendingDown, TrendingUp, Wallet,
+  Layers, LineChart, PackageCheck, Scale, Sigma, Split, TrendingDown, TrendingUp, Wallet,
   type LucideIcon,
   CalendarClock,
 } from "lucide-react";
@@ -28,6 +28,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/arbitrage", label: "Arbitrage", icon: Scale },
   { to: "/buy-on-gap", label: "Buy-on-Gap", icon: TrendingDown },
   { to: "/short-call", label: "Short Call", icon: CalendarClock },
+  { to: "/dispersion", label: "Dispersion (paper)", icon: Split },
   { to: "/kalman-pairs", label: "Kalman Pairs", icon: Sigma },
   { to: "/kalman-trend", label: "Kalman Trend (loop)", icon: Activity },
   { to: "/ma-momentum", label: "MA Momentum (§6.3)", icon: LineChart },

@@ -34,6 +34,8 @@ Both are driven by `systemd` timers. Cron is **not** used — the units in `depl
 | `buy-on-gap-paper.service`    | Type=simple, ~6 hours         | Runs `runners/run_paper_buy_on_gap.py` — intraday gap-down mean reversion, paper mode, EOD sidecar |
 | `kalman-pairs-paper.timer`    | Mon–Fri 09:16 IST + jitter    | Fires `kalman-pairs-paper.service` (after buy-on-gap; just after the open, reuses cached session) |
 | `kalman-pairs-paper.service`  | Type=simple, ~6 hours         | Runs `runners/run_paper_kalman_pairs.py` — Kalman time-varying-γ pairs, paper-only, A/B vs static (§3.4) |
+| `dispersion-paper.timer`      | Mon–Fri 14:55 IST + jitter    | Fires `dispersion-paper.service` (no login — consumer-key quotes only)               |
+| `dispersion-paper.service`    | Type=simple, ~25 min          | Runs `runners/run_paper_dispersion.py` — two Nifty dispersion paper books, acts 15:00–15:20 IST only |
 | `pair-verify.timer`           | Mon–Fri 16:00 IST + jitter    | Fires `pair-verify.service`                                                          |
 | `pair-verify.service`         | Oneshot, ~5 min               | Runs `scripts/verify_pair_paper.py` — diffs today's pair paper P&L against a trailing-60d backtest |
 | `screen-pairs.timer`          | Mon–Fri 19:00 IST + jitter    | Fires `screen-pairs.service` (refreshes `data_cache/pair_candidates.csv`)            |
@@ -403,6 +405,49 @@ ls -l data_cache/pair_paper_kalman_eod_$(date +%F).json
 ```bash
 sudo systemctl disable --now kalman-pairs-paper.timer   # stop arming
 sudo systemctl stop kalman-pairs-paper.service          # kill a mid-session run (paper → nothing to unwind)
+```
+
+### 3.5 Dispersion paper runner (two books)
+
+Hedged hold-to-expiry Nifty dispersion (Bloch 2016, §7.6.5): short the Nifty ATM straddle, long same-expiry constituent straddles, futures-hedged at the close, held to the monthly expiry. **Paper only** — `DispersionPaperStrategy` raises for `mode=live` and the runner has no `--mode` flag. One process runs two books on one set of quotes, each with its own state file:
+
+| Book | Sizing | State file |
+|---|---|---|
+| `dispersion_paper` | 30–40% of names, rescaled to the index notional, NSE free-float weights | `data_cache/dispersion_paper_state.json` |
+| `dispersion_short_vol_paper` | PR 9 sizing: 30% of weight, raw-weight lots, equal weight (net short index vol) | `data_cache/dispersion_short_vol_paper_state.json` |
+
+The timer fires **Mon–Fri 14:55 IST**; the runner sleeps to 15:00, hedges/enters/settles once per minute inside **15:00–15:20 IST**, then exits 0. It quotes with the Kotak consumer key and **never calls `login()`**, so unlike the morning units it cannot rotate the trade token a live runner holds, and `Persistent=true` is safe at any hour (after 15:30 it exits with "nothing to do"). Entries happen only on the session after a monthly expiry, so the first one is the session after the **2026-10-27** expiry; until then each fire only logs.
+
+```bash
+sudo cp deploy/dispersion-paper.service /etc/systemd/system/
+sudo cp deploy/dispersion-paper.timer   /etc/systemd/system/
+# …then apply the host path/User substitution to the installed .service (§3.3)…
+sudo systemctl daemon-reload
+sudo systemctl enable --now dispersion-paper.timer
+systemctl list-timers dispersion-paper.timer   # next fire: next weekday 14:55 IST
+```
+
+**Smoke-test first (no orders, no login, book unchanged):**
+
+```bash
+TZ=Asia/Kolkata .venv/bin/python -m runners.run_paper_dispersion --dry-run --force
+```
+
+**Known limitation:** settlement values each leg's intrinsic off the spot LTP at the 15:00–15:20 pass, not NSE's 15:00–15:30 average. Closed cycles carry `settle_basis: window_ltp_proxy` and the dashboard marks them. A state file that will not restore makes the runner refuse to start without rewriting either book's state; fix or move the file, then `systemctl reset-failed dispersion-paper.service`.
+
+**Dashboard:** restart `dashboard-backend.service` for `/api/dispersion-paper`, and rebuild/redeploy `frontend/dist` for the "Dispersion (paper)" tab (§10). The 2-year replay curves read `data_cache/dispersion_cycles_{matched,short_vol}.csv`; regenerate both (each run needs its own `--output`, or the second overwrites the first and the page reads neither):
+
+```bash
+.venv/bin/python -m research.backtest_dispersion --raw-dir data_cache/research_bhavcopy_raw \
+  --weights market_data/nifty50_weights.csv --sizing matched --output data_cache/dispersion_cycles_matched.csv
+.venv/bin/python -m research.backtest_dispersion --raw-dir data_cache/research_bhavcopy_raw \
+  --equal-weight --sizing raw --output data_cache/dispersion_cycles_short_vol.csv
+```
+
+**Silent failure:** if every pass in the window fails (e.g. a quote outage) the runner touches `data_cache/SILENT_FAIL_dispersion_paper` and exits **3**; the unit does not restart on 3, so it fails and `notify-failure@` alerts. The dashboard shows a red banner while the file exists. Investigate, then `rm data_cache/SILENT_FAIL_dispersion_paper` and `systemctl reset-failed dispersion-paper.service`.
+
+```bash
+journalctl -u dispersion-paper.service -f
 ```
 
 ---

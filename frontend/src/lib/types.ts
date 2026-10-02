@@ -809,3 +809,76 @@ export type ShortCallResponse = {
   open_positions: ShortCallOpenPosition[];
   closed_trades: ShortCallClosedTrade[];
 };
+
+// ── Dispersion paper books (backend/routers/dispersion_paper.py) ──
+
+export type DispersionLeg = {
+  symbol: string;
+  side: number; // -1 short index straddle, +1 long stock straddle
+  strike: number;
+  lots: number;
+  lot_size: number;
+  premium: number; // ce + pe at entry, per unit
+  iv: number;
+  hedge_lots: number;
+};
+
+export type DispersionOpenBook = {
+  expiry: string;
+  entry: string;
+  index_lots: number;
+  n_names: number;
+  covered_weight: number;
+  notional_ratio: number | null;
+  weighting: string;
+  costs: number;
+  futures_pnl: number;
+  last_hedge_session: string | null;
+  legs: DispersionLeg[];
+};
+
+export type DispersionCycle = {
+  expiry: string;
+  entry: string | null;
+  status: string;
+  index_lots: number | null;
+  covered_weight: number | null;
+  notional_ratio: number | null;
+  premium_pnl: number;
+  futures_pnl: number;
+  costs: number;
+  net: number;
+  cumulative: number;
+  weighting: string | null;
+  settle_basis: string | null; // "window_ltp_proxy": valued at the 15:00 LTP, not NSE settlement
+};
+
+export type DispersionSummary = {
+  cycles: number;
+  total_net: number;
+  wins: number;
+  best: number | null;
+  worst: number | null;
+  costs: number;
+};
+
+export type DispersionBook = {
+  name: string;
+  label: string;
+  sizing: string;
+  has_state: boolean;
+  state_error: string | null;
+  weightings: string[]; // used by the paper record; >1 means mixed history
+  replay_weighting: string | null;
+  open: DispersionOpenBook | null;
+  paper: DispersionCycle[];
+  paper_summary: DispersionSummary;
+  replay: DispersionCycle[];
+  replay_summary: DispersionSummary;
+  replay_source: string | null;
+};
+
+export type DispersionResponse = {
+  books: DispersionBook[];
+  runner_silent_fail: boolean;
+};
