@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 from configparser import ConfigParser
 from datetime import date, datetime, timedelta
@@ -506,7 +507,7 @@ class KotakNeoClient:
         # Every Neo form POST is jData=JSON. A raw form body 500s; the
         # same body under jData is the call the trade host accepts.
         data = self._trade_json(
-            "POST", _PATHS["place_order"], form=_jdata_form(body)
+            "POST", _PATHS["place_order"], form=_jdata_form(body), detail=True,
         )
         order_id = _extract_order_id(data)
         if not order_id:
@@ -521,6 +522,7 @@ class KotakNeoClient:
             "POST",
             _PATHS["cancel_order"],
             form=_jdata_form({"on": str(order_id), "am": "NO"}),
+            detail=True,
         )
 
     def order_history(self, order_id) -> List[dict]:
@@ -818,6 +820,7 @@ class KotakNeoClient:
         content_type: Optional[str] = None,
         include_server_id: bool = True,
         allow_not_ok: bool = False,
+        detail: bool = False,
     ) -> dict:
         if form is not None:
             content_type = "form"
@@ -830,6 +833,7 @@ class KotakNeoClient:
             form=form,
             json_body=json_body,
             allow_not_ok=allow_not_ok,
+            detail=detail,
         )
 
     def _request_json(
@@ -841,6 +845,7 @@ class KotakNeoClient:
         form: Optional[dict] = None,
         json_body: Optional[dict] = None,
         allow_not_ok: bool = False,
+        detail: bool = False,
     ) -> dict:
         try:
             resp = self.session.request(
@@ -874,12 +879,12 @@ class KotakNeoClient:
         if resp.status_code >= 400:
             raise BrokerOrderError(
                 (_error_message(payload) or f"Kotak HTTP {resp.status_code}")
-                + _rejection_detail(resp.status_code, payload)
+                + (_rejection_detail(resp.status_code, payload) if detail else "")
             )
         if _is_not_ok(payload) and not allow_not_ok:
             raise BrokerOrderError(
                 (_error_message(payload) or str(payload))
-                + _rejection_detail(resp.status_code, payload)
+                + (_rejection_detail(resp.status_code, payload) if detail else "")
             )
         return payload
 
@@ -1343,16 +1348,31 @@ def _is_not_ok(payload: dict) -> bool:
     return False
 
 
+_SENSITIVE_KEY = re.compile(
+    r"token|sid|session|serverid|hsserver|ucc|pan|mobile|password|mpin|otp|"
+    r"secret|auth|greeting|ip$|^ip|clientip|email|dob|account", re.I)
+
+
+def _redact(obj):
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if _SENSITIVE_KEY.search(str(k)) else _redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
 def _rejection_detail(status_code: int, payload) -> str:
-    """HTTP status and the raw Kotak body, appended to a rejection message.
+    """HTTP status and the redacted Kotak body, appended to an ORDER rejection.
 
     2026-10-07: 41 orders were refused as just "error from core", with no
     order number and nothing in the order book, so the reason was lost.
-    The body of an order response carries no credentials (those travel in
-    request headers), so it is safe to log; it is truncated to bound the line.
+    Only order place/cancel calls opt in (detail=True) — never login,
+    client-ip or quote calls — and identity/credential-looking keys are
+    redacted anyway. Truncated to bound the log line.
     """
     try:
-        body = json.dumps(payload, default=str, sort_keys=True)
+        body = json.dumps(_redact(payload), default=str, sort_keys=True)
     except (TypeError, ValueError):
         body = str(payload)
     return f" [HTTP {status_code}] body={body[:800]}"
