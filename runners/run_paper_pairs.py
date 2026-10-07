@@ -33,6 +33,7 @@ import configparser
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -54,6 +55,7 @@ from core.runner_common import (  # noqa: F401  (re-exported)
     HOLIDAYS_PATH,
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
+    scoped_halt_new_entries_path,
     HARD_STOP,
     HOLIDAY_HORIZON_DAYS,
     HOLIDAYS_PER_YEAR_FLOOR,
@@ -116,6 +118,15 @@ def halt_daily_loss_path(system: str) -> Path:
     if system == "persistent":
         return HALT_DAILY_LOSS_PATH
     return DATA_CACHE / f"HALT_DAILY_LOSS_{system}"
+
+def naked_leg_halt_path(system: str) -> Path:
+    """This runner's own entry-halt flag for naked legs / untracked exposure.
+
+    Scoped, never the shared HALT_NEW_ENTRIES: that flag is operator-owned
+    and freezes every runner (core.runner_common, 2026-07-15 incident).
+    """
+    return scoped_halt_new_entries_path(f"pairs_{system}")
+
 
 # 3.7 / M-6: how often to re-reconcile against the broker DURING a live
 # session. The startup gate alone leaves a drift window from one start to the
@@ -415,10 +426,13 @@ def build_strategies(
 class _HaltState:
     # Tracks halt-flag state across ticks so transitions are logged once.
     # Kill switch hierarchy: HALT_ALL implies HALT_NEW_ENTRIES.
-    def __init__(self, daily_loss_path: Path = HALT_DAILY_LOSS_PATH):
+    def __init__(self, daily_loss_path: Path = HALT_DAILY_LOSS_PATH,
+                 scoped_path: Optional[Path] = None):
         # Per-runner daily-loss flag (see halt_daily_loss_path). Defaults to the
         # canonical flag so any caller/test that omits it keeps prior behaviour.
         self.daily_loss_path = daily_loss_path
+        # Naked-leg / untracked-exposure latch for this runner only.
+        self.scoped_path = scoped_path
         self.halt_all = False
         self.halt_new = False
 
@@ -426,9 +440,10 @@ class _HaltState:
         prev_all, prev_new = self.halt_all, self.halt_new
         self.halt_all = HALT_ALL_PATH.exists()
         halt_loss = self.daily_loss_path.exists()
+        halt_scoped = bool(self.scoped_path and self.scoped_path.exists())
         self.halt_new = (self.halt_all
                          or HALT_NEW_ENTRIES_PATH.exists()
-                         or halt_loss)
+                         or halt_loss or halt_scoped)
         if self.halt_all and not prev_all:
             log.critical("KILL SWITCH: HALT_ALL flag present (%s) — all "
                          "entries AND exits suspended. Positions frozen "
@@ -441,6 +456,8 @@ class _HaltState:
                 sources.append("HALT_NEW_ENTRIES")
             if halt_loss:
                 sources.append("HALT_DAILY_LOSS")
+            if halt_scoped:
+                sources.append(self.scoped_path.name)
             log.warning("Entries suspended (flags: %s); exits and rehedges "
                         "continue normally", "+".join(sources))
         elif prev_new and not self.halt_new:
@@ -479,9 +496,34 @@ class TickOutcome(NamedTuple):
     errored: bool
 
 
+def latch_halt_new_entries(log: logging.Logger, why: str,
+                           path: Optional[Path]) -> None:
+    """Touch this runner's scoped entry-halt flag (exits and unwinds
+    continue). Idempotent; a no-op without a path (paper/tests)."""
+    if path is None or path.exists():
+        return
+    log.critical("Latching %s: %s. Clear with `rm %s` once the broker book "
+                 "is verified flat/expected.", path.name, why, path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    except Exception as e:
+        log.exception("Failed to touch %s: %s", path, e)
+
+
+def has_stray_legs(strategy) -> bool:
+    """A naked leg: latched by a failed reversal, or a FLAT pair holding legs."""
+    st = strategy.state
+    legs = getattr(st, "legs", None)
+    legs = legs if isinstance(legs, list) else []
+    return (getattr(st, "unwind_pending", False) is True
+            or (getattr(st, "position", None) == "FLAT" and len(legs) > 0))
+
+
 def tick_one(strategy, log: logging.Logger,
              halt_all: bool = False,
-             halt_new_entries: bool = False) -> TickOutcome:
+             halt_new_entries: bool = False,
+             halt_path: Optional[Path] = None) -> TickOutcome:
     """One pair's iteration. Failures logged but do not kill the loop.
 
     Returns a TickOutcome with two booleans the caller uses to drive
@@ -493,6 +535,22 @@ def tick_one(strategy, log: logging.Logger,
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if halt_all:
         return TickOutcome(attempted_execution=False, errored=False)
+
+    # 2026-10-07 naked-leg incident: a stray leg is closed before anything
+    # else, and no pair on this runner opens new exposure until it is gone.
+    if has_stray_legs(strategy):
+        if getattr(strategy, "mode", "paper") == "live":
+            latch_halt_new_entries(
+                log, f"[{pair_label}] naked leg(s) "
+                     f"{[leg.tradingsymbol for leg in strategy.state.legs]}",
+                halt_path,
+            )
+        try:
+            strategy.retry_unwind()
+        except Exception as e:
+            log.exception("[%s] unwind retry raised: %s", pair_label, e)
+            return TickOutcome(attempted_execution=True, errored=True)
+        return TickOutcome(attempted_execution=True, errored=False)
 
     attempted_execution = False
     error_count = 0
@@ -569,7 +627,19 @@ def flatten_one(strategy, log: logging.Logger, reason: str = "EOD_CLOSE"):
     Used only by the operator-forced flatten or by the expiry-day flatten;
     the default session end persists state instead."""
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
-    if strategy.state.position == "FLAT" or not strategy.state.legs:
+    if not strategy.state.legs:
+        return
+    if has_stray_legs(strategy):
+        if HALT_ALL_PATH.exists():
+            log.critical("[%s] naked leg(s) NOT closed: HALT_ALL is set (book "
+                         "frozen by operator)", pair_label)
+            return
+        # Not via execute_proposals: on a FLAT pair that is an entry batch.
+        log.critical("[%s] flatten: closing naked leg(s) (%s)", pair_label, reason)
+        try:
+            strategy.retry_unwind()
+        except Exception as e:
+            log.exception("[%s] naked-leg flatten failed: %s", pair_label, e)
         return
     try:
         spread, prices = strategy._observe_spread()
@@ -799,6 +869,7 @@ def build_orphan_strategies(
     max_book_notional: float = 0.0,
     spread_panel: Optional[pd.DataFrame] = None,
     signal_publisher=None,
+    halt_path: Optional[Path] = None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -813,8 +884,10 @@ def build_orphan_strategies(
         if key in matched_keys:
             continue
         state_blob = blob.get("state", {})
-        if state_blob.get("position", "FLAT") == "FLAT":
-            # Closed before this session — nothing to manage.
+        if (state_blob.get("position", "FLAT") == "FLAT"
+                and not state_blob.get("legs")):
+            # Closed before this session — nothing to manage. A FLAT pair
+            # that still holds legs is a naked leg and IS loaded, to unwind.
             continue
         try:
             pair = blob["pair"]
@@ -853,10 +926,20 @@ def build_orphan_strategies(
                 "Orphan strategy for %s could not be built: %s — "
                 "position ABANDONED (manual review)", key, e,
             )
+            if state_blob.get("legs") and getattr(args, "mode", "paper") == "live":
+                latch_halt_new_entries(
+                    log, f"orphan {key} holding legs could not be loaded", halt_path)
     return orphans
 
 
-def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
+def _fut_underlying(tradingsymbol: str) -> Optional[str]:
+    """'M&M26OCTFUT' -> 'M&M'; None for anything that is not a monthly future."""
+    m = re.match(r"^(.+?)\d{2}[A-Z]{3}FUT$", tradingsymbol or "")
+    return m.group(1) if m else None
+
+
+def reconcile_with_broker(strategies, kite, log: logging.Logger,
+                          halt_path: Optional[Path] = None) -> None:
     # Live-mode safety: state-file is the runner's view of open positions;
     # kite.positions() is the broker's truth. They must agree before the
     # tick loop touches anything. Paper-mode runs skip silently — there is
@@ -904,8 +987,8 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
     expected_qty: Dict[str, int] = {}
     leg_holders: Dict[str, List[tuple]] = {}
     for s in live_strategies:
-        if s.state.position == "FLAT":
-            continue
+        # Every leg in state is broker exposure — including a FLAT pair's
+        # stray leg after a failed reversal (2026-10-07 naked-leg incident).
         for leg in s.state.legs:
             shares = leg.quantity * leg.lot_size  # signed
             expected_qty[leg.tradingsymbol] = (
@@ -957,11 +1040,21 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
     unknown = [ts for ts, qty in broker_qty.items()
                if qty != 0 and ts not in expected_tradingsymbols]
     if unknown:
-        log.warning(
+        # 2026-10-07: two naked legs sat here as a WARNING for hours while
+        # the runner kept opening pairs. Untracked exposure in a contract this
+        # runner trades halts THIS runner's entries; anything else (a manual
+        # hedge, another book on the account) is surfaced but not halted on.
+        log.critical(
             "Broker has %d NFO position(s) not tracked by this runner — "
             "this runner will NOT manage them: %s",
-            len(unknown), unknown,
+            len(unknown), {ts: broker_qty[ts] for ts in unknown},
         )
+        ours = {sym for s in live_strategies for sym in (s.symbol_a, s.symbol_b)}
+        overlapping = [ts for ts in unknown if _fut_underlying(ts) in ours]
+        if overlapping:
+            latch_halt_new_entries(
+                log, f"untracked broker positions in this runner's contracts "
+                     f"{overlapping}", halt_path)
 
     if price_warnings:
         # M-R2: entry_price drift is non-fatal — broker agrees on shares
@@ -989,7 +1082,8 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
              len(expected_tradingsymbols))
 
 
-def reconcile_mid_session(strategies, kite, log: logging.Logger) -> bool:
+def reconcile_mid_session(strategies, kite, log: logging.Logger,
+                          halt_path: Optional[Path] = None) -> bool:
     """3.7 / M-6: periodic in-session drift check. Unlike the startup gate
     (reconcile_with_broker, which RAISES to refuse start), a mismatch or a
     kite.positions() failure here must NOT crash the live loop. On drift, log
@@ -1001,7 +1095,7 @@ def reconcile_mid_session(strategies, kite, log: logging.Logger) -> bool:
     if not any(getattr(s, "mode", "paper") == "live" for s in strategies):
         return False
     try:
-        reconcile_with_broker(strategies, kite, log)
+        reconcile_with_broker(strategies, kite, log, halt_path)
         return False
     except Exception as e:
         log.critical(
@@ -1381,9 +1475,13 @@ def main():
     # open while the market traded. prior_state is loaded here (pure JSON
     # read) instead of after build_strategies for the same reason.
     prior_state = load_prior_state(args.system, log)
+    # This runner's own entry-halt latch (naked legs / untracked exposure).
+    naked_halt = naked_leg_halt_path(args.system)
     panel_symbols = set(pairs["symbol_a"]) | set(pairs["symbol_b"])
     for blob in prior_state.values():
-        if blob.get("state", {}).get("position", "FLAT") != "FLAT":
+        st = blob.get("state", {})
+        # Naked-leg (FLAT with legs) orphans are loaded too — preload them.
+        if st.get("position", "FLAT") != "FLAT" or st.get("legs"):
             panel_symbols.update(blob.get("pair", []))
     try:
         from core.screen_pairs import load_front_month_panel
@@ -1461,6 +1559,7 @@ def main():
         max_book_notional=args.max_book_notional_inr,
         spread_panel=spread_panel,
         signal_publisher=signal_publisher,
+        halt_path=naked_halt if args.mode == "live" else None,
     )
     strategies = strategies + orphans
 
@@ -1470,7 +1569,7 @@ def main():
         prior_state, {f"{s.symbol_a}/{s.symbol_b}" for s in strategies}, log,
     )
 
-    reconcile_with_broker(strategies, kite, log)
+    reconcile_with_broker(strategies, kite, log, naked_halt)
 
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
@@ -1489,7 +1588,7 @@ def main():
              TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
 
     halt_loss_path = halt_daily_loss_path(args.system)
-    halt_state = _HaltState(halt_loss_path)
+    halt_state = _HaltState(halt_loss_path, scoped_path=naked_halt)
     if args.max_daily_loss_inr <= 0:
         log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
                     "circuit breaker for runaway losses this session")
@@ -1513,13 +1612,14 @@ def main():
             # next halt_state.refresh) rather than crashing the loop.
             if (args.mode == "live"
                     and time.monotonic() - last_reconcile >= RECONCILE_INTERVAL_S):
-                reconcile_mid_session(strategies, kite, log)
+                reconcile_mid_session(strategies, kite, log, naked_halt)
                 last_reconcile = time.monotonic()
             n_errored = 0
             for s in strategies:
                 outcome = tick_one(s, log,
                                    halt_all=halt_state.halt_all,
-                                   halt_new_entries=halt_state.halt_new)
+                                   halt_new_entries=halt_state.halt_new,
+                                   halt_path=naked_halt)
                 if outcome.attempted_execution:
                     # Persist immediately so a SIGKILL before the next
                     # strategy in this tick can't lose state mutations
@@ -1646,8 +1746,19 @@ def end_of_session(strategies, today: date, args, log: logging.Logger,
             )
 
     unverified_expiry: List[str] = []
+    naked_open: List[str] = []
     for s in strategies:
         pair_label = f"{s.symbol_a}/{s.symbol_b}"
+        if has_stray_legs(s):
+            # A naked leg never carries overnight (flatten_one honours
+            # HALT_ALL and signals mode; the leftover still escalates).
+            flatten_one(s, log, reason="NAKED_LEG_EOD")
+            if s.state.legs:
+                naked_open.append(
+                    f"{pair_label} "
+                    f"{[(leg.tradingsymbol, leg.quantity * leg.lot_size) for leg in s.state.legs]}"
+                )
+            continue
         if s.state.position == "FLAT":
             continue
         if args.force_flatten_on_exit:
@@ -1666,6 +1777,14 @@ def end_of_session(strategies, today: date, args, log: logging.Logger,
     write_state_file(strategies, args.system, log, mode=args.mode,
                      carry_forward=carry_forward)
     write_eod_sidecar(strategies, today, log, args.system)
+    if naked_open:
+        log.critical(
+            "NAKED LEG(S) STILL OPEN AT SESSION END: %s. State and EOD sidecar "
+            "are written; exiting non-zero so notify-failure@ alerts. "
+            "OPERATOR ACTION: square off before the next session (and before "
+            "cash settlement if the contract expires today).",
+            "; ".join(naked_open),
+        )
     if unverified_expiry:
         log.critical(
             "EXPIRY CHECK FAILED for %d open pair(s): %s. State and EOD "
@@ -1679,6 +1798,11 @@ def end_of_session(strategies, today: date, args, log: logging.Logger,
         raise RuntimeError(
             f"Expiry-day check failed for {len(unverified_expiry)} pair(s); "
             "refusing to silently proceed (H18)."
+        )
+    if naked_open:
+        raise RuntimeError(
+            f"{len(naked_open)} naked leg(s) open at session end; refusing to "
+            "exit cleanly."
         )
 
 
