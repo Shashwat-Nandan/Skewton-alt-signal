@@ -37,7 +37,7 @@ import re
 import signal
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
@@ -118,6 +118,54 @@ def halt_daily_loss_path(system: str) -> Path:
     if system == "persistent":
         return HALT_DAILY_LOSS_PATH
     return DATA_CACHE / f"HALT_DAILY_LOSS_{system}"
+
+def default_tick_offset(system: str) -> int:
+    """Second-of-the-minute this runner ticks on. The live persistent book
+    keeps :00; every other system ticks at :30 so two pair runners on the
+    same Kotak login never burst the quotes API in the same second
+    (2026-10-07: both entered the loop at 09:15:00.000/.001 and collided
+    every minute)."""
+    return 0 if system == "persistent" else 30
+
+
+def seconds_to_next_slot(offset: int, now: Optional[float] = None) -> float:
+    """Seconds until the next wall-clock tick slot (second `offset` of a
+    minute). Wall-clock alignment, not sleep-after-work: two runners with
+    different per-tick work would otherwise drift into each other."""
+    now = time.time() if now is None else now
+    wait = (offset - now) % TICK_SECONDS
+    return wait if wait >= 1.0 else wait + TICK_SECONDS
+
+
+def prefetch_tick_quotes(strategies, kite, log: logging.Logger):
+    """One batched quotes request for every contract this tick reads.
+
+    Installs the snapshot on each strategy (their _get_last_price reads it
+    first) and returns it; on any failure returns None and the strategies
+    fall back to their own per-symbol quotes, i.e. the old behaviour.
+    """
+    keys: List[str] = []
+    for s in strategies:
+        try:
+            for k in s.quote_keys():
+                if k not in keys:
+                    keys.append(k)
+        except Exception as e:
+            log.warning("[%s/%s] quote_keys failed: %s", s.symbol_a, s.symbol_b, e)
+    snapshot = None
+    if keys:
+        try:
+            raw = kite.quote(keys)
+            snapshot = {k: float(v["last_price"]) for k, v in raw.items()
+                        if v and v.get("last_price") is not None}
+        except Exception as e:
+            log.warning("batched quote for %d contract(s) failed (%s) — "
+                        "pairs fall back to per-symbol quotes this tick",
+                        len(keys), e)
+    for s in strategies:
+        s.set_tick_quotes(snapshot)
+    return snapshot
+
 
 def naked_leg_halt_path(system: str) -> Path:
     """This runner's own entry-halt flag for naked legs / untracked exposure.
@@ -1204,6 +1252,11 @@ def main():
                              "tool can split P&L by system. Defaults to "
                              "'baseline' which preserves the original "
                              "filenames.")
+    parser.add_argument("--tick-offset-seconds", type=int, default=None,
+                        help="Second of each minute to tick on (0-59). "
+                             "Default: 0 for --system persistent, 30 for any "
+                             "other system, so co-running pair runners never "
+                             "hit the broker's quotes API in the same second.")
     parser.add_argument("--quality-max-pvalue", type=float, default=None,
                         help="Override the cointegration p-value ceiling in "
                              "the quality floor (default QUALITY_MAX_PVALUE = "
@@ -1581,11 +1634,16 @@ def main():
         log.info("Started after %s — nothing to do today.", hard_stop_ts.strftime("%H:%M"))
         return 0
 
-    if now < open_ts:
-        sleep_until(open_ts, log)
+    tick_offset = (args.tick_offset_seconds if args.tick_offset_seconds is not None
+                   else default_tick_offset(args.system)) % TICK_SECONDS
+    first_slot = open_ts + timedelta(seconds=tick_offset)
+    if now < first_slot:
+        sleep_until(first_slot, log)
 
-    log.info("Entering tick loop (every %ds until %s) over %d pair(s)",
-             TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
+    log.info("Entering tick loop (every %ds at second :%02d, until %s) over "
+             "%d pair(s); one batched quotes request per tick",
+             TICK_SECONDS, tick_offset, session_end_ts.strftime("%H:%M"),
+             len(strategies))
 
     halt_loss_path = halt_daily_loss_path(args.system)
     halt_state = _HaltState(halt_loss_path, scoped_path=naked_halt)
@@ -1615,6 +1673,8 @@ def main():
                 reconcile_mid_session(strategies, kite, log, naked_halt)
                 last_reconcile = time.monotonic()
             n_errored = 0
+            if not halt_state.halt_all:
+                prefetch_tick_quotes(strategies, kite, log)
             for s in strategies:
                 outcome = tick_one(s, log,
                                    halt_all=halt_state.halt_all,
@@ -1637,6 +1697,10 @@ def main():
                                       "— continuing", e)
                 if outcome.errored:
                     n_errored += 1
+            # The snapshot is this tick's only: anything quoted outside the
+            # loop (session-end flatten, order pricing) reads fresh.
+            for s in strategies:
+                s.set_tick_quotes(None)
             n_ran = 0 if halt_state.halt_all else len(strategies)
             if heartbeat.record_tick(n_ran=n_ran, n_errored=n_errored):
                 silent_fail = True
@@ -1649,7 +1713,7 @@ def main():
             except Exception as e:
                 log.exception("Intraday state persist failed: %s — continuing", e)
             remaining = (session_end_ts - datetime.now()).total_seconds()
-            time.sleep(max(1, min(TICK_SECONDS, remaining)))
+            time.sleep(max(1, min(seconds_to_next_slot(tick_offset), remaining)))
 
         # Run end_of_session for both normal and silent-fail exits, but
         # wrap it in the silent-fail case: an uncaught exception in

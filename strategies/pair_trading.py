@@ -1892,8 +1892,31 @@ class PairTradingStrategy(BaseStrategy):
         self._cached_futures[symbol] = info
         return info
 
+    def quote_keys(self) -> List[str]:
+        """NFO quote keys this pair reads in one tick: both front-month legs
+        plus any held leg's own contract. The runner batches these across
+        every pair into one quotes request (Kotak takes up to 50 symbols)."""
+        keys = []
+        for sym in (self.symbol_a, self.symbol_b):
+            fut = self._resolve_futures(sym)
+            if fut:
+                keys.append(f"NFO:{fut['tradingsymbol']}")
+        for leg in self.state.legs:
+            keys.append(f"NFO:{leg.tradingsymbol}")
+        return keys
+
+    def set_tick_quotes(self, snapshot: Optional[Dict[str, float]]) -> None:
+        """Install (or clear, with None) this tick's batched last prices."""
+        self._tick_quotes = snapshot
+
     def _get_last_price(self, tradingsymbol: str) -> Optional[float]:
         key = f"NFO:{tradingsymbol}"
+        # Batched per-tick snapshot first (2026-10-07: one request per leg,
+        # two runners firing at second :00, ran the account into Kotak 429s).
+        # getattr: test fixtures build instances via __new__.
+        snap = getattr(self, "_tick_quotes", None)
+        if snap and key in snap:
+            return snap[key]
         try:
             quote = self.client.quote([key])
             return float(quote[key]["last_price"])
