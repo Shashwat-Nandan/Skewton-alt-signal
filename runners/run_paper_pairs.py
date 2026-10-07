@@ -479,6 +479,29 @@ class TickOutcome(NamedTuple):
     errored: bool
 
 
+def latch_halt_new_entries(log: logging.Logger, why: str) -> None:
+    """Touch HALT_NEW_ENTRIES (exits and unwinds continue). Idempotent."""
+    if HALT_NEW_ENTRIES_PATH.exists():
+        return
+    log.critical("Latching HALT_NEW_ENTRIES: %s. Clear with `rm %s` once the "
+                 "broker book is verified flat/expected.", why,
+                 HALT_NEW_ENTRIES_PATH)
+    try:
+        HALT_NEW_ENTRIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HALT_NEW_ENTRIES_PATH.touch()
+    except Exception as e:
+        log.exception("Failed to touch HALT_NEW_ENTRIES: %s", e)
+
+
+def has_stray_legs(strategy) -> bool:
+    """A naked leg: latched by a failed reversal, or a FLAT pair holding legs."""
+    st = strategy.state
+    legs = getattr(st, "legs", None)
+    legs = legs if isinstance(legs, list) else []
+    return (getattr(st, "unwind_pending", False) is True
+            or (getattr(st, "position", None) == "FLAT" and len(legs) > 0))
+
+
 def tick_one(strategy, log: logging.Logger,
              halt_all: bool = False,
              halt_new_entries: bool = False) -> TickOutcome:
@@ -493,6 +516,19 @@ def tick_one(strategy, log: logging.Logger,
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if halt_all:
         return TickOutcome(attempted_execution=False, errored=False)
+
+    # 2026-10-07 naked-leg incident: a stray leg is closed before anything
+    # else, and no pair on this runner opens new exposure until it is gone.
+    if has_stray_legs(strategy):
+        latch_halt_new_entries(
+            log, f"[{pair_label}] naked leg(s) {[l.tradingsymbol for l in strategy.state.legs]}"
+        )
+        try:
+            strategy.retry_unwind()
+        except Exception as e:
+            log.exception("[%s] unwind retry raised: %s", pair_label, e)
+            return TickOutcome(attempted_execution=True, errored=True)
+        return TickOutcome(attempted_execution=True, errored=False)
 
     attempted_execution = False
     error_count = 0
@@ -569,7 +605,15 @@ def flatten_one(strategy, log: logging.Logger, reason: str = "EOD_CLOSE"):
     Used only by the operator-forced flatten or by the expiry-day flatten;
     the default session end persists state instead."""
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
-    if strategy.state.position == "FLAT" or not strategy.state.legs:
+    if not strategy.state.legs:
+        return
+    if has_stray_legs(strategy):
+        # Not via execute_proposals: on a FLAT pair that is an entry batch.
+        log.critical("[%s] flatten: closing naked leg(s) (%s)", pair_label, reason)
+        try:
+            strategy.retry_unwind()
+        except Exception as e:
+            log.exception("[%s] naked-leg flatten failed: %s", pair_label, e)
         return
     try:
         spread, prices = strategy._observe_spread()
@@ -813,8 +857,10 @@ def build_orphan_strategies(
         if key in matched_keys:
             continue
         state_blob = blob.get("state", {})
-        if state_blob.get("position", "FLAT") == "FLAT":
-            # Closed before this session — nothing to manage.
+        if (state_blob.get("position", "FLAT") == "FLAT"
+                and not state_blob.get("legs")):
+            # Closed before this session — nothing to manage. A FLAT pair
+            # that still holds legs is a naked leg and IS loaded, to unwind.
             continue
         try:
             pair = blob["pair"]
@@ -904,8 +950,8 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
     expected_qty: Dict[str, int] = {}
     leg_holders: Dict[str, List[tuple]] = {}
     for s in live_strategies:
-        if s.state.position == "FLAT":
-            continue
+        # Every leg in state is broker exposure — including a FLAT pair's
+        # stray leg after a failed reversal (2026-10-07 naked-leg incident).
         for leg in s.state.legs:
             shares = leg.quantity * leg.lot_size  # signed
             expected_qty[leg.tradingsymbol] = (
@@ -957,11 +1003,14 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger) -> None:
     unknown = [ts for ts, qty in broker_qty.items()
                if qty != 0 and ts not in expected_tradingsymbols]
     if unknown:
-        log.warning(
+        # 2026-10-07: two naked legs sat here as a WARNING for hours while
+        # the runner kept opening pairs. Unknown exposure stops new entries.
+        log.critical(
             "Broker has %d NFO position(s) not tracked by this runner — "
             "this runner will NOT manage them: %s",
-            len(unknown), unknown,
+            len(unknown), {ts: broker_qty[ts] for ts in unknown},
         )
+        latch_halt_new_entries(log, f"untracked broker NFO positions {unknown}")
 
     if price_warnings:
         # M-R2: entry_price drift is non-fatal — broker agrees on shares
@@ -1648,6 +1697,16 @@ def end_of_session(strategies, today: date, args, log: logging.Logger,
     unverified_expiry: List[str] = []
     for s in strategies:
         pair_label = f"{s.symbol_a}/{s.symbol_b}"
+        if has_stray_legs(s):
+            # A naked leg never carries overnight, whatever the flags say.
+            flatten_one(s, log, reason="NAKED_LEG_EOD")
+            if s.state.legs:
+                log.critical(
+                    "[%s] NAKED LEG STILL OPEN AT SESSION END: %s — square off "
+                    "manually before the next session.", pair_label,
+                    [(l.tradingsymbol, l.quantity * l.lot_size) for l in s.state.legs],
+                )
+            continue
         if s.state.position == "FLAT":
             continue
         if args.force_flatten_on_exit:

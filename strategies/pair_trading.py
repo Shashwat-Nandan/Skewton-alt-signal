@@ -222,6 +222,12 @@ class PairState:
     # the 60-minute gate — stopped again, then ran the same loop on 08-05.
     # Three entries, three stops, one monotonically diverging spread.
     stop_rearm_pending: bool = False
+    # 2026-10-07 naked-leg incident: True when an entry batch filled one leg,
+    # the sibling was rejected, and the reversal was rejected too. The pair is
+    # FLAT (one leg is no spread) but state.legs still holds the filled leg,
+    # which is real broker exposure. While set, the pair opens nothing and
+    # retry_unwind() closes the stray legs every tick until they are gone.
+    unwind_pending: bool = False
     # Baseline frozen at the moment of the stop, so the latch is cleared by the
     # spread actually coming back — not by the yardstick moving. The runner
     # re-seeds _spread_history from bhavcopy every session and the window is
@@ -529,6 +535,9 @@ class PairTradingStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         if self.state.position != "FLAT":
+            return []
+        # Naked-leg latch: never open a new spread on top of a stray leg.
+        if self.state.unwind_pending or self.state.legs:
             return []
         # H5: post-STOP cooldown. Keeps a freshly-stopped pair out of the
         # entry pipeline until the gate elapses, regardless of how favourable
@@ -997,6 +1006,9 @@ class PairTradingStrategy(BaseStrategy):
                 # session, so it MUST round-trip through the state file — a
                 # flag that resets at 09:15 is the bug it replaces.
                 "stop_rearm_pending": self.state.stop_rearm_pending,
+                # Naked-leg latch: must survive a restart, or tomorrow's
+                # runner treats the stray leg as an ordinary FLAT pair.
+                "unwind_pending": self.state.unwind_pending,
                 # The frozen pre-stop baseline the latch is judged against.
                 # Without it the latch survives the session but its yardstick
                 # does not, and tomorrow's re-seeded window clears it.
@@ -1068,6 +1080,12 @@ class PairTradingStrategy(BaseStrategy):
             "stop_rearm_pending",
             self.state.last_exit_reason == "STOP" and not state_blob["legs"],
         ))
+        # A FLAT pair that still carries legs is a stray (naked) leg whatever
+        # the flag says — files written before the latch existed included.
+        self.state.unwind_pending = bool(
+            state_blob.get("unwind_pending")
+            or (state_blob.get("position", "FLAT") == "FLAT" and state_blob["legs"])
+        )
 
         def _opt_float(key):
             v = state_blob.get(key)
@@ -2282,7 +2300,8 @@ class PairTradingStrategy(BaseStrategy):
             )
         return self._live_order_executor
 
-    def _live_execute(self, prop: TradeProposal) -> Dict:
+    def _live_execute(self, prop: TradeProposal,
+                      bypass_backoff: bool = False) -> Dict:
         # Marketable LIMIT with protection (Zerodha rejects naked MARKET on
         # F&O). State is booked only on a confirmed COMPLETE inside the shared
         # executor (poll-until-terminal, cancel-on-timeout, H7 inline
@@ -2292,7 +2311,10 @@ class PairTradingStrategy(BaseStrategy):
         # tick-counter here so a multi-leg batch in one tick only counts as
         # ONE tick of cooldown; the decrement happens in execute_proposals
         # before the per-prop loop.
-        if self._place_order_skip_ticks_left > 0:
+        # bypass_backoff: closing a naked leg reduces risk, so the M-B5
+        # backoff (which exists to stop hammering a broken account with new
+        # exposure) must not hold an unwind back for up to an hour.
+        if self._place_order_skip_ticks_left > 0 and not bypass_backoff:
             logger.warning(
                 "%s/%s: place_order backoff in effect (%d ticks remaining)",
                 self.symbol_a, self.symbol_b,
@@ -2348,6 +2370,47 @@ class PairTradingStrategy(BaseStrategy):
         sb = (self.symbol_b or "")[:5]
         return f"pair-{sa}-{sb}"[:20]
 
+    def retry_unwind(self) -> bool:
+        """Close every stray leg left by a failed reversal. True once flat.
+
+        Goes straight to the executor, not execute_proposals: on a FLAT pair
+        that would treat the closes as an ENTRY batch (margin precheck, ENTRY
+        signal, partial-fill reversal of a close). One attempt per leg per
+        call; the runner calls it every tick until the legs are gone.
+        """
+        if not self.state.legs:
+            if self.state.unwind_pending:
+                logger.critical("%s/%s: unwind complete — no stray legs left",
+                                self.symbol_a, self.symbol_b)
+            self.state.unwind_pending = False
+            return True
+        self.state.unwind_pending = True
+        for leg in list(self.state.legs):
+            side = "SELL" if leg.quantity > 0 else "BUY"
+            prop = self._make_exit_proposal_from_leg(
+                leg, leg.current_price or leg.entry_price, side,
+                f"UNWIND_NAKED_LEG on {self.symbol_a}/{self.symbol_b}",
+            )
+            result = (self._paper_execute(prop) if self.is_paper_mode
+                      else self._live_execute(prop, bypass_backoff=True))
+            if result.get("status") == "COMPLETE":
+                self._apply_fill(prop, result)
+                logger.critical("%s/%s: UNWIND closed stray leg %s",
+                                self.symbol_a, self.symbol_b, leg.tradingsymbol)
+            else:
+                logger.critical(
+                    "%s/%s: UNWIND RETRY FAILED for %s — naked leg still open "
+                    "(will retry next tick). status=%s error=%s",
+                    self.symbol_a, self.symbol_b, leg.tradingsymbol,
+                    result.get("status"), result.get("error"),
+                )
+        if not self.state.legs:
+            self.state.unwind_pending = False
+            logger.critical("%s/%s: unwind complete — book flat",
+                            self.symbol_a, self.symbol_b)
+            return True
+        return False
+
     def _reverse_filled_legs(self,
                               filled_props: List[Tuple[TradeProposal, Dict]],
                               ) -> None:
@@ -2372,9 +2435,11 @@ class PairTradingStrategy(BaseStrategy):
             result = (self._paper_execute(reverse_prop) if self.is_paper_mode
                       else self._live_execute(reverse_prop))
             if result.get("status") != "COMPLETE":
+                self.state.unwind_pending = True
                 logger.critical(
-                    "REVERSAL FAILED for %s — NAKED LEG IN MARKET. "
-                    "Manual intervention required. status=%s error=%s",
+                    "REVERSAL FAILED for %s — NAKED LEG IN MARKET. Latching "
+                    "unwind_pending: retry_unwind() will try to close it every "
+                    "tick and the runner halts new entries. status=%s error=%s",
                     prop.tradingsymbol, result.get("status"),
                     result.get("error"),
                 )

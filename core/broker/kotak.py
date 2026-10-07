@@ -873,10 +873,14 @@ class KotakNeoClient:
             ) from e
         if resp.status_code >= 400:
             raise BrokerOrderError(
-                _error_message(payload) or f"Kotak HTTP {resp.status_code}"
+                (_error_message(payload) or f"Kotak HTTP {resp.status_code}")
+                + _rejection_detail(resp.status_code, payload)
             )
         if _is_not_ok(payload) and not allow_not_ok:
-            raise BrokerOrderError(_error_message(payload) or str(payload))
+            raise BrokerOrderError(
+                (_error_message(payload) or str(payload))
+                + _rejection_detail(resp.status_code, payload)
+            )
         return payload
 
 
@@ -1337,6 +1341,21 @@ def _is_not_ok(payload: dict) -> bool:
     if payload.get("error"):
         return True
     return False
+
+
+def _rejection_detail(status_code: int, payload) -> str:
+    """HTTP status and the raw Kotak body, appended to a rejection message.
+
+    2026-10-07: 41 orders were refused as just "error from core", with no
+    order number and nothing in the order book, so the reason was lost.
+    The body of an order response carries no credentials (those travel in
+    request headers), so it is safe to log; it is truncated to bound the line.
+    """
+    try:
+        body = json.dumps(payload, default=str, sort_keys=True)
+    except (TypeError, ValueError):
+        body = str(payload)
+    return f" [HTTP {status_code}] body={body[:800]}"
 
 
 def _error_message(payload: dict) -> str:
