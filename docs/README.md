@@ -86,6 +86,17 @@ Crons that produce the inputs the strategies consume.
   buy-on-gap), and a test queue of new sleeves that fit this stack
   (NIFTY–BANKNIFTY pair, STF cross-sectional reversal, MA index-futures
   momentum). 90-day sequence is subtraction-first.
+- [research/drive-research-library-review-2026-09-26.md](./research/drive-research-library-review-2026-09-26.md) —
+  645 AI-generated paper summaries (Drive mirror, gitignored under
+  `research_library/`) read against the finetuning review. No NO-GO is
+  overturned. §6.2 reversal, sector-demeaned, tested 2026-09-27: KILL
+  (gross +3.9 bp/day vs 22.3 bp/day cost; the MIS open-to-close variant
+  is also KILL, gross +7.0 vs 21.2 bp/day at a ₹10 lakh side;
+  `research/backtest_sector_reversal.py`).
+  Also adds a buy-and-hold benchmark to §6.3's kill rule, a t ≥ 3 hurdle
+  for E9, and three more offline tests (pre-earnings run-up reversal,
+  IV-slope Taleb gate, same-sector pair gate). Sector map:
+  `market_data/sectors.csv` (`python -m market_data.fetch_sectors`).
 
 ## Cross-reference: cron timer ↔ doc
 

@@ -39,6 +39,14 @@ SYMBOL_ALIASES: Dict[str, str] = {
     # 2026-02-26, first LTM row the next session). ISIN INE214T01019 is
     # identical on both sides in the equity archive — same security.
     "LTIM": "LTM",
+    # GMR Infrastructure → GMR Airports, effective 2024-12-11 (last GMRINFRA
+    # row 2024-12-10, first GMRAIRPORT row the next session). ISIN
+    # INE776C01039 identical on both sides in the equity archive.
+    "GMRINFRA": "GMRAIRPORT",
+    # Zomato → Eternal, effective 2025-04-09 (last ZOMATO row 2025-04-08,
+    # first ETERNAL row the next session). ISIN INE758T01015 identical on
+    # both sides in the equity archive.
+    "ZOMATO": "ETERNAL",
 }
 
 
