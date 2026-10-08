@@ -2436,6 +2436,42 @@ class PairTradingStrategy(BaseStrategy):
                 total += int(row.get("quantity", 0) or 0)
         return total
 
+    def _drop_leg_closed_outside(self, leg) -> None:
+        """Remove a stray leg the broker no longer holds (a manual square-off,
+        or a close that filled unseen). No order of ours, so no cost: book the
+        mark against entry and drop it."""
+        logger.critical("%s/%s: broker is flat in %s — dropping the stray leg "
+                        "from state", self.symbol_a, self.symbol_b,
+                        leg.tradingsymbol)
+        mark = leg.current_price or leg.entry_price
+        self.state.realized_pnl += (
+            (mark - leg.entry_price) * leg.quantity * leg.lot_size)
+        self.state.legs.remove(leg)
+
+    def sync_stray_legs(self, broker_net: Dict[str, int]) -> List[str]:
+        """Start-up, read-only: drop stray legs the broker no longer holds.
+
+        2026-10-08: two stray legs squared off by hand the day before were
+        still in state, so the start-up reconcile saw state -475 / +100
+        against broker 0, refused to start five times, and the failure
+        handler latched HALT_ALL for every runner. retry_unwind already drops
+        a broker-flat leg, but it runs in the tick loop, which start-up never
+        reached. Sends no orders: a leg the broker still holds stays, passes
+        reconcile, and is unwound by the tick loop.
+        """
+        if not (self.state.unwind_pending
+                or (self.state.position == "FLAT" and self.state.legs)):
+            return []
+        dropped = []
+        for leg in list(self.state.legs):
+            if broker_net.get(leg.tradingsymbol, 0) == 0:
+                self._drop_leg_closed_outside(leg)
+                dropped.append(leg.tradingsymbol)
+        if dropped and not self.state.legs:
+            self._record_close()
+            self.state.unwind_pending = False
+        return dropped
+
     def retry_unwind(self) -> bool:
         """Close every stray leg left by a failed reversal. True once flat.
 
@@ -2476,16 +2512,7 @@ class PairTradingStrategy(BaseStrategy):
                     continue                      # unknown → send nothing
                 want = leg.quantity * leg.lot_size
                 if held == 0:
-                    logger.critical("%s/%s: broker is flat in %s — dropping the "
-                                    "stray leg from state", self.symbol_a,
-                                    self.symbol_b, ts)
-                    # Closed outside this runner (manual square-off, or an
-                    # earlier close that filled unseen). No order of ours, so
-                    # no cost: book the mark against entry and drop the leg.
-                    mark = leg.current_price or leg.entry_price
-                    self.state.realized_pnl += (
-                        (mark - leg.entry_price) * leg.quantity * leg.lot_size)
-                    self.state.legs.remove(leg)
+                    self._drop_leg_closed_outside(leg)
                     continue
                 if held * want < 0 or abs(held) % leg.lot_size:
                     logger.critical(
