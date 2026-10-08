@@ -1024,6 +1024,37 @@ def _fut_underlying(tradingsymbol: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def sync_stray_legs_with_broker(strategies, kite, log: logging.Logger) -> List[str]:
+    """Before the start-up reconcile: drop stray legs the broker no longer
+    holds. Read-only — no orders. Without it, a stray leg squared off by hand
+    makes reconcile refuse to start, and the crash-loop latches HALT_ALL for
+    every runner (2026-10-08). A positions() failure is left to reconcile,
+    which refuses to start on unknown broker state, as before."""
+    live = [s for s in strategies if getattr(s, "mode", "paper") == "live"
+            and has_stray_legs(s)]
+    if not live:
+        return []
+    try:
+        net = kite.positions().get("net", []) or []
+    except Exception as e:
+        log.error("stray-leg sync skipped: positions() failed: %s", e)
+        return []
+    broker_net: Dict[str, int] = {}
+    for row in net:
+        if row.get("exchange") == "NFO" and row.get("tradingsymbol"):
+            ts = row["tradingsymbol"]
+            broker_net[ts] = broker_net.get(ts, 0) + int(row.get("quantity", 0) or 0)
+    dropped: List[str] = []
+    for s in live:
+        gone = s.sync_stray_legs(broker_net)
+        if gone:
+            log.critical("[%s/%s] stray leg(s) %s are flat at the broker (closed "
+                         "outside the runner) — removed from state before reconcile",
+                         s.symbol_a, s.symbol_b, gone)
+            dropped.extend(gone)
+    return dropped
+
+
 def reconcile_with_broker(strategies, kite, log: logging.Logger,
                           halt_path: Optional[Path] = None) -> None:
     # Live-mode safety: state-file is the runner's view of open positions;
@@ -1667,6 +1698,8 @@ def main():
         prior_state, {f"{s.symbol_a}/{s.symbol_b}" for s in strategies}, log,
     )
 
+    if args.mode == "live":
+        sync_stray_legs_with_broker(strategies, kite, log)
     reconcile_with_broker(strategies, kite, log, naked_halt)
 
     now = datetime.now()

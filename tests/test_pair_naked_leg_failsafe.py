@@ -320,3 +320,53 @@ def test_kotak_order_rejection_keeps_the_reason_but_not_secrets():
     with pytest.raises(BrokerOrderError) as e2:
         client._request_json("POST", "https://x/login/1.0/tradeApiValidate", headers={})
     assert "body=" not in str(e2.value)
+
+
+def _stray(sym_a, sym_b, ts, lots, lot_size, px):
+    from strategies.pair_trading import PairLeg
+    s = _make_strategy(mode="live", spread_history=HIST)
+    s.symbol_a, s.symbol_b = sym_a, sym_b
+    s.state.legs = [PairLeg(symbol=sym_a, tradingsymbol=ts, lot_size=lot_size,
+                            quantity=lots, entry_price=px, current_price=px,
+                            expiry="2026-10-27")]
+    s.state.unwind_pending = True
+    return s
+
+
+def test_startup_drops_legs_squared_off_by_hand_and_starts(flags):
+    """2026-10-08: yesterday's two stray legs were closed by hand, still in
+    state; reconcile saw -475/+100 vs broker 0, refused to start 5 times and
+    the failure handler latched HALT_ALL for every runner."""
+    bharti = _stray("BHARTIARTL", "M&M", "BHARTIARTL26OCTFUT", -1, 475, 1847.2)
+    eicher = _stray("EICHERMOT", "BAJFINANCE", "EICHERMOT26OCTFUT", 1, 100, 7024.5)
+    broker = _net()                                   # flat, as on 10-08
+    log = _Log()
+    dropped = rpp.sync_stray_legs_with_broker([bharti, eicher], broker, log)
+    assert sorted(dropped) == ["BHARTIARTL26OCTFUT", "EICHERMOT26OCTFUT"]
+    for s in (bharti, eicher):
+        assert s.state.legs == [] and s.state.unwind_pending is False
+    rpp.reconcile_with_broker([bharti, eicher], broker, log, flags.scoped)  # no raise
+    assert not flags.scoped.exists()
+
+
+def test_startup_keeps_a_leg_the_broker_still_holds(flags):
+    """No orders at start-up: a real naked leg stays for the tick loop."""
+    eicher = _stray("EICHERMOT", "BAJFINANCE", "EICHERMOT26OCTFUT", 1, 100, 7024.5)
+    eicher._live_execute = lambda *a, **k: pytest.fail("start-up must not trade")
+    broker = _net(EICHERMOT26OCTFUT=100)
+    assert rpp.sync_stray_legs_with_broker([eicher], broker, _Log()) == []
+    assert eicher.state.legs and eicher.state.unwind_pending
+    rpp.reconcile_with_broker([eicher], broker, _Log(), flags.scoped)     # matches
+
+
+def test_startup_still_refuses_when_the_broker_is_unreadable(flags):
+    eicher = _stray("EICHERMOT", "BAJFINANCE", "EICHERMOT26OCTFUT", 1, 100, 7024.5)
+
+    def down():
+        raise RuntimeError("positions down")
+
+    broker = SimpleNamespace(positions=down)
+    assert rpp.sync_stray_legs_with_broker([eicher], broker, _Log()) == []
+    assert eicher.state.legs, "unknown broker state must not drop a leg"
+    with pytest.raises(RuntimeError):
+        rpp.reconcile_with_broker([eicher], broker, _Log(), flags.scoped)
