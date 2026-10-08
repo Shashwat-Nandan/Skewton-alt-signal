@@ -24,6 +24,24 @@
 - [x] `deploy/dispersion-paper.{service,timer}` + VPS guide §3.5: Mon–Fri
       14:55 IST, Persistent (safe: no login, exits after 15:30). Files only —
       NOT installed or enabled on the host; that is a post-merge deploy step.
+- [x] Merged 2026-10-02 as b529a94 (squash) on owner instruction, with no
+      CODEOWNER review — overrides safety rule 5; recorded in the merge body.
+      Deployed on this host: frontend rebuilt, dashboard-backend restarted
+      (/api/dispersion-paper live, gated), dispersion-paper.{service,timer}
+      installed (root, /root/Skewton-alt-signal) and enabled WITHOUT a
+      daemon-reload. First fire Mon 2026-10-05 14:55 IST; first entry the
+      session after 2026-10-27.
+- [x] Reviewed pair-persistent units (2026-10-02): for
+      pair-paper-persistent{,-live}.{service,timer} and
+      pair-live-halt-on-failure the LOADED config equals the on-disk file,
+      so a daemon-reload changes nothing for them (the 2026-09-30 edit is
+      already live — 2026-10-01's live session logged a ₹100000 breaker).
+- [ ] Owner decision: the host LIVE unit runs --max-daily-loss-inr 100000
+      (+ --max-book-notional-inr 4000000, no Redis publish). The recorded
+      live decision (VPS guide §7.10, 2026-06-07) and deploy/ template are
+      ₹25,000; ₹100k was approved only for the baseline PAPER runner (#147).
+      No record of the 2026-09-30 host change. Either restore ₹25k on the
+      host or record the ₹100k decision and update the template.
 - [ ] Follow-up (owner decision): settle on the next session from the
       official bhavcopy close instead of the window LTP. Interacts with
       the missed-settlement path (dte < 0), so it is a design change to a
@@ -147,6 +165,146 @@ CODEOWNER review.
 - `pytest tests/`: 2230 passed, 9 skipped — 8 data_cache plus
   `fakeredis`, which is in requirements-dev.lock but missing from this
   venv. ruff clean.
+# Kotak orders must leave from the whitelisted IPv4 — 2026-10-01
+
+The IPv4 was already registered. The first live session still got
+`unauthorized` on every `place_order`. Kotak's `get-client-ip` says
+the Trade token created at 09:11 IST is bound to
+`2400:d321:2357:7648::1`. This host prefers the AAAA on
+`mis` and `e41`, so the order calls left from that address. Margin
+and positions are not IP-checked, which is why those succeeded.
+A forced-IPv4 call of `get-client-ip` still returns the login
+address, so the binding is the session, not the later request.
+
+- [x] Default Kotak HTTPS sockets resolve `AF_INET` only.
+- [x] A cached token bound to a non-IPv4 address is logged in again.
+      A timeout on that check does not replace the shared token.
+- [x] Squash-merged as 73ec29d. On the 2026-10-02 holiday a login
+      through that pin bound the Trade token to 94.136.188.224.
+      No order was sent. The official 2026-10-01 F&O bhavcopy
+      replaced the 20-row fallback, and both candidate files now
+      end on 2026-10-01 (Monday age 4, inside the live cap).
+
+`tests/test_broker_adapter.py` covers the pin. Monday 2026-10-05
+is the next session that can trade. Today's timers no-op on
+Gandhi Jayanti before login.
+
+# §6.2 MIS open-to-close — 2026-09-27
+
+User asked to price the sector-reversal session (next open → close) as
+cash intraday. Research only. The 2016–2023 cash archive named as the
+out-of-sample check is not on this host and was not fetched.
+
+- [x] `--mis` on `research/backtest_sector_reversal.py`. Same signal.
+      Full round trip every day (the position does not carry). ₹10 lakh
+      per side, orders sized by weight. Sensitivities: 5 bp/order, and
+      ₹10 lakh per name.
+- [x] Ran once. **KILL**: quintile gross +7.0 bp/day (t 3.10), statutory
+      cost 21.2, holdout net SR −3.33. ₹10 lakh/name holdout net SR
+      +1.02 on a multi-crore book; full sample at that size is −1.0 bp/day.
+      Review doc §2.2.
+
+`ruff check` clean on the two touched Python files. Sector-reversal
+tests: 20 passed. Full suite not re-run for this variant.
+
+# §6.2 sector-demeaned short-term reversal — offline test — 2026-09-27
+
+Pre-registered test from FT §6.2 as sharpened by
+`docs/research/drive-research-library-review-2026-09-26.md` §2. Research
+only: no strategy, runner, or live-cache change.
+
+- [x] Fix: `fetch_sectors` had its own `RENAMED` table duplicating
+      `core.universe.SYMBOL_ALIASES` (Rule 7/8). Now reads the one table.
+      `sectors.csv` data unchanged (header line only).
+- [x] Backfill 2024-07-08 → 2026-02-16 into
+      `data_cache/research_bhavcopy_raw/` + 149 live days (2026-09-25
+      Kite-fallback day excluded) = 549 sessions. 400/419 weekdays
+      fetched; all 19 misses checked against the NSE holiday list, 0
+      download errors. Live `bhavcopy_raw/` verified byte-unchanged
+      (name/size/mtime snapshot before vs after).
+- [x] `research/backtest_sector_reversal.py`: spec frozen in its docstring,
+      reuses `load_stf_panel`, same-contract returns (no roll jumps; the
+      expiry-day contract is not carried). Two bugs caught by the tests
+      before the real run: the expiring contract was being "held"
+      overnight, and a strict `> quantile` liquidity gate emptied tied
+      days. `tests/test_backtest_sector_reversal.py`: 9 pass.
+- [x] Ran once. **KILL**: primary holdout net SR −7.53; gross +3.5 bp/day
+      (t 1.2) vs cost 32.5 bp/day. 5-day retry: gross +0.8 vs cost 6.5,
+      holdout SR −3.39. Dead at zero slippage too. Recorded in the review
+      doc §2.1.
+- [x] User approved: `GMRINFRA→GMRAIRPORT` (ISIN INE776C01039,
+      2024-12-11) and `ZOMATO→ETERNAL` (ISIN INE758T01015, 2025-04-09)
+      added to `core.universe.SYMBOL_ALIASES`, ISINs checked in the NSE
+      cash bhavcopy either side of each date. New guard test: no alias
+      chains. `fetch_sectors` now WARNS (not raises) when an alias target
+      is outside the Nifty 500 — raising would have blocked every future
+      refresh once a renamed company left the index; `--check` stays the
+      loud gate. `sectors.csv` regenerated (504 rows).
+      The reversal verdict was NOT re-run with the merged histories: two
+      names in a ~167-name universe cannot close a 10x cost gap.
+
+- [x] History check (user asked): legacy F&O bhavcopy 2001 → mid-2024,
+      UDiFF Jan 2024 → today, Jan–Jun 2024 in both. Blocker: today's
+      sector map covers 48 % of 2008's F&O names, 73 % of 2016's
+      (survivorship). Review doc §2.2.
+- [x] Research side fixed: `corporate_action_adjusted` (lot-ratio rescale
+      for splits/bonuses, drop + log unexplained |ret| > 35 %). 4 new
+      tests. Corrected run: 28 rescaled, 5 dropped; still KILL (holdout
+      net SR −8.89, gross +3.9 bp/day t 1.6). Review doc §2.2.
+- [x] Cost audit (user asked): backtest double-counted slippage
+      (7 bp/side, now 5) and charged 0.05 % STT on 2024-25 history (now
+      date-correct: 0.0125 % / 0.02 % / 0.05 %). 3 new tests (15 total).
+      Corrected: cost 22.3 bp/day, holdout net SR −6.50, still KILL.
+      Exploratory split: overnight −3.7 bp/day (t −2.4), next-session
+      +6.8 (t 3.0); open-to-close variant is below the statutory floor
+      (≈13 bp/day at today's STT). Review doc §2.2.
+- [ ] For a CODEOWNERS owner: `core/costs.py` futures stamp duty 0.003 %
+      → 0.002 % (buy side). ~0.05 bp/side; touches live cost gates.
+- [ ] Live side, for a CODEOWNERS owner: the pair screener
+      (`core/screen_pairs.py` via `core/universe.py`) has no split/bonus
+      adjustment. No current exposure found (TRENT 2026-06-04 is in the
+      window but in no candidate/state/log).
+
+`ruff check .` clean. Full suite: 2143 passed, 9 skipped (the same 9 as
+before: 8 data_cache + fakeredis).
+
+# Drive research library: mirror + review against strategies — 2026-09-26
+
+User shared a Drive folder of paper research and asked to save it and
+review it against this repo's strategies. Docs-only; no strategy,
+runner, or dependency change.
+
+- [x] Mirror all 659 Drive entries to `research_library/` (gitignored).
+      645 unique paths; the 14 same-name collisions are byte-identical.
+      gdown hit Drive throttling, so fetched via `drive.usercontent`
+      with curl from a scratch venv (repo lockfiles untouched).
+- [x] 10 of 20 `.md.xz` are corrupt at source (re-download identical).
+      Readable prefixes are saved as `.md.partial` and listed in
+      `research_library/PROVENANCE.md`.
+- [x] Review written: `docs/research/drive-research-library-review-2026-09-26.md`,
+      indexed in `docs/README.md`.
+- [x] Sector map (user asked, same day): `market_data/sectors.csv`
+      (502 symbols, NSE's 20 Nifty 500 industries) +
+      `market_data/fetch_sectors.py` (refresh, `load_sector_map()`,
+      `--check`). `RENAMED` maps LTIM→LTM (ticker change 2026-02-27).
+      `--check` over the whole archive: 221/221 F&O stock tickers mapped.
+      `tests/test_fetch_sectors.py`: 8 pass. `ruff check .` clean. Full
+      suite: 2134 passed, 9 skipped — the 8 known data_cache skips plus
+      `fakeredis` missing from this venv (pre-existing, not this change).
+      Nothing consumes the map yet; no strategy or runner touched.
+- [x] ~~Flagged~~ Not a bug: `bhavcopy_raw/bhavcopy_fo_20260925.parquet`
+      (19 STF names) is the documented same-day Kite fallback; its
+      `.kite-fallback` sentinel makes the next fetch over that date
+      replace it with the NSE file (`_download_bhavcopy` docstring).
+      Worth confirming the daily fetch did revisit 2026-09-25.
+- [ ] Open, not done: check the "(per summary)" numbers against source
+      PDFs before any of them drives a decision.
+
+Review: titles triaged for all 645; ~25 summaries read at the level of
+their approach, results, and takeaways sections. The summaries are
+AI-generated and partly padded, so the review cites them as leads, not
+facts. No tests or lint run: no Python changed.
+
 # Calendar mean-reversion gates — 2026-09-25
 
 The review found entry and exit holes. The August full-archive NO-GO

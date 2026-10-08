@@ -137,6 +137,14 @@ class TestTheListItself:
             f"{stale} were renamed — the alias exists to carry HISTORY, not to "
             f"paper over a stale list; put the current ticker in NIFTY_50")
 
+    def test_no_alias_chains(self):
+        # canonical() resolves ONE hop. If a current ticker is later renamed
+        # again, the old entry must be repointed, or its history lands on a
+        # retired name and splits from the company's live series.
+        chained = {old: new for old, new in U.SYMBOL_ALIASES.items()
+                   if new in U.SYMBOL_ALIASES}
+        assert not chained, f"repoint these to the final ticker: {chained}"
+
     def test_no_duplicate_after_alias_resolution(self):
         from core.screen_pairs import NIFTY_50
         resolved = [U.canonical(s) for s in NIFTY_50]
