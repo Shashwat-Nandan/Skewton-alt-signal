@@ -1892,8 +1892,54 @@ class PairTradingStrategy(BaseStrategy):
         self._cached_futures[symbol] = info
         return info
 
+    # A batched snapshot is trusted for this long. Order placement and fill
+    # polling inside a tick take ~10 s per leg, so a tick-start snapshot read
+    # by a later pair would decide on prices tens of seconds old (PR #12
+    # review). Past this age every read goes back to a fresh quote.
+    TICK_QUOTE_MAX_AGE_S = 3.0
+    # Snapshot marker: the batch was rate-limited, so this tick reads no
+    # quotes at all rather than bursting 2N single requests into a 429.
+    RATE_LIMITED = "__rate_limited__"
+
+    def quote_keys(self) -> List[str]:
+        """Front-month NFO keys this pair's spread reads each tick. The runner
+        batches them across every pair into one quotes request (Kotak takes
+        up to 50). Held legs are not included: nothing reads them from the
+        snapshot, and an expired or illiquid one would fail the whole batch."""
+        keys = []
+        for sym in (self.symbol_a, self.symbol_b):
+            fut = self._resolve_futures(sym)
+            if fut:
+                keys.append(f"NFO:{fut['tradingsymbol']}")
+        return keys
+
+    def set_tick_quotes(self, snapshot: Optional[Dict[str, float]],
+                        taken_at: Optional[float] = None) -> None:
+        """Install (or clear, with None) this tick's batched last prices."""
+        self._tick_quotes = snapshot
+        self._tick_quotes_at = time.monotonic() if taken_at is None else taken_at
+
+    def _snapshot_price(self, key: str):
+        """(hit, price) from the tick snapshot; hit=False means quote fresh."""
+        snap = getattr(self, "_tick_quotes", None)   # __new__-built fixtures
+        if snap is None:
+            return False, None
+        age = time.monotonic() - getattr(self, "_tick_quotes_at", 0.0)
+        if age > self.TICK_QUOTE_MAX_AGE_S:
+            return False, None
+        if snap.get(self.RATE_LIMITED):
+            return True, None                        # skip, don't burst
+        if key in snap:
+            return True, snap[key]
+        return False, None
+
     def _get_last_price(self, tradingsymbol: str) -> Optional[float]:
         key = f"NFO:{tradingsymbol}"
+        # Batched per-tick snapshot first (2026-10-07: one request per leg,
+        # two runners firing at second :00, ran the account into Kotak 429s).
+        hit, price = self._snapshot_price(key)
+        if hit:
+            return price
         try:
             quote = self.client.quote([key])
             return float(quote[key]["last_price"])

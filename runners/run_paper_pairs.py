@@ -37,7 +37,7 @@ import re
 import signal
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
@@ -118,6 +118,92 @@ def halt_daily_loss_path(system: str) -> Path:
     if system == "persistent":
         return HALT_DAILY_LOSS_PATH
     return DATA_CACHE / f"HALT_DAILY_LOSS_{system}"
+
+def default_tick_offset(system: str) -> int:
+    """Second-of-the-minute this runner ticks on. The live persistent book
+    keeps :00; every other system ticks at :30 so two pair runners on the
+    same Kotak login never burst the quotes API in the same second
+    (2026-10-07: both entered the loop at 09:15:00.000/.001 and collided
+    every minute)."""
+    return 0 if system == "persistent" else 30
+
+
+def seconds_to_next_slot(offset: int, now: Optional[float] = None) -> float:
+    """Seconds until the next wall-clock tick slot (second `offset` of a
+    minute), in [0, TICK_SECONDS). Wall-clock alignment, not sleep-after-work:
+    two runners with different per-tick work would otherwise drift into each
+    other. A tick that ends just before its slot waits the fraction, it does
+    not skip a minute."""
+    now = time.time() if now is None else now
+    return (offset - now) % TICK_SECONDS
+
+
+def _is_rate_limited(err: Exception) -> bool:
+    text = str(err).lower()
+    return "429" in text or "rate-limit" in text or "too many requests" in text
+
+
+def _quote_isolating(client, keys: List[str], log: logging.Logger) -> Dict[str, float]:
+    """Quote `keys`, splitting the batch in halves when it fails for a reason
+    other than rate limiting, so one contract with no LTP or no scrip token
+    costs ~2·log2(N) requests instead of failing every pair every tick.
+    Rate limiting propagates: the caller backs off rather than retrying."""
+    try:
+        raw = client.quote(keys)
+        return {k: float(v["last_price"]) for k, v in raw.items()
+                if v and v.get("last_price") is not None}
+    except Exception as e:
+        if _is_rate_limited(e):
+            raise
+        if len(keys) == 1:
+            log.warning("quote dropped %s from this tick's batch: %s", keys[0], e)
+            return {}
+        mid = len(keys) // 2
+        out = _quote_isolating(client, keys[:mid], log)
+        out.update(_quote_isolating(client, keys[mid:], log))
+        return out
+
+
+def prefetch_tick_quotes(strategies, client, log: logging.Logger):
+    """One batched quotes request for every front-month contract this tick
+    reads. Installs the snapshot on each strategy and returns
+    (snapshot, status) with status "ok", "rate_limited" or "failed".
+
+    rate_limited: the snapshot is a skip marker — no pair quotes this tick,
+    instead of bursting 2N single requests into a throttling endpoint.
+    failed: no snapshot; strategies quote fresh per leg (the old behaviour).
+    """
+    from strategies.pair_trading import PairTradingStrategy as _P
+    keys: List[str] = []
+    for s in strategies:
+        try:
+            for k in s.quote_keys():
+                if k not in keys:
+                    keys.append(k)
+        except Exception as e:
+            log.warning("[%s/%s] quote_keys failed: %s", s.symbol_a, s.symbol_b, e)
+    snapshot, status = None, "ok"
+    if keys:
+        try:
+            snapshot = _quote_isolating(client, keys, log)
+        except Exception as e:
+            if _is_rate_limited(e):
+                snapshot, status = {_P.RATE_LIMITED: True}, "rate_limited"
+                log.warning("batched quote rate-limited — skipping quotes this "
+                            "tick for all %d pair(s): %s", len(strategies), e)
+            else:
+                snapshot, status = None, "failed"
+                log.warning("batched quote for %d contract(s) failed (%s) — "
+                            "pairs quote per leg this tick", len(keys), e)
+    taken_at = time.monotonic()
+    for s in strategies:
+        s.set_tick_quotes(snapshot, taken_at)
+    return snapshot, status
+
+
+# Consecutive non-ok batches before the runner escalates to CRITICAL.
+QUOTE_BATCH_ALERT_AFTER = 5
+
 
 def naked_leg_halt_path(system: str) -> Path:
     """This runner's own entry-halt flag for naked legs / untracked exposure.
@@ -1204,6 +1290,11 @@ def main():
                              "tool can split P&L by system. Defaults to "
                              "'baseline' which preserves the original "
                              "filenames.")
+    parser.add_argument("--tick-offset-seconds", type=int, default=None,
+                        help="Second of each minute to tick on (0-59). "
+                             "Default: 0 for --system persistent, 30 for any "
+                             "other system, so co-running pair runners never "
+                             "hit the broker's quotes API in the same second.")
     parser.add_argument("--quality-max-pvalue", type=float, default=None,
                         help="Override the cointegration p-value ceiling in "
                              "the quality floor (default QUALITY_MAX_PVALUE = "
@@ -1440,13 +1531,20 @@ def main():
         )
         nfo_instruments = None
 
+    # Current broker client for the per-tick quote batch; _refresh_broker
+    # swaps it so the batch never keeps using a dead session.
+    client_ref = {"kite": kite}
+
     # H8: closure for mid-session token refresh. broker.refresh()
     # re-authenticates (cached session if it is still valid, else a full
     # login), then re-wraps with the same throttler so the strategies
     # don't bypass H14 after a refresh.
     def _refresh_broker():
-        fresh = broker.refresh()
-        return throttle_broker(fresh, kite_limiter)
+        fresh = throttle_broker(broker.refresh(), kite_limiter)
+        # The tick batch must use the refreshed client too (PR #12 review);
+        # strategies rebind their own copy from this return value.
+        client_ref["kite"] = fresh
+        return fresh
 
     # H13: closure summing open-leg notional, called by each strategy before
     # it generates entry proposals.
@@ -1581,14 +1679,24 @@ def main():
         log.info("Started after %s — nothing to do today.", hard_stop_ts.strftime("%H:%M"))
         return 0
 
-    if now < open_ts:
-        sleep_until(open_ts, log)
+    tick_offset = (args.tick_offset_seconds if args.tick_offset_seconds is not None
+                   else default_tick_offset(args.system)) % TICK_SECONDS
+    first_slot = open_ts + timedelta(seconds=tick_offset)
+    if datetime.now() < first_slot:
+        sleep_until(first_slot, log)
+    else:
+        # Started late (crash or deploy restart): still wait for this
+        # runner's slot, so two runners restarted together don't collide.
+        time.sleep(seconds_to_next_slot(tick_offset))
 
-    log.info("Entering tick loop (every %ds until %s) over %d pair(s)",
-             TICK_SECONDS, session_end_ts.strftime("%H:%M"), len(strategies))
+    log.info("Entering tick loop (every %ds at second :%02d, until %s) over "
+             "%d pair(s); one batched quotes request per tick",
+             TICK_SECONDS, tick_offset, session_end_ts.strftime("%H:%M"),
+             len(strategies))
 
     halt_loss_path = halt_daily_loss_path(args.system)
     halt_state = _HaltState(halt_loss_path, scoped_path=naked_halt)
+    quote_failures = 0
     if args.max_daily_loss_inr <= 0:
         log.warning("--max-daily-loss-inr is disabled (0) — no automatic "
                     "circuit breaker for runaway losses this session")
@@ -1615,28 +1723,50 @@ def main():
                 reconcile_mid_session(strategies, kite, log, naked_halt)
                 last_reconcile = time.monotonic()
             n_errored = 0
-            for s in strategies:
-                outcome = tick_one(s, log,
-                                   halt_all=halt_state.halt_all,
-                                   halt_new_entries=halt_state.halt_new,
-                                   halt_path=naked_halt)
-                if outcome.attempted_execution:
-                    # Persist immediately so a SIGKILL before the next
-                    # strategy in this tick can't lose state mutations
-                    # from the call we just made. write_state_file is
-                    # fsync-durable (H4), so the post-rename state
-                    # survives power loss too. A no-op execute_proposals
-                    # (all-rejected, signals-mode) still triggers a write
-                    # here; that's harmless and the safer side to err on.
-                    try:
-                        write_state_file(strategies, args.system, log,
-                                         archive=False, mode=args.mode,
-                                         carry_forward=latch_carry)
-                    except Exception as e:
-                        log.exception("Per-fill state persist failed: %s "
-                                      "— continuing", e)
-                if outcome.errored:
-                    n_errored += 1
+            tick_started = time.time()
+            if not halt_state.halt_all:
+                _snap, quote_status = prefetch_tick_quotes(
+                    strategies, client_ref["kite"], log)
+                quote_failures = 0 if quote_status == "ok" else quote_failures + 1
+                if quote_failures == QUOTE_BATCH_ALERT_AFTER:
+                    log.critical(
+                        "Batched quotes have failed %d ticks in a row (last: %s) "
+                        "— pairs are blind or on per-leg fallback. Check the "
+                        "broker session and other processes on this login.",
+                        quote_failures, quote_status)
+            try:
+                for s in strategies:
+                    outcome = tick_one(s, log,
+                                       halt_all=halt_state.halt_all,
+                                       halt_new_entries=halt_state.halt_new,
+                                       halt_path=naked_halt)
+                    if outcome.attempted_execution:
+                        # Orders and fill polling take seconds; every later
+                        # decision this tick quotes fresh (PR #12 review).
+                        for other in strategies:
+                            other.set_tick_quotes(None)
+                        # Persist immediately so a SIGKILL before the next
+                        # strategy in this tick can't lose state mutations
+                        # from the call we just made. write_state_file is
+                        # fsync-durable (H4), so the post-rename state
+                        # survives power loss too. A no-op execute_proposals
+                        # (all-rejected, signals-mode) still triggers a write
+                        # here; that's harmless and the safer side to err on.
+                        try:
+                            write_state_file(strategies, args.system, log,
+                                             archive=False, mode=args.mode,
+                                             carry_forward=latch_carry)
+                        except Exception as e:
+                            log.exception("Per-fill state persist failed: %s "
+                                          "— continuing", e)
+                    if outcome.errored:
+                        n_errored += 1
+            finally:
+                # The snapshot is this tick's only: session-end flatten and
+                # order pricing read fresh, including after a SIGTERM
+                # mid-tick (PR #12 review).
+                for s in strategies:
+                    s.set_tick_quotes(None)
             n_ran = 0 if halt_state.halt_all else len(strategies)
             if heartbeat.record_tick(n_ran=n_ran, n_errored=n_errored):
                 silent_fail = True
@@ -1648,8 +1778,14 @@ def main():
                                  mode=args.mode, carry_forward=latch_carry)
             except Exception as e:
                 log.exception("Intraday state persist failed: %s — continuing", e)
+            elapsed = time.time() - tick_started
+            if elapsed > TICK_SECONDS:
+                log.warning("tick took %.0fs — %d slot(s) at :%02d skipped",
+                            elapsed, int(elapsed // TICK_SECONDS), tick_offset)
             remaining = (session_end_ts - datetime.now()).total_seconds()
-            time.sleep(max(1, min(TICK_SECONDS, remaining)))
+            # Floor 0.05 s, not 1 s: a tick ending at :59.4 waits 0.6 s for
+            # its :00 slot instead of sleeping past it into the next minute.
+            time.sleep(max(0.05, min(seconds_to_next_slot(tick_offset), remaining)))
 
         # Run end_of_session for both normal and silent-fail exits, but
         # wrap it in the silent-fail case: an uncaught exception in

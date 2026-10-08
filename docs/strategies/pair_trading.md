@@ -116,7 +116,7 @@ repo root>`, `OnFailure=notify-failure@%n.service`.
 | Orphan loading | For pairs in the state file but NOT in today's candidates → load as ORPHAN ("management-to-exit") | (search `ORPHAN` in source) |
 | Backup ring | `_state_backup.archive_state_backup` rolls a snapshot | shared with taleb |
 | Wait | Sleep until 09:15 IST | runner |
-| Tick | 09:15 → 15:25, every 60s | runner main loop |
+| Tick | 09:15 → 15:25, every 60s at a fixed second (:00 live, :30 others) | runner main loop |
 | Session end | Persist state per tick (commit `8bbd606`), write EOD sidecar, exit | runner |
 
 EOD does NOT force-flatten by default (since 2026-05-19). Open positions
@@ -262,17 +262,47 @@ notional on leg B.
 
 ## Tick loop and broker reconciliation
 
-Tick interval: 60s, from 09:15 to 15:25 IST. Per tick:
+Tick interval: 60 s, from 09:15 to 15:25 IST, **aligned to the wall clock**
+(2026-10-08, PR #12). Every runner on the shared Kotak login acts in its own
+second of the minute, so their quote bursts never collide:
 
-1. Fetch LTPs for all configured pair tradingsymbols in one batched
-   `kite.quote(...)` call
-2. For each `PairTradingStrategy` instance:
-   - `update_prices(ltp_map)` updates `_spread_history` and last-tick prices
-   - `scan_and_propose()` checks entry conditions
-   - `check_and_rehedge()` checks exit conditions on open positions
-   - In paper mode, mock-fill any returned proposals via `_paper_execute`
-3. Persist state to DB / state file (per `8bbd606`, every tick — earlier
-   was EOD-only)
+| Runner | Second | Set by |
+|---|---|---|
+| `--system persistent` (live) | :00 | `default_tick_offset` |
+| any other `--system` (e.g. baseline paper) | :30 | `default_tick_offset`; `--tick-offset-seconds` overrides |
+| dispersion paper (15:00–15:20) | :15 | `run_paper_dispersion.TICK_SECOND` |
+
+Slots are wall-clock, not "sleep 60 s after the work", so runners with
+different per-tick work cannot drift into each other. A tick that ends just
+before its slot waits the fraction; one that overruns 60 s logs the skipped
+slots. A runner that starts late (crash or deploy restart) still waits for its
+slot before the first tick.
+
+Per tick:
+
+1. `prefetch_tick_quotes` fetches every pair's **front-month** legs in one
+   `quote()` request (Kotak takes up to 50 symbols) and installs a per-tick
+   snapshot on each strategy.
+   - A contract with no LTP or scrip token is isolated by splitting the batch
+     in halves (~2·log2 N requests), not by failing every pair.
+   - A **429** installs a skip marker: no pair quotes this tick, instead of a
+     burst of per-leg requests into a throttling endpoint.
+   - Any other failure leaves no snapshot; pairs quote per leg as before.
+   - Five non-ok batches in a row log CRITICAL.
+   - The batch uses the refreshed client after a mid-session token refresh.
+2. For each `PairTradingStrategy`, `tick_one` runs the scan/exit/unwind logic.
+   `_get_last_price` reads the snapshot only while it is under
+   `TICK_QUOTE_MAX_AGE_S` (3 s) old; after any order activity in the tick the
+   snapshot is cleared, so later decisions quote fresh. Order prices are always
+   re-quoted by `OrderExecutor`.
+3. The snapshot is cleared in a `finally`, so session-end flatten, the EOD
+   report and a SIGTERM mid-tick never read it.
+4. Persist state to the state file (per `8bbd606`, every tick).
+
+Before PR #12 this section said quotes were already batched; the code issued
+one request per leg, which with two runners firing at :00 ran the account into
+quote 429s (26 on 2026-10-07, 79–99 on busier days). Kotak publishes no quote
+rate limit, so the per-process throttle stays at 8 req/s.
 
 Live mode adds broker reconciliation: `kite.positions()` is fetched
 each tick and the strategy's `state.positions` is reconciled against

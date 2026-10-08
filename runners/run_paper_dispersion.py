@@ -92,6 +92,10 @@ SILENT_FAIL_FLAG = DATA_CACHE / "SILENT_FAIL_dispersion_paper"
 SILENT_FAIL_EXIT = 3
 
 ENTRY_WINDOW_START = dtime(15, 0)
+# Second of each minute this runner acts on. The pair runners on the same
+# Kotak login tick at :00 (live persistent) and :30 (other systems); :15 keeps
+# all three quote bursts in different seconds (PR #12 review).
+TICK_SECOND = 15
 ENTRY_WINDOW_END = dtime(15, 20)
 # Closest strikes inside the replay's 0.85–1.15 band. Quoting the whole
 # board on an entry day is hundreds of contracts past what ATM selection uses.
@@ -102,6 +106,14 @@ _FILE_DAY = re.compile(r"bhavcopy_fo_(\d{8})")
 _SPOT_FALLBACK_LOGGED: set[str] = set()
 
 logger = logging.getLogger("run_paper_dispersion")
+
+
+def next_tick_slot(now: datetime) -> datetime:
+    """The next wall-clock second-:TICK_SECOND after `now`."""
+    nxt = now.replace(second=TICK_SECOND, microsecond=0)
+    while nxt <= now:
+        nxt += timedelta(seconds=TICK_SECONDS)
+    return nxt
 
 
 def in_decision_window(now: datetime, ignore: bool) -> bool:
@@ -643,7 +655,8 @@ def main(argv=None) -> int:
             while datetime.now() < session_end:
                 now = datetime.now()
                 if not args.ignore_entry_window and now.time() < ENTRY_WINDOW_START:
-                    sleep_until(datetime.combine(today, ENTRY_WINDOW_START), logger)
+                    sleep_until(datetime.combine(today, ENTRY_WINDOW_START)
+                                + timedelta(seconds=TICK_SECOND), logger)
                     continue
                 if not args.ignore_entry_window and now.time() > ENTRY_WINDOW_END:
                     logger.info(
@@ -658,7 +671,7 @@ def main(argv=None) -> int:
                 account(outcome)
                 if code:
                     break
-                nxt = datetime.now() + timedelta(seconds=TICK_SECONDS)
+                nxt = next_tick_slot(datetime.now())
                 if nxt >= session_end:
                     break
                 sleep_until(nxt, logger)
