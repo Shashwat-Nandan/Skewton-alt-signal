@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import logging
 import math
+import re
+import threading
 import time
+from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from core.broker.errors import (
@@ -64,6 +67,41 @@ _NETWORK_ERRORS = (_NetworkException, BrokerNetworkError)
 _ORDER_ERRORS = (_OrderException, BrokerOrderError)
 
 logger = logging.getLogger(__name__)
+
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+_last_cid_ms = [-1]
+_cid_lock = threading.Lock()
+
+
+def make_client_order_id(tag: str) -> str:
+    """One unique client order id per logical order (Kotak `ig`/GuiOrdId).
+
+    2026-10-07/09: every order of a pair reused one tag; Kotak refused all
+    but the first (stCode 32 "Client OrderID already exists") and left
+    naked legs. The id is made once per order and REUSED on that order's
+    retries, so a resend after a lost response is refused as a duplicate,
+    never a second live order (PR #15 review).
+
+    Readable prefix (letters, digits, '-'; 'pair-' shortened to 'p-') + '-'
+    + six base-36 chars of a per-process millisecond-of-day clock that
+    never repeats within a process. Deterministic: no random collisions.
+    Kotak's uniqueness is per trading day (a 10-07 tag was accepted again
+    on 10-09), and each live book runs in one process.
+    """
+    base = re.sub(r"[^A-Za-z0-9-]", "", str(tag or "")) or "algo"
+    if base.startswith("pair-"):
+        base = "p-" + base[len("pair-"):]
+    now = datetime.now()
+    ms = ((now.hour * 60 + now.minute) * 60 + now.second) * 1000 + now.microsecond // 1000
+    with _cid_lock:
+        ms = max(ms, _last_cid_ms[0] + 1)
+        _last_cid_ms[0] = ms
+    digits = ""
+    n = ms
+    for _ in range(6):                  # 36**6 > 86_400_000 ms in a day
+        n, r = divmod(n, 36)
+        digits = _B36[r] + digits
+    return f"{base[:13]}-{digits}"
 
 
 class OrderExecutor:
@@ -213,6 +251,8 @@ class OrderExecutor:
         limit_price = self._protective_limit_price(
             prop.tradingsymbol, prop.transaction_type, prop.price,
         )
+        # One client order id for this order, reused by every retry below.
+        cid = make_client_order_id(self._tag_for(prop))
 
         def _do_place():
             return self.client.place_order(
@@ -227,8 +267,38 @@ class OrderExecutor:
                 order_type=self.client.ORDER_TYPE_LIMIT,
                 price=limit_price,
                 validity=self.client.VALIDITY_DAY,
-                tag=self._tag_for(prop),
+                tag=cid,
             )
+
+        def _placed_earlier():
+            """Order id of an earlier attempt of THIS order that reached the
+            broker even though its response was lost; None if none or
+            unknowable. Read-only."""
+            finder = getattr(self.client, "find_order_by_tag", None)
+            if finder is None:
+                return None
+            try:
+                found = finder(cid)
+            except Exception as fe:
+                logger.warning("order-book lookup for %s (%s) failed: %s",
+                               prop.tradingsymbol, cid, fe)
+                return None
+            # Only a real order number counts; anything else (None, a test
+            # double's auto-attribute) means "not found" and the normal
+            # retry path runs.
+            return found if isinstance(found, str) and found else None
+
+        def _adopt_or_fail(reason: str, err, found=None) -> Dict:
+            found = found or _placed_earlier()
+            if found:
+                logger.critical(
+                    "%s: %s, but client order id %s is in the order book as "
+                    "%s — adopting it (no second order sent)",
+                    prop.tradingsymbol, reason, cid, found)
+                return self._poll_until_terminal(found, prop)
+            return {"order_id": None, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": f"{reason}: {err}", "mode": "live"}
 
         try:
             order_id = _do_place()
@@ -242,6 +312,9 @@ class OrderExecutor:
                         "filled_lots": 0, "average_price": 0.0,
                         "error": f"place_order: token-expired ({e})",
                         "mode": "live"}
+            found = _placed_earlier()
+            if found:
+                return _adopt_or_fail("token refresh", e, found)
             try:
                 order_id = _do_place()
             except Exception as e2:
@@ -249,10 +322,7 @@ class OrderExecutor:
                     "place_order failed after token refresh for %s: %s",
                     prop.tradingsymbol, e2,
                 )
-                return {"order_id": None, "status": "FAILED",
-                        "filled_lots": 0, "average_price": 0.0,
-                        "error": f"place_order post-refresh: {e2}",
-                        "mode": "live"}
+                return _adopt_or_fail("place_order post-refresh", e2)
         except _NETWORK_ERRORS as e:
             # M-B4: transient kite/network blip. Retry once with a brief
             # delay; if the second attempt also fails, give up for this
@@ -260,6 +330,12 @@ class OrderExecutor:
             logger.warning("place_order NetworkException for %s: %s — retrying once",
                            prop.tradingsymbol, e)
             time.sleep(1.0)
+            # The first attempt may have reached the broker with its response
+            # lost: adopt it rather than re-send (same cid would be refused
+            # as a duplicate anyway).
+            found = _placed_earlier()
+            if found:
+                return _adopt_or_fail("network error on place", e, found)
             try:
                 order_id = _do_place()
             except Exception as e2:
@@ -267,10 +343,7 @@ class OrderExecutor:
                     "place_order NetworkException retry failed for %s: %s",
                     prop.tradingsymbol, e2,
                 )
-                return {"order_id": None, "status": "FAILED",
-                        "filled_lots": 0, "average_price": 0.0,
-                        "error": f"place_order net-retry: {e2}",
-                        "mode": "live"}
+                return _adopt_or_fail("place_order net-retry", e2)
         except _ORDER_ERRORS as e:
             # M-B4: broker-side reject (margin, validation, exchange
             # error). Do not retry — the underlying cause is unlikely to
@@ -278,6 +351,10 @@ class OrderExecutor:
             # invalid-order issue. Log and return FAILED.
             logger.error("place_order OrderException for %s: %s",
                          prop.tradingsymbol, e)
+            if "already exists" in str(e).lower():
+                # Kotak stCode 32: this cid was already accepted — by an
+                # earlier attempt of this order. Track that order.
+                return _adopt_or_fail("place_order rejected", e)
             return {"order_id": None, "status": "FAILED",
                     "filled_lots": 0, "average_price": 0.0,
                     "error": f"place_order rejected: {e}", "mode": "live"}
@@ -409,7 +486,7 @@ class OrderExecutor:
                     prop.tradingsymbol, reverse_type, prop.price,
                 ),
                 validity=self.client.VALIDITY_DAY,
-                tag=self._tag_for(prop),
+                tag=make_client_order_id(self._tag_for(prop)),
             )
             logger.warning(
                 "H7 partial-fill recovery: placed reversing %s order %s for "

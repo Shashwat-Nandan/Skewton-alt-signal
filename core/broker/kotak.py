@@ -501,7 +501,7 @@ class KotakNeoClient:
             "tp": _fmt_price(trigger_price),
             "ts": strategy_to_kotak_tradingsymbol(exchange, tradingsymbol),
             "tt": kotak_side(transaction_type),
-            "ig": str(tag or "")[:20],
+            "ig": clean_client_order_id(tag),
             "os": "NEOTRADEAPI",
         }
         # Every Neo form POST is jData=JSON. A raw form body 500s; the
@@ -524,6 +524,20 @@ class KotakNeoClient:
             form=_jdata_form({"on": str(order_id), "am": "NO"}),
             detail=True,
         )
+
+    def find_order_by_tag(self, tag: str) -> Optional[str]:
+        """Broker order number of today's order whose client order ID is
+        `tag`, or None. Read-only. Lets the executor adopt an order whose
+        place_order response was lost, instead of re-sending it."""
+        want = clean_client_order_id(tag)
+        if not want:
+            return None
+        rows = _extract_list(self._trade_json("GET", _PATHS["order_book"]))
+        hits = [r for r in rows if str(r.get("GuiOrdId") or "") == want]
+        if not hits:
+            return None
+        hits.sort(key=lambda r: str(r.get("ordDtTm") or ""))
+        return str(hits[-1].get("nOrdNo") or "") or None
 
     def order_history(self, order_id) -> List[dict]:
         # `on` is the cancel field. History requires nOrdNo; `on` is
@@ -1360,6 +1374,16 @@ def _redact(obj):
     if isinstance(obj, list):
         return [_redact(v) for v in obj]
     return obj
+
+
+def clean_client_order_id(tag: str = "") -> str:
+    """Kotak's `ig` (shown as GuiOrdId) is the client order ID: unique per
+    order, and returned in the order book. Uniqueness is the caller's job —
+    OrderExecutor makes one per logical order and reuses it on retries, so
+    a resend after a lost response is refused as a duplicate instead of
+    becoming a second live order. Here it is only made safe: letters, digits
+    and '-' (an M&M tag carries '&'), at most 20 characters."""
+    return re.sub(r"[^A-Za-z0-9-]", "", str(tag or ""))[:20]
 
 
 def _rejection_detail(status_code: int, payload) -> str:

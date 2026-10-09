@@ -42,6 +42,8 @@ DEFAULT_THROTTLED_METHODS = (
     "cancel_order",
     "orders",
     "order_history",
+    # Order-book lookup by client order id (executor retry recovery).
+    "find_order_by_tag",
     "trades",
     "positions",
     "holdings",
