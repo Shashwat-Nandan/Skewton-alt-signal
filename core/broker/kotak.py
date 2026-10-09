@@ -18,7 +18,6 @@ import logging
 import os
 import re
 import socket
-import uuid
 from configparser import ConfigParser
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -502,7 +501,7 @@ class KotakNeoClient:
             "tp": _fmt_price(trigger_price),
             "ts": strategy_to_kotak_tradingsymbol(exchange, tradingsymbol),
             "tt": kotak_side(transaction_type),
-            "ig": unique_client_order_id(tag),
+            "ig": clean_client_order_id(tag),
             "os": "NEOTRADEAPI",
         }
         # Every Neo form POST is jData=JSON. A raw form body 500s; the
@@ -525,6 +524,20 @@ class KotakNeoClient:
             form=_jdata_form({"on": str(order_id), "am": "NO"}),
             detail=True,
         )
+
+    def find_order_by_tag(self, tag: str) -> Optional[str]:
+        """Broker order number of today's order whose client order ID is
+        `tag`, or None. Read-only. Lets the executor adopt an order whose
+        place_order response was lost, instead of re-sending it."""
+        want = clean_client_order_id(tag)
+        if not want:
+            return None
+        rows = _extract_list(self._trade_json("GET", _PATHS["order_book"]))
+        hits = [r for r in rows if str(r.get("GuiOrdId") or "") == want]
+        if not hits:
+            return None
+        hits.sort(key=lambda r: str(r.get("ordDtTm") or ""))
+        return str(hits[-1].get("nOrdNo") or "") or None
 
     def order_history(self, order_id) -> List[dict]:
         # `on` is the cancel field. History requires nOrdNo; `on` is
@@ -1363,19 +1376,14 @@ def _redact(obj):
     return obj
 
 
-def unique_client_order_id(tag: str = "") -> str:
-    """Kotak's `ig` is a client order ID and must be unique per order.
-
-    2026-10-07/09: the pair strategy tagged every order of a pair with the
-    same `pair-EICHE-BAJFI`. Kotak filled the first and refused the second
-    leg, the reversal and every unwind retry with stCode 32 "Client Order Id
-    Error Client OrderID already exists" (surfaced as "error from core"),
-    leaving one-legged positions twice. The readable tag is kept as a prefix
-    (without the redundant "pair-") and a random suffix makes each order
-    unique, within the 20 characters this adapter has always sent.
-    """
-    prefix = str(tag or "").replace("pair-", "", 1)[:11] or "algo"
-    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+def clean_client_order_id(tag: str = "") -> str:
+    """Kotak's `ig` (shown as GuiOrdId) is the client order ID: unique per
+    order, and returned in the order book. Uniqueness is the caller's job —
+    OrderExecutor makes one per logical order and reuses it on retries, so
+    a resend after a lost response is refused as a duplicate instead of
+    becoming a second live order. Here it is only made safe: letters, digits
+    and '-' (an M&M tag carries '&'), at most 20 characters."""
+    return re.sub(r"[^A-Za-z0-9-]", "", str(tag or ""))[:20]
 
 
 def _rejection_detail(status_code: int, payload) -> str:

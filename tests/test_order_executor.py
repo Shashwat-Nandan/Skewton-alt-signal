@@ -102,13 +102,15 @@ class TestCompleteFill:
         assert order["quantity"] == 50          # 2 lots × 25
         assert order["exchange"] == "NFO"
         assert order["validity"] == "DAY"
-        assert order["tag"] == "x" * 20         # kite's 20-char cap
+        # Broker 20-char cap; the readable tag leads, then a per-order
+        # suffix (Kotak client order ids must be unique — 2026-10-09).
+        assert len(order["tag"]) <= 20 and order["tag"].startswith("x" * 13)
 
     def test_callable_order_tag_receives_proposal(self):
         kite = FakeKite()
         _executor(kite, order_tag=lambda p: f"t-{p.transaction_type}",
                   ).execute(_prop("SELL"))
-        assert kite.placed[0]["tag"] == "t-SELL"
+        assert kite.placed[0]["tag"].startswith("t-SELL-")
 
 
 class TestProtectiveLimitPrice:
