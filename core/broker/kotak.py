@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import socket
+import uuid
 from configparser import ConfigParser
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -501,7 +502,7 @@ class KotakNeoClient:
             "tp": _fmt_price(trigger_price),
             "ts": strategy_to_kotak_tradingsymbol(exchange, tradingsymbol),
             "tt": kotak_side(transaction_type),
-            "ig": str(tag or "")[:20],
+            "ig": unique_client_order_id(tag),
             "os": "NEOTRADEAPI",
         }
         # Every Neo form POST is jData=JSON. A raw form body 500s; the
@@ -1360,6 +1361,21 @@ def _redact(obj):
     if isinstance(obj, list):
         return [_redact(v) for v in obj]
     return obj
+
+
+def unique_client_order_id(tag: str = "") -> str:
+    """Kotak's `ig` is a client order ID and must be unique per order.
+
+    2026-10-07/09: the pair strategy tagged every order of a pair with the
+    same `pair-EICHE-BAJFI`. Kotak filled the first and refused the second
+    leg, the reversal and every unwind retry with stCode 32 "Client Order Id
+    Error Client OrderID already exists" (surfaced as "error from core"),
+    leaving one-legged positions twice. The readable tag is kept as a prefix
+    (without the redundant "pair-") and a random suffix makes each order
+    unique, within the 20 characters this adapter has always sent.
+    """
+    prefix = str(tag or "").replace("pair-", "", 1)[:11] or "algo"
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
 def _rejection_detail(status_code: int, payload) -> str:
