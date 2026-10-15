@@ -1,5 +1,26 @@
 # Lessons
 
+## Test a state fix from the next start-up, not just the current session
+
+- 2026-10-08: PR #11 taught reconcile to count stray legs and the tick loop
+  to drop broker-flat ones. Nobody tested the next morning: legs already
+  squared off by hand made the start-up reconcile refuse before the tick
+  loop ran, the crash-loop latched HALT_ALL, and all three books lost a day.
+  Fixed in #13; caught only by the live run.
+- Takeaway: **any change to what state means must be replayed against the
+  real state file at start-up** (restore → reconcile → first tick), including
+  "the operator fixed it by hand overnight".
+
+## Quote every heredoc that carries prose
+
+- 2026-10-02 and 2026-10-07: an unquoted `<<EOF` holding markdown let bash
+  run each backticked word as a command substitution. Nothing executable
+  matched, but a todo note and a PR body were silently mangled, and the
+  second time it hit a live-incident PR description.
+- Takeaway: **prose, PR bodies and commit messages go through `<<'EOF'`
+  (quoted), always.** Only use an unquoted heredoc when variable expansion
+  is the point, and then keep backticks out of it.
+
 ## Read the whole function's locals before naming a new one in it
 
 - 2026-10-02: the dispersion gamma attribution got a new `held` dict (basket
@@ -18,6 +39,25 @@
 - Takeaway: **on a branch with someone else's uncommitted changes, any
   stash/checkout must name paths.**
 
+## Grep for the concept, not just the word, before adding a lookup table
+
+- 2026-09-26: `market_data/fetch_sectors.py` shipped its own `RENAMED =
+  {"LTIM": "LTM"}`. `core.universe.SYMBOL_ALIASES` already held exactly that,
+  and it is what the pair screener and `load_stf_panel` apply. The pre-build
+  check grepped for "sector"/"industry" (none) but not for rename/alias, so
+  the second table went in unnoticed. Found the next day while reading
+  `load_stf_panel`; fixed to read the one table.
+- Takeaway: **before adding any mapping keyed by ticker (renames, cutoffs,
+  sectors, lot sizes), grep `core/universe.py` and for `ALIASES|RENAME|MAP`.**
+  Two rename tables drift the first time one ticker changes and only one
+  gets updated — a backtest then splits one company into two histories.
+
+## The same pass surfaced a second trap: the live screener reads its whole directory
+
+- `load_front_month_panel` reads EVERY file in `data_cache/bhavcopy_raw/`.
+  Backfilling research history there would silently change the live pair
+  book's screen. Research history goes in `data_cache/research_bhavcopy_raw/`
+  (`research.backtest_sector_reversal.backfill`).
 
 ## Answer a "should we ban X" question with the split, not the anecdote
 

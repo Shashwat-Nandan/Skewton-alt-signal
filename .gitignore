@@ -31,6 +31,8 @@ Dynamic_Hedging-Taleb.pdf
 portfolio-optimization-book.pdf
 shot.png
 claude_example.py
+# Drive paper-summary mirror (2026-09-26); see research_library/PROVENANCE.md
+research_library/
 
 # OS
 .DS_Store
