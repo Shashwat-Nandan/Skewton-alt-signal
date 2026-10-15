@@ -407,6 +407,23 @@ sudo systemctl disable --now kalman-pairs-paper.timer   # stop arming
 sudo systemctl stop kalman-pairs-paper.service          # kill a mid-session run (paper → nothing to unwind)
 ```
 
+### 3.4.2 Live pair runner: automated entry halts (PR #17)
+
+The live pair runner latches **its own** entry-halt flags; it never touches the
+shared, operator-owned `HALT_NEW_ENTRIES` (2026-10-13: one Kotak read timeout
+set the shared flag and froze every runner for 1.5 days).
+
+| Flag in `data_cache/` | Set when | Cleared |
+|---|---|---|
+| `HALT_NEW_ENTRIES_pairs_persistent` | state ≠ broker mid-session, a naked leg, or positions() fails non-transiently (session rejected) | **by a human** after verifying broker vs state: `rm` it |
+| `HALT_NEW_ENTRIES_pairs_persistent_broker_unreadable` | positions() unreadable (timeout/connection/429) on 3 checks in a row, retried every 60 s | **automatically** the next time positions() answers (or at the next start-up) |
+
+Exits continue under both. Every `HALT_*` flag shows as a red banner on every
+dashboard page (`GET /api/halt-flags`). For a Telegram alert, install
+`deploy/pair-entry-halt-alert.{path,service}` + `pair-entry-halt-alert.sh`
+with the §3.3 path/user substitution (needs a `daemon-reload`; review pending
+unit changes first).
+
 ### 3.5 Dispersion paper runner (two books)
 
 Hedged hold-to-expiry Nifty dispersion (Bloch 2016, §7.6.5): short the Nifty ATM straddle, long same-expiry constituent straddles, futures-hedged at the close, held to the monthly expiry. **Paper only** — `DispersionPaperStrategy` raises for `mode=live` and the runner has no `--mode` flag. One process runs two books on one set of quotes, each with its own state file:

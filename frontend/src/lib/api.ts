@@ -3,6 +3,7 @@ import type {
   AuthStatus,
   BuyOnGapResponse,
   DispersionResponse,
+  HaltFlagsResponse,
   EquityPendingEntriesResponse,
   EquityPositionsResponse,
   EquityScansResponse,
@@ -158,6 +159,8 @@ export const api = {
   },
 
   dispersionPaper: () => http<DispersionResponse>("/dispersion-paper"),
+
+  haltFlags: () => http<HaltFlagsResponse>("/halt-flags"),
 
   mpTrend: (params: { days?: number } = {}) => {
     const q = new URLSearchParams();

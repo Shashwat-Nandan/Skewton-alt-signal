@@ -26,6 +26,7 @@ from .routers import (
     delivery_accum,
     dispersion_paper,
     equity_swing,
+    halt_flags,
     kalman_pairs,
     kalman_trend,
     ma_momentum,
@@ -112,6 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(arbitrage_paper.router, prefix="/api", dependencies=gated)
     app.include_router(buy_on_gap_paper.router, prefix="/api", dependencies=gated)
     app.include_router(dispersion_paper.router, prefix="/api", dependencies=gated)
+    app.include_router(halt_flags.router, prefix="/api", dependencies=gated)
     app.include_router(positions.router, prefix="/api", dependencies=gated)
     app.include_router(portfolio.router, prefix="/api", dependencies=gated)
     app.include_router(equity_swing.router, prefix="/api", dependencies=gated)
