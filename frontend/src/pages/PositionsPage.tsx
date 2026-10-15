@@ -247,24 +247,48 @@ function fmtZ(z: number | null | undefined): string {
   return z == null ? "—" : `${z >= 0 ? "+" : ""}${z.toFixed(2)}`;
 }
 
+// "15 Oct 11:42 IST" — the date matters: before today's first tick the
+// value is yesterday's.
+function fmtAsOf(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return (
+    d.toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata", day: "numeric", month: "short",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }) + " IST"
+  );
+}
+
 // One line under a held pair: the runner's own z and the bands it exits on.
 function PairZRow({ z }: { z: PairZ }) {
-  const inBand = z.current_z != null && z.exit_z != null && Math.abs(z.current_z) <= z.exit_z;
+  const inBand =
+    !z.stale && z.current_z != null && z.exit_z != null && Math.abs(z.current_z) <= z.exit_z;
   return (
-    <TableRow className="bg-muted/10 hover:bg-muted/10">
-      <TableCell colSpan={8} className="py-1.5 text-xs text-muted-foreground">
-        <span className="font-medium text-foreground">Runner z now {fmtZ(z.current_z)}</span>
-        {z.as_of && <span> (as of {formatTime(z.as_of)})</span>}
-        {inBand && <span className="ml-1 text-emerald-600">· inside exit band</span>}
+    <TableRow className={cn("bg-muted/10 hover:bg-muted/10", z.stale && "opacity-70")}>
+      <TableCell colSpan={8} className="whitespace-normal py-1.5 text-xs text-muted-foreground">
+        <span className="font-medium text-foreground">Runner z {fmtZ(z.current_z)}</span>
+        {z.as_of && <span> (as of {fmtAsOf(z.as_of)})</span>}
+        {z.stale && <span className="ml-1 font-medium text-amber-600">· stale, not the current z</span>}
+        {inBand && (
+          <span className="ml-1 text-emerald-600">
+            · inside exit band
+            {z.exit_debounce_ticks ? ` (${z.exit_streak ?? 0}/${z.exit_debounce_ticks} ticks)` : ""}
+          </span>
+        )}
         <span> · entry {fmtZ(z.entry_z)}</span>
         {z.exit_z != null && (
           <span>
             {" "}· exits at |z| ≤ {z.exit_z.toFixed(2)}
-            {z.exit_debounce_ticks ? ` for ${z.exit_debounce_ticks} ticks` : ""}
+            {z.exit_debounce_ticks ? ` for ${z.exit_debounce_ticks} ticks in a row` : ""}
           </span>
         )}
         {z.stop_z != null && <span> · stop |z| ≥ {z.stop_z.toFixed(2)}</span>}
-        {z.max_holding_days != null && <span> · max hold {z.max_holding_days} trading days</span>}
+        {z.max_holding_days != null && (
+          <span>
+            {" "}· held {z.held_trading_days ?? "?"}/{z.max_holding_days} trading days
+          </span>
+        )}
       </TableCell>
     </TableRow>
   );
@@ -304,7 +328,6 @@ function OpenPositionsTable({ rows }: { rows: OpenPosition[] }) {
             const prevGroup = i > 0 ? rows[i - 1].group : null;
             const isNewGroup = prevGroup !== p.group;
             const pct = pctChange(p.entry_price, p.current_price);
-            const isLastOfGroup = i === rows.length - 1 || rows[i + 1].group !== p.group;
             return (
               <Fragment key={`${p.group}-${p.tradingsymbol}-${i}`}>
               <TableRow
@@ -358,7 +381,7 @@ function OpenPositionsTable({ rows }: { rows: OpenPosition[] }) {
                   <PnlIntensityBar pnl={p.unrealized_pnl} max={maxAbs} />
                 </TableCell>
               </TableRow>
-              {isLastOfGroup && p.pair_z && <PairZRow z={p.pair_z} />}
+              {p.pair_z && <PairZRow z={p.pair_z} />}
               </Fragment>
             );
           })}

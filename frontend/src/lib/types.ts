@@ -606,10 +606,13 @@ export type PositionMode = "paper" | "live";
 export type PairZ = {
   current_z: number | null;
   as_of: string | null;
+  stale: boolean;
   entry_z: number | null;
   exit_z: number | null;
   exit_debounce_ticks: number | null;
+  exit_streak: number | null;
   stop_z: number | null;
+  held_trading_days: number | null;
   max_holding_days: number | null;
 };
 

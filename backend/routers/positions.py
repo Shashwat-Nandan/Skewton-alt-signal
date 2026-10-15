@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -44,11 +46,16 @@ class PairZ(BaseModel):
     window) — the number its exits act on. Not the screener's refit z on the
     candidates page, which uses a different beta and window."""
     current_z: Optional[float] = None
-    as_of: Optional[str] = None
+    as_of: Optional[str] = None             # ISO with +05:30 offset
+    # True when current_z is not from the last few ticks today (quote outage,
+    # rate-limited tick, halt, or yesterday's value before today's first tick).
+    stale: bool = True
     entry_z: Optional[float] = None
     exit_z: Optional[float] = None          # exit when |z| <= this ...
     exit_debounce_ticks: Optional[int] = None   # ... on this many ticks in a row
-    stop_z: Optional[float] = None          # stop when |z| >= this
+    exit_streak: Optional[int] = None       # ticks in a row inside the band so far
+    stop_z: Optional[float] = None          # stop when |z| >= this (the one in force)
+    held_trading_days: Optional[int] = None
     max_holding_days: Optional[int] = None
 
 
@@ -107,6 +114,58 @@ class PositionsResponse(BaseModel):
 
 
 # ─────────────────────────── helpers ───────────────────────────
+
+# The pair runner ticks once a minute; a z older than this is not current.
+PAIR_Z_STALE_AFTER_S = 180
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _num(x) -> Optional[float]:
+    """A finite float or None — NaN/inf would fail the JSON response."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _int(x) -> Optional[int]:
+    v = _num(x)
+    return None if v is None else int(v)
+
+
+def _pair_z(pair: dict, st: dict, now: datetime) -> Optional[PairZ]:
+    """The runner's own z for a held pair, or None when the state file does
+    not record one (a runner on older code, or the Kalman runner, whose z and
+    exit rules differ) — better no row than a misleading one."""
+    if "last_z" not in st:
+        return None
+    as_of = st.get("last_z_at")
+    as_of = as_of if isinstance(as_of, str) else None
+    stale = True
+    try:
+        ts = datetime.fromisoformat(as_of) if as_of else None
+        if ts is not None:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=IST)
+            stale = (ts.astimezone(IST).date() != now.date()
+                     or (now - ts).total_seconds() > PAIR_Z_STALE_AFTER_S)
+    except (TypeError, ValueError):
+        pass
+    current = _num(st.get("last_z"))
+    return PairZ(
+        current_z=current,
+        as_of=as_of,
+        stale=stale or current is None,
+        entry_z=_num(st.get("entry_z")),
+        exit_z=_num(pair.get("exit_z")),
+        exit_debounce_ticks=_int(pair.get("exit_debounce_ticks")),
+        exit_streak=_int(st.get("mean_revert_streak")),
+        stop_z=_num(st.get("stop_z_in_force")),
+        held_trading_days=_int(st.get("held_trading_days")),
+        max_holding_days=_int(pair.get("max_holding_days")),
+    )
+
 
 def _empty_summary() -> SystemSummary:
     return SystemSummary(
@@ -279,7 +338,8 @@ def _build_taleb_block(today: date, underlying: str = "NIFTY") -> SystemBlock:
     )
 
 
-def _build_pair_block(name: str, label: str, filename: str, today: date) -> SystemBlock:
+def _build_pair_block(name: str, label: str, filename: str, today: date,
+                      now: Optional[datetime] = None) -> SystemBlock:
     path = DATA_CACHE / filename
     payload = _load_state(path)
     if not payload:
@@ -307,15 +367,8 @@ def _build_pair_block(name: str, label: str, filename: str, today: date) -> Syst
         if st.get("position") and st.get("position") != "FLAT":
             entry_time = st.get("entry_time")
             entry_z = st.get("entry_z")
-            pair_z = PairZ(
-                current_z=st.get("last_z"),
-                as_of=st.get("last_z_at"),
-                entry_z=entry_z if isinstance(entry_z, (int, float)) else None,
-                exit_z=pair.get("exit_z"),
-                exit_debounce_ticks=pair.get("exit_debounce_ticks"),
-                stop_z=st.get("effective_stop_z") or None,
-                max_holding_days=pair.get("max_holding_days"),
-            )
+            pair_z = _pair_z(pair, st, now or datetime.now(IST))
+            n_before = len(open_positions)
             spread_note = (
                 f"{st.get('position')} · entry z={entry_z:+.2f}"
                 if isinstance(entry_z, (int, float))
@@ -342,8 +395,11 @@ def _build_pair_block(name: str, label: str, filename: str, today: date) -> Syst
                     unrealized_pnl=unrealized,
                     entry_time=entry_time,
                     note=spread_note,
-                    pair_z=pair_z,
                 ))
+            # Pair-level, so once per pair: on its last leg, under which the
+            # Positions tab draws it.
+            if pair_z is not None and len(open_positions) > n_before:
+                open_positions[-1].pair_z = pair_z
 
         for t in st.get("closed_trades", []) or []:
             if not _is_today(t.get("exit_time"), today):
