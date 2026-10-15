@@ -39,6 +39,19 @@ DATA_CACHE = REPO_ROOT / "data_cache"
 
 # ─────────────────────────── response shape ───────────────────────────
 
+class PairZ(BaseModel):
+    """The live runner's own z for a held pair (entry beta, its lookback
+    window) — the number its exits act on. Not the screener's refit z on the
+    candidates page, which uses a different beta and window."""
+    current_z: Optional[float] = None
+    as_of: Optional[str] = None
+    entry_z: Optional[float] = None
+    exit_z: Optional[float] = None          # exit when |z| <= this ...
+    exit_debounce_ticks: Optional[int] = None   # ... on this many ticks in a row
+    stop_z: Optional[float] = None          # stop when |z| >= this
+    max_holding_days: Optional[int] = None
+
+
 class OpenPosition(BaseModel):
     # `group` lets the UI keep pair legs visually together; a Taleb structure's
     # legs share one group named for the structure, e.g. "NIFTY straddle" or
@@ -54,6 +67,8 @@ class OpenPosition(BaseModel):
     entry_time: Optional[str] = None
     # Free-form context: z-score for pairs, strike/expiry for options
     note: Optional[str] = None
+    # Pairs only: the runner's live z and its exit bands, shown under the pair.
+    pair_z: Optional[PairZ] = None
 
 
 class ClosedTrade(BaseModel):
@@ -292,6 +307,15 @@ def _build_pair_block(name: str, label: str, filename: str, today: date) -> Syst
         if st.get("position") and st.get("position") != "FLAT":
             entry_time = st.get("entry_time")
             entry_z = st.get("entry_z")
+            pair_z = PairZ(
+                current_z=st.get("last_z"),
+                as_of=st.get("last_z_at"),
+                entry_z=entry_z if isinstance(entry_z, (int, float)) else None,
+                exit_z=pair.get("exit_z"),
+                exit_debounce_ticks=pair.get("exit_debounce_ticks"),
+                stop_z=st.get("effective_stop_z") or None,
+                max_holding_days=pair.get("max_holding_days"),
+            )
             spread_note = (
                 f"{st.get('position')} · entry z={entry_z:+.2f}"
                 if isinstance(entry_z, (int, float))
@@ -318,6 +342,7 @@ def _build_pair_block(name: str, label: str, filename: str, today: date) -> Syst
                     unrealized_pnl=unrealized,
                     entry_time=entry_time,
                     note=spread_note,
+                    pair_z=pair_z,
                 ))
 
         for t in st.get("closed_trades", []) or []:

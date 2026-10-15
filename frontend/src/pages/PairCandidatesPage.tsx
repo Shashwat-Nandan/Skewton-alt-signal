@@ -40,7 +40,7 @@ type Column = { key: SortKey; label: string; align?: "right" | "center"; help?: 
 const BASE_COLUMNS: Column[] = [
   { key: "processing_rank", label: "Order", align: "center", help: "Admit order for the runner under the requested --top cutoff. Blank = skipped (hover for reason)." },
   { key: "symbol_a", label: "Pair" },
-  { key: "latest_z_score", label: "Z-score", align: "right", help: "Latest spread vs panel mean/std" },
+  { key: "latest_z_score", label: "Screen z", align: "right", help: "Screener's z: refit beta, screen window. Not the exit signal for a held pair — the runner's own z is on the Positions tab" },
   { key: "rank_score", label: "Rank", align: "right", help: "Lower is better — composite of p, half-life, vol" },
   { key: "coint_pvalue", label: "Coint p", align: "right", help: "Engle-Granger p-value" },
   { key: "half_life_days", label: "Half-life", align: "right", help: "Days for spread to revert halfway" },

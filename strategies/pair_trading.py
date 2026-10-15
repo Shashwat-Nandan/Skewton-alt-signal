@@ -228,6 +228,12 @@ class PairState:
     # which is real broker exposure. While set, the pair opens nothing and
     # retry_unwind() closes the stray legs every tick until they are gone.
     unwind_pending: bool = False
+    # The z the runner itself last computed for a HELD pair (entry beta,
+    # lookback_days window) and when. Display only: the Positions tab shows it
+    # so an operator does not read the screener's refit z (different beta and
+    # window) as the exit signal (2026-10-15, EICHERMOT/SHRIRAMFIN).
+    last_z: Optional[float] = None
+    last_z_at: Optional[datetime] = None
     # Baseline frozen at the moment of the stop, so the latch is cleared by the
     # spread actually coming back — not by the yardstick moving. The runner
     # re-seeds _spread_history from bhavcopy every session and the window is
@@ -627,6 +633,8 @@ class PairTradingStrategy(BaseStrategy):
         if spread is None:
             return []
         z = self._z_score(spread)
+        self.state.last_z = z
+        self.state.last_z_at = self._clock()
 
         # Update marks for unrealized P&L reporting
         self._update_unrealized(prices)
@@ -961,6 +969,10 @@ class PairTradingStrategy(BaseStrategy):
         return {
             "pair": [self.symbol_a, self.symbol_b],
             "hedge_ratio": self.hedge_ratio,
+            # Exit thresholds in force, so the dashboard shows the real bands.
+            "exit_z": self.exit_z,
+            "exit_debounce_ticks": self.exit_debounce_ticks,
+            "max_holding_days": self.max_holding_days,
             "state": {
                 "position": self.state.position,
                 "entry_z": self.state.entry_z,
@@ -1009,6 +1021,9 @@ class PairTradingStrategy(BaseStrategy):
                 # Naked-leg latch: must survive a restart, or tomorrow's
                 # runner treats the stray leg as an ordinary FLAT pair.
                 "unwind_pending": self.state.unwind_pending,
+                "last_z": self.state.last_z,
+                "last_z_at": (self.state.last_z_at.isoformat()
+                              if self.state.last_z_at else None),
                 # The frozen pre-stop baseline the latch is judged against.
                 # Without it the latch survives the session but its yardstick
                 # does not, and tomorrow's re-seeded window clears it.
@@ -1082,6 +1097,13 @@ class PairTradingStrategy(BaseStrategy):
         ))
         # A FLAT pair that still carries legs is a stray (naked) leg whatever
         # the flag says — files written before the latch existed included.
+        lz = state_blob.get("last_z")
+        self.state.last_z = None if lz is None else float(lz)
+        lza = state_blob.get("last_z_at")
+        try:
+            self.state.last_z_at = datetime.fromisoformat(lza) if lza else None
+        except (TypeError, ValueError):
+            self.state.last_z_at = None
         self.state.unwind_pending = bool(
             state_blob.get("unwind_pending")
             or (state_blob.get("position", "FLAT") == "FLAT" and state_blob["legs"])
