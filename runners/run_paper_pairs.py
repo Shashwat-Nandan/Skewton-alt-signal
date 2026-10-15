@@ -219,6 +219,17 @@ def naked_leg_halt_path(system: str) -> Path:
 # next (a manual square-off, an un-captured partial, an expiry) — re-check
 # hourly so drift is caught within the session, not the next morning.
 RECONCILE_INTERVAL_S = 3600
+# A mid-session positions() read that fails is not drift (2026-10-13: one Kotak
+# read timeout latched the shared HALT_NEW_ENTRIES and froze every runner's
+# entries for a day and a half). Re-check soon; halt only if broker state stays
+# unknown for this many checks in a row.
+RECONCILE_RETRY_S = 60
+RECONCILE_UNKNOWN_HALT_AFTER = 3
+
+
+class BrokerStateUnknown(RuntimeError):
+    """positions() could not be read. A RuntimeError, so the start-up gate
+    still refuses to start; mid-session it is retried, not treated as drift."""
 
 
 def ensure_pair_config(orig_path: str, cli_max_leg_notional: float, log: logging.Logger) -> str:
@@ -1070,7 +1081,7 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger,
         broker_positions = kite.positions().get("net", []) or []
     except Exception as e:
         log.exception("kite.positions() failed: %s", e)
-        raise RuntimeError(
+        raise BrokerStateUnknown(
             f"Broker reconciliation could not run: kite.positions() raised "
             f"{e!r}. Refusing to start — broker state is unknown."
         )
@@ -1200,32 +1211,69 @@ def reconcile_with_broker(strategies, kite, log: logging.Logger,
 
 
 def reconcile_mid_session(strategies, kite, log: logging.Logger,
-                          halt_path: Optional[Path] = None) -> bool:
-    """3.7 / M-6: periodic in-session drift check. Unlike the startup gate
-    (reconcile_with_broker, which RAISES to refuse start), a mismatch or a
-    kite.positions() failure here must NOT crash the live loop. On drift, log
-    CRITICAL and touch HALT_NEW_ENTRIES so no NEW exposure opens while existing
-    positions can still exit — then leave escalation (HALT_ALL / manual
-    square-off) to the operator. Returns True iff drift was detected.
+                          halt_path: Optional[Path] = None) -> str:
+    """3.7 / M-6: periodic in-session drift check. Never raises (the start-up
+    gate, reconcile_with_broker, is the one that refuses to start).
 
-    No-op when no live strategy is present (paper books have no broker truth)."""
+    Returns "ok", "drift" or "unknown":
+    - drift (state and broker disagree): CRITICAL and latch this runner's own
+      entry halt (`halt_path`, HALT_NEW_ENTRIES_<system>-scoped) so no new
+      exposure opens while positions still exit.
+    - unknown (positions() could not be read): ERROR only. A failed read is
+      not drift; the caller re-checks after RECONCILE_RETRY_S and latches the
+      halt only after RECONCILE_UNKNOWN_HALT_AFTER unknowns in a row.
+
+    Never touches the shared, operator-owned HALT_NEW_ENTRIES: it freezes
+    every runner (core.runner_common; 2026-07-15 and 2026-10-13 incidents).
+    No-op ("ok") when no live strategy is present."""
     if not any(getattr(s, "mode", "paper") == "live" for s in strategies):
-        return False
+        return "ok"
     try:
         reconcile_with_broker(strategies, kite, log, halt_path)
-        return False
+        return "ok"
+    except BrokerStateUnknown as e:
+        log.error("Mid-session reconcile skipped — broker positions unreadable "
+                  "(not drift; re-checking in %ds): %s", RECONCILE_RETRY_S, e)
+        return "unknown"
     except Exception as e:
         log.critical(
-            "MID-SESSION RECONCILE DRIFT: %s — touching HALT_NEW_ENTRIES "
-            "(existing positions keep exiting; investigate broker vs state "
-            "before clearing the flag).", e,
+            "MID-SESSION RECONCILE DRIFT: %s — halting this runner's new "
+            "entries (existing positions keep exiting; investigate broker vs "
+            "state before clearing the flag).", e,
         )
-        try:
-            HALT_NEW_ENTRIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-            HALT_NEW_ENTRIES_PATH.touch()
-        except Exception as te:
-            log.exception("Failed to touch HALT_NEW_ENTRIES: %s", te)
-        return True
+        latch_halt_new_entries(log, f"mid-session reconcile drift: {e}", halt_path)
+        return "drift"
+
+
+class ReconcileSchedule:
+    """When the next mid-session reconcile is due, and the unreadable streak.
+
+    Hourly while the broker answers. After an "unknown" (positions() could
+    not be read) it re-checks every RECONCILE_RETRY_S and latches this
+    runner's entry halt once RECONCILE_UNKNOWN_HALT_AFTER checks in a row
+    were unknown; any readable answer resets the streak."""
+
+    def __init__(self, now: float):
+        self.last = now
+        self.every = RECONCILE_INTERVAL_S
+        self.unknown_streak = 0
+
+    def due(self, now: float) -> bool:
+        return now - self.last >= self.every
+
+    def record(self, status: str, now: float, log: logging.Logger,
+               halt_path: Optional[Path]) -> None:
+        self.last = now
+        if status == "unknown":
+            self.unknown_streak += 1
+            self.every = RECONCILE_RETRY_S
+            if self.unknown_streak >= RECONCILE_UNKNOWN_HALT_AFTER:
+                latch_halt_new_entries(
+                    log, f"broker positions unreadable for {self.unknown_streak} "
+                         "checks in a row", halt_path)
+        else:
+            self.unknown_streak = 0
+            self.every = RECONCILE_INTERVAL_S
 
 
 def write_eod_sidecar(strategies, today: date, log: logging.Logger,
@@ -1743,7 +1791,7 @@ def main():
         log=log,
     )
     silent_fail = False
-    last_reconcile = time.monotonic()
+    reconcile_due = ReconcileSchedule(time.monotonic())
     try:
         while datetime.now() < session_end_ts:
             halt_state.refresh(log)
@@ -1751,10 +1799,9 @@ def main():
             # sessions so drift is caught in-session, not at next startup.
             # Non-fatal: on drift it touches HALT_NEW_ENTRIES (caught by the
             # next halt_state.refresh) rather than crashing the loop.
-            if (args.mode == "live"
-                    and time.monotonic() - last_reconcile >= RECONCILE_INTERVAL_S):
-                reconcile_mid_session(strategies, kite, log, naked_halt)
-                last_reconcile = time.monotonic()
+            if args.mode == "live" and reconcile_due.due(time.monotonic()):
+                status = reconcile_mid_session(strategies, kite, log, naked_halt)
+                reconcile_due.record(status, time.monotonic(), log, naked_halt)
             n_errored = 0
             tick_started = time.time()
             if not halt_state.halt_all:

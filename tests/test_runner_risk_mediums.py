@@ -206,62 +206,74 @@ def _live_leg_strategy():
     ])
 
 
-def test_mid_session_clean_reconcile_no_halt(tmp_path, monkeypatch):
-    # A matching broker book → no drift, no HALT_NEW_ENTRIES, returns False.
+def _flags(tmp_path, monkeypatch):
+    """Shared operator flag and this runner's scoped latch, both in tmp."""
     from runners import run_paper_pairs as rp
-    halt = tmp_path / "HALT_NEW_ENTRIES"
-    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+    shared = tmp_path / "HALT_NEW_ENTRIES"
+    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", shared)
+    return rp, shared, tmp_path / "HALT_NEW_ENTRIES_pairs_persistent"
+
+
+def test_mid_session_clean_reconcile_no_halt(tmp_path, monkeypatch):
+    # A matching broker book → "ok", no flag of any kind.
+    rp, shared, scoped = _flags(tmp_path, monkeypatch)
     s = _live_leg_strategy()
     kite = _kite_with_positions([{
         "exchange": "NFO", "tradingsymbol": "AAA26APRFUT",
         "quantity": 100, "average_price": 1000.0,
     }])
-    drift = rp.reconcile_mid_session([s], kite, logging.getLogger("test"))
-    assert drift is False
-    assert not halt.exists()
+    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test"), scoped) == "ok"
+    assert not shared.exists() and not scoped.exists()
 
 
-def test_mid_session_drift_halts_new_entries_without_raising(tmp_path, monkeypatch, caplog):
-    # Share mismatch mid-session must NOT raise (would crash the live loop) —
-    # it touches HALT_NEW_ENTRIES and returns True so existing positions still
-    # exit while no new exposure opens.
-    from runners import run_paper_pairs as rp
-    halt = tmp_path / "HALT_NEW_ENTRIES"
-    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+def test_mid_session_drift_halts_this_runner_without_raising(tmp_path, monkeypatch, caplog):
+    # A share mismatch mid-session must NOT raise (it would crash the live
+    # loop). It halts THIS runner's new entries — its scoped flag — so
+    # positions still exit while no new exposure opens. It never touches the
+    # shared operator flag, which would freeze every runner (2026-10-13).
+    rp, shared, scoped = _flags(tmp_path, monkeypatch)
     caplog.set_level(logging.CRITICAL, logger="")
     s = _live_leg_strategy()
     kite = _kite_with_positions([{
         "exchange": "NFO", "tradingsymbol": "AAA26APRFUT",
         "quantity": 50, "average_price": 1000.0,   # broker disagrees on shares
     }])
-    drift = rp.reconcile_mid_session([s], kite, logging.getLogger("test"))
-    assert drift is True
-    assert halt.exists()                            # new entries halted
+    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test"), scoped) == "drift"
+    assert scoped.exists() and not shared.exists()
     assert any("MID-SESSION RECONCILE DRIFT" in r.message for r in caplog.records)
 
 
-def test_mid_session_kite_failure_halts_not_raises(tmp_path, monkeypatch):
-    # A kite.positions() outage mid-session must also halt-new, not crash.
-    from runners import run_paper_pairs as rp
-    halt = tmp_path / "HALT_NEW_ENTRIES"
-    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+def test_mid_session_unreadable_broker_is_not_drift(tmp_path, monkeypatch):
+    # 2026-10-13: one Kotak positions() read timeout was treated as drift and
+    # latched the shared HALT_NEW_ENTRIES, freezing every runner for a day and
+    # a half. A failed read must not crash and must not halt on its own; the
+    # caller re-checks and halts only if it stays unreadable (next test).
+    rp, shared, scoped = _flags(tmp_path, monkeypatch)
     s = _live_leg_strategy()
     kite = MagicMock()
-    kite.positions = MagicMock(side_effect=RuntimeError("kite down"))
-    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test")) is True
-    assert halt.exists()
+    kite.positions = MagicMock(side_effect=RuntimeError("Read timed out"))
+    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test"), scoped) == "unknown"
+    assert not shared.exists() and not scoped.exists()
+
+
+def test_start_up_still_refuses_on_an_unreadable_broker():
+    # The start-up gate is unchanged: unknown broker state refuses to start.
+    from runners import run_paper_pairs as rp
+    s = _live_leg_strategy()
+    kite = MagicMock()
+    kite.positions = MagicMock(side_effect=RuntimeError("Read timed out"))
+    with pytest.raises(RuntimeError, match="could not run"):
+        rp.reconcile_with_broker([s], kite, logging.getLogger("test"))
 
 
 def test_mid_session_noop_for_paper(tmp_path, monkeypatch):
     # Paper books have no broker truth → no-op, no HALT, no kite call.
-    from runners import run_paper_pairs as rp
-    halt = tmp_path / "HALT_NEW_ENTRIES"
-    monkeypatch.setattr(rp, "HALT_NEW_ENTRIES_PATH", halt)
+    rp, shared, scoped = _flags(tmp_path, monkeypatch)
     s = _live_leg_strategy()
     s.mode = "paper"
     kite = MagicMock()
-    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test")) is False
-    assert not halt.exists()
+    assert rp.reconcile_mid_session([s], kite, logging.getLogger("test"), scoped) == "ok"
+    assert not shared.exists() and not scoped.exists()
     kite.positions.assert_not_called()
 
 
@@ -327,3 +339,27 @@ def test_halt_state_reads_only_its_own_daily_loss_flag(tmp_path, monkeypatch):
     baseline_flag.touch()                            # own flag now present
     hs.refresh(logging.getLogger("test"))
     assert hs.halt_new is True
+
+
+def test_reconcile_schedule_retries_fast_and_halts_only_on_a_streak(tmp_path):
+    # One unreadable check must not halt (2026-10-13); it re-checks after 60 s.
+    # Three unreadable checks in a row — ~3 minutes blind to the broker — halt
+    # this runner's entries. A readable answer in between resets the streak.
+    from runners import run_paper_pairs as rp
+    scoped = tmp_path / "HALT_NEW_ENTRIES_pairs_persistent"
+    log = logging.getLogger("test")
+    sched = rp.ReconcileSchedule(now=0.0)
+    assert not sched.due(3599.0) and sched.due(3600.0)
+
+    sched.record("unknown", 3600.0, log, scoped)
+    assert not scoped.exists() and sched.due(3600.0 + rp.RECONCILE_RETRY_S)
+    sched.record("ok", 3660.0, log, scoped)                 # recovered
+    assert sched.unknown_streak == 0 and not sched.due(3660.0 + 3599)
+
+    t = 7260.0
+    for _ in range(rp.RECONCILE_UNKNOWN_HALT_AFTER - 1):
+        sched.record("unknown", t, log, scoped)
+        t += rp.RECONCILE_RETRY_S
+    assert not scoped.exists()
+    sched.record("unknown", t, log, scoped)
+    assert scoped.exists()
