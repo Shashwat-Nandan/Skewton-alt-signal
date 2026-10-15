@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch the LIVE pair runner's own entry-halt flags and Telegram-alert the operator
+Documentation=man:systemd.path(5)
+
+[Path]
+# Drift / naked-leg latch (needs a human) and the self-clearing
+# unreadable-broker latch (PR #17). Path/user substitution as in VPS guide §3.3.
+PathExists=/opt/taleb-karpathy-kite/data_cache/HALT_NEW_ENTRIES_pairs_persistent
+PathExists=/opt/taleb-karpathy-kite/data_cache/HALT_NEW_ENTRIES_pairs_persistent_broker_unreadable
+Unit=pair-entry-halt-alert.service
+
+[Install]
+WantedBy=paths.target

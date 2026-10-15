@@ -37,6 +37,13 @@ const NAV_ITEMS: NavItem[] = [
 export function Header() {
   const qc = useQueryClient();
   const { data: auth } = useQuery({ queryKey: ["auth"], queryFn: api.authStatus });
+  // Any HALT_* flag in data_cache, on every page: an automated halt froze
+  // every runner for 1.5 days on 2026-10-13 with nothing on screen.
+  const { data: halts } = useQuery({
+    queryKey: ["halt-flags"],
+    queryFn: api.haltFlags,
+    refetchInterval: 60_000,
+  });
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -148,6 +155,19 @@ export function Header() {
           </Button>
         </div>
       </div>
+      {halts && halts.flags.length > 0 && (
+        <div className="border-t border-rose-600/50 bg-rose-600/10 text-rose-600">
+          <div className="container py-2 text-sm">
+            {halts.flags.map((f) => (
+              <div key={f.name} className="flex flex-wrap items-baseline gap-x-2">
+                <span className="font-semibold">{f.name}</span>
+                <span className="text-xs opacity-80">since {f.since.replace("T", " ")}</span>
+                <span>— {f.meaning}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </header>
   );
 }

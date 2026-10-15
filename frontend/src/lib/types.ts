@@ -810,6 +810,17 @@ export type ShortCallResponse = {
   closed_trades: ShortCallClosedTrade[];
 };
 
+// ── Halt flags (backend/routers/halt_flags.py) ──
+
+export type HaltFlag = {
+  name: string;
+  since: string;
+  meaning: string;
+  self_clearing: boolean;
+};
+
+export type HaltFlagsResponse = { flags: HaltFlag[] };
+
 // ── Dispersion paper books (backend/routers/dispersion_paper.py) ──
 
 export type DispersionLeg = {
