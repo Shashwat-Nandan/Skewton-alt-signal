@@ -27,11 +27,13 @@ Mode dispatch:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -160,6 +162,26 @@ def _aggregate_book_notional(data_cache: Optional[Path] = None, *,
     return total
 
 
+def _finite_or_none(x) -> Optional[float]:
+    """float(x) if it is a finite number, else None (never raises)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _ist_iso(ts: Optional[datetime]) -> Optional[str]:
+    """ISO timestamp with an explicit +05:30 offset. The runner's clock is
+    naive IST (systemd TZ=Asia/Kolkata); an explicit offset lets readers age
+    it correctly whatever their own TZ."""
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    return ts.isoformat(timespec="seconds")
+
+
 def _trading_days_between(start: date, end: date, holidays: set) -> int:
     # H6: count NSE trading days in (start, end] — weekends and
     # holidays.csv excluded. Matches the run_paper_pairs gating.
@@ -228,6 +250,12 @@ class PairState:
     # which is real broker exposure. While set, the pair opens nothing and
     # retry_unwind() closes the stray legs every tick until they are gone.
     unwind_pending: bool = False
+    # The z the runner itself last computed for a HELD pair (entry beta,
+    # lookback_days window) and when. Display only: the Positions tab shows it
+    # so an operator does not read the screener's refit z (different beta and
+    # window) as the exit signal (2026-10-15, EICHERMOT/SHRIRAMFIN).
+    last_z: Optional[float] = None
+    last_z_at: Optional[datetime] = None
     # Baseline frozen at the moment of the stop, so the latch is cleared by the
     # spread actually coming back — not by the yardstick moving. The runner
     # re-seeds _spread_history from bhavcopy every session and the window is
@@ -619,6 +647,16 @@ class PairTradingStrategy(BaseStrategy):
             return self._build_entry_proposals(direction="SHORT_SPREAD", z=z, spread=spread, prices=prices)
         return []
 
+    def _held_trading_days(self) -> Optional[int]:
+        """Trading days the open position has been held (MAX_HOLD's count)."""
+        if self.state.position == "FLAT" or not self.state.entry_time:
+            return None
+        try:
+            return _trading_days_between(self.state.entry_time.date(),
+                                         self._clock().date(), self._holidays())
+        except Exception:
+            return None
+
     def check_and_rehedge(self) -> List[TradeProposal]:
         if self.state.position == "FLAT":
             return []
@@ -627,6 +665,8 @@ class PairTradingStrategy(BaseStrategy):
         if spread is None:
             return []
         z = self._z_score(spread)
+        self.state.last_z = _finite_or_none(z)
+        self.state.last_z_at = self._clock()
 
         # Update marks for unrealized P&L reporting
         self._update_unrealized(prices)
@@ -961,6 +1001,10 @@ class PairTradingStrategy(BaseStrategy):
         return {
             "pair": [self.symbol_a, self.symbol_b],
             "hedge_ratio": self.hedge_ratio,
+            # Exit thresholds in force, so the dashboard shows the real bands.
+            "exit_z": self.exit_z,
+            "exit_debounce_ticks": self.exit_debounce_ticks,
+            "max_holding_days": self.max_holding_days,
             "state": {
                 "position": self.state.position,
                 "entry_z": self.state.entry_z,
@@ -1009,6 +1053,13 @@ class PairTradingStrategy(BaseStrategy):
                 # Naked-leg latch: must survive a restart, or tomorrow's
                 # runner treats the stray leg as an ordinary FLAT pair.
                 "unwind_pending": self.state.unwind_pending,
+                # Display-only fields for the Positions tab (PR #18).
+                "last_z": _finite_or_none(self.state.last_z),
+                "last_z_at": _ist_iso(self.state.last_z_at),
+                # The stop check_and_rehedge actually applies.
+                "stop_z_in_force": (self.state.effective_stop_z or self.stop_z)
+                if self.state.position != "FLAT" else None,
+                "held_trading_days": self._held_trading_days(),
                 # The frozen pre-stop baseline the latch is judged against.
                 # Without it the latch survives the session but its yardstick
                 # does not, and tomorrow's re-seeded window clears it.
@@ -1086,6 +1137,18 @@ class PairTradingStrategy(BaseStrategy):
             state_blob.get("unwind_pending")
             or (state_blob.get("position", "FLAT") == "FLAT" and state_blob["legs"])
         )
+        # Display-only (Positions tab). Never allowed to fail a restore: a bad
+        # value here must not abandon a live position (PR #18 review).
+        self.state.last_z = _finite_or_none(state_blob.get("last_z"))
+        try:
+            lza = state_blob.get("last_z_at")
+            ts = datetime.fromisoformat(lza) if lza else None
+            if ts is not None and ts.tzinfo is not None:
+                # Back to the runner's naive-IST clock.
+                ts = ts.astimezone(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+            self.state.last_z_at = ts
+        except (TypeError, ValueError):
+            self.state.last_z_at = None
 
         def _opt_float(key):
             v = state_blob.get(key)

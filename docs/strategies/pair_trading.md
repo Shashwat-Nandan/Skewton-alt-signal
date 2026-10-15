@@ -344,6 +344,9 @@ on held positions and emit warnings to `logs/pair-verify-*.json` and
     {
       "pair": ["<symbol_a>", "<symbol_b>"],
       "hedge_ratio": 0.1725,
+      "exit_z": 0.75,                   // display: exit band in force
+      "exit_debounce_ticks": 2,         // display
+      "max_holding_days": 7,            // display
       "state": {
         "position": "FLAT|LONG_SPREAD|SHORT_SPREAD",
         "entry_z": -2.0127,
@@ -364,6 +367,10 @@ on held positions and emit warnings to `logs/pair-verify-*.json` and
         "realized_pnl": -752.71,
         "unrealized_pnl": -4250.0,
         "total_transaction_costs": 752.71,
+        "last_z": -1.1067,              // display: runner's z, last tick it had a spread
+        "last_z_at": "2026-10-15T11:42:00+05:30",
+        "stop_z_in_force": 4.0,         // display: effective_stop_z or stop_z; null when FLAT
+        "held_trading_days": 2,         // display: MAX_HOLD's count; null when FLAT
         "closed_trades": [
           {
             "exit_time": "<ISO>",
@@ -386,6 +393,18 @@ Persistence cadence:
   60s tick. Backup ring not touched.
 - **Per session end** — backup ring rolled (`pair_paper_state_<system>.<timestamp>.json`,
   4 kept) via `_state_backup.archive_state_backup`.
+
+The `// display` fields (PR #18, 2026-10-15) feed the Positions tab's
+"Runner z" line under each held pair. No trading, exit, reconcile or
+restore decision reads them; `restore_state` turns a malformed `last_z`
+into `null` rather than failing (a raise there abandons the saved
+position). `last_z` only advances on a tick that observed a spread, so a
+rate-limited/failed-quote tick or a halt leaves it frozen — the
+Positions API marks it `stale` when it is not from today or is over
+3 minutes old. It is the runner's z (entry β, `lookback_days` window),
+not the pair screen's "Screen z" (refit β, screen window): the two can
+differ a lot (EICHERMOT/SHRIRAMFIN on 2026-10-14: runner −1.11, screen
+−0.41).
 
 EOD sidecar `pair_paper_eod_<date>.json` written at session end with
 per-pair `generate_eod_report()` output — consumed by the dashboard and

@@ -6138,3 +6138,19 @@ whole sweep flat.
 - [x] Tests: pre-flight exclude+backfill, all-stillborn fallback, empty
       frame fail-loud, quarantine-suffix convention (38 green).
 - [x] Full suite (1268 passed) → merge → re-run sweep (supervised).
+
+## 2026-10-15 — Positions tab: the pair runner's own z (PR #18)
+
+Operator read the persistent-candidates z (EICHERMOT/SHRIRAMFIN −0.41,
+refit β, 130-session window) as the exit signal; the runner's own z
+(entry β 4.77, 60d window) was −1.11, outside the 0.75 band.
+
+- [x] Runner records last_z/last_z_at per held-pair tick; persists the
+      stop in force, held trading days, exit band/debounce/max hold.
+- [x] Positions tab: one line under each held pair (z, IST date+time,
+      stale flag, debounce progress, stop, held/max days).
+- [x] Candidates column renamed "Screen z".
+- [x] Review fixes: guarded restore (bad last_z never abandons a
+      position), NaN-safe API, real stop (fallback to stop_z), no row for
+      Kalman/old-code blobs, once per pair, docs.
+- [ ] CODEOWNER review → merge → deploy (backend restart + frontend build).

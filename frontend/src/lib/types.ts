@@ -601,6 +601,21 @@ export type EquityPendingEntriesResponse = {
 
 export type PositionMode = "paper" | "live";
 
+// The live pair runner's own z for a held pair (entry beta, its lookback
+// window): the number its exits act on. Not the candidates page's refit z.
+export type PairZ = {
+  current_z: number | null;
+  as_of: string | null;
+  stale: boolean;
+  entry_z: number | null;
+  exit_z: number | null;
+  exit_debounce_ticks: number | null;
+  exit_streak: number | null;
+  stop_z: number | null;
+  held_trading_days: number | null;
+  max_holding_days: number | null;
+};
+
 export type OpenPosition = {
   group: string;
   tradingsymbol: string;
@@ -612,6 +627,7 @@ export type OpenPosition = {
   unrealized_pnl: number | null;
   entry_time: string | null;
   note: string | null;
+  pair_z?: PairZ | null;
 };
 
 export type ClosedTrade = {
