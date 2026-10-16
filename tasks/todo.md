@@ -91,6 +91,37 @@ Command (cwd = deploy checkout, code from this branch):
   date too.
 - Paper (step 5) is not triggered. Nothing goes to paper or live.
 
+### Follow-up (owner request 2026-10-16): wider or no trail — still KILL
+
+Train is the test here. The holdout was already spent, so the holdout
+rows are description only and cannot unlock paper. "off" = a 1,000,000-
+point trail, which never tightens past the ATR stop.
+
+| trail | BarsToExit | train net | train gross | holdout net | holdout gross |
+|---|---|---|---|---|---|
+| 15 (published) | 10 | −3296.6 | +427.5 | −1719.7 | −71.8 |
+| 40 | 10 | −4408.2 | −683.9 | −761.1 | +887.2 |
+| 80 | 10 | −4144.6 | −420.3 | −905.8 | +742.2 |
+| 150 / 250 / 400 | 10 | −4252.3 | −528.1 | −651.3 | +996.8 |
+| off | 10 | −4252.3 | −528.1 | −649.2 | +998.9 |
+| 40 | 20 | −4952.0 | −1227.8 | −648.3 | +1000.0 |
+| 80 | 20 | −4128.8 | −404.8 | −656.8 | +991.2 |
+| 150 / 250 / 400 | 20 | −4543.1 | −819.0 | −247.3 | +1400.9 |
+| off | 20 | −4543.1 | −819.0 | −386.0 | +1262.2 |
+
+- **Every variant loses net, in both samples.** On train, every wider
+  trail also loses *before* costs: widening only removes the published
+  version's small gross gain.
+- **The holdout is gross-positive with wider trails** (+10 to +19 points
+  a trade) but pays about 22 points a trade, using the 0.05% STT from
+  2026-04-01.
+- **At the old 0.02% STT,** one holdout row is net-positive: trail ≥150
+  with BarsToExit 20 (+105 points, Sharpe 0.13). It fails the 1.5× cost
+  gate (−543), loses −4541 on train, and was picked after seeing the
+  holdout. Not a pass.
+- Six months of holdout gains that train does not show are regime, not
+  evidence. Verdict unchanged: KILL.
+
 ## Pre-registered gates (owner-approved 2026-10-16, before any 5-minute data was fetched; Jev kept)
 
 - Keep a rung only if: Jev mechanism_fit ≥ 1.0; train trades ≥ 100;
