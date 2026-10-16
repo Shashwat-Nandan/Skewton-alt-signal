@@ -4,14 +4,15 @@ Pre-registered before the run. Do not loosen these gates after seeing
 the numbers.
 
 Data
-    Daily front-month NIFTY futures in ``data_cache/research_bhavcopy_raw``
-    (2024-07-08 through 2026-09-24). This host has no 5-minute tape. Each
-    daily bar is stamped 15:30, so the published 09:30–15:30 window
-    includes every bar. Costs are ``core.costs.estimate_transaction_cost``
-    for one lot of futures, entry and exit, converted to points by the
-    entry lot. The 15:30 flatten is not in the spec and is not added.
-    The expiring contract is flattened at its own close so a roll gap
-    is not a profit.
+    ``--bars 5min`` (default): NIFTY 50 index 5-minute candles from
+    ``market_data.fetch_index_5min``, regular-session bars only (09:15 to
+    15:25 starts; Kotak's 15:30 closing print and special evening sessions
+    are dropped). The span is limited to sessions with a NIFTY futures lot
+    in the bhavcopy archives (``--lot-dir``, repeatable). ``--bars daily``:
+    the superseded daily front-month futures proxy. Costs are
+    ``core.costs.estimate_transaction_cost`` for one lot of futures, entry
+    and exit, at the fill-date STT, converted to points by the entry lot.
+    The 15:30 flatten is not in the spec and is not added.
 
 Split
     The session set and the 70/30 cut are frozen on the published windows
@@ -164,7 +165,7 @@ EVIDENCE_LEVELS = [
     "Too thin to learn from: very few trades, or a single window carries the whole result.",
     "Thin but not empty. A parameter change here would mostly be a guess.",
     "Enough trades that a change can be read, and the windows are not all one fluke.",
-    "Thick sample for a daily breakout: many trades, and more than one window agrees on the sign.",
+    "Thick sample for this breakout: many trades, and more than one window agrees on the sign.",
 ]
 
 HYPOTHESIS = (
@@ -236,8 +237,11 @@ def _ladder_index(name: str, value):
     raise ValueError(f"{name}={value!r} is not on its ladder")
 
 
-# Wilder seed weight at the longest ADX rung: (1 - 1/30) ** 120 ~= 1.7%.
-WARMUP_BARS = 4 * max(LADDERS["adx_length"])
+# ADX is smoothed twice (DM, then DX), so its seed fades far slower than
+# one Wilder EWM. Measured 2026-10-16 (perturbing the first +DM/-DM bars,
+# window 30, 30 random paths): worst relative ADX change 9.4% at 240 bars,
+# 1.5% at 300. 12 x the longest rung (360 bars) is past that.
+WARMUP_BARS = 12 * max(LADDERS["adx_length"])
 
 
 def move_key(name: str, rung) -> str:
@@ -317,7 +321,7 @@ def report_prose(summary: dict) -> str:
         f"Chronological window nets in points: {windows or 'n/a'}. "
         f"Bars skipped because both stop entries could have filled: "
         f"{summary['ambiguous']}. Entry bars that crossed the initial stop "
-        f"but closed back inside it (held, unresolvable on a daily bar): "
+        f"but closed back inside it (held, unresolvable on one OHLC bar): "
         f"{summary.get('entry_bar_unresolved', 0)}."
     )
 
@@ -412,11 +416,11 @@ def _choice_question(instructions: str, options: Dict[str, str]) -> dict:
     return {"type": "choice", "instructions": instructions, "criteria": options}
 
 
-def judge_baseline(summary: dict, params: Params) -> dict:
+def judge_baseline(summary: dict, params: Params, data_note: str) -> dict:
     """Score the published defaults and ask for the first experiment."""
     state = {
         "hypothesis": HYPOTHESIS,
-        "data": DATA_NOTE,
+        "data": data_note,
         "configuration": {
             "params": public_params(params),
             "change": "published defaults",
@@ -452,7 +456,7 @@ def judge_baseline(summary: dict, params: Params) -> dict:
 
 def judge_experiment(
     kept_summary: dict, kept: Params,
-    trial_summary: dict, trial: Params,
+    trial_summary: dict, trial: Params, data_note: str,
 ) -> dict:
     """Score the experiment, and ask for the next move under both premises.
 
@@ -461,7 +465,7 @@ def judge_experiment(
     """
     state = {
         "hypothesis": HYPOTHESIS,
-        "data": DATA_NOTE,
+        "data": data_note,
         "kept": {
             "params": public_params(kept),
             "prose": report_prose(kept_summary),
@@ -590,15 +594,26 @@ def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
     return front
 
 
+REGULAR_FIRST, REGULAR_LAST = 915, 1525   # 5-minute bar starts, NSE session
+
+
 def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame:
     """Simulate-ready frame from 5-minute index candles (``ts`` IST bar start).
 
-    One continuous series (an index has no roll). ``hhmm`` is the bar
-    close, EasyLanguage's Time. ``lot`` is the NIFTY futures lot on that
-    session from the bhavcopy front-month frame, nearest earlier session
-    when a date is missing there (later if none is earlier).
+    Regular-session bars only: starts 09:15..15:25. Kotak's 15:30 candle is
+    the index's computed closing print after F&O stops trading, and
+    special evening sessions (Muhurat) are not the published 09:30-15:30
+    system; nothing could be filled at either. One continuous series (an
+    index has no roll). ``hhmm`` is the bar close, EasyLanguage's Time.
+    ``lot`` is the NIFTY futures lot on that session, nearest earlier
+    archive session; a session outside the archive's span is refused
+    (a clipped lot would silently mis-cost the fixed brokerage and GST).
     """
     ts = pd.to_datetime(five_min["ts"]).dt.tz_convert("Asia/Kolkata")
+    start_hhmm = ts.dt.hour * 100 + ts.dt.minute
+    regular = ((start_hhmm >= REGULAR_FIRST) & (start_hhmm <= REGULAR_LAST)).to_numpy()
+    five_min = five_min.loc[regular].reset_index(drop=True)
+    ts = ts.loc[regular].reset_index(drop=True)
     end = ts + pd.Timedelta(minutes=5)
     out = pd.DataFrame({
         "date": ts.dt.date,
@@ -610,8 +625,14 @@ def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame
     })
     lots = front.set_index("date")["lot"].sort_index()
     lot_index = pd.Index(lots.index)
+    first, last = lot_index[0], lot_index[-1]
+    outside = sorted({d for d in out["date"] if d < first or d > last})
+    if outside:
+        raise ValueError(
+            f"{len(outside)} 5-minute sessions have no NIFTY lot in the archive "
+            f"({first}..{last}), e.g. {outside[0]}; trim the span or add a --lot-dir"
+        )
     pos = lot_index.searchsorted(out["date"], side="right") - 1
-    pos = pos.clip(0, len(lots) - 1)
     out["lot"] = lots.to_numpy()[pos].astype(int)
     out["expiry"] = None
     out["offset"] = 0.0
@@ -623,8 +644,10 @@ def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame
 
 
 def ready_frame(full: pd.DataFrame, warmup: int = WARMUP_BARS) -> pd.DataFrame:
-    """Drop the first ``warmup`` sessions and any whose indicators are not
-    finite. Values already use that history."""
+    """Keep only whole sessions whose every bar is past the first ``warmup``
+    bars and has finite indicators. Values already use that history. A
+    session straddling the warm-up boundary is dropped entirely, so a
+    replay that keeps whole dates never scores a half-warmed bar."""
     ok = (
         (np.arange(len(full)) >= warmup)
         & np.isfinite(full["adx"].to_numpy(float))
@@ -633,7 +656,9 @@ def ready_frame(full: pd.DataFrame, warmup: int = WARMUP_BARS) -> pd.DataFrame:
         & np.isfinite(full["brk_long"].to_numpy(float))
         & np.isfinite(full["brk_short"].to_numpy(float))
     )
-    out = full.loc[ok].reset_index(drop=True)
+    dates = full["date"].map(_as_date)
+    bad_dates = set(dates[~ok])
+    out = full.loc[~dates.isin(bad_dates)].reset_index(drop=True)
     if out.empty:
         raise RuntimeError("indicators never become finite")
     return out
@@ -673,12 +698,12 @@ def _choice(response: dict, key: str) -> dict:
     return response["answers"][key]
 
 
-def search(evaluate, rounds: int) -> dict:
+def search(evaluate, rounds: int, data_note: str) -> dict:
     """Walk one Jev-chosen rung at a time. ``evaluate`` sees train only."""
     baseline = Params()
     base_summary = evaluate(baseline)
     print("published defaults, train:", report_prose(base_summary), flush=True)
-    first = judge_baseline(base_summary, baseline)
+    first = judge_baseline(base_summary, baseline, data_note)
     fit, fit_conf = _fit(first)
     evid, evid_conf = _evidence(first)
     print(
@@ -720,7 +745,7 @@ def search(evaluate, rounds: int) -> dict:
         trial_summary = evaluate(trial)
         print(f"round {rnd}: {change}", flush=True)
         print(" ", report_prose(trial_summary), flush=True)
-        judged = judge_experiment(current_summary, current, trial_summary, trial)
+        judged = judge_experiment(current_summary, current, trial_summary, trial, data_note)
         fit, fit_conf = _fit(judged)
         evid, evid_conf = _evidence(judged)
         ok, reason = accept_experiment(trial_summary, current_summary, fit)
@@ -786,14 +811,26 @@ def _dates_of(df: pd.DataFrame) -> set:
     return {_as_date(d) for d in df["date"]}
 
 
-def replay(continuous: pd.DataFrame, params: Params, want: set) -> dict:
-    """Indicators for ``params`` on the full history, scored only on ``want`` dates."""
+def replay(
+    continuous: pd.DataFrame, params: Params, want: set, entry_bar_pessimistic: bool = False,
+) -> dict:
+    """Indicators for ``params`` on the full history, scored only on ``want`` dates.
+
+    ``continuous`` is already in time order and the filter keeps it; no
+    re-sort (sorting on the date alone scrambles intraday bars).
+    """
     built = add_indicators(continuous, params)
     dates = built["date"].map(_as_date)
-    sample = built.loc[dates.isin(want)].sort_values("date").reset_index(drop=True)
+    sample = built.loc[dates.isin(want)].reset_index(drop=True)
     if sample.empty:
         raise RuntimeError("replay sample is empty")
-    return run_sample(sample, params)
+    order = list(zip(sample["date"].map(_as_date), sample["hhmm"]))
+    if order != sorted(order):
+        raise ValueError("replay sample is not in time order")
+    return summarize(
+        simulate(sample, params, entry_bar_pessimistic=entry_bar_pessimistic),
+        sample, params,
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -802,6 +839,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--raw-dir",
         default="data_cache/research_bhavcopy_raw",
         help="F&O bhavcopy archive (default: the research archive)",
+    )
+    parser.add_argument(
+        "--lot-dir", action="append", default=None,
+        help="extra bhavcopy archive for NIFTY lots (5min mode; repeatable)",
     )
     parser.add_argument("--bars", choices=("5min", "daily"), default="5min")
     parser.add_argument(
@@ -815,9 +856,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("--rounds must be positive")
 
     print(
-        "ADX filtered breakout. Daily NIFTY front-month, research archive. "
-        "Jev chooses the next rung; code keeps it only if train quality "
-        "improves and mechanism_fit stays at least 1. Holdout is scored once.",
+        f"ADX filtered breakout, {args.bars} bars. "
+        "Jev chooses the next rung; code keeps it only if train gates pass "
+        "and mechanism_fit stays at least 1. Holdout is scored once.",
         flush=True,
     )
     front = load_nifty_front(Path(args.raw_dir))
@@ -828,12 +869,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if args.bars == "5min":
         from market_data.fetch_index_5min import load_all
-        global DATA_NOTE
-        DATA_NOTE = DATA_NOTE_5MIN
-        continuous = load_nifty_5min(load_all(Path(args.five_min_dir)), front)
+        data_note = DATA_NOTE_5MIN
+        lot_front = pd.concat(
+            [front] + [load_nifty_front(Path(d)) for d in (args.lot_dir or [])],
+            ignore_index=True,
+        ).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+        first_lot, last_lot = lot_front["date"].iloc[0], lot_front["date"].iloc[-1]
+        five = load_all(Path(args.five_min_dir))
+        five_dates = pd.to_datetime(five["ts"]).dt.tz_convert("Asia/Kolkata").dt.date
+        keep = (five_dates >= first_lot) & (five_dates <= last_lot)
+        print(f"lot archive {first_lot} -> {last_lot}: 5-minute span trimmed to it "
+              f"({int((~keep).sum())} of {len(five)} candles outside)", flush=True)
+        continuous = load_nifty_5min(five.loc[keep].reset_index(drop=True), lot_front)
         print(f"5-minute bars {len(continuous)} over {continuous['date'].nunique()} sessions "
               f"{continuous['date'].iloc[0]} -> {continuous['date'].iloc[-1]}", flush=True)
     else:
+        data_note = DATA_NOTE
         continuous = build_continuous(front)
     rolls = {str(k): int(v) for k, v in continuous["roll_basis"].value_counts().items() if k}
     print(f"roll adjustments by basis: {rolls}", flush=True)
@@ -846,14 +897,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"holdout {len(hold_dates)}  holdout starts {cut}",
         flush=True,
     )
-    found = search(lambda params: replay(continuous, params, train_dates), args.rounds)
+    found = search(lambda params: replay(continuous, params, train_dates), args.rounds, data_note)
     selected: Params = found.pop("_selected")
     baseline: Params = found.pop("_baseline")
     base_hold = replay(continuous, baseline, hold_dates)
     sel_hold = replay(continuous, selected, hold_dates)
     verdict = holdout_verdict(sel_hold)
+    # Bound for the held unresolvable entry bars: every one booked as the stop.
+    # Reported beside the verdict; not a gate (the gates were approved without it).
+    sel_hold_pess = replay(continuous, selected, hold_dates, entry_bar_pessimistic=True)
     print("holdout, published defaults:", report_prose(base_hold), flush=True)
     print("holdout, selected:", report_prose(sel_hold), flush=True)
+    print(
+        f"holdout, selected, unresolved entry bars booked as stops: "
+        f"net {sel_hold_pess['net_points']:.1f} points, Sharpe {sel_hold_pess['sharpe']:.2f}, "
+        f"verdict under the same gates {holdout_verdict(sel_hold_pess)}",
+        flush=True,
+    )
     print(f"verdict on the selected parameters: {verdict}", flush=True)
     if verdict == "SURVIVES_SAMPLE":
         print(
@@ -872,6 +932,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "holdout_min_trades": HOLDOUT_MIN_TRADES,
             "holdout_cost_stress": HOLDOUT_COST_STRESS,
             "bars": args.bars,
+            "lot_dirs": [args.raw_dir] + list(args.lot_dir or []),
             "objective": "net_points / max(max_dd_points, 1) on train",
             "warmup_bars": WARMUP_BARS,
             "moves": "one knob to any rung on its ladder",
@@ -887,6 +948,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "baseline_holdout": _round_summary(base_hold),
         "selected_holdout": _round_summary(sel_hold),
         "selected_holdout_net_at_cost_stress": net_at_cost_multiple(sel_hold, HOLDOUT_COST_STRESS),
+        "selected_holdout_pessimistic_entry_bar": _round_summary(sel_hold_pess),
+        "selected_holdout_pessimistic_verdict": holdout_verdict(sel_hold_pess),
         "verdict": verdict,
         "input_tokens": tokens_in,
         "output_tokens": tokens_out,

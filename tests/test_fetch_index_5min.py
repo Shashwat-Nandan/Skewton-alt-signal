@@ -15,6 +15,11 @@ from market_data import fetch_index_5min as f
 IST = f.IST
 
 
+def _weekdays(start: date, end: date) -> list:
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)
+            if (start + timedelta(days=i)).weekday() < 5]
+
+
 def _session(d: date, n: int = 76) -> list:
     start = datetime(d.year, d.month, d.day, 9, 15, tzinfo=IST)
     return [{"date": start + timedelta(minutes=5 * i), "open": 100.0, "high": 101.0,
@@ -29,15 +34,39 @@ def test_chunks_cover_the_span_without_overlap_or_exceeding_the_cap():
     assert all((b - a).days + 1 <= 29 for a, b in chunks)
 
 
-def test_missing_and_short_sessions_are_reported_inside_the_span():
-    mon, tue, wed, thu = (date(2026, 9, 14) + timedelta(days=i) for i in range(4))
-    candles = _session(mon) + _session(wed, n=40) + _session(thu)   # Tuesday absent
-    missing, short = f.session_report(f.candles_to_frame(candles), holidays=set())
-    assert missing == [tue]
-    assert short == {wed: 40}
-    # A holiday is not missing.
-    missing, _ = f.session_report(f.candles_to_frame(candles), holidays={tue})
-    assert missing == []
+def test_missing_and_short_sessions_are_judged_against_the_exchange_calendar():
+    """The calendar is the index's own daily candles, not holidays.csv
+    (which lists 2026 only and would call every 2024-25 holiday missing)."""
+    mon, tue, wed, thu, fri = (date(2025, 9, 15) + timedelta(days=i) for i in range(5))
+    candles = _session(mon) + _session(wed, n=40) + _session(thu)
+    rep = f.session_report(f.candles_to_frame(candles), [mon, tue, wed, thu, fri], end=fri)
+    assert rep["missing"] == [tue, fri]          # a gap and a lost trailing day
+    assert rep["short"] == {wed: 40}
+    # Tuesday a holiday: not in the calendar, so not missing.
+    rep = f.session_report(f.candles_to_frame(candles), [mon, wed, thu], end=thu)
+    assert rep["missing"] == [] and rep["short"] == {wed: 40}
+
+
+def test_sessions_before_the_first_candle_are_reported_not_hidden():
+    first, later = date(2025, 9, 15), date(2025, 9, 16)
+    rep = f.session_report(f.candles_to_frame(_session(later)), [first, later], end=later)
+    assert rep["before_history"] == [first] and rep["missing"] == []
+
+
+def test_the_1530_print_does_not_complete_a_short_session():
+    """75 rows with the 15:30 print but a missing 10:00 bar is not a full day."""
+    d = date(2025, 9, 15)
+    rows = [c for c in _session(d, n=76) if c["date"].strftime("%H:%M") != "10:00"]
+    assert len(rows) == 75
+    assert f.regular_counts(f.candles_to_frame(rows))[d] == 74
+
+
+def test_an_evening_only_session_is_special_not_missing():
+    d = date(2024, 11, 1)                                  # Muhurat
+    evening = [{"date": datetime(2024, 11, 1, 18, 0, tzinfo=IST) + timedelta(minutes=5 * i),
+                "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0} for i in range(12)]
+    rep = f.session_report(f.candles_to_frame(evening), [d], end=d)
+    assert rep["special"] == [d] and rep["missing"] == [] and rep["short"] == {}
 
 
 def test_inconsistent_candles_are_refused():
@@ -47,16 +76,21 @@ def test_inconsistent_candles_are_refused():
         f.candles_to_frame(bad)
 
 
-def test_a_complete_month_is_not_fetched_again(tmp_path):
-    """Re-runs must not spend the shared Kotak quota on stored months."""
-    sessions = f.sessions_between(date(2025, 6, 1), date(2025, 6, 30), set())
+def test_a_month_is_complete_only_with_every_session_full(tmp_path):
+    """Re-runs must not spend the shared Kotak quota on stored months, and
+    must not freeze a partial day as stored."""
+    sessions = _weekdays(date(2025, 6, 1), date(2025, 6, 30))
     frame = f.candles_to_frame([c for d in sessions for c in _session(d)])
     f.write_months(frame, tmp_path)
-    assert f.month_complete(tmp_path, 2025, 6, set(), today=date(2026, 10, 16))
-    gap = frame[frame["ts"].dt.date != sessions[3]]
+    assert f.month_complete(tmp_path, 2025, 6, sessions, end=date(2026, 10, 15))
+    # A short day: incomplete, so the next run fetches it again.
+    short = f.candles_to_frame([c for d in sessions for c in _session(d, 76 if d != sessions[3] else 40)])
     f.month_path(tmp_path, 2025, 6).unlink()
-    f.write_months(gap, tmp_path)
-    assert not f.month_complete(tmp_path, 2025, 6, set(), today=date(2026, 10, 16))
+    f.write_months(short, tmp_path)
+    assert not f.month_complete(tmp_path, 2025, 6, sessions, end=date(2026, 10, 15))
+    # A holiday absent from the calendar does not block completeness.
+    assert f.month_complete(tmp_path, 2025, 6, [d for d in sessions if d != sessions[3]],
+                            end=date(2026, 10, 15))
 
 
 class _FakeClient:
@@ -113,3 +147,51 @@ def test_loaded_series_is_sorted_and_deduplicated(tmp_path):
     out = f.load_all(tmp_path)
     assert len(out) == 5 and out["ts"].is_monotonic_increasing
     assert isinstance(out["ts"].dtype, pd.DatetimeTZDtype)
+
+
+class _FakeKotak:
+    """Daily calendar for every weekday; 5-minute data stops early."""
+
+    def __init__(self, sessions, five_until):
+        self.sessions, self.five_until = sessions, five_until
+        self.calls = []
+
+    def instruments(self, exchange):
+        return [{"tradingsymbol": "NIFTY 50", "instrument_token": -900001},
+                {"tradingsymbol": "NIFTY", "instrument_token": 26000}]
+
+    def historical_data(self, token, frm, to, interval):
+        self.calls.append(interval)
+        days = [d for d in self.sessions if frm <= d <= to]
+        if interval == "day":
+            return [{"date": datetime(d.year, d.month, d.day, tzinfo=IST), "open": 1.0,
+                     "high": 1.0, "low": 1.0, "close": 1.0} for d in days]
+        days = [d for d in days if d <= self.five_until]
+        if not days:
+            raise BrokerOrderError("Kotak historical_data returned no candles")
+        return [c for d in days for c in _session(d)]
+
+
+def test_a_lost_trailing_window_fails_the_run(monkeypatch, tmp_path):
+    """Before the fix, a span that came back short at the end shrank
+    silently and the run exited 0 on a truncated history."""
+    sessions = _weekdays(date(2025, 6, 2), date(2025, 7, 31))
+    fake = _FakeKotak(sessions, five_until=date(2025, 7, 10))
+
+    class _Evening(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2025, 8, 1, 18, 0, tzinfo=IST)
+
+    monkeypatch.setattr(f, "datetime", _Evening)
+    monkeypatch.setattr(f._time, "sleep", lambda s: None)
+    monkeypatch.setattr("market_data.fetch_5min_stf.get_cached_client", lambda *_: fake)
+    args = ["--start", "2025-06-02", "--end", "2025-07-31", "--out-dir", str(tmp_path)]
+    assert f.main(args) == 1
+    # Complete the data: the same command now passes, and a re-run does
+    # not fetch any 5-minute window again.
+    fake.five_until = date(2025, 7, 31)
+    assert f.main(args) == 0
+    fake.calls.clear()
+    assert f.main(args) == 0
+    assert "5minute" not in fake.calls

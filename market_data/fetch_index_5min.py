@@ -22,10 +22,17 @@ RATE LIMIT: the pair runners share this account's Kotak quota and were
 60 s back-off on 429, and the run refuses 09:00–15:45 IST on a weekday
 unless ``--force``.
 
-Fail loud: after the fetch, every NSE session (weekdays outside
-``holidays.csv``) between the first and last candle must have at least
-75 bars (09:15–15:25 starts). Missing or short sessions are listed and
-the exit code is 1.
+Sessions: the calendar is the index's own daily candles from Kotak over
+the same span (``holidays.csv`` only lists the current year, so it cannot
+judge 2024-25). A session counts as stored only with all 75 regular bars
+(09:15..15:25 starts); Kotak's extra 15:30 print is stored but not counted.
+
+Fail loud, exit 1: any session from the first 5-minute session to
+``--end`` without regular bars (a gap or a lost trailing window), or with
+fewer than 75. Sessions before the first 5-minute session are reported as
+a WARNING (Kotak's depth, or a failed leading window: a re-run retries
+them, since their months are incomplete). Evening-only sessions (Muhurat)
+are listed, not judged.
 
     python -m market_data.fetch_index_5min --start 2024-01-01
 """
@@ -42,18 +49,18 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from core.runner_common import load_holidays
 from market_data.history_limits import chunk_days
 
 logger = logging.getLogger("fetch_index_5min")
 
 HERE = Path(__file__).resolve().parent.parent
 OUT_DIR = HERE / "data_cache" / "research_nifty_5min"
-HOLIDAYS = HERE / "market_data" / "holidays.csv"
 IST = ZoneInfo("Asia/Kolkata")
 INDEX_SYMBOL = "NIFTY 50"
 INTERVAL = "5minute"
-# 09:15 .. 15:25 bar starts. Kotak also prints a 15:30 bar; it is kept.
+# Regular 5-minute bar starts 09:15 .. 15:25. Kotak's 15:30 print is
+# stored but is not part of a full session.
+REGULAR_FIRST, REGULAR_LAST = time(9, 15), time(15, 25)
 FULL_SESSION_BARS = 75
 QUIET_START, QUIET_END = time(9, 0), time(15, 45)
 
@@ -70,26 +77,39 @@ def chunk_ranges(start: date, end: date, span: int) -> List[Tuple[date, date]]:
     return out
 
 
-def sessions_between(start: date, end: date, holidays: set) -> List[date]:
-    d, out = start, []
-    while d <= end:
-        if d.weekday() < 5 and d not in holidays:
-            out.append(d)
-        d += timedelta(days=1)
-    return out
-
-
-def session_report(frame: pd.DataFrame, holidays: set) -> Tuple[List[date], Dict[date, int]]:
-    """(missing sessions, short sessions -> bar count) between the first
-    and last candle. The span outside the data is not judged."""
+def regular_counts(frame: pd.DataFrame) -> Dict[date, int]:
+    """Session -> number of distinct regular bar starts (09:15..15:25)."""
     if frame.empty:
-        return [], {}
-    days = frame["ts"].dt.tz_convert(IST).dt.date
-    counts = days.value_counts().to_dict()
-    expected = sessions_between(min(counts), max(counts), holidays)
-    missing = [d for d in expected if d not in counts]
-    short = {d: int(counts[d]) for d in expected if 0 < counts.get(d, 0) < FULL_SESSION_BARS}
-    return missing, short
+        return {}
+    local = frame["ts"].dt.tz_convert(IST)
+    t = local.dt.time
+    regular = local[(t >= REGULAR_FIRST) & (t <= REGULAR_LAST)]
+    return regular.groupby(regular.dt.date).nunique().to_dict()
+
+
+def session_report(
+    frame: pd.DataFrame, sessions: Iterable[date], end: date,
+) -> dict:
+    """Judge the stored candles against the exchange's sessions up to ``end``.
+
+    ``missing``: sessions from the first 5-minute session to ``end`` with no
+    regular bars (a gap, or a lost trailing window). ``short``: fewer than
+    75 regular bars. ``before_history``: sessions before the first
+    5-minute session. ``special``: dates with candles but no regular bars.
+    """
+    counts = regular_counts(frame)
+    days_with_candles = set(frame["ts"].dt.tz_convert(IST).dt.date) if not frame.empty else set()
+    special = sorted(days_with_candles - set(counts))
+    expected = sorted(d for d in sessions if d <= end and d not in special)
+    if not counts:
+        return {"missing": expected, "short": {}, "before_history": [], "special": special}
+    first = min(counts)
+    return {
+        "missing": [d for d in expected if d >= first and d not in counts],
+        "short": {d: counts[d] for d in expected if 0 < counts.get(d, 0) < FULL_SESSION_BARS},
+        "before_history": [d for d in expected if d < first],
+        "special": special,
+    }
 
 
 def candles_to_frame(candles: Iterable[dict]) -> pd.DataFrame:
@@ -140,15 +160,29 @@ def write_months(frame: pd.DataFrame, out_dir: Path) -> List[Path]:
     return written
 
 
-def month_complete(out_dir: Path, year: int, month: int, holidays: set, today: date) -> bool:
+def month_complete(out_dir: Path, year: int, month: int, sessions: Iterable[date],
+                   end: date) -> bool:
+    """Every exchange session of the month up to ``end`` is stored with all
+    75 regular bars. A month with no sessions to judge is not complete."""
     path = month_path(out_dir, year, month)
     if not path.exists():
         return False
-    days = set(pd.read_parquet(path)["ts"].dt.tz_convert(IST).dt.date)
-    first = date(year, month, 1)
-    last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-    want = sessions_between(first, min(last, today - timedelta(days=1)), holidays)
-    return all(d in days for d in want)
+    want = [d for d in sessions if (d.year, d.month) == (year, month) and d <= end]
+    if not want:
+        return False
+    counts = regular_counts(pd.read_parquet(path))
+    return all(counts.get(d, 0) >= FULL_SESSION_BARS for d in want)
+
+
+def fetch_sessions(client, token: int, start: date, end: date, delay: float) -> List[date]:
+    """Exchange sessions from the index's daily candles (the calendar)."""
+    days = set()
+    for frm, to in chunk_ranges(start, end, chunk_days("day")):
+        candles = fetch_chunk(client, token, frm, to, delay, interval="day")
+        for c in candles or []:
+            ts = pd.Timestamp(c["date"])
+            days.add((ts.tz_convert(IST) if ts.tzinfo else ts).date())
+    return sorted(days)
 
 
 def resolve_index_token(client) -> int:
@@ -159,13 +193,14 @@ def resolve_index_token(client) -> int:
     return int(rows[0]["instrument_token"])
 
 
-def fetch_chunk(client, token: int, frm: date, to: date, delay: float) -> Optional[List[dict]]:
+def fetch_chunk(client, token: int, frm: date, to: date, delay: float,
+                interval: str = INTERVAL) -> Optional[List[dict]]:
     """Candles for one window; None when Kotak has none for it. Retries 429s."""
     from core.broker.errors import BrokerNetworkError, BrokerOrderError
 
     for attempt in range(4):
         try:
-            return client.historical_data(token, frm, to, INTERVAL)
+            return client.historical_data(token, frm, to, interval)
         except BrokerOrderError as e:
             if "no candles" in str(e):
                 return None
@@ -205,18 +240,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     today = now.date()
     end = args.end or today - timedelta(days=1)
-    holidays = load_holidays(HOLIDAYS)
 
     from market_data.fetch_5min_stf import get_cached_client
     client = get_cached_client(args.config)
     token = resolve_index_token(client)
     logger.info("%s token %s, %s .. %s, %.0f s between requests",
                 INDEX_SYMBOL, token, args.start, end, args.delay)
+    sessions = fetch_sessions(client, token, args.start, end, args.delay)
+    if not sessions:
+        logger.error("no daily candles for %s..%s: no session calendar to judge against",
+                     args.start, end)
+        return 1
+    logger.info("session calendar: %d sessions %s -> %s", len(sessions), sessions[0], sessions[-1])
 
     empty, fetched = [], 0
     for frm, to in chunk_ranges(args.start, end, chunk_days(INTERVAL)):
         months = {(frm.year, frm.month), (to.year, to.month)}
-        if all(month_complete(args.out_dir, y, m, holidays, today) for y, m in months):
+        if all(month_complete(args.out_dir, y, m, sessions, end) for y, m in months):
             continue
         candles = fetch_chunk(client, token, frm, to, args.delay)
         if not candles:
@@ -233,21 +273,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     except FileNotFoundError:
         logger.error("no candles at all for %s..%s", args.start, end)
         return 1
-    missing, short = session_report(data, holidays)
-    first, last = data["ts"].iloc[0], data["ts"].iloc[-1]
-    logger.info("stored %d candles, %s -> %s (%d new this run); windows with no data: %d",
-                len(data), first, last, fetched, len(empty))
+    data = data[(data["ts"].dt.tz_convert(IST).dt.date >= args.start)
+                & (data["ts"].dt.tz_convert(IST).dt.date <= end)]
+    rep = session_report(data, sessions, end)
+    logger.info("stored %d candles in range, %s -> %s (%d new this run); windows with no data: %d",
+                len(data), data["ts"].iloc[0] if len(data) else None,
+                data["ts"].iloc[-1] if len(data) else None, fetched, len(empty))
     if empty:
-        logger.info("no-data windows (history starts after them, or a gap): %s",
-                    ", ".join(f"{a}..{b}" for a, b in empty))
-    if short:
-        logger.warning("SHORT sessions (< %d bars): %s", FULL_SESSION_BARS,
-                       ", ".join(f"{d} ({n})" for d, n in sorted(short.items())))
-    if missing:
-        logger.error("MISSING sessions inside the data span (%d): %s", len(missing),
-                     ", ".join(str(d) for d in missing))
-        return 1
-    return 0
+        logger.info("no-data windows: %s", ", ".join(f"{a}..{b}" for a, b in empty))
+    if rep["special"]:
+        logger.info("special sessions (no regular bars, e.g. Muhurat), not judged: %s",
+                    ", ".join(str(d) for d in rep["special"]))
+    if rep["before_history"]:
+        logger.warning(
+            "5-minute data starts %s: %d earlier sessions (%s..%s) have none. Kotak's "
+            "depth, or a failed leading window; a re-run retries them.",
+            min(regular_counts(data)) if len(data) else None, len(rep["before_history"]),
+            rep["before_history"][0], rep["before_history"][-1])
+    failed = False
+    if rep["short"]:
+        logger.error("SHORT sessions (< %d regular bars): %s", FULL_SESSION_BARS,
+                     ", ".join(f"{d} ({n})" for d, n in sorted(rep["short"].items())))
+        failed = True
+    if rep["missing"]:
+        logger.error("MISSING sessions up to %s (%d): %s", end, len(rep["missing"]),
+                     ", ".join(str(d) for d in rep["missing"]))
+        failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

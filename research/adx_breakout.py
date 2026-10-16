@@ -18,9 +18,15 @@ Fills the daily bar cannot order
   signal bar, as EasyLanguage's "Buy next bar at Highest(High, N) stop"
   evaluates them at that bar's close. ADX and ATR use that bar and earlier.
 * A bar that trades through both levels fills the side its open is
-  already beyond (that stop filled at the open, first). Only when the
-  open is between the levels is the bar skipped and counted: the tape
-  cannot say which stop was hit first.
+  already beyond (that stop filled at the open, first). The opposite stop
+  entry is still working on that bar: when the bar then trades through
+  it, the position reverses there (EasyLanguage's SellShort stop while
+  long), after the first leg's own initial stop if that lies nearer the
+  open. Only when the open is between the levels is the bar skipped and
+  counted: the tape cannot say which stop was hit first.
+* EntriesToday(Date) is checked at the signal bar, as EasyLanguage does:
+  a session that already had an entry places no order, including one
+  that would fill in the next session.
 * The trail is a "next bar" order: it is armed at a bar's close from the
   best price since entry, so it is not live on the entry bar. It
   ratchets off bars already closed; this bar's new extreme does not
@@ -30,7 +36,9 @@ Fills the daily bar cannot order
   open, else only when the bar CLOSES beyond the stop. A level fill whose
   low/high crosses the stop but closes back inside is unresolvable on a
   daily bar; it is held and counted (``entry_bar_unresolved``) so the
-  reader sees how much rides on that call. The profit target is not live
+  reader sees how much rides on that call, and ``simulate(...,
+  entry_bar_pessimistic=True)`` books every such bar as the stop to bound
+  the downside. The profit target is not live
   on the entry bar (a same-bar target would flatter the fill).
 * After the entry bar, stop and target are both live and the stop wins
   when the bar touches both. A gap through a level fills at the open.
@@ -297,8 +305,14 @@ def _as_date(value) -> date:
     return ts.date()
 
 
-def simulate(df: pd.DataFrame, params: Params) -> BacktestResult:
-    """Replay the spec over a prepared frame. One position, one entry a day."""
+def simulate(
+    df: pd.DataFrame, params: Params, entry_bar_pessimistic: bool = False,
+) -> BacktestResult:
+    """Replay the spec over a prepared frame. One position, one entry a day.
+
+    ``entry_bar_pessimistic`` books an unresolvable entry bar (range crossed
+    the initial stop, close back inside) as stopped out instead of held.
+    """
     params.validate()
     need = {
         "date", "hhmm", "open", "high", "low", "close", "lot", "offset",
@@ -342,12 +356,18 @@ def simulate(df: pd.DataFrame, params: Params) -> BacktestResult:
                 result, pending, bar_date, i, bar_open, high, low, offset, lot,
                 entries_today,
             )
+            if position is not None:
+                position = _gap_reversal(
+                    result, position, pending, params, bar_date, i, high, low,
+                    offset, lot, entries_today,
+                )
             pending = None
 
         if position is not None:
             position = _manage(
                 result, position, params, frame, i, last,
                 bar_date, bar_open, high, low, close, offset,
+                entry_bar_pessimistic,
             )
 
         if position is None and i < last:
@@ -392,8 +412,14 @@ def _try_entry(
     else:
         return None
     entries_today[bar_date] = entries_today.get(bar_date, 0) + 1
+    return _open(side, side_name, fill, fill == bar_open, bar_date, i, offset, lot, pending)
+
+
+def _open(
+    side: int, side_name: str, fill: float, filled_at_open: bool,
+    bar_date: date, i: int, offset: float, lot: int, pending: dict,
+) -> dict:
     raw_fill = fill - offset
-    entry_sell = side == -1
     return {
         "side": side,
         "side_name": side_name,
@@ -401,22 +427,56 @@ def _try_entry(
         "entry_date": bar_date,
         "entry_px": fill,
         "entry_raw": raw_fill,
-        "entry_cost": _cost_points(raw_fill, lot, entry_sell, bar_date),
+        "entry_cost": _cost_points(raw_fill, lot, side == -1, bar_date),
         "lot": lot,
         "extreme": fill,
         "adx": pending["adx"],
         # Signal bar's ATR, fixed for the life of the trade.
         "atr": pending["atr"],
-        "filled_at_open": fill == bar_open,
+        "filled_at_open": filled_at_open,
         "exit_at_open": False,
         "entry_bar": True,
     }
 
 
+def _gap_reversal(
+    result: BacktestResult, pos: dict, pending: dict, params: Params,
+    bar_date: date, i: int, high: float, low: float, offset: float, lot: int,
+    entries_today: Dict[date, int],
+) -> dict:
+    """A gap fill at the open, then the bar trades through the opposite
+    resting stop: that order still fills, reversing the position.
+
+    Price runs from the open towards the opposite level, so whichever of
+    the first leg's initial stop and the opposite level lies nearer the
+    open is hit first. Either way the bar ends up in the opposite side,
+    filled at the opposite level (not the open), on its entry bar.
+    """
+    if not pos["filled_at_open"]:
+        return pos
+    side = pos["side"]
+    opposite = pending["short"] if side == 1 else pending["long"]
+    if opposite is None:
+        return pos
+    crossed = low <= opposite if side == 1 else high >= opposite
+    if not crossed:
+        return pos
+    stop = pos["entry_px"] - side * _stop_distance(params, pos["atr"])
+    stop_first = stop >= opposite if side == 1 else stop <= opposite
+    if stop_first:
+        _close(result, pos, bar_date, i, float(stop), offset, "STOP")
+    else:
+        _close(result, pos, bar_date, i, float(opposite), offset, "REVERSE")
+    entries_today[bar_date] = entries_today.get(bar_date, 0) + 1
+    new_side = -side
+    return _open(new_side, "LONG" if new_side == 1 else "SHORT", float(opposite),
+                 False, bar_date, i, offset, lot, pending)
+
+
 def _manage(
     result: BacktestResult, pos: dict, params: Params, frame: pd.DataFrame,
     i: int, last: int, bar_date: date, bar_open: float, high: float,
-    low: float, close: float, offset: float,
+    low: float, close: float, offset: float, entry_bar_pessimistic: bool = False,
 ) -> Optional[dict]:
     stop_dist = _stop_distance(params, pos["atr"])
     if pos["entry_bar"]:
@@ -452,6 +512,8 @@ def _manage(
         hit = ("STOP", float(stop_px)) if closed_through else None
         if crossed and not closed_through:
             result.entry_bar_unresolved += 1
+            if entry_bar_pessimistic:
+                hit = ("STOP", float(stop_px))
     else:
         hit = _exit_fill(
             pos["side"], bar_open, high, low, stop_px, target,
@@ -517,8 +579,9 @@ def _arm(
     hhmm = int(row["hhmm"])
     if hhmm < params.start_time or hhmm > params.end_time:
         return None
-    # EntriesToday is checked at the fill (_try_entry): this order is for
-    # the next bar, which on daily bars is another session.
+    # EntriesToday(Date) on the signal bar, as EasyLanguage evaluates it.
+    if entries_today.get(bar_date, 0) >= 1:
+        return None
     adx = float(row["adx"])
     adx_ma = float(row["adx_ma"])
     if not _filter_on(adx, adx_ma, params.adx_threshold):

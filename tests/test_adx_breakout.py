@@ -27,6 +27,7 @@ from research.adx_breakout import (
 )
 from research.optimize_adx_breakout import (
     LADDERS,
+    replay,
     WARMUP_BARS,
     accept_experiment,
     apply_move,
@@ -238,16 +239,17 @@ def test_same_day_stop_out_does_not_rearm():
     assert trade.exit_px == pytest.approx(75.0)
 
 
-def test_one_entry_a_day_does_not_block_the_next_session():
-    """On daily bars the order armed at today's close is for tomorrow. An
-    entry today must not stop tomorrow's order being placed."""
+def test_a_session_with_an_entry_places_no_order_for_the_next():
+    """EntriesToday(Date) is evaluated on the signal bar, as EasyLanguage
+    does: a session that already had an entry places no order, even one
+    that would fill in the next session (review 2 of PR #19)."""
     df = _bars([
         dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
         dict(date=_day(1), open=99, high=110, low=70, close=72, brk_long=100, atr=5.0),
         dict(date=_day(2), open=99, high=101, low=98, close=100, atr=5.0),
     ])
     result = simulate(df, Params(trail_amount=15.0, bars_to_exit=20, atr_multiplier=5.0))
-    assert [t.entry_date for t in result.trades] == [_day(1), _day(2)]
+    assert [t.entry_date for t in result.trades] == [_day(1)]
 
 
 def test_the_trail_is_not_live_on_the_entry_bar():
@@ -531,6 +533,72 @@ def test_ready_frame_waits_out_the_wilder_seed():
     assert ready.iloc[0]["date"] == full.iloc[WARMUP_BARS]["date"]
 
 
+def test_ready_frame_drops_a_session_that_straddles_the_warm_up():
+    """Replay keeps whole dates, so a half-warmed session would be scored."""
+    bars_per_day = 75
+    days = WARMUP_BARS // bars_per_day + 3
+    full = pd.DataFrame({
+        "date": [date(2025, 1, 1) + timedelta(days=i // bars_per_day)
+                 for i in range(days * bars_per_day)],
+        "adx": 10.0, "adx_ma": 12.0, "atr": 50.0, "brk_long": 1.0, "brk_short": 1.0,
+    })
+    ready = ready_frame(full)
+    straddler = full.iloc[WARMUP_BARS]["date"]
+    assert WARMUP_BARS % bars_per_day != 0
+    assert straddler not in set(ready["date"])
+    assert ready.groupby("date").size().eq(bars_per_day).all()
+
+
+def test_warm_up_outlasts_the_double_smoothed_adx_seed():
+    """ADX smooths DM and then DX, so its seed fades far slower than one
+    EWM: 120 bars left up to ~470% sway from a big seed bar. At
+    WARMUP_BARS a large +DM/-DM seed must move ADX by under 2%."""
+    from strategies import _indicators as ind
+
+    worst = 0.0
+    for seed in range(10):
+        rng = np.random.default_rng(seed)
+        n = WARMUP_BARS + 10
+        c = pd.Series(24000 + np.cumsum(rng.normal(0, 12, n)))
+        h = c + rng.uniform(1, 10, n)
+        lo = c - rng.uniform(1, 10, n)
+        base = ind.adx(h, lo, c, max(LADDERS["adx_length"]))
+        h2, l2 = h.copy(), lo.copy()
+        h2.iloc[1] += 80
+        l2.iloc[2] -= 80
+        alt = ind.adx(h2, l2, c, max(LADDERS["adx_length"]))
+        worst = max(worst, abs(alt.iloc[WARMUP_BARS] - base.iloc[WARMUP_BARS]) / base.iloc[WARMUP_BARS])
+    assert worst < 0.02
+
+
+def test_replay_keeps_intraday_bars_in_time_order():
+    """Review 2: replay sorted on the date alone (not stable), which
+    scrambles every session's 5-minute bars before simulating. Replay must
+    score exactly the bars a direct simulation in time order scores."""
+    rng = np.random.default_rng(7)
+    rows = []
+    for k in range(6):
+        d = date(2026, 3, 2) + timedelta(days=k)
+        for j in range(75):
+            end = (9 * 60 + 20) + 5 * j
+            px = 100 + rng.normal(0, 1)
+            rows.append(dict(date=d, hhmm=(end // 60) * 100 + end % 60, open=px,
+                             high=px + abs(rng.normal(0, 1)) + 0.5,
+                             low=px - abs(rng.normal(0, 1)) - 0.5, close=px))
+    frame = pd.DataFrame(rows)
+    frame["close"] = frame[["close", "high"]].min(axis=1).clip(lower=frame["low"])
+    for col, val in (("lot", 65), ("offset", 0.0), ("roll_flat", False), ("expiry", None)):
+        frame[col] = val
+    params = Params(adx_length=14, ma_length=5, breakout_length=10, atr_length=10,
+                    adx_threshold=99.0, trail_amount=1.0, atr_multiplier=1.0)
+    want = set(frame["date"])
+    via_replay = replay(frame, params, want)
+    direct = summarize(simulate(add_indicators(frame, params), params),
+                       add_indicators(frame, params), params)
+    assert via_replay["trades"] == direct["trades"] > 0
+    assert via_replay["net_points"] == pytest.approx(direct["net_points"])
+
+
 def test_5min_frame_uses_bar_close_time_and_the_lot_in_force():
     """EasyLanguage's Time is the bar close: a 09:15 candle is 0920, so the
     09:30 start first arms on the 09:25 candle. The lot is the futures lot
@@ -539,12 +607,33 @@ def test_5min_frame_uses_bar_close_time_and_the_lot_in_force():
         "2025-12-30 09:15", "2025-12-30 09:25", "2025-12-30 15:25", "2026-01-02 09:15",
     ]).tz_localize("Asia/Kolkata")
     five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
-    front = pd.DataFrame({"date": [date(2025, 12, 29), date(2026, 1, 1)], "lot": [75, 65]})
+    front = pd.DataFrame({"date": [date(2025, 12, 29), date(2026, 1, 1), date(2026, 1, 2)],
+                          "lot": [75, 65, 65]})
     out = load_nifty_5min(five, front)
     assert list(out["hhmm"]) == [920, 930, 1530, 920]
     assert list(out["lot"]) == [75, 75, 75, 65]
     assert list(out["date"]) == [date(2025, 12, 30)] * 3 + [date(2026, 1, 2)]
     assert (out["offset"] == 0).all() and not out["roll_flat"].any()
+
+
+def test_5min_frame_drops_the_closing_print_and_evening_sessions():
+    """Kotak's 15:30 candle is the index's computed close after F&O stops;
+    Muhurat bars are an evening session. Nothing can be filled at either."""
+    ts = pd.to_datetime([
+        "2025-12-30 15:25", "2025-12-30 15:30", "2025-12-30 18:00",
+    ]).tz_localize("Asia/Kolkata")
+    five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    front = pd.DataFrame({"date": [date(2025, 12, 29), date(2025, 12, 30)], "lot": [75, 75]})
+    assert list(load_nifty_5min(five, front)["hhmm"]) == [1530]
+
+
+def test_5min_frame_refuses_a_session_without_a_known_lot():
+    """A clipped lot silently mis-costs the fixed brokerage and GST."""
+    ts = pd.to_datetime(["2024-03-01 09:15"]).tz_localize("Asia/Kolkata")
+    five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    front = pd.DataFrame({"date": [date(2024, 7, 8)], "lot": [25]})
+    with pytest.raises(ValueError, match="no NIFTY lot"):
+        load_nifty_5min(five, front)
 
 
 def test_intraday_one_entry_a_day_and_the_session_window():
@@ -570,3 +659,45 @@ def test_intraday_one_entry_a_day_and_the_session_window():
     assert [(t.entry_date, t.entry_i, t.exit_reason) for t in result.trades] == [
         (d1, 2, "STOP"), (d2, 8, "END"),
     ]
+
+
+def test_a_gap_fill_then_the_opposite_stop_reverses_the_position():
+    """Both stops armed; the bar opens above the long level, then falls
+    through the short level. The SellShort stop still fills there and
+    reverses the long (review 2). The long's own stop is further away."""
+    df = _bars([
+        dict(date=_day(0), open=95, high=96, low=94, close=95, brk_long=100, brk_short=90,
+             atr=50.0),
+        dict(date=_day(1), open=102, high=103, low=85, close=86),
+    ])
+    trades = simulate(df, Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=2.0)).trades
+    assert [(t.side, t.entry_px, t.exit_reason, t.exit_px) for t in trades] == [
+        ("LONG", 102.0, "REVERSE", 90.0), ("SHORT", 90.0, "END", 86.0),
+    ]
+
+
+def test_on_a_gap_reversal_the_nearer_stop_fills_first():
+    """The long's initial stop (97) is above the short level (90): price
+    falling from the open hits the stop first, then the short entry."""
+    df = _bars([
+        dict(date=_day(0), open=95, high=96, low=94, close=95, brk_long=100, brk_short=90,
+             atr=2.5),
+        dict(date=_day(1), open=102, high=103, low=85, close=86),
+    ])
+    trades = simulate(df, Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=2.0)).trades
+    assert [(t.side, t.exit_reason, t.exit_px) for t in trades][0] == ("LONG", "STOP", 97.0)
+    assert (trades[1].side, trades[1].entry_px) == ("SHORT", 90.0)
+
+
+def test_pessimistic_mode_books_unresolved_entry_bars_as_stops():
+    """Holding a dip-through-and-recover entry bar is the generous call;
+    the pessimistic replay bounds how much the verdict leans on it."""
+    df = _bars([
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=_day(1), open=95, high=101, low=85, close=100),
+    ])
+    params = Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=2.0)
+    held = simulate(df, params)
+    assert held.trades[0].exit_reason == "END" and held.entry_bar_unresolved == 1
+    booked = simulate(df, params, entry_bar_pessimistic=True)
+    assert (booked.trades[0].exit_reason, booked.trades[0].exit_px) == ("STOP", 90.0)

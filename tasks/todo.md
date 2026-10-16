@@ -23,6 +23,16 @@ superseded by this plan. Research only until the paper step; the paper
       fill-date STT, lot size by date from the bhavcopy archive.
       Tests for intraday specifics (one entry a day across bars,
       session-window arming, overnight holds).
+- [x] Review 2 of PR #19 fixed (no 5-minute data seen yet): replay no
+      longer scrambles intraday bars; session calendar from Kotak's daily
+      index candles (holidays.csv is 2026-only); a session counts only
+      with all 75 regular bars; lost trailing windows fail the run; the
+      15:30 closing print and evening sessions are not traded; lots must
+      come from the archive (span trimmed to 2024-07-08 on); EntriesToday
+      at the signal bar (EasyLanguage); gap-then-opposite-stop reversal;
+      pessimistic entry-bar replay reported beside the verdict (not a
+      gate); Jev's data note passed in, not a mutated global; warm-up
+      360 bars (ADX's double smoothing measured: 9.4% sway at 240 bars).
 - [ ] 3. Freeze the split before looking: chronological, 70% train /
       30% holdout by session, after a warm-up of 4 × the longest ADX
       rung in bars. The 5-minute holdout has never been looked at.
