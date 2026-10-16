@@ -54,12 +54,42 @@ superseded by this plan. Research only until the paper step; the paper
         2025-02-01 is not in the research bhavcopy archive either.
       - Lots from `data_cache/research_bhavcopy_raw` (to 2026-09-24);
         no `--lot-dir` needed for this span.
-- [ ] 4. ONE pre-registered Jev search on train (gates below), then the
-      holdout scored once. Report in this file and PR #19.
-- [ ] 5. Only if the holdout SURVIVES: plan the paper runner
+- [x] 4. ONE pre-registered Jev search on train (gates below), then the
+      holdout scored once. Report in this file and PR #19. Run
+      2026-10-16 ~16:35 IST: **KILL** (see Review below).
+- [ ] ~~5. Only if the holdout SURVIVES~~ not triggered (KILL): plan the paper runner
       (`runners/run_paper_adx_breakout.py`, paper-only, no live code
       path, 09:14 timer, NIFTY front-month future 5-minute bars, own
       state + daily log, paced Kotak calls). CODEOWNER review.
+
+## Review — 5-minute verdict: KILL (2026-10-16)
+
+Command (cwd = deploy checkout, code from this branch):
+`python -m research.optimize_adx_breakout --bars 5min --end 2026-08-20
+--accept-short 2025-01-31`. Output JSON was kept outside the repo.
+
+| sample | trades | net pts | gross pts | win | PF | max DD | daily Sharpe |
+|---|---|---|---|---|---|---|---|
+| train, published defaults | 213 | −3296.6 | +427.5 | 18% | 0.19 | 3288.1 | −7.64 |
+| holdout, selected (= defaults) | 75 | −1719.7 | −71.8 | 8% | 0.13 | 1689.8 | −8.55 |
+| holdout, entry bars as stops | 75 | −1774.3 | | | | | −8.61 |
+
+- Every train window and every holdout window is negative.
+- Jev gave the published defaults mechanism_fit 0.53. It proposed four
+  moves, and all four were dropped:
+  - TrailAmount 40 / 80 / 150: all three train windows negative.
+  - BarsToExit 20: mechanism_fit 0.67.
+- Jev then chose `stop`. The selected parameters are the defaults.
+  Jev used 23.8k tokens in and 3.6k out.
+- **Why it fails:** the published 15-point trail sits inside one 5-minute
+  NIFTY range. 210 of 213 train trades exit on the trail, with a median
+  hold of 1 bar. Gross is +2.0 points a trade on train and −1.0 on the
+  holdout, against about 17.5 points of round-trip cost. Wider trails
+  hold longer but lose more gross, so there is no edge for costs to eat.
+- **The verdict does not depend on cost assumptions:** the holdout
+  is negative before costs. That covers the unconfirmed 2026-04-01 STT
+  date too.
+- Paper (step 5) is not triggered. Nothing goes to paper or live.
 
 ## Pre-registered gates (owner-approved 2026-10-16, before any 5-minute data was fetched; Jev kept)
 

@@ -936,7 +936,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     train_dates = _dates_of(train)
     hold_dates = _dates_of(hold)
     print(
-        f"ready sessions {len(published)}  train {len(train_dates)} "
+        f"ready sessions {published['date'].nunique()}  train {len(train_dates)} "
         f"holdout {len(hold_dates)}  holdout starts {cut}",
         flush=True,
     )

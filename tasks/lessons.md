@@ -465,3 +465,13 @@
   producer, not against your assumption. Belt-and-suspenders for a
   read-only tool: tolerate list-or-dict containers and isolate each source
   so one shape change can't crash the whole view.
+
+- 2026-10-16: Kotak's 5-minute NIFTY 50 history is not clean. It has
+  ten 09:15 bars (from 2026-07-03) with the open outside the bar's
+  high-low. From 2026-08-21 the 15:20 bar is missing on every session,
+  and a re-fetch does not restore it. There is also a lone Saturday
+  candle (2025-08-23).
+- Rule: validate every Kotak intraday fetch per session (bar count and
+  OHLC consistency), and make backtests refuse short sessions. Stop the
+  span before a degraded tail instead of silently keeping it, and decide
+  that before any result is seen.
