@@ -1,3 +1,57 @@
+# ADX filtered breakout — 5-minute backtest, then paper — PLAN (2026-10-16)
+
+Owner decision 2026-10-16: backtest first on 5-minute bars, then paper
+only if it survives. Kotak serves 5-minute NIFTY 50 *index* candles at
+least 400 days back (probed 08:12 IST: 30/120/400 days all full
+09:15–15:30 sessions). The daily-bar pass below was a proxy and is
+superseded by this plan. Research only until the paper step; the paper
+→ live gate stays closed.
+
+## Steps
+
+- [ ] 1. `market_data/fetch_nifty_5min.py`: NIFTY 50 index 5-minute
+      candles from Kotak `historical_data` (cached session, read-only,
+      no login, no orders), 6-day chunks, one call every 15 s, run only
+      after 15:45 IST so the runners' Kotak rate limit is untouched.
+      Resumable, one parquet per month under
+      `data_cache/research_nifty_5min/`. Probe the oldest available
+      date first. Fail loud: every NSE session in `holidays.csv` terms
+      must have 75 bars (09:15–15:25 starts) or be listed as short/missing.
+- [ ] 2. Engine on 5-minute bars: index series as one continuous
+      contract (no roll, offset 0), `hhmm` = bar start, 09:30–15:30
+      window as published. Costs: one NIFTY futures lot per side at the
+      fill-date STT, lot size by date from the bhavcopy archive.
+      Tests for intraday specifics (one entry a day across bars,
+      session-window arming, overnight holds).
+- [ ] 3. Freeze the split before looking: chronological, 70% train /
+      30% holdout by session, after a warm-up of 4 × the longest ADX
+      rung in bars. The 5-minute holdout has never been looked at.
+- [ ] 4. ONE pre-registered Jev search on train (gates below), then the
+      holdout scored once. Report in this file and PR #19.
+- [ ] 5. Only if the holdout SURVIVES: plan the paper runner
+      (`runners/run_paper_adx_breakout.py`, paper-only, no live code
+      path, 09:14 timer, NIFTY front-month future 5-minute bars, own
+      state + daily log, paced Kotak calls). CODEOWNER review.
+
+## Pre-registered gates (owner-approved 2026-10-16, before any 5-minute data was fetched; Jev kept)
+
+- Keep a rung only if: Jev mechanism_fit ≥ 1.0; train trades ≥ 100;
+  the three chronological train windows not all negative; quality
+  (net points / max DD) improves.
+- Holdout verdict SURVIVES only if: trades ≥ 40, net points > 0, daily
+  Sharpe > 0, AND net still > 0 at 1.5 × costs. Otherwise KILL.
+- Six rounds max; moves set one knob to any ladder rung; `stop` ends.
+- A SURVIVES is not a live promotion: it unlocks paper only.
+
+## Known limits (stated up front)
+
+- Index, not futures: signals and fills on the NIFTY 50 index; the
+  futures basis drift intraday is not modelled.
+- 5-minute OHLC still cannot order events inside one bar; the same
+  conservative fill rules apply (stop before target, entry-bar stop
+  only when proven, both-levels bars skipped and counted).
+- The search sends train statistics to TypeSafe (`api.typesafe.ai`).
+
 # ADX filtered breakout — Jev rung search — 2026-10-16
 
 Research only. No strategy class, no paper runner, no live order. The

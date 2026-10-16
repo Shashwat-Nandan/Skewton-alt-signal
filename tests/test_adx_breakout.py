@@ -32,7 +32,9 @@ from research.optimize_adx_breakout import (
     apply_move,
     holdout_verdict,
     legal_moves,
+    load_nifty_5min,
     load_nifty_front,
+    net_at_cost_multiple,
     pick_move,
     ready_frame,
 )
@@ -414,20 +416,20 @@ def test_apply_move_sets_one_knob_and_stays_on_the_ladder():
 
 
 def test_mechanism_veto_and_window_gate_block_a_better_train_number():
-    baseline = {"trades": 30, "net_points": -100.0, "max_dd_points": 50.0,
+    baseline = {"trades": 150, "net_points": -100.0, "max_dd_points": 50.0,
                 "windows": [-40.0, -30.0, -30.0]}
-    better = {"trades": 30, "net_points": 10.0, "max_dd_points": 20.0,
+    better = {"trades": 150, "net_points": 10.0, "max_dd_points": 20.0,
               "windows": [4.0, 3.0, 3.0]}
     kept, _ = accept_experiment(better, baseline, fit_score=1.5)
     assert kept is True
     vetoed, _ = accept_experiment(better, baseline, fit_score=0.4)
     assert vetoed is False
-    still_all_red = {"trades": 30, "net_points": -10.0, "max_dd_points": 20.0,
+    still_all_red = {"trades": 150, "net_points": -10.0, "max_dd_points": 20.0,
                      "windows": [-2.0, -3.0, -5.0]}
     rejected, reason = accept_experiment(still_all_red, baseline, fit_score=2.0)
     assert rejected is False
     assert "windows" in reason
-    thin = dict(better, trades=5)
+    thin = dict(better, trades=99)        # MIN_TRADES is 100
     assert accept_experiment(thin, baseline, fit_score=2.0)[0] is False
 
 
@@ -436,17 +438,24 @@ def test_a_thin_baseline_does_not_let_any_loser_through():
     candidate "improved" however much it lost. Quality is compared as is."""
     thin_base = {"trades": 12, "net_points": -100.0, "max_dd_points": 100.0,
                  "windows": [0.0, -50.0, -50.0]}
-    big_loser = {"trades": 25, "net_points": -5000.0, "max_dd_points": 2500.0,
+    big_loser = {"trades": 150, "net_points": -5000.0, "max_dd_points": 2500.0,
                  "windows": [10.0, -2500.0, -2510.0]}
     kept, reason = accept_experiment(big_loser, thin_base, fit_score=2.0)
     assert kept is False and "did not beat" in reason
 
 
 def test_holdout_verdict_is_kill_unless_the_sample_clears_every_bar():
-    assert holdout_verdict({"trades": 9, "net_points": 10.0, "sharpe": 1.0}) == "KILL"
-    assert holdout_verdict({"trades": 10, "net_points": 0.0, "sharpe": 1.0}) == "KILL"
-    assert holdout_verdict({"trades": 12, "net_points": 5.0, "sharpe": 0.0}) == "KILL"
-    assert holdout_verdict({"trades": 12, "net_points": 5.0, "sharpe": 0.2}) == "SURVIVES_SAMPLE"
+    """Owner-approved gates: >= 40 trades, net > 0, Sharpe > 0, and net
+    still > 0 with costs x 1.5 — an edge that only survives exact costs is
+    not one to paper-trade."""
+    ok = {"trades": 40, "gross_points": 300.0, "net_points": 200.0, "sharpe": 0.2}
+    assert holdout_verdict(ok) == "SURVIVES_SAMPLE"      # stressed net 150
+    assert holdout_verdict(dict(ok, trades=39)) == "KILL"
+    assert holdout_verdict(dict(ok, net_points=0.0)) == "KILL"
+    assert holdout_verdict(dict(ok, sharpe=0.0)) == "KILL"
+    thin_edge = {"trades": 40, "gross_points": 300.0, "net_points": 90.0, "sharpe": 0.5}
+    assert net_at_cost_multiple(thin_edge, 1.5) == pytest.approx(-15.0)
+    assert holdout_verdict(thin_edge) == "KILL"
 
 
 def test_pick_move_skips_a_rejected_rung():
@@ -520,3 +529,44 @@ def test_ready_frame_waits_out_the_wilder_seed():
     ready = ready_frame(full)
     assert len(ready) == 30
     assert ready.iloc[0]["date"] == full.iloc[WARMUP_BARS]["date"]
+
+
+def test_5min_frame_uses_bar_close_time_and_the_lot_in_force():
+    """EasyLanguage's Time is the bar close: a 09:15 candle is 0920, so the
+    09:30 start first arms on the 09:25 candle. The lot is the futures lot
+    on that session (nearest earlier when the archive skips a day)."""
+    ts = pd.to_datetime([
+        "2025-12-30 09:15", "2025-12-30 09:25", "2025-12-30 15:25", "2026-01-02 09:15",
+    ]).tz_localize("Asia/Kolkata")
+    five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    front = pd.DataFrame({"date": [date(2025, 12, 29), date(2026, 1, 1)], "lot": [75, 65]})
+    out = load_nifty_5min(five, front)
+    assert list(out["hhmm"]) == [920, 930, 1530, 920]
+    assert list(out["lot"]) == [75, 75, 75, 65]
+    assert list(out["date"]) == [date(2025, 12, 30)] * 3 + [date(2026, 1, 2)]
+    assert (out["offset"] == 0).all() and not out["roll_flat"].any()
+
+
+def test_intraday_one_entry_a_day_and_the_session_window():
+    """On 5-minute bars a same-day stop-out must not re-enter that session,
+    an order can only be armed by a bar closing inside 09:30-15:30, and
+    the next session trades again."""
+    d1, d2 = date(2026, 1, 5), date(2026, 1, 6)
+    rows = [
+        dict(date=d1, hhmm=925, open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=d1, hhmm=930, open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=d1, hhmm=935, open=99, high=101, low=80, close=80, brk_long=100, atr=5.0),
+        dict(date=d1, hhmm=940, open=80, high=99, low=80, close=99, brk_long=100, atr=5.0),
+        dict(date=d1, hhmm=945, open=99, high=102, low=98, close=101, brk_long=100, atr=5.0),
+        dict(date=d1, hhmm=1535, open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=d2, hhmm=920, open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=d2, hhmm=930, open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=d2, hhmm=935, open=99, high=101, low=99, close=100, atr=5.0),
+    ]
+    result = simulate(_bars(rows), Params(trail_amount=15.0, bars_to_exit=20, atr_multiplier=2.0))
+    # d1: armed by the 09:30 close (09:25 is outside), filled 09:35 and
+    # stopped there (closed through 90); the 09:45 break is not re-entered.
+    # The 15:35 bar cannot arm for d2, nor can d2's 09:20 bar; 09:30 does.
+    assert [(t.entry_date, t.entry_i, t.exit_reason) for t in result.trades] == [
+        (d1, 2, "STOP"), (d2, 8, "END"),
+    ]

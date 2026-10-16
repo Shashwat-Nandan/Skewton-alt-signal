@@ -60,8 +60,19 @@ holdout. The first pass's holdout numbers are therefore spent; a rerun's
 holdout is evidence, but not virgin.
 
 Holdout verdict, scored once on the kept parameters
-    KILL unless holdout has at least 10 trades, positive net points, and
-    positive daily Sharpe. A pass is still not a paper or live promotion.
+    KILL unless holdout has at least 40 trades, positive net points,
+    positive daily Sharpe, AND positive net points with costs x 1.5.
+    A pass unlocks paper trading only; it is never a live promotion.
+
+5-minute run (owner-approved 2026-10-16, before any 5-minute data was
+fetched): ``--bars 5min`` (the default) replays NIFTY 50 index 5-minute
+candles from ``market_data.fetch_index_5min``. EasyLanguage's Time is the
+bar's close, so a Kotak candle starting 09:15 has hhmm 0920 and the
+published 09:30-15:30 window is applied to bar closes. The index has no
+roll. Fills are costed as one NIFTY futures lot (lot size by date from the
+bhavcopy archive) at the fill-date STT; futures basis is not modelled.
+Train gates: trades >= 100 (MIN_TRADES). ``--bars daily`` keeps the
+superseded daily proxy runnable under the same gates.
 
 Search ladders (published defaults are on them). UseATRStop stays true,
 so FixedStopPoints is unused and is not a rung. StartTime and EndTime
@@ -95,10 +106,11 @@ from research.adx_breakout import (
 
 # Gates. Written with the protocol above; the loop reads these constants.
 TRAIN_FRACTION = 0.70
-MIN_TRADES = 20
+MIN_TRADES = 100
 MECHANISM_FIT_MIN = 1.0
 MAX_ROUNDS = 6
-HOLDOUT_MIN_TRADES = 10
+HOLDOUT_MIN_TRADES = 40
+HOLDOUT_COST_STRESS = 1.5
 MODEL = "jev-latest"
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 
@@ -136,7 +148,7 @@ KNOB_HELP = {
     "bars_to_exit": "Bars after the entry bar before a market exit. This is the time stop.",
     "atr_length": "Wilder ATR window for the initial stop distance.",
     "atr_multiplier": "Initial stop distance, in ATRs, from the fill.",
-    "trail_amount": "Trailing stop in index points from the best closed-bar price since entry, armed from the entry bar's close. A trail inside one daily range usually exits on the bar after entry.",
+    "trail_amount": "Trailing stop in index points from the best closed-bar price since entry, armed from the entry bar's close. A trail narrower than a typical bar's range usually exits on the bar after entry.",
     "use_profit_target": "Turn the fixed-point profit target on or off.",
     "profit_target_points": "Profit-target distance in index points from the fill. It does nothing while the target is off.",
 }
@@ -160,6 +172,14 @@ HYPOTHESIS = (
     "below its own average. Buy-stop at the highest high of the prior "
     "lookback, sell-stop at the lowest low. An initial ATR stop, a point "
     "trail, an optional point target, and a time exit. Long and short."
+)
+
+DATA_NOTE_5MIN = (
+    "NIFTY 50 index 5-minute bars. Time is the bar close, so the "
+    "published 09:30-15:30 entry window applies to bar closes. Positions "
+    "may be held overnight, as the spec has no session flatten. Costs are "
+    "one lot of NSE NIFTY futures, both sides, in points; index fills "
+    "stand in for futures fills."
 )
 
 DATA_NOTE = (
@@ -191,12 +211,19 @@ def accept_experiment(cand: dict, base: dict, fit_score: float) -> Tuple[bool, s
     return False, f"quality {q_c:.4f} did not beat {q_b:.4f}"
 
 
+def net_at_cost_multiple(summary: dict, mult: float) -> float:
+    """Net points if every cost were ``mult`` times larger."""
+    costs = float(summary["gross_points"]) - float(summary["net_points"])
+    return float(summary["gross_points"]) - mult * costs
+
+
 def holdout_verdict(summary: dict) -> str:
-    """Scored once. A pass is not a promotion to paper or live."""
+    """Scored once. A pass unlocks paper only, never live."""
     if (
         summary["trades"] < HOLDOUT_MIN_TRADES
         or summary["net_points"] <= 0
         or summary["sharpe"] <= 0
+        or net_at_cost_multiple(summary, HOLDOUT_COST_STRESS) <= 0
     ):
         return "KILL"
     return "SURVIVES_SAMPLE"
@@ -563,6 +590,38 @@ def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
     return front
 
 
+def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame:
+    """Simulate-ready frame from 5-minute index candles (``ts`` IST bar start).
+
+    One continuous series (an index has no roll). ``hhmm`` is the bar
+    close, EasyLanguage's Time. ``lot`` is the NIFTY futures lot on that
+    session from the bhavcopy front-month frame, nearest earlier session
+    when a date is missing there (later if none is earlier).
+    """
+    ts = pd.to_datetime(five_min["ts"]).dt.tz_convert("Asia/Kolkata")
+    end = ts + pd.Timedelta(minutes=5)
+    out = pd.DataFrame({
+        "date": ts.dt.date,
+        "hhmm": (end.dt.hour * 100 + end.dt.minute).astype(int),
+        "open": five_min["open"].astype(float).to_numpy(),
+        "high": five_min["high"].astype(float).to_numpy(),
+        "low": five_min["low"].astype(float).to_numpy(),
+        "close": five_min["close"].astype(float).to_numpy(),
+    })
+    lots = front.set_index("date")["lot"].sort_index()
+    lot_index = pd.Index(lots.index)
+    pos = lot_index.searchsorted(out["date"], side="right") - 1
+    pos = pos.clip(0, len(lots) - 1)
+    out["lot"] = lots.to_numpy()[pos].astype(int)
+    out["expiry"] = None
+    out["offset"] = 0.0
+    out["roll_flat"] = False
+    out["roll_basis"] = ""
+    if out.duplicated(["date", "hhmm"]).any():
+        raise ValueError("duplicate 5-minute bar")
+    return out.reset_index(drop=True)
+
+
 def ready_frame(full: pd.DataFrame, warmup: int = WARMUP_BARS) -> pd.DataFrame:
     """Drop the first ``warmup`` sessions and any whose indicators are not
     finite. Values already use that history."""
@@ -744,6 +803,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="data_cache/research_bhavcopy_raw",
         help="F&O bhavcopy archive (default: the research archive)",
     )
+    parser.add_argument("--bars", choices=("5min", "daily"), default="5min")
+    parser.add_argument(
+        "--five-min-dir", default="data_cache/research_nifty_5min",
+        help="output of market_data.fetch_index_5min",
+    )
     parser.add_argument("--rounds", type=int, default=MAX_ROUNDS)
     parser.add_argument("--out", default="/tmp/adx_breakout_opt.json")
     args = parser.parse_args(argv)
@@ -762,7 +826,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"{front['date'].iloc[0]} -> {front['date'].iloc[-1]}",
         flush=True,
     )
-    continuous = build_continuous(front)
+    if args.bars == "5min":
+        from market_data.fetch_index_5min import load_all
+        global DATA_NOTE
+        DATA_NOTE = DATA_NOTE_5MIN
+        continuous = load_nifty_5min(load_all(Path(args.five_min_dir)), front)
+        print(f"5-minute bars {len(continuous)} over {continuous['date'].nunique()} sessions "
+              f"{continuous['date'].iloc[0]} -> {continuous['date'].iloc[-1]}", flush=True)
+    else:
+        continuous = build_continuous(front)
     rolls = {str(k): int(v) for k, v in continuous["roll_basis"].value_counts().items() if k}
     print(f"roll adjustments by basis: {rolls}", flush=True)
     published = ready_frame(add_indicators(continuous, Params()))
@@ -798,6 +870,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "mechanism_fit_min": MECHANISM_FIT_MIN,
             "max_rounds": args.rounds,
             "holdout_min_trades": HOLDOUT_MIN_TRADES,
+            "holdout_cost_stress": HOLDOUT_COST_STRESS,
+            "bars": args.bars,
             "objective": "net_points / max(max_dd_points, 1) on train",
             "warmup_bars": WARMUP_BARS,
             "moves": "one knob to any rung on its ladder",
@@ -812,6 +886,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "selected_train": found["selected_train"],
         "baseline_holdout": _round_summary(base_hold),
         "selected_holdout": _round_summary(sel_hold),
+        "selected_holdout_net_at_cost_stress": net_at_cost_multiple(sel_hold, HOLDOUT_COST_STRESS),
         "verdict": verdict,
         "input_tokens": tokens_in,
         "output_tokens": tokens_out,
