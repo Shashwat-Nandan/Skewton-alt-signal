@@ -16,6 +16,40 @@ optional point target, time exit.
       (net points / max drawdown) improved. Evidence was recorded and
       was not a gate. Holdout was scored once, after selection.
 - [x] Report. Full journal: `/tmp/adx_breakout_opt.json`
+- [x] Review of PR #19 (2026-10-16): the KILL below is withdrawn. Fixed:
+      trail not live on the entry bar; entry-bar initial stop only when
+      the tape proves it (else held and counted as `entry_bar_unresolved`);
+      any-rung moves; no -inf quality for a thin baseline; breakout levels
+      include the signal bar; an open beyond one level is not ambiguous;
+      calendar-basis rolls (26/26 rolls used the next contract's close);
+      point-in-time futures STT; initial stop fixed at the signal ATR;
+      one-entry-a-day checked at the fill; 120-bar Wilder warm-up.
+      32 tests.
+- [ ] Owner: approve the revised protocol, then ONE Jev search + holdout.
+
+## Revision after review — train-only diagnostic, no Jev, holdout not scored
+
+429 ready sessions after the 120-bar warm-up. Train 300
+(2024-12-31 → 2026-03-17); holdout 129 from 2026-03-18, not scored.
+Published defaults, each trail rung:
+
+| trail | trades | gross | net | win | max DD | Sharpe | bars held | exits |
+|---|---|---|---|---|---|---|---|---|
+| 15 | 14 | −456 | −706 | 36% | 706 | −1.33 | 1 | TRAIL 12, ROLL 2 |
+| 40 | 14 | −531 | −781 | 36% | 781 | −1.48 | 1 | TRAIL 12, ROLL 2 |
+| 80 | 14 | −455 | −705 | 29% | 864 | −1.29 | 1 | TRAIL 12, ROLL 2 |
+| 150 | 12 | −64 | −279 | 50% | 496 | −0.49 | 1 | TRAIL 10, ROLL 2 |
+| 250 | 11 | −649 | −846 | 45% | 900 | −1.11 | 2 | TRAIL 9, ROLL 2 |
+| 400 | 10 | −496 | −675 | 50% | 1278 | −0.60 | 4 | TRAIL 7, ROLL 3 |
+
+No entry bar was unresolved and no bar was ambiguous. Every rung loses
+gross and net, but no rung reaches the 20-trade floor: on daily NIFTY the
+spec makes about one trade a month. The first train third has no trades.
+As specified (a 5-minute intraday system), daily bars cannot test it
+with these gates; only a knob that raises the trade count (breakout
+length, ADX threshold) could, and that is what a Jev search would try.
+
+## First pass (superseded — entry-bar trail artifact)
 
 Data: `research_bhavcopy_raw` front-month NIFTY futures (IDF, ticker
 NIFTY), 549 sessions, 2024-07-08 → 2026-09-24. No 5-minute tape on this
@@ -33,7 +67,7 @@ that open. The protective stop on the entry bar now fills at the stop.
 Later bars still gap-fill at the open. The numbers below are the
 corrected pass.
 
-## Result — KILL
+### Result — KILL (withdrawn)
 
 Selected parameters are the published defaults. Both tried rungs were
 dropped. Holdout on that config: 2 trades, net −78.9 points

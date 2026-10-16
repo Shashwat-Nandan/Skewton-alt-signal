@@ -37,11 +37,27 @@ What code decides
       * at least 20 trades
       * the three chronological train windows are not all negative
       * quality improves, where quality = net points / max(max drawdown, 1)
-        and quality is -inf when there are fewer than 20 trades
-    Evidence-quality is recorded and is not a gate. One rung per round,
-    six rounds. The highest-probability legal move that has not already
-    been rejected from the current parameters is the next experiment.
-    ``stop`` ends the search.
+        for both sides, whatever their trade counts (the trade floor is
+        the gate above; a thin baseline is not scored -inf, which would
+        let any 20-trade loser count as an improvement)
+    Evidence-quality is recorded and is not a gate. One change per round,
+    six rounds. A move sets ONE knob to any other rung on its ladder (not
+    only the adjacent rung), so rejecting one rung never makes the rungs
+    beyond it unreachable. The highest-probability legal move that has not
+    already been rejected from the current parameters is the next
+    experiment. ``stop`` ends the search.
+
+Warm-up
+    ADX/ATR are Wilder EWMs seeded from their first value. A session is
+    "ready" only after WARMUP_BARS (4 x the longest ADX rung) of history,
+    when that seed carries under 2% weight, and once every level is finite.
+
+Revision 2026-10-16 (PR #19 review), registered before any rerun: the
+entry-bar/trail fill rules, calendar-basis rolls, point-in-time STT,
+breakout levels including the signal bar, the quality gate, any-rung
+moves and the warm-up all changed after the first pass had seen its
+holdout. The first pass's holdout numbers are therefore spent; a rerun's
+holdout is evidence, but not virgin.
 
 Holdout verdict, scored once on the kept parameters
     KILL unless holdout has at least 10 trades, positive net points, and
@@ -120,7 +136,7 @@ KNOB_HELP = {
     "bars_to_exit": "Bars after the entry bar before a market exit. This is the time stop.",
     "atr_length": "Wilder ATR window for the initial stop distance.",
     "atr_multiplier": "Initial stop distance, in ATRs, from the fill.",
-    "trail_amount": "Trailing stop in index points from the best closed-bar price since entry. A trail inside one daily range exits on the entry bar.",
+    "trail_amount": "Trailing stop in index points from the best closed-bar price since entry, armed from the entry bar's close. A trail inside one daily range usually exits on the bar after entry.",
     "use_profit_target": "Turn the fixed-point profit target on or off.",
     "profit_target_points": "Profit-target distance in index points from the fill. It does nothing while the target is off.",
 }
@@ -156,9 +172,7 @@ DATA_NOTE = (
 
 
 def quality(summary: dict) -> float:
-    """Train objective. Ineligible samples score -inf and cannot be kept."""
-    if summary["trades"] < MIN_TRADES:
-        return float("-inf")
+    """Train objective. The trade floor is a separate gate in accept_experiment."""
     return float(summary["net_points"]) / max(float(summary["max_dd_points"]), 1.0)
 
 
@@ -195,24 +209,27 @@ def _ladder_index(name: str, value):
     raise ValueError(f"{name}={value!r} is not on its ladder")
 
 
+# Wilder seed weight at the longest ADX rung: (1 - 1/30) ** 120 ~= 1.7%.
+WARMUP_BARS = 4 * max(LADDERS["adx_length"])
+
+
+def move_key(name: str, rung) -> str:
+    return f"{name}={rung}"
+
+
 def apply_move(params: Params, move: str) -> Params:
-    """Move one rung. ``stop`` is not a parameter change."""
+    """Set one knob to a rung on its ladder. ``stop`` is not a parameter change."""
     if move == "stop":
         raise ValueError("stop is not a parameter move")
-    if move.endswith("_up"):
-        name, direction = move[: -len("_up")], 1
-    elif move.endswith("_down"):
-        name, direction = move[: -len("_down")], -1
-    else:
+    name, sep, _ = move.partition("=")
+    if not sep or name not in LADDERS:
         raise ValueError(f"unreadable move {move!r}")
-    if name not in LADDERS:
-        raise ValueError(f"unknown parameter in {move!r}")
-    i = _ladder_index(name, getattr(params, name))
-    j = i + direction
-    ladder = LADDERS[name]
-    if not 0 <= j < len(ladder):
-        raise ValueError(f"{move} leaves the {name} ladder")
-    return replace(params, **{name: ladder[j]})
+    for rung in LADDERS[name]:
+        if move_key(name, rung) == move:
+            if rung == getattr(params, name):
+                raise ValueError(f"{move} does not change {name}")
+            return replace(params, **{name: rung})
+    raise ValueError(f"{move} is not on the {name} ladder")
 
 
 def legal_moves(params: Params) -> Dict[str, str]:
@@ -223,19 +240,12 @@ def legal_moves(params: Params) -> Dict[str, str]:
         names = [n for n in names if n != "profit_target_points"]
     moves = {}
     for name in names:
-        i = _ladder_index(name, getattr(params, name))
-        ladder = LADDERS[name]
-        cur = ladder[i]
-        if i > 0:
-            nxt = ladder[i - 1]
-            moves[f"{name}_down"] = (
-                f"Change {EL[name]} from {cur} to {nxt}. {KNOB_HELP[name]}"
-            )
-        if i < len(ladder) - 1:
-            nxt = ladder[i + 1]
-            moves[f"{name}_up"] = (
-                f"Change {EL[name]} from {cur} to {nxt}. {KNOB_HELP[name]}"
-            )
+        cur = LADDERS[name][_ladder_index(name, getattr(params, name))]
+        for rung in LADDERS[name]:
+            if rung != cur:
+                moves[move_key(name, rung)] = (
+                    f"Change {EL[name]} from {cur} to {rung}. {KNOB_HELP[name]}"
+                )
     moves["stop"] = (
         "Stop searching. The configuration is already a fair test of the "
         "hypothesis, and another single knob is more likely to fit this "
@@ -279,7 +289,9 @@ def report_prose(summary: dict) -> str:
         f"bars with a finite ADX. Median ADX at entry {adx_txt}. "
         f"Chronological window nets in points: {windows or 'n/a'}. "
         f"Bars skipped because both stop entries could have filled: "
-        f"{summary['ambiguous']}."
+        f"{summary['ambiguous']}. Entry bars that crossed the initial stop "
+        f"but closed back inside it (held, unresolvable on a daily bar): "
+        f"{summary.get('entry_bar_unresolved', 0)}."
     )
 
 
@@ -303,6 +315,7 @@ def _round_summary(summary: dict) -> dict:
         ),
         "windows": [round(w, 1) for w in summary["windows"]],
         "ambiguous": summary["ambiguous"],
+        "entry_bar_unresolved": summary.get("entry_bar_unresolved", 0),
         "sessions": summary["sessions"],
     }
     return out
@@ -517,12 +530,19 @@ def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
     if out.empty:
         raise RuntimeError("no unexpired NIFTY future rows")
     idx = out.groupby("date")["expiry"].idxmin()
+    # Second-nearest contract's close on the same session: the calendar
+    # basis build_continuous uses at a roll.
+    rest = out.drop(index=idx)
+    nxt = rest.loc[rest.groupby("date")["expiry"].idxmin(), ["date", "expiry", "ClsPric"]]
+    nxt = nxt.rename(columns={"expiry": "next_expiry", "ClsPric": "next_close"})
     front = out.loc[idx, ["date", "expiry", "OpnPric", "HghPric", "LwPric", "ClsPric", "NewBrdLotQty"]]
+    front = front.merge(nxt, on="date", how="left")
     front = front.rename(columns={
         "OpnPric": "open", "HghPric": "high", "LwPric": "low",
         "ClsPric": "close", "NewBrdLotQty": "lot",
     })
     front = front.sort_values("date").reset_index(drop=True)
+    front["next_close"] = front["next_close"].astype(float)
     for col in ("open", "high", "low", "close"):
         front[col] = front[col].astype(float)
     front["lot"] = front["lot"].astype(int)
@@ -543,10 +563,12 @@ def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
     return front
 
 
-def ready_frame(full: pd.DataFrame) -> pd.DataFrame:
-    """Drop sessions whose indicators are not finite yet. Values already use that history."""
+def ready_frame(full: pd.DataFrame, warmup: int = WARMUP_BARS) -> pd.DataFrame:
+    """Drop the first ``warmup`` sessions and any whose indicators are not
+    finite. Values already use that history."""
     ok = (
-        np.isfinite(full["adx"].to_numpy(float))
+        (np.arange(len(full)) >= warmup)
+        & np.isfinite(full["adx"].to_numpy(float))
         & np.isfinite(full["adx_ma"].to_numpy(float))
         & np.isfinite(full["atr"].to_numpy(float))
         & np.isfinite(full["brk_long"].to_numpy(float))
@@ -741,6 +763,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         flush=True,
     )
     continuous = build_continuous(front)
+    rolls = {str(k): int(v) for k, v in continuous["roll_basis"].value_counts().items() if k}
+    print(f"roll adjustments by basis: {rolls}", flush=True)
     published = ready_frame(add_indicators(continuous, Params()))
     train, hold, cut = split_train_holdout(published)
     train_dates = _dates_of(train)
@@ -775,6 +799,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_rounds": args.rounds,
             "holdout_min_trades": HOLDOUT_MIN_TRADES,
             "objective": "net_points / max(max_dd_points, 1) on train",
+            "warmup_bars": WARMUP_BARS,
+            "moves": "one knob to any rung on its ladder",
+            "roll_basis": rolls,
             "model": MODEL,
         },
         "holdout_starts": cut.isoformat(),

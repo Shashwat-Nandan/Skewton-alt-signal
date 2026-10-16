@@ -18,19 +18,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from research.adx_breakout import (
     Params,
+    _cost_points,
     add_indicators,
     build_continuous,
+    fut_stt_rate,
     simulate,
     summarize,
 )
 from research.optimize_adx_breakout import (
     LADDERS,
+    WARMUP_BARS,
     accept_experiment,
     apply_move,
     holdout_verdict,
     legal_moves,
     load_nifty_front,
     pick_move,
+    ready_frame,
 )
 
 WIDE = Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=5.0)
@@ -59,8 +63,11 @@ def _day(n):
     return date(2026, 1, 5) + timedelta(days=n)
 
 
-def test_breakout_level_excludes_the_signal_bar():
-    """Highest(High, N)[1] is the prior N highs. Today's spike is tomorrow's level."""
+def test_breakout_level_includes_the_signal_bar():
+    """EasyLanguage's "Buy next bar at Highest(High, N) stop" is evaluated at
+    the signal bar's close and includes that bar. Leaving it out arms a
+    buy-stop at a level the signal bar already traded through, so the next
+    bar's "breakout" fills inside yesterday's range."""
     highs = [1.0, 1.0, 1.0, 1.0, 10.0, 1.0]
     df = pd.DataFrame({
         "date": [_day(i) for i in range(6)],
@@ -72,8 +79,8 @@ def test_breakout_level_excludes_the_signal_bar():
         "lot": [65] * 6,
     })
     out = add_indicators(build_continuous(df), Params(breakout_length=3))
-    assert out.loc[4, "brk_long"] == pytest.approx(1.0)
-    assert out.loc[5, "brk_long"] == pytest.approx(10.0)
+    assert out.loc[3, "brk_long"] == pytest.approx(1.0)
+    assert out.loc[4, "brk_long"] == pytest.approx(10.0)
 
 
 def test_roll_gap_is_not_a_breakout_and_not_a_profit():
@@ -85,7 +92,9 @@ def test_roll_gap_is_not_a_breakout_and_not_a_profit():
         dict(date=_day(2), expiry=exp_b, open=110, high=112, low=109, close=111, lot=65),
     ])
     cont = build_continuous(front)
-    # Day-1 close is shifted onto day-2's open. The latest contract stays raw.
+    # No next-contract close: falls back to shifting day-1's close onto
+    # day-2's open, and says so. The latest contract stays raw.
+    assert cont.loc[1, "roll_basis"] == "open_gap"
     assert cont.loc[1, "close"] == pytest.approx(110.0)
     assert cont.loc[2, "open"] == pytest.approx(110.0)
     assert bool(cont.loc[1, "roll_flat"]) is True
@@ -107,6 +116,25 @@ def test_roll_gap_is_not_a_breakout_and_not_a_profit():
     # Raw fill 101, raw exit 102. The 110 open of the new contract is not in this.
     assert trade.points_gross == pytest.approx(1.0)
     assert trade.points_net < trade.points_gross
+
+
+def test_roll_adjusts_by_the_calendar_basis_and_keeps_the_overnight_gap():
+    """The new contract opens 10 above the old close, but 4 of that is the
+    calendar basis (next contract's close that day). The other 6 is a real
+    overnight move and must stay in the series ADX/ATR/levels read."""
+    exp_a, exp_b = date(2026, 1, 6), date(2026, 2, 24)
+    front = pd.DataFrame([
+        dict(date=_day(0), expiry=exp_a, open=100, high=101, low=99, close=100, lot=65,
+             next_expiry=exp_b, next_close=104.0),
+        dict(date=_day(1), expiry=exp_a, open=100, high=105, low=100, close=102, lot=65,
+             next_expiry=exp_b, next_close=106.0),
+        dict(date=_day(2), expiry=exp_b, open=112, high=113, low=111, close=112, lot=65,
+             next_expiry=None, next_close=np.nan),
+    ])
+    cont = build_continuous(front)
+    assert cont.loc[1, "roll_basis"] == "calendar"
+    assert cont.loc[1, "close"] == pytest.approx(106.0)
+    assert cont.loc[2, "open"] - cont.loc[1, "close"] == pytest.approx(6.0)
 
 
 def test_long_stop_fills_at_the_level_and_a_gap_fills_at_the_open():
@@ -151,6 +179,20 @@ def test_a_bar_that_can_fill_both_stops_is_skipped():
     assert result.ambiguous_bars == 1
 
 
+def test_an_open_beyond_one_level_fills_that_side_not_ambiguous():
+    """A gap above the long level filled the buy-stop at the open, first.
+    Dropping such bars as ambiguous removes the big-range breakout days the
+    hypothesis is about."""
+    df = _bars([
+        dict(date=_day(0), open=95, high=96, low=94, close=95, brk_long=100, brk_short=90),
+        dict(date=_day(1), open=102, high=103, low=89, close=95),
+    ])
+    result = simulate(df, WIDE)
+    assert result.ambiguous_bars == 0
+    trade = result.trades[0]
+    assert trade.side == "LONG" and trade.entry_px == pytest.approx(102.0)
+
+
 def test_close_already_through_the_level_does_not_place_a_buy_stop():
     df = _bars([
         dict(date=_day(0), open=104, high=106, low=104, close=105, brk_long=100),
@@ -180,8 +222,9 @@ def test_same_day_stop_out_does_not_rearm():
     """EntriesToday counts the fill. A second bar that same day must not enter."""
     same = _day(1)
     df = _bars([
-        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100),
-        dict(date=same, open=99, high=110, low=80, close=90, brk_long=100),
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        # Fill at 100, stop 75 (5 x ATR 5), closes through it at 72.
+        dict(date=same, open=99, high=110, low=70, close=72, brk_long=100),
         dict(date=same, open=100, high=101, low=99, close=100, brk_long=100),
         dict(date=_day(2), open=100, high=101, low=99, close=100),
     ])
@@ -189,35 +232,85 @@ def test_same_day_stop_out_does_not_rearm():
     assert len(result.trades) == 1
     trade = result.trades[0]
     assert trade.exit_date == same
-    assert trade.exit_reason == "TRAIL"
-    assert trade.exit_px == pytest.approx(85.0)
+    assert trade.exit_reason == "STOP"
+    assert trade.exit_px == pytest.approx(75.0)
 
 
-def test_entry_bar_stop_does_not_fill_at_the_pre_entry_open():
-    """The open prints before a level fill. Booking it as the stop turns a
-    15-point trail into a loss of the whole open-to-level distance, which
-    is what a daily bar does on almost every breakout.
-    """
+def test_one_entry_a_day_does_not_block_the_next_session():
+    """On daily bars the order armed at today's close is for tomorrow. An
+    entry today must not stop tomorrow's order being placed."""
+    df = _bars([
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=_day(1), open=99, high=110, low=70, close=72, brk_long=100, atr=5.0),
+        dict(date=_day(2), open=99, high=101, low=98, close=100, atr=5.0),
+    ])
+    result = simulate(df, Params(trail_amount=15.0, bars_to_exit=20, atr_multiplier=5.0))
+    assert [t.entry_date for t in result.trades] == [_day(1), _day(2)]
+
+
+def test_the_trail_is_not_live_on_the_entry_bar():
+    """The first pass booked a 15-point trail inside a 200-point daily bar,
+    so every trade exited on its entry bar at exactly -trail: the KILL
+    measured the simulator, not the strategy. A "next bar" trail is armed
+    at the entry bar's close."""
     params = Params(trail_amount=15.0, bars_to_exit=20, atr_multiplier=5.0)
-    long_df = _bars([
+    df = _bars([
         dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100),
-        dict(date=_day(1), open=80, high=110, low=79, close=90, brk_long=100),
+        dict(date=_day(1), open=95, high=120, low=94, close=118),
+        dict(date=_day(2), open=118, high=119, low=104, close=106),
     ])
-    long_trade = simulate(long_df, params).trades[0]
-    assert long_trade.entry_px == pytest.approx(100.0)
-    assert long_trade.exit_i == 1
-    assert long_trade.exit_reason == "TRAIL"
-    assert long_trade.exit_px == pytest.approx(85.0)
+    trade = simulate(df, params).trades[0]
+    assert trade.entry_px == pytest.approx(100.0)
+    assert trade.exit_i == 2                     # not the entry bar
+    assert trade.exit_reason == "TRAIL"
+    assert trade.exit_px == pytest.approx(105.0)   # 120 - 15
+    assert trade.points_gross == pytest.approx(5.0)
 
-    short_df = _bars([
-        dict(date=_day(0), open=101, high=102, low=100, close=101, brk_short=100),
-        dict(date=_day(1), open=120, high=121, low=90, close=110, brk_short=100),
+
+def test_entry_bar_initial_stop_only_when_the_tape_proves_it():
+    """A level fill: the low may have printed before the breakout. Closing
+    through the stop proves it; crossing and closing back is held and counted."""
+    params = Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=2.0)
+    proven = _bars([
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=_day(1), open=95, high=101, low=85, close=86),
     ])
-    short_trade = simulate(short_df, params).trades[0]
-    assert short_trade.side == "SHORT"
-    assert short_trade.entry_px == pytest.approx(100.0)
-    assert short_trade.exit_reason == "TRAIL"
-    assert short_trade.exit_px == pytest.approx(115.0)
+    trade = simulate(proven, params).trades[0]
+    assert (trade.exit_i, trade.exit_reason) == (1, "STOP")
+    assert trade.exit_px == pytest.approx(90.0)
+
+    unresolved = _bars([
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=_day(1), open=95, high=101, low=85, close=100),
+    ])
+    result = simulate(unresolved, params)
+    assert result.trades[0].exit_reason == "END"
+    assert result.entry_bar_unresolved == 1
+
+
+def test_a_gap_entry_bar_is_wholly_after_the_fill():
+    """Filled at the open, the whole range is after the fill, so a low
+    through the initial stop is a real stop-out."""
+    df = _bars([
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=_day(1), open=105, high=106, low=90, close=100),
+    ])
+    trade = simulate(df, Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=2.0)).trades[0]
+    assert trade.entry_px == pytest.approx(105.0)
+    assert (trade.exit_i, trade.exit_reason) == (1, "STOP")
+    assert trade.exit_px == pytest.approx(95.0)
+
+
+def test_initial_stop_distance_is_fixed_at_entry():
+    """ATR rising after entry must not loosen the protective stop."""
+    df = _bars([
+        dict(date=_day(0), open=99, high=99, low=98, close=99, brk_long=100, atr=5.0),
+        dict(date=_day(1), open=100, high=101, low=99, close=100, atr=50.0),
+        dict(date=_day(2), open=100, high=100, low=85, close=86, atr=50.0),
+    ])
+    trade = simulate(df, Params(trail_amount=5000.0, bars_to_exit=20, atr_multiplier=2.0)).trades[0]
+    assert trade.exit_reason == "STOP"
+    assert trade.exit_px == pytest.approx(90.0)    # 100 - 2 x 5, not 100 - 2 x 50
 
 
 def test_trail_uses_the_prior_extreme_not_this_bars_high():
@@ -295,17 +388,29 @@ def test_published_defaults_sit_on_the_search_ladders():
 
 def test_a_dead_target_distance_is_not_offered_while_the_target_is_off():
     off = legal_moves(Params())
-    assert not any(key.startswith("profit_target_points_") for key in off)
-    on = legal_moves(apply_move(Params(), "use_profit_target_up"))
-    assert any(key.startswith("profit_target_points_") for key in on)
+    assert not any(key.startswith("profit_target_points=") for key in off)
+    on = legal_moves(apply_move(Params(), "use_profit_target=True"))
+    assert any(key.startswith("profit_target_points=") for key in on)
 
 
-def test_apply_move_steps_one_rung_and_will_not_walk_off_the_ladder():
-    stepped = apply_move(Params(), "trail_amount_up")
+def test_a_rejected_rung_does_not_make_the_rungs_beyond_it_unreachable():
+    """First pass: rejecting trail 15 -> 40 banned the only path to 80+,
+    the only trails wider than a daily range. Any rung is one move away."""
+    legal = legal_moves(Params())
+    assert {"trail_amount=40.0", "trail_amount=80.0", "trail_amount=400.0"} <= set(legal)
+    banned = {"trail_amount=40.0"}
+    choice = {"probabilities": {"trail_amount=40.0": 0.6, "trail_amount=150.0": 0.3, "stop": 0.1}}
+    assert pick_move(choice, legal, banned) == "trail_amount=150.0"
+    assert apply_move(Params(), "trail_amount=150.0").trail_amount == 150.0
+
+
+def test_apply_move_sets_one_knob_and_stays_on_the_ladder():
+    stepped = apply_move(Params(), "trail_amount=40.0")
     assert stepped.trail_amount == 40.0
     assert stepped.adx_threshold == Params().adx_threshold
-    with pytest.raises(ValueError):
-        apply_move(Params(), "trail_amount_down")
+    for bad in ("trail_amount=7.0", "trail_amount=15.0", "trail_amount_up", "nope=1"):
+        with pytest.raises(ValueError):
+            apply_move(Params(), bad)
 
 
 def test_mechanism_veto_and_window_gate_block_a_better_train_number():
@@ -326,6 +431,17 @@ def test_mechanism_veto_and_window_gate_block_a_better_train_number():
     assert accept_experiment(thin, baseline, fit_score=2.0)[0] is False
 
 
+def test_a_thin_baseline_does_not_let_any_loser_through():
+    """First pass scored a <20-trade baseline as -inf, so any 20-trade
+    candidate "improved" however much it lost. Quality is compared as is."""
+    thin_base = {"trades": 12, "net_points": -100.0, "max_dd_points": 100.0,
+                 "windows": [0.0, -50.0, -50.0]}
+    big_loser = {"trades": 25, "net_points": -5000.0, "max_dd_points": 2500.0,
+                 "windows": [10.0, -2500.0, -2510.0]}
+    kept, reason = accept_experiment(big_loser, thin_base, fit_score=2.0)
+    assert kept is False and "did not beat" in reason
+
+
 def test_holdout_verdict_is_kill_unless_the_sample_clears_every_bar():
     assert holdout_verdict({"trades": 9, "net_points": 10.0, "sharpe": 1.0}) == "KILL"
     assert holdout_verdict({"trades": 10, "net_points": 0.0, "sharpe": 1.0}) == "KILL"
@@ -334,10 +450,10 @@ def test_holdout_verdict_is_kill_unless_the_sample_clears_every_bar():
 
 
 def test_pick_move_skips_a_rejected_rung():
-    legal = {"trail_amount_up": "widen", "stop": "stop"}
-    choice = {"probabilities": {"trail_amount_up": 0.7, "stop": 0.3}}
-    assert pick_move(choice, legal, set()) == "trail_amount_up"
-    assert pick_move(choice, legal, {"trail_amount_up"}) == "stop"
+    legal = {"trail_amount=40.0": "widen", "stop": "stop"}
+    choice = {"probabilities": {"trail_amount=40.0": 0.7, "stop": 0.3}}
+    assert pick_move(choice, legal, set()) == "trail_amount=40.0"
+    assert pick_move(choice, legal, {"trail_amount=40.0"}) == "stop"
     assert pick_move({"probabilities": {}}, legal, set()) == "stop"
 
 
@@ -358,6 +474,9 @@ def test_loader_keeps_the_near_nifty_and_drops_other_indexes(tmp_path):
     assert front.iloc[0]["expiry"] == date(2026, 1, 29)
     assert front.iloc[0]["close"] == pytest.approx(102.0)
     assert int(front.iloc[0]["lot"]) == 65
+    # The next NIFTY contract's same-day close, for the roll's calendar basis.
+    assert front.iloc[0]["next_expiry"] == date(2026, 2, 24)
+    assert front.iloc[0]["next_close"] == pytest.approx(101.0)
 
 
 def test_summarize_drawdown_is_the_peak_to_trough_of_net_points():
@@ -374,3 +493,30 @@ def test_summarize_drawdown_is_the_peak_to_trough_of_net_points():
     assert stats["gross_points"] == pytest.approx(-10.0)
     assert stats["max_dd_points"] == pytest.approx(abs(stats["net_points"]))
     assert stats["net_points"] < stats["gross_points"]
+
+
+def test_costs_use_the_futures_stt_in_force_on_the_fill_date():
+    """core.costs carries today's 0.05% futures STT; a 2025 sale paid 0.02%.
+    Charging today's rate on 2024-25 trades biases the net toward KILL."""
+    assert fut_stt_rate(date(2024, 9, 30)) == pytest.approx(0.000125)
+    assert fut_stt_rate(date(2025, 6, 2)) == pytest.approx(0.0002)
+    assert fut_stt_rate(date(2026, 5, 4)) == pytest.approx(0.0005)
+    old = _cost_points(24000.0, 65, True, date(2025, 6, 2))
+    new = _cost_points(24000.0, 65, True, date(2026, 5, 4))
+    assert new - old == pytest.approx(24000.0 * (0.0005 - 0.0002))
+    # Buy side has no STT, so the date does not move it.
+    assert _cost_points(24000.0, 65, False, date(2025, 6, 2)) == pytest.approx(
+        _cost_points(24000.0, 65, False, date(2026, 5, 4)))
+
+
+def test_ready_frame_waits_out_the_wilder_seed():
+    """ADX is an EWM seeded from its first value. "Finite" is not "warmed
+    up": the first ready bars must sit WARMUP_BARS into the history."""
+    n = WARMUP_BARS + 30
+    full = pd.DataFrame({
+        "date": [date(2025, 1, 1) + timedelta(days=i) for i in range(n)],
+        "adx": 10.0, "adx_ma": 12.0, "atr": 50.0, "brk_long": 1.0, "brk_short": 1.0,
+    })
+    ready = ready_frame(full)
+    assert len(ready) == 30
+    assert ready.iloc[0]["date"] == full.iloc[WARMUP_BARS]["date"]

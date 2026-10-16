@@ -1,15 +1,17 @@
 # Lessons
 
-## A stop entry's bar cannot exit at that bar's open
+## On a daily bar, don't check the entry bar against its whole range
 
-- 2026-10-16: the ADX breakout booked the entry-bar trail at the open
-  whenever the open sat beyond the trail. On a daily NIFTY bar that open
-  prints before the breakout, so a 15-point trail was reported as a loss
-  of the whole open-to-level distance. The corrected fill is the stop
-  price. A later bar still gap-fills at the open.
-- Takeaway: **an entry-bar protective stop fills at the stop. The open is
-  a gap fill only once the position is already on, or when the entry
-  itself filled at the open.**
+- 2026-10-16: the ADX breakout first booked the entry-bar trail at the
+  open, then "fixed" it to fill at the stop. Both checked a 15-point
+  trail against a ~200-point daily range whose low may have printed
+  before the breakout, so every trade exited on its entry bar at exactly
+  −trail and a KILL measured the simulator. Review of PR #19 caught it.
+- Takeaway: **on the entry bar only the part of the range after the fill
+  counts: the whole bar for a gap fill at the open; otherwise only a close
+  beyond the stop proves it. A "next bar" trail is armed at the entry
+  bar's close. When every trade exits the same way for the same amount,
+  suspect the engine before the strategy.**
 
 ## Read the whole function's locals before naming a new one in it
 

@@ -14,23 +14,35 @@ NIFTY futures. A daily bar is the cash session, stamped 15:30, so the
 Fills the daily bar cannot order
 --------------------------------
 * Signal is the bar close. The stop entry is the next bar only.
-* Breakout levels, ADX, and ATR on the signal bar use that bar's close
-  and earlier bars. The current bar is not inside its own Donchian level.
-* A bar that trades through both the long level and the short level is
-  skipped and counted. The tape cannot say which stop was hit first.
-* On the entry bar the protective stop is live (pessimistic: a range that
-  covers the fill and the stop books the stop, at the stop). The open of
-  that bar printed before a level fill, so it is not a gap through the
-  stop. The profit target is not live on the entry bar (a same-bar target
-  would flatter the fill).
+* Breakout levels are Highest(High, N) / Lowest(Low, N) INCLUDING the
+  signal bar, as EasyLanguage's "Buy next bar at Highest(High, N) stop"
+  evaluates them at that bar's close. ADX and ATR use that bar and earlier.
+* A bar that trades through both levels fills the side its open is
+  already beyond (that stop filled at the open, first). Only when the
+  open is between the levels is the bar skipped and counted: the tape
+  cannot say which stop was hit first.
+* The trail is a "next bar" order: it is armed at a bar's close from the
+  best price since entry, so it is not live on the entry bar. It
+  ratchets off bars already closed; this bar's new extreme does not
+  tighten the stop being checked.
+* Entry bar: only the initial stop is live, and only where the tape
+  proves it traded after the fill — the whole bar for a gap fill at the
+  open, else only when the bar CLOSES beyond the stop. A level fill whose
+  low/high crosses the stop but closes back inside is unresolvable on a
+  daily bar; it is held and counted (``entry_bar_unresolved``) so the
+  reader sees how much rides on that call. The profit target is not live
+  on the entry bar (a same-bar target would flatter the fill).
 * After the entry bar, stop and target are both live and the stop wins
   when the bar touches both. A gap through a level fills at the open.
-* The trail ratchets off the best price of bars already closed. This
-  bar's new extreme does not tighten the stop that is being checked.
+* The initial stop distance is fixed at entry from the signal bar's ATR.
 * The expiring contract is flattened at its close. P&L does not cross
-  the roll gap. Indicators run on a difference-adjusted continuous
-  series so the gap is not a breakout. Point P&L inside one contract
+  the roll. Indicators run on a difference-adjusted continuous series;
+  each roll's adjustment is the calendar basis (next contract's close
+  minus the expiring close, same session), so the overnight gap into the
+  new contract stays in the series. Point P&L inside one contract
   matches the raw contract.
+* Costs are ``core.costs.estimate_transaction_cost`` with the futures
+  STT rate in force on the fill date (``FUT_STT_HISTORY``), not today's.
 """
 from __future__ import annotations
 
@@ -101,15 +113,41 @@ class Trade:
 class BacktestResult:
     trades: List[Trade] = field(default_factory=list)
     ambiguous_bars: int = 0
+    # Entry bars whose range crossed the initial stop but closed back
+    # inside it: held, because daily OHLC cannot say the cross came after
+    # the fill. A large count means the verdict leans on that call.
+    entry_bar_unresolved: int = 0
+
+
+# Futures STT on the sell side, by effective date. core.costs carries
+# today's rate only; a 2024-25 trade paid less. (from, rate)
+FUT_STT_HISTORY: Tuple[Tuple[date, float], ...] = (
+    (date(1900, 1, 1), 0.000125),   # 0.0125%
+    (date(2024, 10, 1), 0.0002),    # 0.02%, Finance (No. 2) Act 2024
+    (date(2026, 4, 1), 0.0005),     # 0.05%, Budget 2026 (core.costs rate)
+)
+_CORE_FUT_STT = 0.0005
+
+
+def fut_stt_rate(on: date) -> float:
+    rate = FUT_STT_HISTORY[0][1]
+    for start, r in FUT_STT_HISTORY:
+        if on >= start:
+            rate = r
+    return rate
 
 
 def build_continuous(front: pd.DataFrame) -> pd.DataFrame:
     """Difference-adjust a front-month OHLC frame so a roll gap is not a return.
 
     ``front`` is one row per session: date, expiry, open, high, low, close, lot.
-    The latest contract is left on its raw price. Earlier contracts are shifted
-    so the expiring close meets the next contract's open. ``roll_flat`` marks
-    the last session of a contract.
+    The latest contract is left on its raw price. Earlier contracts are
+    shifted by the calendar basis at each roll: the next contract's close
+    minus the expiring contract's close on the expiring session (optional
+    columns ``next_expiry`` / ``next_close``). That keeps the real overnight
+    gap into the new contract in the series. Without a usable next-contract
+    close the roll falls back to open-minus-close and ``roll_basis`` says so.
+    ``roll_flat`` marks the last session of a contract.
     """
     need = {"date", "expiry", "open", "high", "low", "close", "lot"}
     missing = need - set(front.columns)
@@ -126,12 +164,22 @@ def build_continuous(front: pd.DataFrame) -> pd.DataFrame:
     expiry = list(df["expiry"])
     raw_open = df["open"].to_numpy(float)
     raw_close = df["close"].to_numpy(float)
+    next_exp = list(df["next_expiry"]) if "next_expiry" in df.columns else [None] * n
+    next_close = (df["next_close"].to_numpy(float) if "next_close" in df.columns
+                  else np.full(n, np.nan))
+    basis = np.array([""] * n, dtype=object)
     for i in range(n - 1, 0, -1):
         if expiry[i] != expiry[i - 1]:
-            cum += float(raw_open[i] - raw_close[i - 1])
+            if next_exp[i - 1] == expiry[i] and _finite(next_close[i - 1]):
+                cum += float(next_close[i - 1] - raw_close[i - 1])
+                basis[i - 1] = "calendar"
+            else:
+                cum += float(raw_open[i] - raw_close[i - 1])
+                basis[i - 1] = "open_gap"
         offset[i - 1] = cum
     out = df.copy()
     out["offset"] = offset
+    out["roll_basis"] = basis
     for col in ("open", "high", "low", "close"):
         out[col] = out[col].astype(float) + offset
     roll = np.zeros(n, dtype=bool)
@@ -152,8 +200,10 @@ def add_indicators(df: pd.DataFrame, params: Params) -> pd.DataFrame:
     out["adx"] = ind.adx(high, low, close, params.adx_length)
     out["adx_ma"] = ind.sma(out["adx"], params.ma_length)
     out["atr"] = ind.atr(high, low, close, params.atr_length)
-    out["brk_long"] = ind.donchian_high(high, params.breakout_length)
-    out["brk_short"] = ind.donchian_low(low, params.breakout_length)
+    # Highest(High, N) at the signal bar's close includes that bar.
+    n = params.breakout_length
+    out["brk_long"] = high.rolling(window=n, min_periods=n).max()
+    out["brk_short"] = low.rolling(window=n, min_periods=n).min()
     return out
 
 
@@ -228,12 +278,15 @@ def _exit_fill(
     return None
 
 
-def _cost_points(price: float, lot: int, sell: bool) -> float:
+def _cost_points(price: float, lot: int, sell: bool, on: date) -> float:
     if lot <= 0 or not _finite(price) or price <= 0:
         raise ValueError(f"cannot cost a fill at price={price} lot={lot}")
     rupees = estimate_transaction_cost(
         float(price), 1, int(lot), "SELL" if sell else "BUY", "FUT",
     )
+    if sell:
+        # Swap core.costs' current futures STT for the rate on the fill date.
+        rupees += float(price) * int(lot) * (fut_stt_rate(on) - _CORE_FUT_STT)
     return rupees / int(lot)
 
 
@@ -316,12 +369,20 @@ def _try_entry(
 ) -> Optional[dict]:
     long_level = pending["long"]
     short_level = pending["short"]
+    if entries_today.get(bar_date, 0) >= 1:
+        return None   # EntriesToday: one fill per session
     long_hit = long_level is not None and high >= long_level
     short_hit = short_level is not None and low <= short_level
     if long_hit and short_hit:
-        # Both resting stops could have filled. Daily OHLC cannot order them.
-        result.ambiguous_bars += 1
-        return None
+        # An open already beyond one level filled that stop first.
+        if bar_open >= long_level:
+            short_hit = False
+        elif bar_open <= short_level:
+            long_hit = False
+        else:
+            # Opened between the levels: daily OHLC cannot order the two.
+            result.ambiguous_bars += 1
+            return None
     if long_hit:
         fill = bar_open if bar_open >= long_level else float(long_level)
         side, side_name = 1, "LONG"
@@ -340,10 +401,13 @@ def _try_entry(
         "entry_date": bar_date,
         "entry_px": fill,
         "entry_raw": raw_fill,
-        "entry_cost": _cost_points(raw_fill, lot, entry_sell),
+        "entry_cost": _cost_points(raw_fill, lot, entry_sell, bar_date),
         "lot": lot,
         "extreme": fill,
         "adx": pending["adx"],
+        # Signal bar's ATR, fixed for the life of the trade.
+        "atr": pending["atr"],
+        "filled_at_open": fill == bar_open,
         "exit_at_open": False,
         "entry_bar": True,
     }
@@ -354,12 +418,15 @@ def _manage(
     i: int, last: int, bar_date: date, bar_open: float, high: float,
     low: float, close: float, offset: float,
 ) -> Optional[dict]:
-    atr_prev = float(frame.iloc[i - 1]["atr"]) if i > 0 else float("nan")
-    # Entry bar's ATR is the signal bar, which is the previous row.
-    stop_dist = _stop_distance(params, atr_prev)
-    stop_px, stop_kind = _working_stop(
-        pos["side"], pos["entry_px"], pos["extreme"], stop_dist, params.trail_amount,
-    )
+    stop_dist = _stop_distance(params, pos["atr"])
+    if pos["entry_bar"]:
+        # The trail is armed at this bar's close; only the initial stop is live.
+        stop_px = pos["entry_px"] - pos["side"] * stop_dist
+        stop_kind = "STOP"
+    else:
+        stop_px, stop_kind = _working_stop(
+            pos["side"], pos["entry_px"], pos["extreme"], stop_dist, params.trail_amount,
+        )
     target = None
     if params.use_profit_target:
         target = pos["entry_px"] + pos["side"] * params.profit_target_points
@@ -377,13 +444,21 @@ def _manage(
             _close(result, pos, bar_date, i, bar_open, offset, "TIME")
         return None
 
-    hit = _exit_fill(
-        pos["side"], bar_open, high, low, stop_px, target,
-        allow_target=not pos["entry_bar"],
-        # The entry bar's open is before a level fill. A gap fill is the
-        # open itself, and the stop then sits away from that open.
-        allow_open_gap=not pos["entry_bar"],
-    )
+    if pos["entry_bar"] and not pos["filled_at_open"]:
+        # A level fill: the bar's range is partly before the fill. Only a
+        # close beyond the stop proves the stop traded after it.
+        crossed = low <= stop_px if pos["side"] == 1 else high >= stop_px
+        closed_through = close <= stop_px if pos["side"] == 1 else close >= stop_px
+        hit = ("STOP", float(stop_px)) if closed_through else None
+        if crossed and not closed_through:
+            result.entry_bar_unresolved += 1
+    else:
+        hit = _exit_fill(
+            pos["side"], bar_open, high, low, stop_px, target,
+            allow_target=not pos["entry_bar"],
+            # A gap entry's fill is the open itself: no gap through the stop.
+            allow_open_gap=not pos["entry_bar"],
+        )
     if hit is not None:
         reason, price = hit
         if reason == "STOP":
@@ -416,7 +491,7 @@ def _close(
     raw = price - offset
     exit_sell = pos["side"] == 1
     # Cost the exit on the entry lot so the point P&L stays one contract.
-    cost = pos["entry_cost"] + _cost_points(raw, pos["lot"], exit_sell)
+    cost = pos["entry_cost"] + _cost_points(raw, pos["lot"], exit_sell, bar_date)
     gross = (price - pos["entry_px"]) * pos["side"]
     result.trades.append(Trade(
         side=pos["side_name"],
@@ -442,8 +517,8 @@ def _arm(
     hhmm = int(row["hhmm"])
     if hhmm < params.start_time or hhmm > params.end_time:
         return None
-    if entries_today.get(bar_date, 0) >= 1:
-        return None
+    # EntriesToday is checked at the fill (_try_entry): this order is for
+    # the next bar, which on daily bars is another session.
     adx = float(row["adx"])
     adx_ma = float(row["adx_ma"])
     if not _filter_on(adx, adx_ma, params.adx_threshold):
@@ -462,6 +537,7 @@ def _arm(
         "short": short_level if arm_short else None,
         "signal_i": i,
         "adx": adx,
+        "atr": float(row["atr"]),
     }
 
 
@@ -517,6 +593,7 @@ def summarize(result: BacktestResult, df: pd.DataFrame, params: Params) -> dict:
         "median_entry_adx": float(np.median([t.adx for t in trades])) if trades else None,
         "filter_on_share": float(filt.sum() / n_valid) if n_valid else 0.0,
         "ambiguous": result.ambiguous_bars,
+        "entry_bar_unresolved": result.entry_bar_unresolved,
         "windows": _window_nets(trades, sessions),
         "first_date": sessions[0].isoformat() if sessions else None,
         "last_date": sessions[-1].isoformat() if sessions else None,
