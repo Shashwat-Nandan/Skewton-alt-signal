@@ -1,3 +1,31 @@
+# Tick capture on Kotak, read-only beside the live runner — 2026-10-16
+
+Goal: record NIFTY option quotes (PR #20 needs a real tape) without the
+recorder hurting the live pair runner's Kotak session or quote quota.
+
+- [x] `--cached-session`: never log in (a fresh login replaces the
+      runners' token). `--poll-seconds` (unit: 10).
+- [x] Review (PR #21), all fixed:
+  - [x] One instrument with no LTP made `_poll_quotes` bisect the batch
+        every pass (~14 calls for 102 keys). Kotak now raises
+        `BrokerQuoteMissingError(key)`, a `BrokerOrderError` subclass so
+        the pair runner is unchanged; the recorder sets that key aside
+        (one extra call, once), re-tries it every 5 min, and fails the
+        pass past 5 new ones.
+  - [x] Any other `BrokerOrderError` (a 4xx or Not_Ok throttle) no longer
+        splits: one call, then back-off.
+  - [x] 10 failed passes in a row, or no records, exits 1 (it retried to
+        15:30 and exited 0).
+  - [x] Back-off doubles from `--poll-seconds` to 60 s and stops at 15:30.
+  - [x] A rejected token re-reads the cached session file.
+  - [x] Unit: `--cached-session --poll-seconds 10`, timer 09:08 → 09:15
+        (after the runners' logins, at the open).
+  - [x] Docs: `docs/data_pipeline/tick_capture.md`, `docs/README.md`.
+  - Kept: the start-up `profile()` check. It needs today's session, which
+    the 09:15 start gives; a stale one should stop the capture loudly.
+- [ ] Owner review (CODEOWNERS: `core/`, `market_data/`, `deploy/`), then
+      schedule the capture.
+
 # Dispersion dashboard page + second review — 2026-10-02
 
 - [x] `GET /api/dispersion-paper` (read-only, session-gated): each book's

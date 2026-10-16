@@ -41,12 +41,17 @@ from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from pathlib import Path
 
+from core.broker.errors import BrokerQuoteMissingError, BrokerTokenError
+
 IST = timezone(timedelta(hours=5, minutes=30))
 REPO = Path(__file__).resolve().parent.parent
 LOG_DIR = REPO / "logs"
 TICKS_DIR = REPO / "data_cache" / "ticks"
 STRIKES_EACH_SIDE = 20
 FAILURE_BACKOFF_S = 60.0
+MAX_CONSECUTIVE_FAILURES = 10
+MAX_NEW_DEAD_PER_PASS = 5
+REPROBE_S = 300.0
 STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100}
 SPOT_DISPLAY_SYMBOLS = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
 
@@ -232,20 +237,33 @@ def _quote_pairs(tokens, sym_map):
     return pairs
 
 
-def _poll_quotes(client, pairs):
-    """One quote pass. A missing LTP splits the batch so one strike
-    does not drop the rest of the book. Anything else (429, timeout,
-    rejected token) propagates: splitting a rate-limited batch fires
-    dozens of calls at the quota the live runners share."""
-    from core.broker.errors import BrokerOrderError
-    try:
-        quoted = client.quote([key for _, key in pairs]) or {}
-    except BrokerOrderError as e:
-        if len(pairs) == 1:
-            _LOG.warning("quote failed for %s: %s", pairs[0][1], e)
-            return []
-        mid = len(pairs) // 2
-        return _poll_quotes(client, pairs[:mid]) + _poll_quotes(client, pairs[mid:])
+def _poll_quotes(client, pairs, dead, max_new_dead=MAX_NEW_DEAD_PER_PASS):
+    """One quote pass over the keys not in `dead`.
+
+    Kotak fails the whole call when one key has no LTP and names that
+    key. It goes into `dead` and the pass is retried without it: one
+    extra call per newly dead key, at most `max_new_dead` per pass. More
+    than that, and every other error (429, timeout, rejected token, any
+    other reject), propagates and the pass fails."""
+    live = [p for p in pairs if p[1] not in dead]
+    new_dead = 0
+    while live:
+        try:
+            quoted = client.quote([key for _, key in live]) or {}
+        except BrokerQuoteMissingError as e:
+            if e.key not in {key for _, key in live} or new_dead >= max_new_dead:
+                raise
+            new_dead += 1
+            dead.add(e.key)
+            _LOG.warning("No LTP for %s; set aside, re-tried every %.0f s.",
+                         e.key, REPROBE_S)
+            live = [p for p in live if p[1] != e.key]
+            continue
+        return _quote_rows(live, quoted)
+    return []
+
+
+def _quote_rows(pairs, quoted):
     now = datetime.now(IST).isoformat()
     ts_recv_ns = time.time_ns()
     rows = []
@@ -267,36 +285,88 @@ def _poll_quotes(client, pairs):
     return rows
 
 
-def _run_quote_poll(client, tokens, sym_map, poll_seconds=2.0):
+def _reprobe(client, pairs, dead):
+    """Quote the set-aside keys again. Those with an LTP rejoin the pass."""
+    still = set()
+    rows = _poll_quotes(client, [p for p in pairs if p[1] in dead], still,
+                        max_new_dead=len(dead))
+    revived = dead - still
+    if revived:
+        _LOG.info("LTP back for %s; rejoined the pass.", ", ".join(sorted(revived)))
+    dead.intersection_update(still)
+    return rows
+
+
+def _write_rows(rows):
+    global _TICK_COUNT
+    if not rows:
+        return
+    with _OUT_LOCK:
+        for row in rows:
+            _OUT_FILE.write(json.dumps(_serialise(row), default=str) + "\n")
+            _TICK_COUNT += 1
+        _OUT_FILE.flush()
+
+
+def _sleep_until_cutoff(seconds):
+    time.sleep(max(0.0, min(seconds, _STOP_EPOCH - time.time())))
+
+
+def _run_quote_poll(client, tokens, sym_map, poll_seconds=2.0, reload_client=None):
     """Poll the broker quote API until 15:30 IST and append one record
     per instrument per pass. This is the Kotak tape. It is not the
-    KiteTicker FULL-mode socket."""
-    global _TICK_COUNT
+    KiteTicker FULL-mode socket.
+
+    A failed pass backs off from `poll_seconds`, doubling to
+    FAILURE_BACKOFF_S. A rejected token re-reads the cached session via
+    `reload_client` (never a login). MAX_CONSECUTIVE_FAILURES in a row
+    stops the poll. Returns True when the day's tape is usable: it did
+    not give up and wrote at least one record."""
     pairs = _quote_pairs(tokens, sym_map)
     _LOG.info("Quote poll of %d instruments every %.0f s until cutoff.",
               len(pairs), poll_seconds)
-    failed = 0
+    dead = set()
+    failed = in_a_row = 0
+    next_reprobe = time.time() + REPROBE_S
     while time.time() < _STOP_EPOCH:
         try:
-            rows = _poll_quotes(client, pairs)
+            if dead and time.time() >= next_reprobe:
+                next_reprobe = time.time() + REPROBE_S
+                _write_rows(_reprobe(client, pairs, dead))
+            rows = _poll_quotes(client, pairs, dead)
         except Exception as e:
             failed += 1
-            _LOG.warning("quote pass failed (%d so far), backing off %.0f s: %s",
-                         failed, FAILURE_BACKOFF_S, e)
-            time.sleep(FAILURE_BACKOFF_S)
+            in_a_row += 1
+            if in_a_row >= MAX_CONSECUTIVE_FAILURES:
+                _LOG.error("Quote poll gave up after %d failed passes in a row: %s",
+                           in_a_row, e)
+                return False
+            backoff = min(FAILURE_BACKOFF_S, poll_seconds * 2 ** (in_a_row - 1))
+            _LOG.warning("Quote pass failed (%d in a row, %d today), backing off "
+                         "%.0f s: %s", in_a_row, failed, backoff, e)
+            if isinstance(e, BrokerTokenError) and reload_client is not None:
+                try:
+                    client = reload_client()
+                    _LOG.info("Re-read the cached session after a rejected token.")
+                except Exception as reload_error:
+                    _LOG.warning("Re-reading the cached session failed: %s", reload_error)
+            _sleep_until_cutoff(backoff)
             continue
-        if rows:
-            with _OUT_LOCK:
-                for row in rows:
-                    _OUT_FILE.write(json.dumps(_serialise(row), default=str) + "\n")
-                    _TICK_COUNT += 1
-                _OUT_FILE.flush()
-        time.sleep(poll_seconds)
+        in_a_row = 0
+        _write_rows(rows)
+        _sleep_until_cutoff(poll_seconds)
+    if dead:
+        _LOG.warning("No LTP at the close for %d instrument(s): %s.",
+                     len(dead), ", ".join(sorted(dead)))
     if failed:
         _LOG.warning("Quote poll finished. %d records; %d passes failed and were "
                      "skipped (the tape has gaps there).", _TICK_COUNT, failed)
     else:
         _LOG.info("Quote poll finished. %d records.", _TICK_COUNT)
+    if not _TICK_COUNT:
+        _LOG.error("Quote poll wrote no records.")
+        return False
+    return True
 
 
 def main():
@@ -407,14 +477,18 @@ def main():
             "Broker is %s. Capturing quotes by polling the trade API.",
             broker_name,
         )
-        _run_quote_poll(kite, tokens, sym_map, args.poll_seconds)
+        reload_client = None
+        if args.cached_session:
+            def reload_client():
+                return get_market_client("config.ini", cached_only=True)
+        ok = _run_quote_poll(kite, tokens, sym_map, args.poll_seconds, reload_client)
         with _OUT_LOCK:
             try:
                 _OUT_FILE.flush()
                 _OUT_FILE.close()
             except Exception:
                 pass
-        return 0
+        return 0 if ok else 1
 
     from kiteconnect import KiteTicker
     ticker = KiteTicker(api_key=kite.api_key, access_token=kite.access_token)

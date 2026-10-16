@@ -41,6 +41,7 @@ from .errors import (
     BrokerConfigError,
     BrokerNetworkError,
     BrokerOrderError,
+    BrokerQuoteMissingError,
     BrokerTokenError,
 )
 from .kotak_instruments import ensure_index_rows, match_scrip_url, parse_scrip_csv
@@ -594,8 +595,8 @@ class KotakNeoClient:
                     row = rows[0]
                 ltp = _extract_ltp(row) if row is not None else _extract_ltp(data)
                 if ltp is None:
-                    raise BrokerOrderError(
-                        f"Kotak quote for {key} ({seg}|{tok}) had no LTP"
+                    raise BrokerQuoteMissingError(
+                        f"Kotak quote for {key} ({seg}|{tok}) had no LTP", key
                     )
                 out[key] = {"last_price": ltp}
                 if isinstance(row, dict) and row.get("ohlc"):
