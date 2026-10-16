@@ -46,6 +46,7 @@ REPO = Path(__file__).resolve().parent.parent
 LOG_DIR = REPO / "logs"
 TICKS_DIR = REPO / "data_cache" / "ticks"
 STRIKES_EACH_SIDE = 20
+FAILURE_BACKOFF_S = 60.0
 STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100}
 SPOT_DISPLAY_SYMBOLS = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
 
@@ -233,10 +234,13 @@ def _quote_pairs(tokens, sym_map):
 
 def _poll_quotes(client, pairs):
     """One quote pass. A missing LTP splits the batch so one strike
-    does not drop the rest of the book."""
+    does not drop the rest of the book. Anything else (429, timeout,
+    rejected token) propagates: splitting a rate-limited batch fires
+    dozens of calls at the quota the live runners share."""
+    from core.broker.errors import BrokerOrderError
     try:
         quoted = client.quote([key for _, key in pairs]) or {}
-    except Exception as e:
+    except BrokerOrderError as e:
         if len(pairs) == 1:
             _LOG.warning("quote failed for %s: %s", pairs[0][1], e)
             return []
@@ -263,23 +267,36 @@ def _poll_quotes(client, pairs):
     return rows
 
 
-def _run_quote_poll(client, tokens, sym_map):
+def _run_quote_poll(client, tokens, sym_map, poll_seconds=2.0):
     """Poll the broker quote API until 15:30 IST and append one record
     per instrument per pass. This is the Kotak tape. It is not the
     KiteTicker FULL-mode socket."""
     global _TICK_COUNT
     pairs = _quote_pairs(tokens, sym_map)
-    _LOG.info("Quote poll of %d instruments until cutoff.", len(pairs))
+    _LOG.info("Quote poll of %d instruments every %.0f s until cutoff.",
+              len(pairs), poll_seconds)
+    failed = 0
     while time.time() < _STOP_EPOCH:
-        rows = _poll_quotes(client, pairs)
+        try:
+            rows = _poll_quotes(client, pairs)
+        except Exception as e:
+            failed += 1
+            _LOG.warning("quote pass failed (%d so far), backing off %.0f s: %s",
+                         failed, FAILURE_BACKOFF_S, e)
+            time.sleep(FAILURE_BACKOFF_S)
+            continue
         if rows:
             with _OUT_LOCK:
                 for row in rows:
                     _OUT_FILE.write(json.dumps(_serialise(row), default=str) + "\n")
                     _TICK_COUNT += 1
                 _OUT_FILE.flush()
-        time.sleep(2)
-    _LOG.info("Quote poll finished. %d records.", _TICK_COUNT)
+        time.sleep(poll_seconds)
+    if failed:
+        _LOG.warning("Quote poll finished. %d records; %d passes failed and were "
+                     "skipped (the tape has gaps there).", _TICK_COUNT, failed)
+    else:
+        _LOG.info("Quote poll finished. %d records.", _TICK_COUNT)
 
 
 def main():
@@ -307,7 +324,20 @@ def main():
              f"speed autoresearch replay but starve backspread/risk-reversal/"
              f"asymmetric-strangle.",
     )
+    parser.add_argument(
+        "--cached-session", action="store_true",
+        help="Use the cached broker session and never start a login. A "
+             "fresh Kotak login replaces the token the live runners hold.",
+    )
+    parser.add_argument(
+        "--poll-seconds", type=float, default=2.0,
+        help="Seconds between quote passes on a polling broker (Kotak). "
+             "The quote API's quota is shared with the runners.",
+    )
     args = parser.parse_args()
+    if args.poll_seconds <= 0:
+        print("--poll-seconds must be positive", file=sys.stderr)
+        return 2
     if args.strikes_each_side < 1:
         print("--strikes-each-side must be >= 1", file=sys.stderr)
         return 2
@@ -330,8 +360,11 @@ def main():
         return 0
 
     _LOG.info("Authenticating...")
-    from core.broker import get_trading_client, read_broker_name
-    kite = get_trading_client("config.ini")
+    from core.broker import get_market_client, get_trading_client, read_broker_name
+    if args.cached_session:
+        kite = get_market_client("config.ini", cached_only=True)
+    else:
+        kite = get_trading_client("config.ini")
     broker_name = read_broker_name("config.ini")
     prof = kite.profile()
     _LOG.info("Authenticated as %s (%s)", prof["user_name"], prof["user_id"])
@@ -374,7 +407,7 @@ def main():
             "Broker is %s. Capturing quotes by polling the trade API.",
             broker_name,
         )
-        _run_quote_poll(kite, tokens, sym_map)
+        _run_quote_poll(kite, tokens, sym_map, args.poll_seconds)
         with _OUT_LOCK:
             try:
                 _OUT_FILE.flush()
