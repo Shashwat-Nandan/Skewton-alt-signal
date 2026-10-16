@@ -22,8 +22,9 @@ So option prices along the 5-minute path must be **modelled**:
 ## Steps
 
 - [x] 1. **Model check, before any strategy result.** Price each
-      session's near-ATM CE/PE at 15:25 from the prior day's IV and that
-      day's index path. Compare with the bhavcopy close.
+      session's near-ATM CE/PE at the 15:30 close (the bhavcopy close's
+      time) from the prior day's IV and that day's index path. Compare
+      with the bhavcopy close.
       - Report the median and 90th-percentile error in points and as a %
         of premium, by days-to-expiry.
       - If the median error is above 10% of premium, stop: the model can't
@@ -40,37 +41,70 @@ So option prices along the 5-minute path must be **modelled**:
       reported as description only.
 - [ ] 5. Report in this file and in a separate research PR.
 
-## Result 2026-10-16: STOP at step 1 (no strategy result was computed)
+## Result 2026-10-16 (re-run after review): STOP at step 1, by 0.1 points
 
 `python -m research.options_breakout` (`research/options_breakout.py`),
-train sessions only. The near-ATM weekly CE and PE were checked on 660
+train sessions only. No strategy result was computed. The near-ATM CE and
+PE of the nearest expiry after the session were checked on 726
 contract-days:
 
 | measure | median abs error | median signed | 90th pct abs |
 |---|---|---|---|
-| next-session close | **13.0%** of premium | −2.3% | 47% |
-| next-session intraday high | 8.6% | −7.8% | |
+| next-session close | **10.1%** of premium (11.1 points) | −0.5% | 39% |
+| next-session intraday high | 7.0% | −5.2% (−10.1 points) | |
 
 Close error by days to expiry:
 
 | days to expiry | 1 | 2 | 3 | 4 | 5 | 6 | 7+ |
 |---|---|---|---|---|---|---|---|
-| median abs error | 18.8% | 13.0% | 17.1% | 9.0% | 9.4% | 5.9% | 2.6% |
+| median abs error | 18.2% | 13.0% | 17.1% | 9.4% | 9.9% | 6.7% | 5.7% |
+| in points | 11.6 | 11.6 | 19.2 | 9.2 | 10.3 | 8.3 | 9.1 |
 
-- 13.0% is above the pre-registered 10%, so the run stopped as designed.
-  Steps 2–4 never ran.
-- The error is largest on the 1–3 day weeklies the strategy would trade.
-  Day-to-day IV changes there are large, and a fixed IV can't follow
-  them.
-- The model under-prices the intraday high by about 8%. That is a bias of
-  several premium points against the buyer, larger than the roughly 1
-  point a trade the index signal could pass through. A modelled run could
-  not tell an edge from model error.
-- **Conclusion:** the options question can't be answered with the data on
-  this host. The honest path is real quotes: record ATM NIFTY weekly
-  option quotes (tick capture) and test once months of tape exist.
+- 10.1% is above the pre-registered 10%, so the run stopped as designed.
+  The margin is 0.1 points: the gate decides it, not the evidence. Moving
+  the limit after seeing this would be a post-hoc change, so it stays.
+- The evidence on its own points the same way. The 1–3 day weeklies the
+  strategy would trade are off by 13–18% (12–19 points), and the model
+  under-prices the intraday high by about 10 points. The index signal
+  passes through roughly 1 point a trade. A modelled run could not tell
+  an edge from model error.
+- **Conclusion (unchanged):** the options question needs real quotes:
+  record NIFTY option quotes (tick capture, PR #21) and test on months of
+  tape.
 
-## Proposed gates (need owner approval before step 4)
+### First run, before the review fixes (superseded)
+
+13.0% median close error on 660 contract-days. It scored contracts that
+expired on the checked day (the strategy never holds one), dropped the
+eve of every futures expiry as well as the expiry day, and priced the
+intraday high at each bar's close instead of its start.
+
+### Review (PR #20), all fixed
+
+- [x] The stop failed open: a NaN median (nothing comparable) skipped the
+      STOP. `model_fails` now treats NaN or no pairs as a failure.
+- [x] `express` crashed when the chosen expiry traded only one side; it
+      is now unpriced.
+- [x] `carry_by_date` dropped the eve of expiry too; only expiry day is
+      skipped, and it carries the previous session's value.
+- [x] `model_check` scored contracts expiring that day; it now uses the
+      nearest expiry after the day, as the strategy does.
+- [x] An exit after the option's expiry is left unpriced (it cannot happen
+      at ≤20 bars, but nothing enforced it).
+- [x] Fills and extremes are priced at the bar's start (`hhmm` is the bar
+      close).
+- [x] `option_cost` subtracted hard-coded copies of core's option STT and
+      slippage. `core.costs.estimate_transaction_cost` takes optional
+      `stt_rate` / `slippage_rate` (defaults unchanged, checked identical
+      on 360 inputs).
+- [x] Errors are also reported in points; the session groupings are built
+      once per run.
+- Not done: moving `black76` / `implied_vol` into `core/greeks_engine.py`.
+  That module is spot Black-Scholes, scalar, and on the money path; a
+  forward, vectorised pricer for one research script does not belong
+  there.
+
+## Pre-registered gates (owner-approved 2026-10-16, "as proposed")
 
 - **Train, published defaults:** at least 100 trades, net > 0, daily
   Sharpe > 0, net > 0 at 1.5× costs, and the three chronological windows

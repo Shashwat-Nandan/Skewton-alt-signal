@@ -119,3 +119,72 @@ def test_model_check_recovers_a_consistent_chain():
     check = ob.model_check(options, bars, pd.Series({p: 0.0, d: 0.0}), {d})
     assert len(check) == 2
     assert check["close_err"].abs().max() < 1e-6
+
+
+def test_a_check_with_nothing_to_compare_stops_the_run():
+    """The stop must fail closed: NaN > limit is False, so a NaN median
+    used to wave an unvalidated model through to a verdict."""
+    assert ob.model_fails(ob.check_summary(pd.DataFrame()))
+    nan_rows = pd.DataFrame({"close_err": [np.nan], "high_err": [np.nan], "dte": [2],
+                             "close_err_pts": [np.nan], "high_err_pts": [np.nan]})
+    assert ob.model_fails(ob.check_summary(nan_rows))
+    good = pd.DataFrame({"close_err": [0.05, -0.04], "high_err": [0.0, 0.0], "dte": [2, 3],
+                         "close_err_pts": [5.0, -4.0], "high_err_pts": [0.0, 0.0]})
+    assert not ob.model_fails(ob.check_summary(good))
+    assert ob.model_fails(ob.check_summary(good.assign(close_err=[0.2, -0.2])))
+
+
+def test_one_sided_chain_is_unpriced_not_a_crash():
+    prior, entry = date(2025, 6, 10), date(2025, 6, 11)
+    options = _chain(prior, [date(2025, 6, 12)], [24700.0])
+    options = options[options["cp"] == -1]                      # only puts traded
+    closes = pd.Series({prior: 24690.0, entry: 24690.0})
+    trade = Trade("LONG", entry, entry, 0, 1, 24690.0, 24740.0, "TIME", 50.0, 40.0, 10.0, 75, 12.0)
+    assert ob.express(trade, _sample(entry, 24690.0, 24740.0), options.groupby("date"),
+                      closes, pd.Series({prior: 0.0})) is None
+
+
+def test_exit_after_the_option_settled_is_unpriced():
+    prior, entry, exp, nxt = date(2025, 6, 10), date(2025, 6, 11), date(2025, 6, 12), date(2025, 6, 13)
+    options = _chain(prior, [exp], [24700.0])
+    closes = pd.Series({prior: 24690.0, entry: 24690.0, exp: 24700.0, nxt: 24740.0})
+    sample = pd.DataFrame({"date": [entry, nxt], "hhmm": [1500, 1000],
+                           "close": [24690.0, 24740.0]})
+    trade = Trade("LONG", entry, nxt, 0, 1, 24690.0, 24740.0, "TIME", 50.0, 40.0, 10.0, 75, 12.0)
+    assert ob.express(trade, sample, options.groupby("date"), closes,
+                      pd.Series({prior: 0.0})) is None
+
+
+def test_carry_keeps_the_eve_of_expiry_and_carries_over_expiry_day():
+    """Only expiry day (t = 0) has no carry of its own. Dropping the eve too
+    left trades on expiry day and the day after unpriced, every month."""
+    eve, exp, after = date(2025, 6, 25), date(2025, 6, 26), date(2025, 6, 27)
+    front = pd.DataFrame({"date": [eve, exp, after],
+                          "expiry": [exp, exp, date(2025, 7, 31)],
+                          "close": [24710.0, 24700.0, 24800.0]})
+    index_close = pd.Series({eve: 24700.0, exp: 24700.0, after: 24700.0})
+    carry = ob.carry_by_date(front, index_close)
+    assert list(carry.index) == [eve, exp, after]
+    assert carry[exp] == carry[eve] > 0
+
+
+def test_model_check_skips_the_contract_expiring_that_day():
+    """The strategy never holds a contract on its expiry day, so the check
+    must not score one either."""
+    p, d = date(2025, 6, 11), date(2025, 6, 12)
+    rows = []
+    for exp, px in ((d, 40.0), (date(2025, 6, 19), 150.0)):
+        for day in (p, d):
+            for cp in (1, -1):
+                rows.append({"date": day, "expiry": exp, "strike": 24700.0, "cp": cp,
+                             "close": px, "high": px, "low": px, "trades": 10.0, "lot": 75})
+    bars = pd.DataFrame({"date": [p, d, d], "hhmm": [1530, 1000, 1530],
+                         "high": 24700.0, "low": 24700.0, "close": 24700.0})
+    check = ob.model_check(pd.DataFrame(rows), bars, pd.Series({p: 0.0, d: 0.0}), {d})
+    assert set(check["expiry"]) == {date(2025, 6, 19)}
+
+
+def test_a_fill_is_priced_at_its_bar_start_not_its_close():
+    """``hhmm`` is the bar close; a fill at the bar's open has 5 more
+    minutes to expiry than the close stamp implies."""
+    assert ob._bar_start(date(2025, 6, 12), 1005) == datetime(2025, 6, 12, 10, 0)

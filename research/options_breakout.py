@@ -11,7 +11,9 @@ the 5-minute path are modelled:
   measured on the prior session (front future close over index close).
 * The contract's IV is implied from its prior-session bhavcopy close and
   held fixed through the trade. IV moves at a breakout are not modelled.
-* Time runs on the calendar to 15:30 IST on the expiry date.
+* Time runs on the calendar to 15:30 IST on the expiry date. ``hhmm``
+  is a bar's close; a fill or an extreme inside a bar is priced at the
+  bar's start, which gives the option at most 5 minutes too much time.
 
 ``model_check`` scores that model against the bhavcopy before any
 strategy result is shown. If the median error is above
@@ -22,7 +24,8 @@ Contract: nearest expiry after the entry date (no 0-DTE), the strike
 nearest the forward at the fill among the strikes that traded on the
 prior session. Costs: ``core.costs`` option charges on premium, with
 the options STT in force on the fill date, plus a half-spread in premium
-points a side in place of core's percentage slippage.
+points a side in place of core's percentage slippage. A trade whose exit
+falls after its option's expiry is left unpriced.
 
 Owner-approved gates (2026-10-16), published defaults, train only:
 at least 100 trades, net > 0, daily Sharpe > 0, net > 0 at 1.5x costs,
@@ -36,7 +39,7 @@ import argparse
 import json
 import math
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -63,8 +66,7 @@ MODEL_MAX_MEDIAN_ERR = 0.10  # of premium, at the next session's close
 HALF_SPREAD = 0.5            # premium points a side
 MIN_TRADES = 100
 COST_STRESS = 1.5
-_CORE_OPT_SLIPPAGE = 0.0005  # core.costs' option slippage, replaced by HALF_SPREAD
-_CORE_OPT_STT = 0.0015
+BAR_MINUTES = 5
 
 # Options STT on the sell side (premium), by effective date. The
 # 2026-04-01 step mirrors core.costs and still needs owner confirmation,
@@ -89,10 +91,8 @@ def option_cost(premium: float, lot: int, sell: bool, on: date,
     """Rupees for one lot, one side."""
     if lot <= 0 or not premium > 0:
         raise ValueError(f"cannot cost an option fill at premium={premium} lot={lot}")
-    rupees = estimate_transaction_cost(premium, 1, lot, "SELL" if sell else "BUY", "OPT")
-    rupees -= premium * lot * _CORE_OPT_SLIPPAGE
-    if sell:
-        rupees += premium * lot * (opt_stt_rate(on) - _CORE_OPT_STT)
+    rupees = estimate_transaction_cost(premium, 1, lot, "SELL" if sell else "BUY", "OPT",
+                                       stt_rate=opt_stt_rate(on), slippage_rate=0.0)
     return rupees + half_spread * lot
 
 
@@ -168,25 +168,36 @@ def session_closes(continuous: pd.DataFrame) -> pd.Series:
 
 
 def carry_by_date(front: pd.DataFrame, index_close: pd.Series) -> pd.Series:
-    """Annual carry implied by the front future on each session, clipped."""
+    """Annual carry implied by the front future on each session, clipped.
+
+    On the front's expiry day the basis is settling, not carrying (and
+    t is 0), so that session carries the previous session's value."""
     f = front.set_index("date")
     common = sorted(set(f.index) & set(index_close.index))
     out = {}
     for d in common:
         t = years_to_expiry(datetime.combine(d, EXPIRY_TIME), f.at[d, "expiry"])
-        if t <= 1.0 / 365.0:
-            continue          # expiry day: the basis is settling, not carrying
+        if t <= 0.0:
+            continue
         out[d] = float(np.clip(math.log(f.at[d, "close"] / index_close[d]) / t, -0.05, 0.15))
-    return pd.Series(out).sort_index()
+    return pd.Series(out, dtype=float).reindex(common).ffill().dropna()
 
 
 def _forward(spot: float, carry: float, t: float) -> float:
     return spot * math.exp(carry * t)
 
 
-def _prior_session(sessions: List[date], d: date) -> Optional[date]:
-    i = np.searchsorted(np.array(sessions, dtype=object), d) - 1
+def _prior_session(sessions: pd.Index, d: date) -> Optional[date]:
+    """``sessions`` sorted ascending."""
+    i = int(sessions.searchsorted(d)) - 1
     return sessions[i] if i >= 0 else None
+
+
+def _bar_start(d: date, hhmm: int) -> datetime:
+    """``hhmm`` is the bar's close. Fills and extremes inside the bar are
+    priced at its start: at most BAR_MINUTES too much time value."""
+    end = datetime.combine(d, time(int(hhmm) // 100, int(hhmm) % 100))
+    return end - timedelta(minutes=BAR_MINUTES)
 
 
 def model_check(options: pd.DataFrame, continuous: pd.DataFrame, carry: pd.Series,
@@ -194,23 +205,23 @@ def model_check(options: pd.DataFrame, continuous: pd.DataFrame, carry: pd.Serie
     """Next-session error of the model on near-ATM weeklies.
 
     For each session D in ``dates`` with a prior session P: the nearest
-    expiry after P, the CE and PE nearest P's forward, IV from P's close.
-    The model prices them at D's close and at D's intraday extremes
-    (CE high from the index high, PE high from the index low) and is
-    compared with D's bhavcopy close and high. Expiry days are excluded
-    from the close comparison (the bhavcopy close is not intrinsic).
+    expiry after D (the strategy never holds a contract on its expiry
+    day), the CE and PE nearest P's forward, IV from P's close. The model
+    prices them at D's close and at D's intraday extremes (CE high from
+    the index high, PE high from the index low) and is compared with D's
+    bhavcopy close and high, as a % of premium and in points.
     """
     closes = session_closes(continuous)
-    sessions = sorted(closes.index)
+    sessions = closes.index
     by_day = options.groupby("date")
-    cdates = continuous["date"].map(_as_date)
+    bars_by_day = dict(iter(continuous.groupby(continuous["date"].map(_as_date))))
     rows = []
     for d in sorted(dates):
         p = _prior_session(sessions, d)
         if p is None or p not in carry.index or p not in by_day.groups or d not in by_day.groups:
             continue
         prev, today = by_day.get_group(p), by_day.get_group(d)
-        expiry = prev.loc[prev["expiry"] > p, "expiry"].min()
+        expiry = prev.loc[prev["expiry"] > d, "expiry"].min()
         if pd.isna(expiry):
             continue
         t_p = years_to_expiry(datetime.combine(p, EXPIRY_TIME), expiry)
@@ -219,7 +230,7 @@ def model_check(options: pd.DataFrame, continuous: pd.DataFrame, carry: pd.Serie
         if chain.empty:
             continue
         strike = chain["strike"].iloc[(chain["strike"] - f_p).abs().argmin()]
-        bars = continuous.loc[cdates == d]
+        bars = bars_by_day[d]
         for cp in (1, -1):
             c_prev = chain[(chain["strike"] == strike) & (chain["cp"] == cp)]
             c_now = today[(today["expiry"] == expiry) & (today["strike"] == strike)
@@ -232,10 +243,9 @@ def model_check(options: pd.DataFrame, continuous: pd.DataFrame, carry: pd.Serie
             carry_d = carry.get(d, carry[p])
             t_d = years_to_expiry(datetime.combine(d, EXPIRY_TIME), expiry)
             model_close = float(black76(_forward(closes[d], carry_d, t_d), strike, t_d, iv, cp))
-            # Intraday high: each bar's favourable extreme at that bar's close time.
+            # Intraday high: each bar's favourable extreme at that bar's start.
             ext = bars["high"].to_numpy(float) if cp == 1 else bars["low"].to_numpy(float)
-            ts = [datetime.combine(d, time(int(h) // 100, int(h) % 100)) for h in bars["hhmm"]]
-            t_bar = np.array([years_to_expiry(x, expiry) for x in ts])
+            t_bar = np.array([years_to_expiry(_bar_start(d, h), expiry) for h in bars["hhmm"]])
             fwd_bar = ext * np.exp(carry_d * t_bar)
             model_high = float(np.max(black76(fwd_bar, strike, t_bar, iv, cp)))
             actual_close, actual_high = float(c_now["close"].iloc[0]), float(c_now["high"].iloc[0])
@@ -244,17 +254,29 @@ def model_check(options: pd.DataFrame, continuous: pd.DataFrame, carry: pd.Serie
                 "dte": (expiry - d).days, "iv": iv,
                 "model_close": model_close, "actual_close": actual_close,
                 "model_high": model_high, "actual_high": actual_high,
-                "close_err": (model_close - actual_close) / actual_close if d != expiry else np.nan,
+                "close_err": (model_close - actual_close) / actual_close,
                 "high_err": (model_high - actual_high) / actual_high,
+                "close_err_pts": model_close - actual_close,
+                "high_err_pts": model_high - actual_high,
             })
     return pd.DataFrame(rows)
 
 
 def check_summary(check: pd.DataFrame) -> dict:
+    """Error statistics of ``model_check``. With no comparable pair every
+    statistic is NaN, and ``model_fails`` treats NaN as a failed check."""
+    if check.empty:
+        nan = float("nan")
+        return {"pairs": 0, "close_median_abs_err": nan, "close_p90_abs_err": nan,
+                "close_median_signed_err": nan, "high_median_abs_err": nan,
+                "high_median_signed_err": nan, "close_median_abs_err_pts": nan,
+                "high_median_signed_err_pts": nan, "close_median_abs_err_by_dte": {},
+                "close_median_abs_err_pts_by_dte": {}}
     close = check["close_err"].dropna()
     high = check["high_err"].dropna()
-    by_dte = (check.dropna(subset=["close_err"]).assign(abs_err=lambda x: x["close_err"].abs())
-              .groupby(np.minimum(check["dte"], 7))["abs_err"].median())
+    dte = np.minimum(check["dte"], 7)
+    by_dte = check["close_err"].abs().groupby(dte).median().dropna()
+    by_dte_pts = check["close_err_pts"].abs().groupby(dte).median().dropna()
     return {
         "pairs": int(len(check)),
         "close_median_abs_err": float(close.abs().median()),
@@ -262,8 +284,17 @@ def check_summary(check: pd.DataFrame) -> dict:
         "close_median_signed_err": float(close.median()),
         "high_median_abs_err": float(high.abs().median()),
         "high_median_signed_err": float(high.median()),
+        "close_median_abs_err_pts": float(check["close_err_pts"].abs().median()),
+        "high_median_signed_err_pts": float(check["high_err_pts"].median()),
         "close_median_abs_err_by_dte": {int(k): float(v) for k, v in by_dte.items()},
+        "close_median_abs_err_pts_by_dte": {int(k): float(v) for k, v in by_dte_pts.items()},
     }
+
+
+def model_fails(summary: dict) -> bool:
+    """The pre-registered stop. A NaN median (nothing comparable) fails."""
+    err = summary["close_median_abs_err"]
+    return not (summary["pairs"] > 0 and np.isfinite(err) and err <= MODEL_MAX_MEDIAN_ERR)
 
 
 @dataclass
@@ -290,16 +321,11 @@ class OptionTrade:
         return self.gross_rupees - self.cost_rupees
 
 
-def _bar_time(row) -> datetime:
-    h = int(row["hhmm"])
-    return datetime.combine(_as_date(row["date"]), time(h // 100, h % 100))
-
-
 def express(trade: Trade, sample: pd.DataFrame, options_by_day, closes: pd.Series,
             carry: pd.Series, half_spread: float = HALF_SPREAD) -> Optional[OptionTrade]:
-    """The option trade for one index trade, or None when no contract can be priced."""
-    sessions = sorted(closes.index)
-    p = _prior_session(sessions, trade.entry_date)
+    """The option trade for one index trade, or None when no contract can be
+    priced. ``closes`` is indexed by session, ascending."""
+    p = _prior_session(closes.index, trade.entry_date)
     if p is None or p not in carry.index or p not in options_by_day.groups:
         return None
     prev = options_by_day.get_group(p)
@@ -309,8 +335,13 @@ def express(trade: Trade, sample: pd.DataFrame, options_by_day, closes: pd.Serie
     expiry = live["expiry"].min()
     cp = 1 if trade.side == "LONG" else -1
     chain = live[(live["expiry"] == expiry) & (live["cp"] == cp)]
-    entry_at = _bar_time(sample.iloc[trade.entry_i])
-    exit_at = _bar_time(sample.iloc[trade.exit_i])
+    if chain.empty:
+        return None
+    entry_row, exit_row = sample.iloc[trade.entry_i], sample.iloc[trade.exit_i]
+    entry_at = _bar_start(_as_date(entry_row["date"]), entry_row["hhmm"])
+    exit_at = _bar_start(_as_date(exit_row["date"]), exit_row["hhmm"])
+    if exit_at >= datetime.combine(expiry, EXPIRY_TIME):
+        return None       # the contract settled before the index exit
     t_in = years_to_expiry(entry_at, expiry)
     f_in = _forward(trade.entry_px, carry[p], t_in)
     row = chain.iloc[(chain["strike"] - f_in).abs().argmin()]
@@ -329,14 +360,15 @@ def express(trade: Trade, sample: pd.DataFrame, options_by_day, closes: pd.Serie
                        cp, iv, entry_prem, exit_prem, lot, cost, trade.exit_reason)
 
 
-def run(continuous: pd.DataFrame, params: Params, want: set, options: pd.DataFrame,
-        carry: pd.Series, half_spread: float = HALF_SPREAD) -> dict:
+def run(continuous: pd.DataFrame, params: Params, want: set, options_by_day,
+        closes: pd.Series, carry: pd.Series, half_spread: float = HALF_SPREAD) -> dict:
+    """``options_by_day`` is ``options.groupby("date")`` and ``closes`` is
+    ``session_closes(continuous)``, both built once by the caller."""
     built = add_indicators(continuous, params)
     sample = built.loc[built["date"].map(_as_date).isin(want)].reset_index(drop=True)
     index_trades = simulate(sample, params).trades
-    closes = session_closes(continuous)
-    by_day = options.groupby("date")
-    priced = [express(t, sample, by_day, closes, carry, half_spread) for t in index_trades]
+    priced = [express(t, sample, options_by_day, closes, carry, half_spread)
+              for t in index_trades]
     trades = [t for t in priced if t is not None]
     return summarize(trades, sorted(want), len(index_trades) - len(trades))
 
@@ -429,20 +461,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         options = load_nifty_options(Path(args.raw_dir))
         if cache:
             options.to_parquet(cache)
-    carry = carry_by_date(front, session_closes(continuous))
+    closes = session_closes(continuous)
+    carry = carry_by_date(front, closes)
     print(f"option rows {len(options)}; carry median {carry.median():.2%}", flush=True)
 
     check = check_summary(model_check(options, continuous, carry, train_dates))
     print("model check (train sessions):", json.dumps(_jsonable(check)), flush=True)
     payload: Dict[str, object] = {"model_check": check, "train_start": min(train_dates),
                                   "train_end": max(train_dates)}
-    if check["close_median_abs_err"] > MODEL_MAX_MEDIAN_ERR:
-        print(f"STOP: median close error {check['close_median_abs_err']:.1%} > "
-              f"{MODEL_MAX_MEDIAN_ERR:.0%}; the model cannot carry the test", flush=True)
+    if model_fails(check):
+        print(f"STOP: median close error {check['close_median_abs_err']:.1%} on "
+              f"{check['pairs']} pairs, limit {MODEL_MAX_MEDIAN_ERR:.0%}; the model "
+              "cannot carry the test", flush=True)
         Path(args.out).write_text(json.dumps(_jsonable(payload), indent=2))
         return 1
 
-    published = run(continuous, Params(), train_dates, options, carry)
+    by_day = options.groupby("date")
+    published = run(continuous, Params(), train_dates, by_day, closes, carry)
     v = verdict(published)
     print("published defaults, train:", prose(published), flush=True)
     print(f"verdict (pre-registered): {v}", flush=True)
@@ -450,12 +485,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("described only (not gated):", flush=True)
     for half_spread in (0.0, 1.0):
-        s = run(continuous, Params(), train_dates, options, carry, half_spread)
+        s = run(continuous, Params(), train_dates, by_day, closes, carry, half_spread)
         payload["described"][f"published_half_spread_{half_spread}"] = s
         print(f"  published, half-spread {half_spread}: {prose(s)}", flush=True)
     for trail, bte in ((40.0, 10), (80.0, 10), (1e6, 10), (150.0, 20), (1e6, 20)):
         s = run(continuous, replace(Params(), trail_amount=trail, bars_to_exit=bte),
-                train_dates, options, carry)
+                train_dates, by_day, closes, carry)
         name = f"trail {'off' if trail > 1e5 else int(trail)} / {bte} bars"
         payload["described"][name] = s
         print(f"  {name}: {prose(s)}", flush=True)
