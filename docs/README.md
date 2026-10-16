@@ -91,7 +91,7 @@ Crons that produce the inputs the strategies consume.
 
 | systemd timer | Fires | Doc |
 |---|---|---|
-| `tick-capture.timer` | Mon–Fri 09:08 IST | [tick_capture.md](./data_pipeline/tick_capture.md) |
+| `tick-capture.timer` | Mon–Fri 09:15 IST | [tick_capture.md](./data_pipeline/tick_capture.md) |
 | `taleb-hedger.timer` | Mon–Fri 09:10 IST | [taleb_karpathy.md](./strategies/taleb_karpathy.md) |
 | `pair-paper.timer` | Mon–Fri 09:11 IST | [pair_trading.md](./strategies/pair_trading.md) |
 | `pair-paper-persistent.timer` | Mon–Fri 09:12 IST | [pair_trading.md](./strategies/pair_trading.md) |

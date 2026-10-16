@@ -21,7 +21,7 @@ trigger-fair-value research that intra-day 30-min bars can't support.
 
 ## Overview
 
-`market_data/tick_capture.py` (307 lines) runs as an independent oneshot process
+`market_data/tick_capture.py` runs as an independent oneshot process
 alongside the trading strategies. A WebSocket exception in the tick
 recorder cannot disrupt the trading loop (docstring line 17–20) —
 they're separate processes.
@@ -42,20 +42,27 @@ underlying so mixed-underlying JSONL files replay cleanly per leg.
 `deploy/tick-capture.timer`:
 
 ```ini
-OnCalendar=Mon..Fri *-*-* 09:08:00 Asia/Kolkata
+OnCalendar=Mon..Fri *-*-* 09:15:00 Asia/Kolkata
 Persistent=true
 RandomizedDelaySec=30
 ```
 
-09:08 IST is 2 minutes before `taleb-hedger.timer` (09:10) and 3
-minutes before `pair-paper.timer` (09:11). Earliest of the three so the
-WebSocket is up before the strategies start polling. `market_data/tick_capture.py`
-self-gates on 15:30 IST, so a slightly early start is harmless.
+09:15 IST is after the runners' 09:10–09:12 logins, so the cached
+session `--cached-session` reads is today's, and at the open, so option
+quotes have an LTP. `market_data/tick_capture.py` self-gates on 15:30 IST.
 
 `deploy/tick-capture.service` ExecStart:
 ```
-…/python -m market_data.tick_capture --underlyings NIFTY,BANKNIFTY
+…/python -m market_data.tick_capture --underlyings NIFTY,BANKNIFTY \
+    --strikes-each-side 20 --cached-session --poll-seconds 10
 ```
+
+- `--cached-session` reads the broker's session file and never starts a
+  login. A fresh Kotak login replaces the token the live runners hold,
+  and they halt on their next positions check. With no usable cached
+  session the capture exits 1 instead.
+- `--poll-seconds` (default 2) is the gap between Kotak quote passes.
+  The quote quota is shared with the runners.
 
 **Hardening gotcha (line 30–34 of the service unit):** `ProtectHome=true`
 is intentionally NOT set. If `WorkingDirectory` is under `/root` or
@@ -115,6 +122,27 @@ Append-only, line-buffered. Write lock (`_OUT_LOCK`) serialises writes
 from the WebSocket callback thread. Rotation: per-day file, no
 mid-day rotation.
 
+## Kotak quote poll
+
+Kotak has no KiteTicker equivalent wired, so on Kotak the recorder polls
+`client.quote()` for every instrument each `--poll-seconds` and writes
+one record per instrument per pass (`"feed": "kotak_quote"`). Kotak's
+quote fails the whole call when one instrument has no LTP and names it
+(`BrokerQuoteMissingError`):
+
+- That instrument is set aside and the pass retried without it: one
+  extra call, once. Set-aside instruments are quoted again every 5
+  minutes and rejoin when their LTP returns. More than 5 new ones in a
+  single pass fail the pass instead of costing a call each.
+- Any other error (429, timeout, a 4xx or Not_Ok reject) fails the pass
+  with that one call. Failed passes back off from `--poll-seconds`,
+  doubling to 60 s, never past 15:30.
+- A rejected token re-reads the cached session file (a runner may have
+  logged in again); it never logs in.
+- 10 failed passes in a row, or a day with no records, exits 1, so
+  `notify-failure@` fires. Gaps from failed passes are counted in the
+  closing log line.
+
 ## WebSocket lifecycle
 
 `KiteTicker` callbacks set up around line 150+:
@@ -134,6 +162,9 @@ log tick count.
 
 | Failure | Effect | Recovery |
 |---|---|---|
+| No cached session (`--cached-session`) | Exit 1, `notify-failure@` alert | Wait for a runner to log in; restart the unit |
+| Kotak passes keep failing (10 in a row) | Exit 1, `notify-failure@` alert; tape stops there | Check `logs/ticks-*.log` for the error |
+| Kotak instrument with no LTP | Set aside, re-tried every 5 min; listed at the close | None needed |
 | TOTP / auth failure at boot | Process exits 1, `notify-failure@` alert | Investigate kite_auth; next day's timer fires fresh |
 | NFO master fetch fails | Raise + exit before WebSocket opens | Manual restart after Kite API recovers |
 | One underlying's instruments missing | Raise + abort capture for the day | Manual investigation (NSE F&O cycle changes?) |
@@ -189,7 +220,7 @@ Failure alerts: nonzero exit triggers `notify-failure@tick-capture.service`
 | `data_cache/ticks/ticks-YYYY-MM-DD.jsonl` | Per-day tick tape |
 | `logs/ticks-YYYY-MM-DD.log` | Per-day log |
 | `deploy/tick-capture.service` | systemd service (note `ProtectHome` gotcha) |
-| `deploy/tick-capture.timer` | 09:08 IST Mon–Fri |
+| `deploy/tick-capture.timer` | 09:15 IST Mon–Fri |
 | `deploy/notify-failure@.service` | Failure alert |
 | `research/backtest.py` | `load_captured_tape` consumer |
 | `research/replay_2026_05_06.py` | One-off incident replay |
