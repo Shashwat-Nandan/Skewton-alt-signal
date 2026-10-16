@@ -90,7 +90,7 @@ import urllib.request
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -595,9 +595,11 @@ def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
 
 
 REGULAR_FIRST, REGULAR_LAST = 915, 1525   # 5-minute bar starts, NSE session
+FULL_SESSION_BARS = 75
 
 
-def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame:
+def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame,
+                    accept_short: Iterable[date] = ()) -> pd.DataFrame:
     """Simulate-ready frame from 5-minute index candles (``ts`` IST bar start).
 
     Regular-session bars only: starts 09:15..15:25. Kotak's 15:30 candle is
@@ -608,6 +610,9 @@ def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame
     ``lot`` is the NIFTY futures lot on that session, nearest earlier
     archive session; a session outside the archive's span is refused
     (a clipped lot would silently mis-cost the fixed brokerage and GST).
+    A session with fewer than 75 regular bars is refused unless named in
+    ``accept_short``: a lost bar shifts bars-to-exit, the Donchian window
+    and any stop that bar would have hit.
     """
     ts = pd.to_datetime(five_min["ts"]).dt.tz_convert("Asia/Kolkata")
     start_hhmm = ts.dt.hour * 100 + ts.dt.minute
@@ -640,7 +645,41 @@ def load_nifty_5min(five_min: pd.DataFrame, front: pd.DataFrame) -> pd.DataFrame
     out["roll_basis"] = ""
     if out.duplicated(["date", "hhmm"]).any():
         raise ValueError("duplicate 5-minute bar")
+    counts = out.groupby("date").size()
+    short = sorted(set(counts[counts < FULL_SESSION_BARS].index) - set(accept_short))
+    if short:
+        raise ValueError(
+            f"{len(short)} sessions have fewer than {FULL_SESSION_BARS} regular bars, "
+            f"e.g. {short[0]} ({counts[short[0]]}); end the span before them "
+            f"or name them with --accept-short"
+        )
     return out.reset_index(drop=True)
+
+
+def five_min_span(five: pd.DataFrame, lot_front: pd.DataFrame, end: Optional[date],
+                  accept_short: List[date]) -> Tuple[pd.DataFrame, List[date]]:
+    """The 5-minute series inside the lot archive's span, up to ``end``.
+
+    A date with no futures bhavcopy had no futures to fill: Kotak has served
+    a lone 10:35 candle on Saturday 2025-08-23. It is dropped and returned
+    so the run reports it. Returns (simulate-ready frame, dropped dates)."""
+    first_lot, last_lot = lot_front["date"].iloc[0], lot_front["date"].iloc[-1]
+    five_dates = pd.to_datetime(five["ts"]).dt.tz_convert("Asia/Kolkata").dt.date
+    last = min(last_lot, end) if end else last_lot
+    keep = (five_dates >= first_lot) & (five_dates <= last)
+    print(f"lot archive {first_lot} -> {last_lot}, end {end}: 5-minute span "
+          f"{first_lot} -> {last} ({int((~keep).sum())} of {len(five)} candles outside)",
+          flush=True)
+    no_futures = sorted(set(five_dates[keep]) - set(lot_front["date"]))
+    if no_futures:
+        print("dropped 5-minute dates with no futures session: "
+              + ", ".join(str(d) for d in no_futures), flush=True)
+        keep &= ~five_dates.isin(no_futures)
+    if accept_short:
+        print("accepted short sessions: " + ", ".join(str(d) for d in accept_short),
+              flush=True)
+    return load_nifty_5min(five.loc[keep].reset_index(drop=True), lot_front,
+                           accept_short), no_futures
 
 
 def ready_frame(full: pd.DataFrame, warmup: int = WARMUP_BARS) -> pd.DataFrame:
@@ -849,6 +888,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--five-min-dir", default="data_cache/research_nifty_5min",
         help="output of market_data.fetch_index_5min",
     )
+    parser.add_argument(
+        "--end", type=date.fromisoformat, default=None,
+        help="last 5-minute session to use (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--accept-short", type=date.fromisoformat, action="append", default=[],
+        help="a 5-minute session allowed fewer than 75 bars (repeatable)",
+    )
     parser.add_argument("--rounds", type=int, default=MAX_ROUNDS)
     parser.add_argument("--out", default="/tmp/adx_breakout_opt.json")
     args = parser.parse_args(argv)
@@ -867,6 +914,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"{front['date'].iloc[0]} -> {front['date'].iloc[-1]}",
         flush=True,
     )
+    no_futures: List[date] = []
     if args.bars == "5min":
         from market_data.fetch_index_5min import load_all
         data_note = DATA_NOTE_5MIN
@@ -874,13 +922,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             [front] + [load_nifty_front(Path(d)) for d in (args.lot_dir or [])],
             ignore_index=True,
         ).drop_duplicates("date").sort_values("date").reset_index(drop=True)
-        first_lot, last_lot = lot_front["date"].iloc[0], lot_front["date"].iloc[-1]
-        five = load_all(Path(args.five_min_dir))
-        five_dates = pd.to_datetime(five["ts"]).dt.tz_convert("Asia/Kolkata").dt.date
-        keep = (five_dates >= first_lot) & (five_dates <= last_lot)
-        print(f"lot archive {first_lot} -> {last_lot}: 5-minute span trimmed to it "
-              f"({int((~keep).sum())} of {len(five)} candles outside)", flush=True)
-        continuous = load_nifty_5min(five.loc[keep].reset_index(drop=True), lot_front)
+        continuous, no_futures = five_min_span(
+            load_all(Path(args.five_min_dir)), lot_front, args.end, args.accept_short)
         print(f"5-minute bars {len(continuous)} over {continuous['date'].nunique()} sessions "
               f"{continuous['date'].iloc[0]} -> {continuous['date'].iloc[-1]}", flush=True)
     else:
@@ -933,6 +976,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "holdout_cost_stress": HOLDOUT_COST_STRESS,
             "bars": args.bars,
             "lot_dirs": [args.raw_dir] + list(args.lot_dir or []),
+            "end": args.end.isoformat() if args.end else None,
+            "accepted_short_sessions": [d.isoformat() for d in args.accept_short],
+            "dropped_no_futures_sessions": [d.isoformat() for d in no_futures],
             "objective": "net_points / max(max_dd_points, 1) on train",
             "warmup_bars": WARMUP_BARS,
             "moves": "one knob to any rung on its ladder",

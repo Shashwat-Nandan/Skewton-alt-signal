@@ -125,10 +125,18 @@ def candles_to_frame(candles: Iterable[dict]) -> pd.DataFrame:
         df["ts"] = df["ts"].dt.tz_localize(IST)
     else:
         df["ts"] = df["ts"].dt.tz_convert(IST)
-    bad = df[(df["high"] < df["low"]) | (df["open"] > df["high"]) | (df["open"] < df["low"])
-             | (df["close"] > df["high"]) | (df["close"] < df["low"]) | (df["low"] <= 0)]
+    bad = df[(df["high"] < df["low"]) | (df["close"] > df["high"]) | (df["close"] < df["low"])
+             | (df["low"] <= 0)]
     if len(bad):
         raise ValueError(f"inconsistent OHLC candle at {bad.iloc[0]['ts']}")
+    # Kotak has served an open outside the bar's own range (2026-07-03 09:15:
+    # open 24375.65 above high 24338.75). Clamp it to the traded range so a
+    # gap fill cannot happen at a price the bar never printed, and say so.
+    stray = (df["open"] > df["high"]) | (df["open"] < df["low"])
+    for _, r in df[stray].iterrows():
+        logger.warning("open %.2f outside [%.2f, %.2f] at %s: clamped into the range",
+                       r["open"], r["low"], r["high"], r["ts"])
+    df["open"] = df["open"].clip(lower=df["low"], upper=df["high"])
     return df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
 

@@ -33,6 +33,7 @@ from research.optimize_adx_breakout import (
     apply_move,
     holdout_verdict,
     legal_moves,
+    five_min_span,
     load_nifty_5min,
     load_nifty_front,
     net_at_cost_multiple,
@@ -609,7 +610,7 @@ def test_5min_frame_uses_bar_close_time_and_the_lot_in_force():
     five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
     front = pd.DataFrame({"date": [date(2025, 12, 29), date(2026, 1, 1), date(2026, 1, 2)],
                           "lot": [75, 65, 65]})
-    out = load_nifty_5min(five, front)
+    out = load_nifty_5min(five, front, accept_short=[date(2025, 12, 30), date(2026, 1, 2)])
     assert list(out["hhmm"]) == [920, 930, 1530, 920]
     assert list(out["lot"]) == [75, 75, 75, 65]
     assert list(out["date"]) == [date(2025, 12, 30)] * 3 + [date(2026, 1, 2)]
@@ -624,7 +625,7 @@ def test_5min_frame_drops_the_closing_print_and_evening_sessions():
     ]).tz_localize("Asia/Kolkata")
     five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
     front = pd.DataFrame({"date": [date(2025, 12, 29), date(2025, 12, 30)], "lot": [75, 75]})
-    assert list(load_nifty_5min(five, front)["hhmm"]) == [1530]
+    assert list(load_nifty_5min(five, front, [date(2025, 12, 30)])["hhmm"]) == [1530]
 
 
 def test_5min_frame_refuses_a_session_without_a_known_lot():
@@ -634,6 +635,41 @@ def test_5min_frame_refuses_a_session_without_a_known_lot():
     front = pd.DataFrame({"date": [date(2024, 7, 8)], "lot": [25]})
     with pytest.raises(ValueError, match="no NIFTY lot"):
         load_nifty_5min(five, front)
+
+
+def test_5min_frame_refuses_a_short_session_unless_named():
+    """Kotak lost the 15:20 bar on every session from 2026-08-21. A lost bar
+    shifts bars-to-exit, the Donchian window and any stop it would have hit,
+    so it is refused unless the run names the session (and records it)."""
+    day = pd.Timestamp("2026-09-01 09:15", tz="Asia/Kolkata")
+    ts = [day + pd.Timedelta(minutes=5 * i) for i in range(75)]
+    ts = [t for t in ts if t.strftime("%H:%M") != "15:20"]
+    five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    front = pd.DataFrame({"date": [date(2026, 9, 1)], "lot": [65]})
+    with pytest.raises(ValueError, match="fewer than 75"):
+        load_nifty_5min(five, front)
+    assert len(load_nifty_5min(five, front, [date(2026, 9, 1)])) == 74
+    full = pd.DataFrame({"ts": [day + pd.Timedelta(minutes=5 * i) for i in range(75)],
+                         "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    assert len(load_nifty_5min(full, front)) == 75
+
+
+def test_5min_span_stops_at_end_and_drops_dates_with_no_futures():
+    """The run ends before Kotak's degraded tail and must not trade a phantom
+    session (a lone Saturday candle) as if futures had traded that day."""
+    def session(d, n=75):
+        start = pd.Timestamp(f"{d} 09:15", tz="Asia/Kolkata")
+        return [start + pd.Timedelta(minutes=5 * i) for i in range(n)]
+    ts = (session("2025-08-22") + [pd.Timestamp("2025-08-23 10:35", tz="Asia/Kolkata")]
+          + session("2025-08-25") + session("2025-08-26", n=74))
+    five = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    front = pd.DataFrame({"date": [date(2025, 8, 22), date(2025, 8, 25), date(2025, 8, 26)],
+                          "lot": [75, 75, 75]})
+    out, dropped = five_min_span(five, front, date(2025, 8, 25), [])
+    assert dropped == [date(2025, 8, 23)]
+    assert sorted(set(out["date"])) == [date(2025, 8, 22), date(2025, 8, 25)]
+    with pytest.raises(ValueError, match="fewer than 75"):      # the short tail
+        five_min_span(five, front, None, [])
 
 
 def test_intraday_one_entry_a_day_and_the_session_window():

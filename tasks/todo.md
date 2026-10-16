@@ -33,9 +33,27 @@ superseded by this plan. Research only until the paper step; the paper
       pessimistic entry-bar replay reported beside the verdict (not a
       gate); Jev's data note passed in, not a mutated global; warm-up
       360 bars (ADX's double smoothing measured: 9.4% sway at 240 bars).
-- [ ] 3. Freeze the split before looking: chronological, 70% train /
-      30% holdout by session, after a warm-up of 4 × the longest ADX
-      rung in bars. The 5-minute holdout has never been looked at.
+- [x] 3. Split frozen 2026-10-16 ~16:30 IST, before any backtest on
+      5-minute data: train 363 sessions 2024-07-15..2025-12-31, holdout
+      156 sessions 2026-01-01..2026-08-20 (519 ready of 524 loaded; the
+      360-bar warm-up drops the first five). Data decisions, made blind
+      to results:
+      - Fetched 16:06 IST (the 15:50 run stopped on a bad candle).
+        Kotak served ten 09:15 bars, all from 2026-07-03 on, with the open
+        outside the bar's high-low; the fetcher clamps them into the range
+        and logs each one. Eight are inside the holdout.
+      - From 2026-08-21 Kotak has no 15:20 bar (and often no 15:15) on
+        every session; a re-fetch does not fix it. The span ends at
+        2026-08-20 (`--end`), the last full session. 2025-01-31 lacks
+        only 11:25 and is accepted by name (`--accept-short`). Any other
+        short session is refused by the loader.
+      - Dropped: 2025-08-23, a Saturday with one stray 10:35 candle and
+        no futures session. Muhurat 2024-11-01 has no regular-session
+        5-minute bars, so it is absent from the series. The Budget
+        specials 2025-02-01 and 2026-02-01 have no 5-minute bars, and
+        2025-02-01 is not in the research bhavcopy archive either.
+      - Lots from `data_cache/research_bhavcopy_raw` (to 2026-09-24);
+        no `--lot-dir` needed for this span.
 - [ ] 4. ONE pre-registered Jev search on train (gates below), then the
       holdout scored once. Report in this file and PR #19.
 - [ ] 5. Only if the holdout SURVIVES: plan the paper runner

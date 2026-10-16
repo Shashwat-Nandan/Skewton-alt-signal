@@ -76,6 +76,21 @@ def test_inconsistent_candles_are_refused():
         f.candles_to_frame(bad)
 
 
+def test_an_open_outside_the_bar_is_clamped_loudly_not_refused(caplog):
+    """Kotak served 2026-07-03 09:15 with open 24375.65 above high 24338.75.
+    Refusing it lost the whole fetch; keeping it would let the backtest fill a
+    gap at a price the bar never printed. Clamp and warn; nothing else bends."""
+    rows = _session(date(2026, 7, 3), n=2)
+    rows[0].update(open=24375.65, high=24338.75, low=24295.45, close=24302.55)
+    with caplog.at_level("WARNING"):
+        out = f.candles_to_frame(rows)
+    assert out.loc[0, "open"] == 24338.75 and out.loc[1, "open"] == 100.0
+    assert "clamped" in caplog.text and "2026-07-03 09:15" in caplog.text
+    rows[1]["close"] = 200.0                     # close outside: still refused
+    with pytest.raises(ValueError, match="inconsistent"):
+        f.candles_to_frame(rows)
+
+
 def test_a_month_is_complete_only_with_every_session_full(tmp_path):
     """Re-runs must not spend the shared Kotak quota on stored months, and
     must not freeze a partial day as stored."""
