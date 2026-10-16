@@ -9,7 +9,7 @@ superseded by this plan. Research only until the paper step; the paper
 
 ## Steps
 
-- [ ] 1. `market_data/fetch_nifty_5min.py`: NIFTY 50 index 5-minute
+- [x] 1. `market_data/fetch_index_5min.py`: NIFTY 50 index 5-minute
       candles from Kotak `historical_data` (cached session, read-only,
       no login, no orders), 6-day chunks, one call every 15 s, run only
       after 15:45 IST so the runners' Kotak rate limit is untouched.
@@ -17,7 +17,7 @@ superseded by this plan. Research only until the paper step; the paper
       `data_cache/research_nifty_5min/`. Probe the oldest available
       date first. Fail loud: every NSE session in `holidays.csv` terms
       must have 75 bars (09:15–15:25 starts) or be listed as short/missing.
-- [ ] 2. Engine on 5-minute bars: index series as one continuous
+- [x] 2. Engine on 5-minute bars: index series as one continuous
       contract (no roll, offset 0), `hhmm` = bar start, 09:30–15:30
       window as published. Costs: one NIFTY futures lot per side at the
       fill-date STT, lot size by date from the bhavcopy archive.
