@@ -1,5 +1,16 @@
 # Lessons
 
+## A stop entry's bar cannot exit at that bar's open
+
+- 2026-10-16: the ADX breakout booked the entry-bar trail at the open
+  whenever the open sat beyond the trail. On a daily NIFTY bar that open
+  prints before the breakout, so a 15-point trail was reported as a loss
+  of the whole open-to-level distance. The corrected fill is the stop
+  price. A later bar still gap-fills at the open.
+- Takeaway: **an entry-bar protective stop fills at the stop. The open is
+  a gap fill only once the position is already on, or when the entry
+  itself filled at the open.**
+
 ## Read the whole function's locals before naming a new one in it
 
 - 2026-10-02: the dispersion gamma attribution got a new `held` dict (basket

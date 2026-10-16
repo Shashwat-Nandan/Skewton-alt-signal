@@ -1,3 +1,73 @@
+# ADX filtered breakout — Jev rung search — 2026-10-16
+
+Research only. No strategy class, no paper runner, no live order. The
+paper → live gate stays closed.
+
+EasyLanguage spec: long and short, one entry a day, only while ADX is
+under ADXThreshold and under its own average. Buy-stop at the prior
+N-bar high, sell-stop at the prior N-bar low. ATR stop, point trail,
+optional point target, time exit.
+
+- [x] Engine `research/adx_breakout.py` and search `research/optimize_adx_breakout.py`
+- [x] Fill tests, including the entry-bar stop (22 passed, ruff clean)
+- [x] Pre-registered search run. Jev (`jev-latest`) chose each rung.
+      Code kept a rung only if mechanism_fit ≥ 1, trades ≥ 20, the three
+      train windows were not all negative, and train quality
+      (net points / max drawdown) improved. Evidence was recorded and
+      was not a gate. Holdout was scored once, after selection.
+- [x] Report. Full journal: `/tmp/adx_breakout_opt.json`
+
+Data: `research_bhavcopy_raw` front-month NIFTY futures (IDF, ticker
+NIFTY), 549 sessions, 2024-07-08 → 2026-09-24. No 5-minute tape on this
+host, so each bar is the cash session stamped 15:30 and the published
+09:30–15:30 window includes every bar. Costs are
+`estimate_transaction_cost` for one lot of futures, both sides, in
+points. Rolls are flattened at the expiring contract's close;
+indicators use a difference-adjusted series. The session set and the
+70/30 cut were frozen on the published windows: 491 ready sessions,
+train 343 (2024-09-30 → 2026-02-17), holdout 148 from 2026-02-18.
+
+An entry-bar bug was fixed before this run. The open of the breakout
+bar prints before a level fill, and the first pass booked the trail at
+that open. The protective stop on the entry bar now fills at the stop.
+Later bars still gap-fill at the open. The numbers below are the
+corrected pass.
+
+## Result — KILL
+
+Selected parameters are the published defaults. Both tried rungs were
+dropped. Holdout on that config: 2 trades, net −78.9 points
+(−₹5,127), Sharpe −1.85. KILL (fewer than 10 trades, net ≤ 0, Sharpe ≤ 0).
+
+| sample | trades | gross pts | net pts | INR | exits | bars held |
+|---|---|---|---|---|---|---|
+| train, published (kept) | 12 | −180.0 | −483.1 | −₹35,819 | TRAIL 12 | 0 |
+| train, TrailAmount 40 (dropped) | 12 | −480.0 | −783.0 | | TRAIL 12 | 0 |
+| holdout, published | 2 | −30.0 | −78.9 | −₹5,127 | TRAIL 2 | 0 |
+
+Gross loss is exactly the trail: −15 points on every published trade,
+−40 on the widened trail. Round-trip cost is about 25 points, so net
+is about −40 points per published trade. Win rate 0%. The low-ADX
+filter was true on 32% of train bars (median ADX at entry 11.0). The
+first train third had no trades; the other two were negative. Median
+daily range on the ready sample is 204 points (10th percentile 113).
+
+Jev path, train only:
+
+1. Baseline mechanism_fit 0.36. Next rung TrailAmount 15 → 40
+   (probability 0.76).
+2. Trail 40 still exits every trade on the entry bar. mechanism_fit
+   0.58. Dropped. The move is banned from these parameters.
+3. BarsToExit 10 → 5. Same 12 trades (they are already closed).
+   mechanism_fit 0.34. Dropped.
+4. BarsToExit 10 → 15. Same trades. mechanism_fit 0.45. Dropped.
+5. Jev's highest remaining probability was another trail widen (0.45),
+   which the ban blocks. Next legal choice was stop.
+
+Trail rungs 80, 150, 250, and 400 were on the ladder and were not run.
+A wider trail needs a new pre-registered pass. These gates were not
+loosened after the numbers.
+
 # Dispersion dashboard page + second review — 2026-10-02
 
 - [x] `GET /api/dispersion-paper` (read-only, session-gated): each book's
