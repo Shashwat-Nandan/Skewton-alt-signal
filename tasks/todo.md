@@ -1,3 +1,250 @@
+# ADX filtered breakout — 5-minute backtest, then paper — PLAN (2026-10-16)
+
+Owner decision 2026-10-16: backtest first on 5-minute bars, then paper
+only if it survives. Kotak serves 5-minute NIFTY 50 *index* candles at
+least 400 days back (probed 08:12 IST: 30/120/400 days all full
+09:15–15:30 sessions). The daily-bar pass below was a proxy and is
+superseded by this plan. Research only until the paper step; the paper
+→ live gate stays closed.
+
+## Steps
+
+- [x] 1. `market_data/fetch_index_5min.py`: NIFTY 50 index 5-minute
+      candles from Kotak `historical_data` (cached session, read-only,
+      no login, no orders), 6-day chunks, one call every 15 s, run only
+      after 15:45 IST so the runners' Kotak rate limit is untouched.
+      Resumable, one parquet per month under
+      `data_cache/research_nifty_5min/`. Probe the oldest available
+      date first. Fail loud: every NSE session in `holidays.csv` terms
+      must have 75 bars (09:15–15:25 starts) or be listed as short/missing.
+- [x] 2. Engine on 5-minute bars: index series as one continuous
+      contract (no roll, offset 0), `hhmm` = bar start, 09:30–15:30
+      window as published. Costs: one NIFTY futures lot per side at the
+      fill-date STT, lot size by date from the bhavcopy archive.
+      Tests for intraday specifics (one entry a day across bars,
+      session-window arming, overnight holds).
+- [x] Review 2 of PR #19 fixed (no 5-minute data seen yet): replay no
+      longer scrambles intraday bars; session calendar from Kotak's daily
+      index candles (holidays.csv is 2026-only); a session counts only
+      with all 75 regular bars; lost trailing windows fail the run; the
+      15:30 closing print and evening sessions are not traded; lots must
+      come from the archive (span trimmed to 2024-07-08 on); EntriesToday
+      at the signal bar (EasyLanguage); gap-then-opposite-stop reversal;
+      pessimistic entry-bar replay reported beside the verdict (not a
+      gate); Jev's data note passed in, not a mutated global; warm-up
+      360 bars (ADX's double smoothing measured: 9.4% sway at 240 bars).
+- [x] 3. Split frozen 2026-10-16 ~16:30 IST, before any backtest on
+      5-minute data: train 363 sessions 2024-07-15..2025-12-31, holdout
+      156 sessions 2026-01-01..2026-08-20 (519 ready of 524 loaded; the
+      360-bar warm-up drops the first five). Data decisions, made blind
+      to results:
+      - Fetched 16:06 IST (the 15:50 run stopped on a bad candle).
+        Kotak served ten 09:15 bars, all from 2026-07-03 on, with the open
+        outside the bar's high-low; the fetcher clamps them into the range
+        and logs each one. Eight are inside the holdout.
+      - From 2026-08-21 Kotak has no 15:20 bar (and often no 15:15) on
+        every session; a re-fetch does not fix it. The span ends at
+        2026-08-20 (`--end`), the last full session. 2025-01-31 lacks
+        only 11:25 and is accepted by name (`--accept-short`). Any other
+        short session is refused by the loader.
+      - Dropped: 2025-08-23, a Saturday with one stray 10:35 candle and
+        no futures session. Muhurat 2024-11-01 has no regular-session
+        5-minute bars, so it is absent from the series. The Budget
+        specials 2025-02-01 and 2026-02-01 have no 5-minute bars, and
+        2025-02-01 is not in the research bhavcopy archive either.
+      - Lots from `data_cache/research_bhavcopy_raw` (to 2026-09-24);
+        no `--lot-dir` needed for this span.
+- [x] 4. ONE pre-registered Jev search on train (gates below), then the
+      holdout scored once. Report in this file and PR #19. Run
+      2026-10-16 ~16:35 IST: **KILL** (see Review below).
+- [ ] ~~5. Only if the holdout SURVIVES~~ not triggered (KILL): plan the paper runner
+      (`runners/run_paper_adx_breakout.py`, paper-only, no live code
+      path, 09:14 timer, NIFTY front-month future 5-minute bars, own
+      state + daily log, paced Kotak calls). CODEOWNER review.
+
+## Review — 5-minute verdict: KILL (2026-10-16)
+
+Command (cwd = deploy checkout, code from this branch):
+`python -m research.optimize_adx_breakout --bars 5min --end 2026-08-20
+--accept-short 2025-01-31`. Output JSON was kept outside the repo.
+
+| sample | trades | net pts | gross pts | win | PF | max DD | daily Sharpe |
+|---|---|---|---|---|---|---|---|
+| train, published defaults | 213 | −3296.6 | +427.5 | 18% | 0.19 | 3288.1 | −7.64 |
+| holdout, selected (= defaults) | 75 | −1719.7 | −71.8 | 8% | 0.13 | 1689.8 | −8.55 |
+| holdout, entry bars as stops | 75 | −1774.3 | | | | | −8.61 |
+
+- Every train window and every holdout window is negative.
+- Jev gave the published defaults mechanism_fit 0.53. It proposed four
+  moves, and all four were dropped:
+  - TrailAmount 40 / 80 / 150: all three train windows negative.
+  - BarsToExit 20: mechanism_fit 0.67.
+- Jev then chose `stop`. The selected parameters are the defaults.
+  Jev used 23.8k tokens in and 3.6k out.
+- **Why it fails:** the published 15-point trail sits inside one 5-minute
+  NIFTY range. 210 of 213 train trades exit on the trail, with a median
+  hold of 1 bar. Gross is +2.0 points a trade on train and −1.0 on the
+  holdout, against about 17.5 points of round-trip cost. Wider trails
+  hold longer but lose more gross, so there is no edge for costs to eat.
+- **The verdict does not depend on cost assumptions:** the holdout
+  is negative before costs. That covers the unconfirmed 2026-04-01 STT
+  date too.
+- Paper (step 5) is not triggered. Nothing goes to paper or live.
+
+### Follow-up (owner request 2026-10-16): wider or no trail — still KILL
+
+Train is the test here. The holdout was already spent, so the holdout
+rows are description only and cannot unlock paper. "off" = a 1,000,000-
+point trail, which never tightens past the ATR stop.
+
+| trail | BarsToExit | train net | train gross | holdout net | holdout gross |
+|---|---|---|---|---|---|
+| 15 (published) | 10 | −3296.6 | +427.5 | −1719.7 | −71.8 |
+| 40 | 10 | −4408.2 | −683.9 | −761.1 | +887.2 |
+| 80 | 10 | −4144.6 | −420.3 | −905.8 | +742.2 |
+| 150 / 250 / 400 | 10 | −4252.3 | −528.1 | −651.3 | +996.8 |
+| off | 10 | −4252.3 | −528.1 | −649.2 | +998.9 |
+| 40 | 20 | −4952.0 | −1227.8 | −648.3 | +1000.0 |
+| 80 | 20 | −4128.8 | −404.8 | −656.8 | +991.2 |
+| 150 / 250 / 400 | 20 | −4543.1 | −819.0 | −247.3 | +1400.9 |
+| off | 20 | −4543.1 | −819.0 | −386.0 | +1262.2 |
+
+- **Every variant loses net, in both samples.** On train, every wider
+  trail also loses *before* costs: widening only removes the published
+  version's small gross gain.
+- **The holdout is gross-positive with wider trails** (+10 to +19 points
+  a trade) but pays about 22 points a trade, using the 0.05% STT from
+  2026-04-01.
+- **At the old 0.02% STT,** one holdout row is net-positive: trail ≥150
+  with BarsToExit 20 (+105 points, Sharpe 0.13). It fails the 1.5× cost
+  gate (−543), loses −4541 on train, and was picked after seeing the
+  holdout. Not a pass.
+- Six months of holdout gains that train does not show are regime, not
+  evidence. Verdict unchanged: KILL.
+
+## Pre-registered gates (owner-approved 2026-10-16, before any 5-minute data was fetched; Jev kept)
+
+- Keep a rung only if: Jev mechanism_fit ≥ 1.0; train trades ≥ 100;
+  the three chronological train windows not all negative; quality
+  (net points / max DD) improves.
+- Holdout verdict SURVIVES only if: trades ≥ 40, net points > 0, daily
+  Sharpe > 0, AND net still > 0 at 1.5 × costs. Otherwise KILL.
+- Six rounds max; moves set one knob to any ladder rung; `stop` ends.
+- A SURVIVES is not a live promotion: it unlocks paper only.
+
+## Known limits (stated up front)
+
+- Index, not futures: signals and fills on the NIFTY 50 index; the
+  futures basis drift intraday is not modelled.
+- 5-minute OHLC still cannot order events inside one bar; the same
+  conservative fill rules apply (stop before target, entry-bar stop
+  only when proven, both-levels bars skipped and counted).
+- The search sends train statistics to TypeSafe (`api.typesafe.ai`).
+
+# ADX filtered breakout — Jev rung search — 2026-10-16
+
+Research only. No strategy class, no paper runner, no live order. The
+paper → live gate stays closed.
+
+EasyLanguage spec: long and short, one entry a day, only while ADX is
+under ADXThreshold and under its own average. Buy-stop at the prior
+N-bar high, sell-stop at the prior N-bar low. ATR stop, point trail,
+optional point target, time exit.
+
+- [x] Engine `research/adx_breakout.py` and search `research/optimize_adx_breakout.py`
+- [x] Fill tests, including the entry-bar stop (22 passed, ruff clean)
+- [x] Pre-registered search run. Jev (`jev-latest`) chose each rung.
+      Code kept a rung only if mechanism_fit ≥ 1, trades ≥ 20, the three
+      train windows were not all negative, and train quality
+      (net points / max drawdown) improved. Evidence was recorded and
+      was not a gate. Holdout was scored once, after selection.
+- [x] Report. Full journal: `/tmp/adx_breakout_opt.json`
+- [x] Review of PR #19 (2026-10-16): the KILL below is withdrawn. Fixed:
+      trail not live on the entry bar; entry-bar initial stop only when
+      the tape proves it (else held and counted as `entry_bar_unresolved`);
+      any-rung moves; no -inf quality for a thin baseline; breakout levels
+      include the signal bar; an open beyond one level is not ambiguous;
+      calendar-basis rolls (26/26 rolls used the next contract's close);
+      point-in-time futures STT; initial stop fixed at the signal ATR;
+      one-entry-a-day checked at the fill; 120-bar Wilder warm-up.
+      32 tests.
+- [ ] Owner: approve the revised protocol, then ONE Jev search + holdout.
+
+## Revision after review — train-only diagnostic, no Jev, holdout not scored
+
+429 ready sessions after the 120-bar warm-up. Train 300
+(2024-12-31 → 2026-03-17); holdout 129 from 2026-03-18, not scored.
+Published defaults, each trail rung:
+
+| trail | trades | gross | net | win | max DD | Sharpe | bars held | exits |
+|---|---|---|---|---|---|---|---|---|
+| 15 | 14 | −456 | −706 | 36% | 706 | −1.33 | 1 | TRAIL 12, ROLL 2 |
+| 40 | 14 | −531 | −781 | 36% | 781 | −1.48 | 1 | TRAIL 12, ROLL 2 |
+| 80 | 14 | −455 | −705 | 29% | 864 | −1.29 | 1 | TRAIL 12, ROLL 2 |
+| 150 | 12 | −64 | −279 | 50% | 496 | −0.49 | 1 | TRAIL 10, ROLL 2 |
+| 250 | 11 | −649 | −846 | 45% | 900 | −1.11 | 2 | TRAIL 9, ROLL 2 |
+| 400 | 10 | −496 | −675 | 50% | 1278 | −0.60 | 4 | TRAIL 7, ROLL 3 |
+
+No entry bar was unresolved and no bar was ambiguous. Every rung loses
+gross and net, but no rung reaches the 20-trade floor: on daily NIFTY the
+spec makes about one trade a month. The first train third has no trades.
+As specified (a 5-minute intraday system), daily bars cannot test it
+with these gates; only a knob that raises the trade count (breakout
+length, ADX threshold) could, and that is what a Jev search would try.
+
+## First pass (superseded — entry-bar trail artifact)
+
+Data: `research_bhavcopy_raw` front-month NIFTY futures (IDF, ticker
+NIFTY), 549 sessions, 2024-07-08 → 2026-09-24. No 5-minute tape on this
+host, so each bar is the cash session stamped 15:30 and the published
+09:30–15:30 window includes every bar. Costs are
+`estimate_transaction_cost` for one lot of futures, both sides, in
+points. Rolls are flattened at the expiring contract's close;
+indicators use a difference-adjusted series. The session set and the
+70/30 cut were frozen on the published windows: 491 ready sessions,
+train 343 (2024-09-30 → 2026-02-17), holdout 148 from 2026-02-18.
+
+An entry-bar bug was fixed before this run. The open of the breakout
+bar prints before a level fill, and the first pass booked the trail at
+that open. The protective stop on the entry bar now fills at the stop.
+Later bars still gap-fill at the open. The numbers below are the
+corrected pass.
+
+### Result — KILL (withdrawn)
+
+Selected parameters are the published defaults. Both tried rungs were
+dropped. Holdout on that config: 2 trades, net −78.9 points
+(−₹5,127), Sharpe −1.85. KILL (fewer than 10 trades, net ≤ 0, Sharpe ≤ 0).
+
+| sample | trades | gross pts | net pts | INR | exits | bars held |
+|---|---|---|---|---|---|---|
+| train, published (kept) | 12 | −180.0 | −483.1 | −₹35,819 | TRAIL 12 | 0 |
+| train, TrailAmount 40 (dropped) | 12 | −480.0 | −783.0 | | TRAIL 12 | 0 |
+| holdout, published | 2 | −30.0 | −78.9 | −₹5,127 | TRAIL 2 | 0 |
+
+Gross loss is exactly the trail: −15 points on every published trade,
+−40 on the widened trail. Round-trip cost is about 25 points, so net
+is about −40 points per published trade. Win rate 0%. The low-ADX
+filter was true on 32% of train bars (median ADX at entry 11.0). The
+first train third had no trades; the other two were negative. Median
+daily range on the ready sample is 204 points (10th percentile 113).
+
+Jev path, train only:
+
+1. Baseline mechanism_fit 0.36. Next rung TrailAmount 15 → 40
+   (probability 0.76).
+2. Trail 40 still exits every trade on the entry bar. mechanism_fit
+   0.58. Dropped. The move is banned from these parameters.
+3. BarsToExit 10 → 5. Same 12 trades (they are already closed).
+   mechanism_fit 0.34. Dropped.
+4. BarsToExit 10 → 15. Same trades. mechanism_fit 0.45. Dropped.
+5. Jev's highest remaining probability was another trail widen (0.45),
+   which the ban blocks. Next legal choice was stop.
+
+Trail rungs 80, 150, 250, and 400 were on the ladder and were not run.
+A wider trail needs a new pre-registered pass. These gates were not
+loosened after the numbers.
+
 # Dispersion dashboard page + second review — 2026-10-02
 
 - [x] `GET /api/dispersion-paper` (read-only, session-gated): each book's

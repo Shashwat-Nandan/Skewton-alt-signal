@@ -1,5 +1,18 @@
 # Lessons
 
+## On a daily bar, don't check the entry bar against its whole range
+
+- 2026-10-16: the ADX breakout first booked the entry-bar trail at the
+  open, then "fixed" it to fill at the stop. Both checked a 15-point
+  trail against a ~200-point daily range whose low may have printed
+  before the breakout, so every trade exited on its entry bar at exactly
+  −trail and a KILL measured the simulator. Review of PR #19 caught it.
+- Takeaway: **on the entry bar only the part of the range after the fill
+  counts: the whole bar for a gap fill at the open; otherwise only a close
+  beyond the stop proves it. A "next bar" trail is armed at the entry
+  bar's close. When every trade exits the same way for the same amount,
+  suspect the engine before the strategy.**
+
 ## Read the whole function's locals before naming a new one in it
 
 - 2026-10-02: the dispersion gamma attribution got a new `held` dict (basket
@@ -452,3 +465,13 @@
   producer, not against your assumption. Belt-and-suspenders for a
   read-only tool: tolerate list-or-dict containers and isolate each source
   so one shape change can't crash the whole view.
+
+- 2026-10-16: Kotak's 5-minute NIFTY 50 history is not clean. It has
+  ten 09:15 bars (from 2026-07-03) with the open outside the bar's
+  high-low. From 2026-08-21 the 15:20 bar is missing on every session,
+  and a re-fetch does not restore it. There is also a lone Saturday
+  candle (2025-08-23).
+- Rule: validate every Kotak intraday fetch per session (bar count and
+  OHLC consistency), and make backtests refuse short sessions. Stop the
+  span before a degraded tail instead of silently keeping it, and decide
+  that before any result is seen.
