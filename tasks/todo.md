@@ -1,3 +1,97 @@
+# Options expression of the ADX breakout (owner-approved 2026-10-16): STOPPED at the model check
+
+Owner request 2026-10-16: "Test the options breakout idea". Same entries
+and exits as the ADX spec on 5-minute NIFTY, but buy one lot of an ATM
+NIFTY option (CE on a long breakout, PE on a short) instead of a future.
+Retail breakout traders mostly trade options. Option charges are taxed
+on premium, not notional, so the cost structure differs.
+
+## Data constraint (stated up front)
+
+There is no intraday option history on the host:
+- `research_bhavcopy_raw` has daily OHLC per contract (2024-07 → 2026-09);
+- the `NIFTY_*_eod` caches are one snapshot a day (Aug–Oct 2026);
+- tick capture is not running.
+
+So option prices along the 5-minute path must be **modelled**:
+- Black-76 on the forward: index × the prior session's futures/index basis;
+- the contract's IV is implied from its prior-session bhavcopy close and
+  held fixed through the trade. IV moves at a breakout (crush or spike)
+  are not modelled, and that bias has no known sign.
+
+## Steps
+
+- [x] 1. **Model check, before any strategy result.** Price each
+      session's near-ATM CE/PE at 15:25 from the prior day's IV and that
+      day's index path. Compare with the bhavcopy close.
+      - Report the median and 90th-percentile error in points and as a %
+        of premium, by days-to-expiry.
+      - If the median error is above 10% of premium, stop: the model can't
+        carry the test.
+- [ ] 2. **Contract choice:** nearest expiry with at least one full session
+      left (no 0-DTE), strike nearest the forward at the fill bar, lot
+      from the bhavcopy.
+- [ ] 3. **Costs:** core option charges on premium (brokerage, exchange,
+      SEBI, GST, stamp), with options STT by fill date (history to
+      confirm), plus a half-spread of 0.5 points a side. Sensitivity runs
+      at 0 and 1.0 points.
+- [ ] 4. **Run on train only** (2024-07-15 → 2025-12-31), published
+      defaults as the single pre-registered variant. Other trail rungs are
+      reported as description only.
+- [ ] 5. Report in this file and in a separate research PR.
+
+## Result 2026-10-16: STOP at step 1 (no strategy result was computed)
+
+`python -m research.options_breakout` (`research/options_breakout.py`),
+train sessions only. The near-ATM weekly CE and PE were checked on 660
+contract-days:
+
+| measure | median abs error | median signed | 90th pct abs |
+|---|---|---|---|
+| next-session close | **13.0%** of premium | −2.3% | 47% |
+| next-session intraday high | 8.6% | −7.8% | |
+
+Close error by days to expiry:
+
+| days to expiry | 1 | 2 | 3 | 4 | 5 | 6 | 7+ |
+|---|---|---|---|---|---|---|---|
+| median abs error | 18.8% | 13.0% | 17.1% | 9.0% | 9.4% | 5.9% | 2.6% |
+
+- 13.0% is above the pre-registered 10%, so the run stopped as designed.
+  Steps 2–4 never ran.
+- The error is largest on the 1–3 day weeklies the strategy would trade.
+  Day-to-day IV changes there are large, and a fixed IV can't follow
+  them.
+- The model under-prices the intraday high by about 8%. That is a bias of
+  several premium points against the buyer, larger than the roughly 1
+  point a trade the index signal could pass through. A modelled run could
+  not tell an edge from model error.
+- **Conclusion:** the options question can't be answered with the data on
+  this host. The honest path is real quotes: record ATM NIFTY weekly
+  option quotes (tick capture) and test once months of tape exist.
+
+## Proposed gates (need owner approval before step 4)
+
+- **Train, published defaults:** at least 100 trades, net > 0, daily
+  Sharpe > 0, net > 0 at 1.5× costs, and the three chronological windows
+  not all negative.
+- **What a result means:**
+  - Fail → KILL.
+  - Pass → still not paper. The 2026 holdout was already seen for this
+    signal, so a pass only justifies recording real ATM option quotes
+    forward (tick capture) for a clean out-of-sample test.
+
+## Expectation (stated before running)
+
+- The index signal makes about +2 points a trade before costs on train.
+  An ATM option (delta about 0.5) gives about half of that, plus a small
+  gamma gain, minus time decay over the hold. That decay is about 5–10
+  premium points for an hour on a weekly.
+- Option charges and spread come to about 2–3 premium points a round
+  trip.
+- A train loss is the likely outcome. The test is cheap and settles the
+  question with numbers.
+
 # ADX filtered breakout — 5-minute backtest, then paper — PLAN (2026-10-16)
 
 Owner decision 2026-10-16: backtest first on 5-minute bars, then paper
