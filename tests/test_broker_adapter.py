@@ -523,6 +523,29 @@ class TestKotakClient:
         client.session.request.return_value = resp
         assert client.positions() == {"net": [], "day": []}
 
+    def test_quote_without_ltp_names_the_key_and_is_still_an_order_error(self):
+        """The tick recorder sets the named key aside instead of splitting
+        the batch; the pair runner still stops on BrokerOrderError."""
+        from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [{
+            "instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE",
+            "name": "NIFTY", "instrument_type": "CE", "lot_size": 75,
+            "exchange": "NFO",
+        }]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"exchange_token": "Nifty 50", "exchange": "nse_cm", "ltp": "22500.5"},
+            {"exchange_token": "999", "exchange": "nse_fo"},
+        ]
+        client.session.request.return_value = resp
+        with pytest.raises(BrokerQuoteMissingError) as err:
+            client.quote(["NSE:NIFTY 50", "NFO:NIFTY25SEP25000CE"])
+        assert err.value.key == "NFO:NIFTY25SEP25000CE"
+        assert isinstance(err.value, BrokerOrderError)
+
     def test_quote_depth_is_kite_shaped_numbers(self):
         client = self._client()
         client._instruments_by_exchange["NSE"] = [{

@@ -13,7 +13,10 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
-ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m market_data.tick_capture --underlyings NIFTY,BANKNIFTY --strikes-each-side 20
+# --cached-session: never log in. A fresh Kotak login replaces the token
+# the live runners hold. --poll-seconds 10 keeps the Kotak quote poll to a
+# few requests a second on the quota those runners share.
+ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m market_data.tick_capture --underlyings NIFTY,BANKNIFTY --strikes-each-side 20 --cached-session --poll-seconds 10
 # ------------------------------------
 
 # Oneshot session — exits cleanly at 15:30 IST. Timer fires again tomorrow.
