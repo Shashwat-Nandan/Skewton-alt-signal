@@ -534,15 +534,18 @@ def _params_key(params: Params) -> tuple:
     return tuple(getattr(params, name) for name in LADDERS)
 
 
-def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
-    """One raw front-month NIFTY future row per session. Near expiry wins."""
+FRONT_COLS = [
+    "TradDt", "FinInstrmTp", "TckrSymb", "XpryDt",
+    "OpnPric", "HghPric", "LwPric", "ClsPric", "NewBrdLotQty",
+]
+
+
+def read_nifty_fo(raw_dir: Path, cols: List[str], kinds: tuple) -> pd.DataFrame:
+    """NIFTY rows of the given FinInstrmTp ``kinds`` from every
+    bhavcopy_fo table, in one pass. A table missing a column fails."""
     files = find_tables(raw_dir, "bhavcopy_fo_*")
     if not files:
         raise RuntimeError(f"no bhavcopy tables in {raw_dir}")
-    cols = [
-        "TradDt", "FinInstrmTp", "TckrSymb", "XpryDt",
-        "OpnPric", "HghPric", "LwPric", "ClsPric", "NewBrdLotQty",
-    ]
     frames = []
     for path in files:
         header = table_columns(path)
@@ -550,11 +553,21 @@ def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
         if missing:
             raise RuntimeError(f"{path.name} lacks {missing}")
         df = read_table(path, usecols=cols, dtype={"TckrSymb": str, "FinInstrmTp": str})
-        df = df[(df["FinInstrmTp"] == "IDF") & (df["TckrSymb"] == "NIFTY")]
-        frames.append(df)
-    if not frames:
-        raise RuntimeError(f"no NIFTY index futures in {raw_dir}")
-    out = pd.concat(frames, ignore_index=True)
+        frames.append(df[df["FinInstrmTp"].isin(kinds) & (df["TckrSymb"] == "NIFTY")])
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_nifty_front(raw_dir: Path) -> pd.DataFrame:
+    """One raw front-month NIFTY future row per session. Near expiry wins."""
+    return front_from_rows(read_nifty_fo(raw_dir, FRONT_COLS, ("IDF",)))
+
+
+def front_from_rows(raw: pd.DataFrame) -> pd.DataFrame:
+    """``load_nifty_front`` on rows already read (FRONT_COLS at least)."""
+    out = raw.loc[raw["FinInstrmTp"] == "IDF", FRONT_COLS]
+    if out.empty:
+        raise RuntimeError("no NIFTY index futures in the bhavcopy rows")
+    out = out.reset_index(drop=True)
     out["date"] = pd.to_datetime(out["TradDt"]).dt.date
     out["expiry"] = pd.to_datetime(out["XpryDt"]).dt.date
     out = out[out["expiry"] >= out["date"]]
