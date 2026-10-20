@@ -1,20 +1,19 @@
 [Unit]
-Description=Fire tick-capture.service Mon–Fri at 09:15 IST
+Description=Fire tick-capture.service Mon–Fri at 09:14 IST
 Documentation=man:systemd.timer(5)
 
 [Timer]
-# 09:15 IST: after the runners' 09:10-09:12 logins, so the cached session
-# --cached-session reads is today's, and at the open, so option quotes
-# have an LTP. The capture never logs in itself. market_data/tick_capture.py
-# self-gates on 15:30.
-OnCalendar=Mon..Fri *-*-* 09:15:00 Asia/Kolkata
+# 09:14 IST, no jitter: after the runners' 09:10-09:13 logins (09:12 plus
+# up to 60 s), so the cached session --cached-session reads is today's,
+# and before the 09:15 open, so the tape has the opening prints. The
+# capture never logs in itself. market_data/tick_capture.py self-gates on
+# 15:30.
+OnCalendar=Mon..Fri *-*-* 09:14:00 Asia/Kolkata
 
 # If the VPS was asleep or systemd missed the window, run once to catch up.
 # market_data/tick_capture.py refuses to start after 15:30 — safe to be Persistent.
 Persistent=true
 
-# Jitter so several captures on one VPS do not poll in step.
-RandomizedDelaySec=30
 
 Unit=tick-capture.service
 

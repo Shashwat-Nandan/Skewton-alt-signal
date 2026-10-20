@@ -70,17 +70,52 @@ def test_a_dead_strike_costs_one_extra_call_once_not_every_pass():
     assert client.calls == 3
 
 
-def test_many_dead_keys_fail_the_pass_instead_of_a_call_each():
+def test_a_dead_strike_re_requests_only_its_own_batch():
+    """Kotak quotes 50 keys a request and fails the whole call on one
+    missing LTP. Batching here means the batches that came back are not
+    fetched again."""
+    pairs = [(i, f"NFO:K{i}") for i in range(120)]
+    client = _Quotes(missing={"NFO:K110"})
+    rows = tc._poll_quotes(client, pairs, set())
+    assert len(rows) == 119
+    assert client.calls == 3 + 1
+
+
+def test_setting_many_keys_aside_is_progress_not_a_failed_pass():
+    """At the open many far strikes can lack an LTP. Each pass spends at
+    most MAX_NEW_DEAD_PER_PASS extra calls setting them aside and returns
+    what it has; it must not raise, or the outage counter would end the
+    day."""
+    healthy = [(100 + i, f"NFO:OK{i}") for i in range(60)]
     client = _Quotes(missing={key for _, key in PAIRS})
-    with pytest.raises(BrokerQuoteMissingError):
-        tc._poll_quotes(client, PAIRS, set())
-    assert client.calls == tc.MAX_NEW_DEAD_PER_PASS + 1
+    dead = set()
+    rows = tc._poll_quotes(client, PAIRS + healthy, dead)   # batches of 50 and 18
+    assert len(rows) == 18        # the first batch waits for the next pass
+    assert len(dead) == tc.MAX_NEW_DEAD_PER_PASS
+    calls = client.calls
+    rows = tc._poll_quotes(client, PAIRS + healthy, dead)
+    assert len(rows) == 60
+    assert dead == {key for _, key in PAIRS}
+    assert client.calls - calls == 2 + (8 - tc.MAX_NEW_DEAD_PER_PASS)
+
+
+def test_a_re_check_is_bounded_and_walks_the_whole_set():
+    dead = {key for _, key in PAIRS}
+    client = _Quotes(missing=set(dead))
+    _, nxt = tc._reprobe(client, PAIRS, dead, 0)
+    assert client.calls <= tc.MAX_NEW_DEAD_PER_PASS + 1
+    client.missing = set()
+    rows, _ = tc._reprobe(client, PAIRS, dead, nxt)
+    assert len(rows) == tc.MAX_NEW_DEAD_PER_PASS
+    assert len(dead) == len(PAIRS) - tc.MAX_NEW_DEAD_PER_PASS
+    rows, _ = tc._reprobe(client, PAIRS, dead, 0)
+    assert not dead
 
 
 def test_a_set_aside_key_rejoins_when_its_ltp_returns():
     client = _Quotes(missing={"NFO:NIFTY5CE"})
     dead = {"NFO:NIFTY3CE", "NFO:NIFTY5CE"}
-    rows = tc._reprobe(client, PAIRS, dead)
+    rows, _ = tc._reprobe(client, PAIRS, dead)
     assert [r["instrument_token"] for r in rows] == [3]
     assert dead == {"NFO:NIFTY5CE"}
 
@@ -124,9 +159,19 @@ def test_backoff_stops_at_the_cutoff(monkeypatch):
     assert sleeps and all(s <= 2.0 for s in sleeps)
 
 
-def test_a_day_of_failures_gives_up_and_is_not_a_success(monkeypatch):
-    _loop(monkeypatch, [BrokerNetworkError("429")] * 50 + ["row"], 200.0)
-    assert tc._run_quote_poll(object(), [], {}, poll_seconds=10.0) is False
+def test_a_long_outage_keeps_polling_but_fails_the_day(monkeypatch):
+    """A 7-minute Kotak outage must not cost the rest of the day's tape,
+    and must still exit 1 so the failure alert fires."""
+    _loop(monkeypatch, [BrokerNetworkError("429")] * tc.MAX_CONSECUTIVE_FAILURES
+          + ["row"] * 3, 1e6)
+    monkeypatch.setattr(tc, "_STOP_EPOCH", 30.0)
+    assert tc._run_quote_poll(object(), [], {}, poll_seconds=1.0) is False
+    assert tc._TICK_COUNT == 3        # recorded after the outage
+
+
+def test_a_short_outage_is_a_good_day(monkeypatch):
+    _loop(monkeypatch, [BrokerNetworkError("429")] * 3 + ["row"], 10.0)
+    assert tc._run_quote_poll(object(), [], {}, poll_seconds=1.0) is True
 
 
 def test_an_empty_tape_is_not_a_success(monkeypatch):
@@ -134,28 +179,34 @@ def test_an_empty_tape_is_not_a_success(monkeypatch):
     assert tc._run_quote_poll(object(), [], {}, poll_seconds=1.0) is False
 
 
-def test_a_rejected_token_rereads_the_cache_not_a_login(monkeypatch):
+def test_a_failed_re_check_does_not_cost_the_live_pass(monkeypatch):
     _loop(monkeypatch, [], 1e6)
-    seen = []
+    monkeypatch.setattr(tc, "REPROBE_S", 0.0)
+    passes = []
 
     def poll(client, pairs, dead):
-        seen.append(client)
-        if len(seen) == 1:
-            raise BrokerTokenError("403")
-        monkeypatch.setattr(tc, "_STOP_EPOCH", 0.0)
+        dead.add("NFO:DEAD")
+        passes.append(1)
+        if len(passes) == 3:
+            monkeypatch.setattr(tc, "_STOP_EPOCH", 0.0)
         return [{"instrument_token": 1}]
 
+    def reprobe(*a):
+        raise BrokerNetworkError("429")
+
     monkeypatch.setattr(tc, "_poll_quotes", poll)
-    stale, fresh = object(), object()
-    assert tc._run_quote_poll(stale, [], {}, 10.0, reload_client=lambda: fresh)
-    assert seen == [stale, fresh]
+    monkeypatch.setattr(tc, "_reprobe", reprobe)
+    assert tc._run_quote_poll(object(), [], {}, poll_seconds=1.0) is True
+    assert len(passes) == 3
 
 
-def test_cached_session_never_starts_a_login(monkeypatch, tmp_path):
+def _main(monkeypatch, tmp_path, argv, profile_error=None):
     import core.broker as broker
 
     class _Client:
         def profile(self):
+            if profile_error:
+                raise profile_error
             return {"user_name": "u", "user_id": "x"}
 
     seen = {}
@@ -165,11 +216,29 @@ def test_cached_session_never_starts_a_login(monkeypatch, tmp_path):
         return _Client()
 
     monkeypatch.setattr(broker, "get_market_client", market)
-    monkeypatch.setattr(broker, "get_trading_client",
-                        lambda *_: pytest.fail("must not log in"))
+    monkeypatch.setattr(broker, "get_trading_client", lambda *_: (
+        _Client() if profile_error else pytest.fail("must not log in")))
     monkeypatch.setattr(broker, "read_broker_name", lambda *_: "kotak")
     monkeypatch.setattr(tc, "resolve_instruments", lambda *a, **k: ([1], {1: "NIFTY 50"}))
     monkeypatch.setattr(tc, "LOG_DIR", tmp_path)
-    monkeypatch.setattr(sys, "argv", ["tick_capture", "--validate", "--cached-session"])
-    assert tc.main() == 0
+    monkeypatch.setattr(sys, "argv", ["tick_capture", "--validate", *argv])
+    return tc.main(), seen
+
+
+def test_a_stale_cached_trade_token_does_not_cost_the_day(monkeypatch, tmp_path):
+    """Kotak quotes use the consumer key only; profile() uses the trade
+    token. A stale cached session must not stop a quote-only capture."""
+    rc, _ = _main(monkeypatch, tmp_path, ["--cached-session"], BrokerTokenError("403"))
+    assert rc == 0
+    # What Kotak actually sent for a day-old token on 2026-10-20.
+    rc, _ = _main(monkeypatch, tmp_path, ["--cached-session"],
+                  BrokerOrderError("invalid session token"))
+    assert rc == 0
+    with pytest.raises(BrokerTokenError):
+        _main(monkeypatch, tmp_path, [], BrokerTokenError("403"))
+
+
+def test_cached_session_never_starts_a_login(monkeypatch, tmp_path):
+    rc, seen = _main(monkeypatch, tmp_path, ["--cached-session"])
+    assert rc == 0
     assert seen == {"cached_only": True}

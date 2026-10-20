@@ -21,8 +21,25 @@ recorder hurting the live pair runner's Kotak session or quote quota.
   - [x] Unit: `--cached-session --poll-seconds 10`, timer 09:08 → 09:15
         (after the runners' logins, at the open).
   - [x] Docs: `docs/data_pipeline/tick_capture.md`, `docs/README.md`.
-  - Kept: the start-up `profile()` check. It needs today's session, which
-    the 09:15 start gives; a stale one should stop the capture loudly.
+- [x] Second review (2026-10-20), all fixed:
+  - [x] Setting keys aside raised and counted toward giving up, so many
+        untraded strikes at the open ended the day. It is now progress:
+        the pass returns what it has and the next pass sets more aside.
+  - [x] The re-check could make one call per set-aside key in a burst.
+        Now up to 5 keys in turn every 60 s, at most 6 calls.
+  - [x] A missing LTP re-requested every batch. Keys go 50 to a call, so
+        only the failing batch is re-requested.
+  - [x] Giving up after 10 failures lost the rest of the day. It now keeps
+        polling and exits 1 at 15:30 if an outage reached 10 passes.
+  - [x] A failed re-check skipped the main pass; separate now.
+  - [x] Re-reading the cached session on a rejected token could not help
+        (quotes use the consumer key); removed.
+  - [x] A stale cached trade token stopped the capture at `profile()`;
+        with `--cached-session` it is a warning now.
+  - [x] Timer 09:15 (+30 s jitter) missed the open; 09:14:00, no jitter.
+  - Not changed: a polling broker other than Kotak that raises a plain
+    `BrokerOrderError` for a missing LTP fails the pass. Groww and Dhan
+    are not wired (`BrokerNotImplementedError`).
 - [ ] Owner review (CODEOWNERS: `core/`, `market_data/`, `deploy/`), then
       schedule the capture.
 
