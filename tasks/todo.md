@@ -41,7 +41,7 @@ So option prices along the 5-minute path must be **modelled**:
       reported as description only.
 - [ ] 5. Report in this file and in a separate research PR.
 
-## Result 2026-10-16 (re-run after review): STOP at step 1, by 0.1 points
+## Result (re-run 2026-10-20 after the second review): STOP at step 1, by 0.1 points
 
 `python -m research.options_breakout` (`research/options_breakout.py`),
 train sessions only. No strategy result was computed. The near-ATM CE and
@@ -50,15 +50,15 @@ contract-days:
 
 | measure | median abs error | median signed | 90th pct abs |
 |---|---|---|---|
-| next-session close | **10.1%** of premium (11.1 points) | −0.5% | 39% |
-| next-session intraday high | 7.0% | −5.2% (−10.1 points) | |
+| next-session close | **10.1%** of premium (11.3 points) | −0.4% | 40% |
+| next-session intraday high | 6.9% | −5.2% (−10.1 points) | |
 
 Close error by days to expiry:
 
 | days to expiry | 1 | 2 | 3 | 4 | 5 | 6 | 7+ |
 |---|---|---|---|---|---|---|---|
-| median abs error | 18.2% | 13.0% | 17.1% | 9.4% | 9.9% | 6.7% | 5.7% |
-| in points | 11.6 | 11.6 | 19.2 | 9.2 | 10.3 | 8.3 | 9.1 |
+| median abs error | 18.8% | 13.0% | 17.1% | 9.4% | 9.9% | 7.0% | 5.9% |
+| in points | 11.6 | 11.6 | 19.2 | 9.2 | 10.3 | 9.4 | 9.1 |
 
 - 10.1% is above the pre-registered 10%, so the run stopped as designed.
   The margin is 0.1 points: the gate decides it, not the evidence. Moving
@@ -79,7 +79,36 @@ expired on the checked day (the strategy never holds one), dropped the
 eve of every futures expiry as well as the expiry day, and priced the
 intraday high at each bar's close instead of its start.
 
-### Review (PR #20), all fixed
+### Second review (2026-10-20), all fixed; verdict unchanged
+
+The 2026-10-16 re-run read 10.1% too (726 pairs); the carry fix below
+moved the by-expiry buckets and the carry median (6.69% → 6.52%) but
+not the overall median.
+
+- [x] The first review's carry fix made it worse: the eve of expiry
+      divides the basis by one day, so 10 points of close-time mismatch
+      read as ~15% annual carry. The futures' last two days now carry the
+      last earlier value.
+- [x] `model_check` chose the expiry before filtering to traded rows,
+      `express` after; both filter first now.
+- [x] More than 5% of index trades unpriced gives verdict UNPRICED
+      instead of scoring the survivors. A validity stop, not a new
+      performance gate.
+- [x] Exits on the option's own expiry day are priced by the model but
+      never checked (the check needs a day left); counted in the summary
+      and stated in the docstring.
+- [x] Max drawdown is measured from the starting zero.
+- [x] `--options-cache` is refused unless its sessions are exactly the
+      archive's.
+- [x] `--accept-short` replaced its default only by appending; passing
+      any now replaces it.
+- [x] The archive is read once for futures and options (the futures rows
+      are identical to the old loader's on all 549 sessions), and the
+      half-spread variants re-cost the priced trades instead of
+      re-simulating.
+- Not done, as before: moving the pricer into `core/greeks_engine.py`.
+
+### First review (PR #20), all fixed
 
 - [x] The stop failed open: a NaN median (nothing comparable) skipped the
       STOP. `model_fails` now treats NaN or no pairs as a failure.

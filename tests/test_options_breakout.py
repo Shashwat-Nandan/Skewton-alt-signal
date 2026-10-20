@@ -4,6 +4,7 @@ contract choice (no 0-DTE), the dated STT, and the stop when the model
 does not match the bhavcopy."""
 from __future__ import annotations
 
+import math
 from datetime import date, datetime
 
 import numpy as np
@@ -92,8 +93,10 @@ def test_no_prior_chain_means_unpriced_not_guessed():
 
 def test_verdict_needs_every_gate():
     base = {"trades": 150, "net_rupees": 1000.0, "sharpe": 0.5, "net_at_cost_stress": 10.0,
-            "windows": [5.0, -1.0, 2.0]}
+            "windows": [5.0, -1.0, 2.0], "unpriced_share": 0.0}
     assert ob.verdict(base) == "PASSES_TRAIN"
+    # Scoring only the trades that could be priced selects on outcome.
+    assert ob.verdict({**base, "unpriced_share": 0.06}) == "UNPRICED"
     for key, bad in (("trades", 99), ("net_rupees", -1.0), ("sharpe", 0.0),
                      ("net_at_cost_stress", -1.0), ("windows", [-1.0, -2.0, -3.0])):
         assert ob.verdict({**base, key: bad}) == "KILL"
@@ -155,17 +158,21 @@ def test_exit_after_the_option_settled_is_unpriced():
                       pd.Series({prior: 0.0})) is None
 
 
-def test_carry_keeps_the_eve_of_expiry_and_carries_over_expiry_day():
-    """Only expiry day (t = 0) has no carry of its own. Dropping the eve too
-    left trades on expiry day and the day after unpriced, every month."""
-    eve, exp, after = date(2025, 6, 25), date(2025, 6, 26), date(2025, 6, 27)
-    front = pd.DataFrame({"date": [eve, exp, after],
-                          "expiry": [exp, exp, date(2025, 7, 31)],
-                          "close": [24710.0, 24700.0, 24800.0]})
-    index_close = pd.Series({eve: 24700.0, exp: 24700.0, after: 24700.0})
+def test_carry_in_the_futures_last_two_days_is_the_earlier_value():
+    """On the eve of expiry t is one day, so 10 points of close-time
+    mismatch read as ~15% annual carry and shift a weekly's forward by tens
+    of points. Those days, and expiry day, carry the last earlier value
+    instead of being dropped (which left trades unpriced every month)."""
+    d3, eve, exp, after = (date(2025, 6, 23), date(2025, 6, 25), date(2025, 6, 26),
+                           date(2025, 6, 27))
+    front = pd.DataFrame({"date": [d3, eve, exp, after],
+                          "expiry": [exp, exp, exp, date(2025, 7, 31)],
+                          "close": [24715.0, 24710.0, 24700.0, 24800.0]})
+    index_close = pd.Series({d3: 24700.0, eve: 24700.0, exp: 24700.0, after: 24700.0})
     carry = ob.carry_by_date(front, index_close)
-    assert list(carry.index) == [eve, exp, after]
-    assert carry[exp] == carry[eve] > 0
+    assert list(carry.index) == [d3, eve, exp, after]
+    assert carry[eve] == carry[exp] == carry[d3]
+    assert carry[d3] == pytest.approx(math.log(24715 / 24700) / (3 / 365))
 
 
 def test_model_check_skips_the_contract_expiring_that_day():
@@ -188,3 +195,58 @@ def test_a_fill_is_priced_at_its_bar_start_not_its_close():
     """``hhmm`` is the bar close; a fill at the bar's open has 5 more
     minutes to expiry than the close stamp implies."""
     assert ob._bar_start(date(2025, 6, 12), 1005) == datetime(2025, 6, 12, 10, 0)
+
+
+def test_model_check_scores_the_expiry_the_strategy_would_trade():
+    """If the nearest expiry did not trade on P, express() moves to the
+    next one; the check must score that one too, not skip the session."""
+    p, d = date(2025, 6, 9), date(2025, 6, 10)
+    rows = []
+    for exp, trades in ((date(2025, 6, 12), 0.0), (date(2025, 6, 19), 10.0)):
+        for day in (p, d):
+            for cp in (1, -1):
+                rows.append({"date": day, "expiry": exp, "strike": 24700.0, "cp": cp,
+                             "close": 150.0, "high": 150.0, "low": 150.0,
+                             "trades": trades, "lot": 75})
+    bars = pd.DataFrame({"date": [p, d, d], "hhmm": [1530, 1000, 1530],
+                         "high": 24700.0, "low": 24700.0, "close": 24700.0})
+    check = ob.model_check(pd.DataFrame(rows), bars, pd.Series({p: 0.0, d: 0.0}), {d})
+    assert set(check["expiry"]) == {date(2025, 6, 19)}
+
+
+def _option_trade(day, net_move, lot=75):
+    return ob.OptionTrade("LONG", day, day, date(2025, 6, 19), 24700.0, 1, 0.15,
+                          100.0, 100.0 + net_move / lot, lot, 0.0, "TIME")
+
+
+def test_drawdown_counts_from_the_starting_zero():
+    days = [date(2025, 6, 2), date(2025, 6, 3), date(2025, 6, 4)]
+    trades = [_option_trade(d, m) for d, m in zip(days, (-500.0, -500.0, 200.0))]
+    assert ob.summarize(trades, days, 0)["max_dd_rupees"] == pytest.approx(1000.0)
+
+
+def test_recost_moves_only_the_spread():
+    days = [date(2025, 6, 2)]
+    base = ob.summarize([_option_trade(days[0], 300.0)], days, 0)
+    base["_trades"] = [_option_trade(days[0], 300.0)]
+    wide = ob.recost(base, days, 1.0)
+    narrow = ob.recost(base, days, 0.0)
+    assert wide["cost_rupees"] - narrow["cost_rupees"] == pytest.approx(2 * 1.0 * 75)
+    assert wide["gross_rupees"] == narrow["gross_rupees"] == pytest.approx(300.0)
+
+
+def test_a_stale_options_cache_is_refused(tmp_path):
+    for day in ("20250602", "20250603"):
+        (tmp_path / f"bhavcopy_fo_{day}.csv").write_text("x\n")
+    cached = pd.DataFrame({"date": [date(2025, 6, 2)]})
+    with pytest.raises(RuntimeError, match="does not match"):
+        ob.check_options_cache(cached, tmp_path)
+    ob.check_options_cache(pd.DataFrame({"date": [date(2025, 6, 2), date(2025, 6, 3)]}),
+                           tmp_path)
+
+
+def test_accept_short_replaces_its_default_instead_of_adding_to_it():
+    """append onto a non-empty default can never drop 2025-01-31, so a run
+    meant to refuse that short session would accept it anyway."""
+    assert ob.parse_args([]).accept_short == [date(2025, 1, 31)]
+    assert ob.parse_args(["--accept-short", "2025-03-03"]).accept_short == [date(2025, 3, 3)]
