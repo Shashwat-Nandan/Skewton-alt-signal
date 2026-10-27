@@ -21,7 +21,9 @@
 # unit sets RestartMode=direct, so it only reaches `failed` terminally and this
 # fires exactly at the hard-stop. Without it, systemd runs OnFailure= on every
 # crash, even one it is about to restart, and a single transient error froze
-# the day (2026-10-27). Invoked via pair-live-halt-on-failure.service; reads TELEGRAM_*
+# the day (2026-10-27). A single crash is handled by
+# pair-live-crash-alert.sh (ExecStopPost=): it pages, and latches in market
+# hours. Invoked via pair-live-halt-on-failure.service; reads TELEGRAM_*
 # from .env via that unit's EnvironmentFile, curl output discarded so no secret
 # reaches stdout/journal.
 set -eu

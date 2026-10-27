@@ -13,7 +13,9 @@ After=redis-server.service
 # Two OnFailure handlers, both fire on the terminal `failed` state only, which
 # needs RestartMode=direct below: notify-failure@ pages the generic failure;
 # pair-live-halt-on-failure latches HALT_ALL so the next start FREEZES instead
-# of blindly resuming real-money trading on the crash-looped state.
+# of blindly resuming real-money trading on the crash-looped state. Single
+# crashes are handled by ExecStopPost= (pair-live-crash-alert.sh): every one
+# pages, and one in market hours also latches HALT_ALL.
 OnFailure=notify-failure@%n.service pair-live-halt-on-failure.service
 # Mutual exclusion with the paper persistent unit: both reuse --system
 # persistent (same fcntl lock) and the same 09:12 slot. Conflicts= makes systemd
@@ -42,6 +44,7 @@ WorkingDirectory=/opt/taleb-karpathy-kite
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
 EnvironmentFile=/opt/taleb-karpathy-kite/.env
+Environment=PROJECT_DIR=/opt/taleb-karpathy-kite
 # LIVE cutover of the persistence-screened pair runner (cutover 2026-06-08;
 # see deploy/VPS_DEPLOYMENT.md §7.10 and tasks/todo.md 2026-06-07). This unit
 # REPLACES pair-paper-persistent.service while live: it reuses --system
@@ -101,8 +104,15 @@ RestartSec=30
 # error latched HALT_ALL and froze the restarted runner for the day
 # (2026-10-08 x3; 2026-10-27, a Kotak read timeout at start-up). direct skips
 # OnFailure= for auto-restarts; the 6th start in the hour still hits the start
-# limit, reaches `failed` and latches. Needs systemd >= 254 (host: 255).
+# limit, reaches `failed` and latches. Needs systemd >= 254 (host: 255); older
+# systemd ignores the key with only a warning, so check after install:
+#   systemctl show pair-paper-persistent-live.service -p RestartMode   # =direct
 RestartMode=direct
+# direct also skips OnFailure='s page, so this pages on every crash and, in
+# market hours (09:15-15:30 IST), latches HALT_ALL: a mid-session crash with
+# open legs freezes for an operator; a start-up failure before the open
+# restarts. Runs under direct too. "-": its own failure never fails the unit.
+ExecStopPost=-/opt/taleb-karpathy-kite/deploy/pair-live-crash-alert.sh
 # Operator stop/restart sends SIGTERM; the runner's handler converts it to
 # KeyboardInterrupt, persists state, and exits 130. Without this, systemd
 # marks that graceful teardown 'failed' and OnFailure= latches HALT_ALL —
