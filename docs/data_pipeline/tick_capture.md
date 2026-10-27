@@ -132,7 +132,8 @@ one record per instrument per pass (`"feed": "kotak_quote"`). Kotak's
 quote fails the whole call when one instrument has no LTP and names it
 (`BrokerQuoteMissingError`):
 
-- Keys are quoted 50 to a request (Kotak's batch size), so a missing
+- Keys are quoted 40 to a request (`QUOTE_MAX_SYMBOLS`; Kotak rejects
+  50 with HTTP 400 and accepts 49), so a missing
   LTP re-requests only its own batch, without that instrument. Each
   pass spends at most 5 such extra calls; a batch still failing after
   that waits for the next pass. Setting instruments aside is progress,

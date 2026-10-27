@@ -71,14 +71,14 @@ def test_a_dead_strike_costs_one_extra_call_once_not_every_pass():
 
 
 def test_a_dead_strike_re_requests_only_its_own_batch():
-    """Kotak quotes 50 keys a request and fails the whole call on one
+    """Kotak quotes QUOTE_BATCH keys a request and fails the whole call on one
     missing LTP. Batching here means the batches that came back are not
     fetched again."""
     pairs = [(i, f"NFO:K{i}") for i in range(120)]
     client = _Quotes(missing={"NFO:K110"})
     rows = tc._poll_quotes(client, pairs, set())
     assert len(rows) == 119
-    assert client.calls == 3 + 1
+    assert client.calls == -(-120 // tc.QUOTE_BATCH) + 1
 
 
 def test_setting_many_keys_aside_is_progress_not_a_failed_pass():
@@ -89,8 +89,8 @@ def test_setting_many_keys_aside_is_progress_not_a_failed_pass():
     healthy = [(100 + i, f"NFO:OK{i}") for i in range(60)]
     client = _Quotes(missing={key for _, key in PAIRS})
     dead = set()
-    rows = tc._poll_quotes(client, PAIRS + healthy, dead)   # batches of 50 and 18
-    assert len(rows) == 18        # the first batch waits for the next pass
+    rows = tc._poll_quotes(client, PAIRS + healthy, dead)   # batches of 40 and 28
+    assert len(rows) == 28        # the first batch waits for the next pass
     assert len(dead) == tc.MAX_NEW_DEAD_PER_PASS
     calls = client.calls
     rows = tc._poll_quotes(client, PAIRS + healthy, dead)

@@ -59,6 +59,11 @@ from .mapping import (
 logger = logging.getLogger(__name__)
 
 
+# Symbols per Quotes API request. Kotak rejects 50 with HTTP 400 "Please
+# set the Neo symbol max value to 50" and accepts 49 (probed 2026-10-27);
+# 40 leaves headroom. 50 here failed every tick-capture pass for a week.
+QUOTE_MAX_SYMBOLS = 40
+
 def _connect_ipv4(host, port, timeout, source_address, socket_options):
     """Open a TCP socket to an IPv4 address of `host`.
 
@@ -571,8 +576,8 @@ class KotakNeoClient:
             seg, token = self._quote_identity(exchange, symbol)
             identities.append((key, seg, token))
         out: Dict[str, dict] = {}
-        for i in range(0, len(identities), 50):
-            batch = identities[i:i + 50]
+        for i in range(0, len(identities), QUOTE_MAX_SYMBOLS):
+            batch = identities[i:i + QUOTE_MAX_SYMBOLS]
             joined = ",".join(f"{seg}|{tok}" for _, seg, tok in batch)
             path = _PATHS["quotes"].format(
                 neo_symbols=urlquote(joined, safe="|,"),

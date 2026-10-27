@@ -42,6 +42,7 @@ from datetime import time as dtime
 from pathlib import Path
 
 from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError, BrokerTokenError
+from core.broker.kotak import QUOTE_MAX_SYMBOLS
 
 IST = timezone(timedelta(hours=5, minutes=30))
 REPO = Path(__file__).resolve().parent.parent
@@ -52,7 +53,7 @@ FAILURE_BACKOFF_S = 60.0
 MAX_CONSECUTIVE_FAILURES = 10   # an outage this long fails the day (exit 1 at 15:30)
 MAX_NEW_DEAD_PER_PASS = 5       # extra quote calls a pass may spend setting keys aside
 REPROBE_S = 60.0                # one re-check of up to MAX_NEW_DEAD_PER_PASS set-aside keys
-QUOTE_BATCH = 50                # Kotak's keys per quote request
+QUOTE_BATCH = QUOTE_MAX_SYMBOLS  # Kotak's keys per quote request
 STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100}
 SPOT_DISPLAY_SYMBOLS = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
 

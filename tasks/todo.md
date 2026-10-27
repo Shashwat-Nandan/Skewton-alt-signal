@@ -27,7 +27,7 @@ recorder hurting the live pair runner's Kotak session or quote quota.
         the pass returns what it has and the next pass sets more aside.
   - [x] The re-check could make one call per set-aside key in a burst.
         Now up to 5 keys in turn every 60 s, at most 6 calls.
-  - [x] A missing LTP re-requested every batch. Keys go 50 to a call, so
+  - [x] A missing LTP re-requested every batch. Keys go 40 to a call, so
         only the failing batch is re-requested.
   - [x] Giving up after 10 failures lost the rest of the day. It now keeps
         polling and exits 1 at 15:30 if an outage reached 10 passes.
@@ -40,8 +40,14 @@ recorder hurting the live pair runner's Kotak session or quote quota.
   - Not changed: a polling broker other than Kotak that raises a plain
     `BrokerOrderError` for a missing LTP fails the pass. Groww and Dhan
     are not wired (`BrokerNotImplementedError`).
-- [ ] Owner review (CODEOWNERS: `core/`, `market_data/`, `deploy/`), then
-      schedule the capture.
+- [x] 2026-10-27: the capture recorded nothing 20–27 Oct; every pass got
+      HTTP 400. Kotak rejects 50 symbols a quote request ("Please set the
+      Neo symbol max value to 50"; 49 is accepted). The adapter and the
+      recorder both sent 50. Now `QUOTE_MAX_SYMBOLS = 40` in
+      `core/broker/kotak.py`, used by both. A real read-only pass after the
+      close quoted 102/102 instruments. The pair runner quotes fewer than 50
+      futures, so it never hit this.
+- [ ] Owner review (CODEOWNERS: `core/`, `market_data/`, `deploy/`).
 
 # Dispersion dashboard page + second review — 2026-10-02
 
