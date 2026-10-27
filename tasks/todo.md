@@ -1,3 +1,54 @@
+# Tick capture on Kotak, read-only beside the live runner — 2026-10-16
+
+Goal: record NIFTY option quotes (PR #20 needs a real tape) without the
+recorder hurting the live pair runner's Kotak session or quote quota.
+
+- [x] `--cached-session`: never log in (a fresh login replaces the
+      runners' token). `--poll-seconds` (unit: 10).
+- [x] Review (PR #21), all fixed:
+  - [x] One instrument with no LTP made `_poll_quotes` bisect the batch
+        every pass (~14 calls for 102 keys). Kotak now raises
+        `BrokerQuoteMissingError(key)`, a `BrokerOrderError` subclass so
+        the pair runner is unchanged; the recorder sets that key aside
+        (one extra call, once), re-tries it every 5 min, and fails the
+        pass past 5 new ones.
+  - [x] Any other `BrokerOrderError` (a 4xx or Not_Ok throttle) no longer
+        splits: one call, then back-off.
+  - [x] 10 failed passes in a row, or no records, exits 1 (it retried to
+        15:30 and exited 0).
+  - [x] Back-off doubles from `--poll-seconds` to 60 s and stops at 15:30.
+  - [x] A rejected token re-reads the cached session file.
+  - [x] Unit: `--cached-session --poll-seconds 10`, timer 09:08 → 09:15
+        (after the runners' logins, at the open).
+  - [x] Docs: `docs/data_pipeline/tick_capture.md`, `docs/README.md`.
+- [x] Second review (2026-10-20), all fixed:
+  - [x] Setting keys aside raised and counted toward giving up, so many
+        untraded strikes at the open ended the day. It is now progress:
+        the pass returns what it has and the next pass sets more aside.
+  - [x] The re-check could make one call per set-aside key in a burst.
+        Now up to 5 keys in turn every 60 s, at most 6 calls.
+  - [x] A missing LTP re-requested every batch. Keys go 40 to a call, so
+        only the failing batch is re-requested.
+  - [x] Giving up after 10 failures lost the rest of the day. It now keeps
+        polling and exits 1 at 15:30 if an outage reached 10 passes.
+  - [x] A failed re-check skipped the main pass; separate now.
+  - [x] Re-reading the cached session on a rejected token could not help
+        (quotes use the consumer key); removed.
+  - [x] A stale cached trade token stopped the capture at `profile()`;
+        with `--cached-session` it is a warning now.
+  - [x] Timer 09:15 (+30 s jitter) missed the open; 09:14:00, no jitter.
+  - Not changed: a polling broker other than Kotak that raises a plain
+    `BrokerOrderError` for a missing LTP fails the pass. Groww and Dhan
+    are not wired (`BrokerNotImplementedError`).
+- [x] 2026-10-27: the capture recorded nothing 20–27 Oct; every pass got
+      HTTP 400. Kotak rejects 50 symbols a quote request ("Please set the
+      Neo symbol max value to 50"; 49 is accepted). The adapter and the
+      recorder both sent 50. Now `QUOTE_MAX_SYMBOLS = 40` in
+      `core/broker/kotak.py`, used by both. A real read-only pass after the
+      close quoted 102/102 instruments. The pair runner quotes fewer than 50
+      futures, so it never hit this.
+- [ ] Owner review (CODEOWNERS: `core/`, `market_data/`, `deploy/`).
+
 # Dispersion dashboard page + second review — 2026-10-02
 
 - [x] `GET /api/dispersion-paper` (read-only, session-gated): each book's
