@@ -10,10 +10,10 @@ After=network-online.target
 # file on a later startup), so this dep is a nicety, not a hard requirement.
 Wants=redis-server.service
 After=redis-server.service
-# Two OnFailure handlers, both fire on the terminal `failed` state (a single
-# crash auto-restarts and never reaches here): notify-failure@ pages the generic
-# failure; pair-live-halt-on-failure latches HALT_ALL so the next start FREEZES
-# instead of blindly resuming real-money trading on the crash-looped state.
+# Two OnFailure handlers, both fire on the terminal `failed` state only, which
+# needs RestartMode=direct below: notify-failure@ pages the generic failure;
+# pair-live-halt-on-failure latches HALT_ALL so the next start FREEZES instead
+# of blindly resuming real-money trading on the crash-looped state.
 OnFailure=notify-failure@%n.service pair-live-halt-on-failure.service
 # Mutual exclusion with the paper persistent unit: both reuse --system
 # persistent (same fcntl lock) and the same 09:12 slot. Conflicts= makes systemd
@@ -96,6 +96,13 @@ ExecStart=/opt/taleb-karpathy-kite/.venv/bin/python -m runners.run_paper_pairs \
 
 Restart=on-failure
 RestartSec=30
+# Without this, systemd (normal mode, the default) passes through `failed` on
+# EVERY crash and runs OnFailure= before the auto-restart, so one transient
+# error latched HALT_ALL and froze the restarted runner for the day
+# (2026-10-08 x3; 2026-10-27, a Kotak read timeout at start-up). direct skips
+# OnFailure= for auto-restarts; the 6th start in the hour still hits the start
+# limit, reaches `failed` and latches. Needs systemd >= 254 (host: 255).
+RestartMode=direct
 # Operator stop/restart sends SIGTERM; the runner's handler converts it to
 # KeyboardInterrupt, persists state, and exits 130. Without this, systemd
 # marks that graceful teardown 'failed' and OnFailure= latches HALT_ALL —

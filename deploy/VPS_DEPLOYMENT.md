@@ -1057,11 +1057,17 @@ runner's mode — and the paper runner will hide them from the dashboard.
 
 **What is wired** (live unit `pair-paper-persistent-live.service`):
 
-- `Restart=on-failure` + `StartLimitIntervalSec=3600`, `StartLimitBurst=5`. A
-  *single* crash auto-restarts and re-reconciles (`auto-restart` state — no
+- `Restart=on-failure` + `RestartMode=direct` + `StartLimitIntervalSec=3600`,
+  `StartLimitBurst=5`. A *single* crash auto-restarts and re-reconciles (no
   alert). Only a **sustained** loop (the 6th start within the hour, ~30–40 min
   given the ~6-min screening per attempt) or a non-recoverable terminal exit
   reaches systemd's terminal `failed` state.
+- `RestartMode=direct` (systemd ≥ 254) is what makes that true. In the default
+  `normal` mode systemd passes through `failed` on every crash and runs
+  `OnFailure=` before restarting, so one transient error latched `HALT_ALL`
+  and the restarted runner sat frozen all day (2026-10-08 three times;
+  2026-10-27, a Kotak read timeout at start-up). The journal shows it as
+  `Triggering OnFailure=` followed by `Scheduled restart job`.
 - Two `OnFailure=` handlers, which fire **only** on that terminal `failed`
   state:
   1. `notify-failure@%n.service` — Telegram page with the unit's last log lines
@@ -1141,6 +1147,15 @@ fire-drill once after any change to the live unit, its `StartLimit*`, or the
 
    On your phone, confirm **two** Telegrams: the `notify-failure@` "ALERT … failed"
    page, and the "🛑 LIVE pair runner HARD-STOPPED …" latch message.
+
+   Then confirm the first crash did **not** fire the handlers (the
+   `RestartMode=direct` check): with `StartLimitBurst=2` there were two
+   starts, and exactly one `Triggering OnFailure=`, after the limit tripped.
+
+   ```bash
+   journalctl -u pair-paper-persistent-live.service --since "2 min ago" --no-pager \
+     | grep -c 'Triggering OnFailure='    # want 1; 2 means auto-restarts still latch HALT_ALL
+   ```
 
 5. **Clean up — mandatory, every line:**
 
