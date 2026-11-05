@@ -298,6 +298,10 @@ class PairTradingStrategy(BaseStrategy):
 
     name = "pair_trading"
 
+    # False for a pair held over but no longer a candidate: manage it to exit,
+    # never open it again (build_orphan_strategies).
+    allow_new_entries: bool = True
+
     def __init__(
         self,
         client,
@@ -563,6 +567,8 @@ class PairTradingStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         if self.state.position != "FLAT":
+            return []
+        if not self.allow_new_entries:
             return []
         # Naked-leg latch: never open a new spread on top of a stray leg.
         if self.state.unwind_pending or self.state.legs:

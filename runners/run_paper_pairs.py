@@ -1034,8 +1034,9 @@ def build_orphan_strategies(
     be orphaned when the screener drops the pair — no one would manage it to
     exit.
 
-    Orphans use the saved hedge_ratio and the saved state; they don't get
-    new entries because their position is already open."""
+    Orphans use the saved hedge_ratio and the saved state. They never get new
+    entries, including after their position closes mid-session: a pair the
+    screen dropped is not a candidate."""
     from strategies.pair_trading import PairTradingStrategy
     orphans = []
     for key, blob in prior_state.items():
@@ -1063,6 +1064,7 @@ def build_orphan_strategies(
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
             s.signal_system_tag = args.system
+            s.allow_new_entries = False
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z

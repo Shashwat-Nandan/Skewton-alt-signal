@@ -99,8 +99,12 @@ Default baseline floor:
 - `half-life ∈ [0, 30]` days (mean-reverts within a month)
 - `spread_vol_pct ≥ 1.0` (enough spread to trade through costs)
 
+Candidate gate (both CSVs, owner decision 2026-11-05): a row with `β ≤ 0` or
+`corr < 0.75` is not written, and the runner refuses one from an older CSV.
+A held pair that fails it is managed to exit and not re-entered.
+
 Persistent floor (stricter):
-- `corr ≥ 0.65`
+- `corr ≥ 0.75`
 - `half-life ≤ 5.0d`
 - `pvalue ≤ 0.025`
 
@@ -171,7 +175,8 @@ Structured per-pair drift report (see Verifier section above).
 | Cointegration p-value | ≤ 0.05 | ≤ 0.025 |
 | Half-life | (0, 30d) | ≤ 5d |
 | Spread vol % | ≥ 1.0 | (inherited) |
-| Pearson correlation | (no floor) | ≥ 0.65 |
+| Pearson correlation | ≥ 0.75 | ≥ 0.75 |
+| Hedge ratio β | > 0 | > 0 |
 | Top-N cap | 12 | 12 (often only 1–3 survive) |
 
 The persistent floor is intentionally tight so it admits only

@@ -665,6 +665,10 @@ def screen_pairs_persistent(
     # stats). Persistence is a separate admission filter, not a rank component —
     # the runner's classify_pair_candidates does its own composite rerank, and
     # we want the downstream code to see a familiar shape.
+    df = drop_untradeable_candidates(df)
+    if df.empty:
+        logger.warning("No persistent pair has β > 0 and corr >= %.2f", QUALITY_MIN_CORR)
+        return df
     df["rank_score"] = _composite_rank(df)
     df = df.sort_values("rank_score").reset_index(drop=True)
 
@@ -758,8 +762,15 @@ def main():
             min_hedge_ratio=args.min_hedge_ratio,
             max_hedge_ratio=args.max_hedge_ratio,
         )
+        # Before the rank, as in screen_pairs_persistent, so percentile
+        # scores are over the rows that are actually candidates.
+        df = drop_untradeable_candidates(df)
+        if not df.empty:
+            df["rank_score"] = _composite_rank(df)
+            df = df.sort_values("rank_score").reset_index(drop=True)
 
     if df.empty:
+        logger.warning("No candidates; %s left unchanged", args.output)
         return 0
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -800,10 +811,11 @@ if __name__ == "__main__":
 
 # Quality floor — pairs below any of these may be statistically cointegrated
 # but are economically untradeable: half-life longer than max_holding_days
-# rules out reversion in window; correlation below 0.65 means the relationship
-# is too weak to anchor the spread; p above 0.025 (tighter than the screener's
-# default 0.05) cuts the false-positive rate across a multi-pair book.
-QUALITY_MIN_CORR = 0.65
+# rules out reversion in window; correlation below 0.75 means the relationship
+# is too weak to anchor the spread (owner decision 2026-11-05, was 0.65); p above
+# 0.025 (tighter than the screener's default 0.05) cuts the false-positive rate
+# across a multi-pair book.
+QUALITY_MIN_CORR = 0.75
 QUALITY_MAX_HALFLIFE = 5.0   # days
 QUALITY_MAX_PVALUE = 0.025
 
@@ -811,6 +823,29 @@ QUALITY_MAX_PVALUE = 0.025
 # many pairs in the book. Prevents one stock's idiosyncratic move from
 # driving multiple positions' P&L in the same direction.
 LEG_CONCENTRATION_CAP = 2
+
+
+def drop_untradeable_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows pair trading must never see: a negative hedge ratio, or
+    correlation below QUALITY_MIN_CORR (owner decision 2026-11-05).
+
+    Applied to the final candidate rows, not inside screen_pairs(): each
+    rolling window of the persistence test keeps its own `min_correlation`
+    prefilter, so this does not change what "persistent" means. `correlation`
+    is |corr| of prices, but OLS β and corr share a sign on one window, so
+    β > 0 and |corr| >= floor is signed corr >= floor. NaN is dropped."""
+    if df.empty:
+        return df
+    beta = pd.to_numeric(df["hedge_ratio"], errors="coerce")
+    corr = pd.to_numeric(df["correlation"], errors="coerce")
+    keep = (beta > 0) & (corr >= QUALITY_MIN_CORR)
+    if not keep.all():
+        logger.info(
+            "Candidate gate (β > 0, corr >= %.2f) dropped %d of %d: %s",
+            QUALITY_MIN_CORR, int((~keep).sum()), len(df),
+            ", ".join(f"{a}/{b}" for a, b in zip(df.loc[~keep, "symbol_a"],
+                                                 df.loc[~keep, "symbol_b"])))
+    return df[keep].reset_index(drop=True)
 
 
 def classify_pair_candidates(
@@ -831,7 +866,7 @@ def classify_pair_candidates(
          excluded/β/quality before scoring).
       - `processing_rank`: 1..N admit order (NaN if not admitted).
       - `skip_reason`: '' for admitted, otherwise one of {'excluded', 'beta',
-         'quality', 'leg_cap', 'cutoff'}.
+         'quality', 'leg_cap', 'cutoff'}. 'beta' covers a negative hedge ratio.
 
     Optional rule overrides (defaults preserve live runner behavior):
       - `exclude_symbols`: skip any pair where either leg is in this set
@@ -888,16 +923,19 @@ def classify_pair_candidates(
     else:
         excluded_mask = pd.Series(False, index=out.index)
 
+    # A CSV written before the candidate gate, or by hand, can still hold a
+    # negative β: refuse it here too, since this is what the runner trades from.
     abs_beta = out["hedge_ratio"].abs()
     beta_mask = (
         ~excluded_mask
+        & (out["hedge_ratio"] > 0)
         & (abs_beta >= HEDGE_RATIO_MIN)
         & (abs_beta <= beta_upper)
     )
     beta_dropped = ~excluded_mask & ~beta_mask
     out.loc[beta_dropped, "skip_reason"] = "beta"
     if log is not None and beta_dropped.any():
-        log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
+        log.info("Skipped %d candidate(s): β negative or |β| outside [%.2f, %.2f]",
                  int(beta_dropped.sum()), HEDGE_RATIO_MIN, beta_upper)
 
     quality_mask = (
