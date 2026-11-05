@@ -799,10 +799,6 @@ def main():
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 # ──────────────────────────────────────────────────────────
 # Candidate classification (audit 3.8: moved here from run_paper_pairs so
 # backtests/sweeps can import the screen logic without importing the live
@@ -997,3 +993,7 @@ def classify_pair_candidates(
         leg_count[b] = leg_count.get(b, 0) + 1
 
     return out
+
+
+if __name__ == "__main__":
+    sys.exit(main())

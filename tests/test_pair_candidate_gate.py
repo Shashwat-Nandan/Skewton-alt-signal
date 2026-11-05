@@ -6,6 +6,8 @@ alone leaves a door open: the screen's output, the runner's selection from
 an older CSV, and a held pair that closes mid-session and could re-enter."""
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -131,3 +133,12 @@ def test_build_orphan_strategies_blocks_entries(monkeypatch):
     assert [s.symbol_a for s in orphans] == ["KOTAKBANK"]
     assert orphans[0].hedge_ratio == -0.123       # still managed on its saved β
     assert orphans[0].allow_new_entries is False
+
+
+def test_the_module_entry_point_comes_after_everything_main_needs():
+    """`python -m core.screen_pairs` is how the nightly screen runs. A guard
+    above a helper main() calls raises NameError at run time, though every
+    test that imports the module first still passes."""
+    tree = ast.parse(Path(sp.__file__).read_text())
+    last = tree.body[-1]
+    assert isinstance(last, ast.If) and "__name__" in ast.unparse(last.test)
