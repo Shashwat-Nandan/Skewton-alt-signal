@@ -37,6 +37,8 @@ import re
 import signal
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -419,13 +421,36 @@ def pair_id(a: str, b: str) -> frozenset:
     return frozenset((a, b))
 
 
+class NoTradeablePairs(RuntimeError):
+    """Selection ran on a current list and no pair passed."""
+
+
+def alert_operator(log: logging.Logger, text: str) -> None:
+    """Best-effort Telegram page; TELEGRAM_* come from the unit's .env. Only the
+    exception's type is logged, because its text can hold the bot-token URL."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        log.warning("Telegram not configured; alert not sent")
+        return
+    try:
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=urllib.parse.urlencode({"chat_id": chat, "text": text}).encode(),
+            timeout=10,
+        ).close()
+    except Exception as e:
+        log.error("Telegram alert failed to send (%s)", type(e).__name__)
+
+
 def select_pairs_or_manage_only(args, log: logging.Logger, *,
                                 seed_leg_count: dict[str, int] | None,
                                 reentry_pairs: set) -> pd.DataFrame:
-    """Today's picks. If selection refuses (CSV missing or stale, no pair
-    passes) and positions are open, start with no picks instead of dying:
-    orphans still get stops and exits, and no new entry opens. Nothing held:
-    the refusal stands, and the failure alert fires."""
+    """Today's picks. If selection refuses and positions are open, start with no
+    picks instead of dying: orphans still get stops and exits, and no new entry
+    opens. With nothing held, an empty list means no trades today (an idle
+    session, not a crash that would latch HALT_ALL); a missing, stale or
+    unreadable list still fails, and that alert fires. Either kept session pages
+    the operator: it can go on for days with nothing else saying so."""
     try:
         return select_pairs(args.top, log,
                             candidates_path=Path(args.candidates),
@@ -433,15 +458,19 @@ def select_pairs_or_manage_only(args, log: logging.Logger, *,
                             max_pvalue=args.quality_max_pvalue,
                             seed_leg_count=seed_leg_count,
                             reentry_pairs=reentry_pairs)
-    except (FileNotFoundError, RuntimeError) as e:
+    # ValueError covers a truncated CSV (pandas' EmptyDataError, ParserError);
+    # KeyError a missing column.
+    except (FileNotFoundError, RuntimeError, ValueError, KeyError) as e:
         held = [key for key, blob in load_prior_state(args.system, log).items()
                 if blob.get("state", {}).get("position", "FLAT") != "FLAT"
                 or blob.get("state", {}).get("legs")]
-        if not held:
+        if not held and not isinstance(e, NoTradeablePairs):
             raise
-        log.critical(
-            "Pair selection refused (%s). MANAGE-ONLY session: no new entries; "
-            "%d held pair(s) keep their exits: %s", e, len(held), ", ".join(held))
+        msg = (f"Pair selection refused ({e}). MANAGE-ONLY session [{args.system}]: "
+               f"no new entries; {len(held)} held pair(s) keep their exits: "
+               f"{', '.join(held) or 'none'}")
+        log.critical(msg)
+        alert_operator(log, msg)
         return pd.DataFrame(columns=["symbol_a", "symbol_b", "hedge_ratio"])
 
 
@@ -475,8 +504,9 @@ def select_pairs(top: int, log: logging.Logger,
     leaving the runner trading on stale hedge ratios. Set to 0 to disable.
 
     `reentry_pairs`, if given, receives `pair_id(a, b)` for each row that passed
-    every filter and was skipped only for --top or the leg cap: a held pair
-    among them may re-enter after closing (build_orphan_strategies).
+    every filter and was skipped only for --top: a held pair among them may
+    re-enter after closing (build_orphan_strategies). A leg_cap row may not, or
+    it would take a symbol past the concentration cap.
     """
     if not candidates_path.exists():
         raise FileNotFoundError(
@@ -531,7 +561,7 @@ def select_pairs(top: int, log: logging.Logger,
         seed_leg_count=seed_leg_count,
     )
     if reentry_pairs is not None:
-        ranked_out = annotated[annotated["skip_reason"].isin(["cutoff", "leg_cap"])]
+        ranked_out = annotated[annotated["skip_reason"] == "cutoff"]
         reentry_pairs.update(pair_id(a, b) for a, b in
                              zip(ranked_out["symbol_a"], ranked_out["symbol_b"]))
     picks = (
@@ -542,7 +572,7 @@ def select_pairs(top: int, log: logging.Logger,
     )
 
     if picks.empty:
-        raise RuntimeError(
+        raise NoTradeablePairs(
             "No tradeable pairs after β + quality + concentration filters")
     if len(picks) < top:
         log.warning("Selected only %d of %d requested pairs "
@@ -1916,6 +1946,10 @@ def main():
         # The broker answered: a leftover unreadable-broker halt from an
         # earlier session no longer applies.
         clear_broker_unreadable_halt(log, broker_unreadable_halt_path(args.system))
+
+    if not strategies:
+        log.warning("No pairs to trade or manage today; the broker book matches. Exiting.")
+        return 0
 
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)

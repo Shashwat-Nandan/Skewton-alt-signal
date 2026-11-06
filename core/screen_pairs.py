@@ -762,16 +762,31 @@ def main():
         )
         df = drop_untradeable_candidates(df)
 
+    # Replace in one step: a crash mid-write must not leave a truncated list.
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    def write_list() -> None:
+        tmp = output.with_name(output.name + ".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(output)
+
     if df.empty:
-        # The old file stays on disk either way. Persistent is the last step of
-        # the screen scripts and the live book's list, so it fails loud. Baseline
-        # runs first under `set -e`: exit 1 there would stop the live list
-        # refreshing over a paper-only result.
-        logger.error("No candidates; %s left unchanged", args.output)
+        # The gate rejected every row (they carry columns): write the empty
+        # list, or yesterday's rows, which today's data rejects, stay tradeable
+        # until the age limit. No columns means the screen could not judge
+        # (archive too shallow, nothing cointegrated): the old file stays.
+        if len(df.columns):
+            write_list()
+            logger.error("No pair passes the gate; wrote an empty %s", output)
+        else:
+            logger.error("Screen produced nothing; %s left unchanged", output)
+        # Persistent is the last step of the screen scripts and the live book's
+        # list, so it fails loud. Baseline runs first under `set -e`: exit 1
+        # there would stop the live list refreshing over a paper-only result.
         return 1 if args.persistence_min is not None else 0
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.output, index=False)
+    write_list()
     logger.info("Wrote %d candidates to %s", len(df), args.output)
 
     has_persistence = "persistence_count" in df.columns

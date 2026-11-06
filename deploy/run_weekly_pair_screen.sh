@@ -43,10 +43,10 @@ PY="$PROJECT_DIR/.venv/bin/python"
 
   echo
   # Persistence screen: only admits pairs that pass p<0.05 in ≥2 rolling
-  # 130d windows AND in the most recent one. With no candidates (archive too
-  # shallow, or the owner's β/correlation gate drops every row) the screener
-  # logs an error, exits 1 and leaves the old CSV; past the age limit the
-  # runner starts manage-only. See tasks/todo.md (2026-05-17, 2026-11-06).
+  # 130d windows AND in the most recent one. With no candidates the screener
+  # logs an error and exits 1: an empty CSV if the owner's β/correlation gate
+  # dropped every row; the old CSV if the archive is too shallow to judge. See
+  # tasks/todo.md (2026-05-17, 2026-11-06).
   echo "[3/3] Screening cointegrated pairs (persistent: ≥2 of N windows)..."
   "$PY" -m core.screen_pairs \
       --persistence-min 2 \

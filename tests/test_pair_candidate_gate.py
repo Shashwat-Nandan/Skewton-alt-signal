@@ -155,40 +155,87 @@ def _select(tmp_path, rows, top):
     return r, picks, out
 
 
-def test_only_rows_skipped_by_ranking_may_re_enter(tmp_path):
-    """A row the quality filters refused (half-life, p-value) must not get back
-    in through the orphan path, outside the floor, --top and the leg cap."""
-    rows = [_row("TOP", "ONE"), _row("NEXT", "TWO"),
-            {**_row("SLOW", "HL"), "half_life_days": 12.0},
-            _row("NEG", "BETA", beta=-1.0), _row("WEAK", "CORR", corr=0.7)]
-    r, picks, out = _select(tmp_path, rows, top=1)
-    assert len(picks) == 1
-    assert len(out) == 1
-    assert out < {r.pair_id("TOP", "ONE"), r.pair_id("NEXT", "TWO")}
+def test_only_rows_skipped_by_the_cutoff_may_re_enter(tmp_path):
+    """A row the quality filters refused, or one at the leg cap, must not get
+    back in through the orphan path, past the floor or the concentration cap."""
+    ranked = [("AAA", "BBB"), ("AAA", "CCC"), ("AAA", "DDD"), ("EEE", "FFF"), ("GGG", "HHH")]
+    rows = [{**_row(a, b), "coint_pvalue": 0.001 * (i + 1), "half_life_days": 1.0 + i,
+             "spread_vol_pct": 10.0 - i, "correlation": 0.95 - 0.01 * i}
+            for i, (a, b) in enumerate(ranked)]
+    rows += [{**_row("SLOW", "HL"), "half_life_days": 12.0},
+             _row("NEG", "BETA", beta=-1.0), _row("WEAK", "CORR", corr=0.7)]
+    r, picks, out = _select(tmp_path, rows, top=3)
+    # AAA is at its cap of 2 after BBB and CCC, so DDD is leg_cap; FFF fills --top.
+    assert list(picks["symbol_b"]) == ["BBB", "CCC", "FFF"]
+    assert out == {r.pair_id("GGG", "HHH")}
 
 
-def _manage_only(monkeypatch, tmp_path, prior):
+def _manage_only(monkeypatch, tmp_path, prior, csv_text=None):
     import logging
 
     import runners.run_paper_pairs as r
+    alerts = []
     monkeypatch.setattr(r, "load_prior_state", lambda *a: prior)
-    args = SimpleNamespace(top=3, candidates=str(tmp_path / "missing.csv"), max_csv_age_days=4,
+    monkeypatch.setattr(r, "alert_operator", lambda log, text: alerts.append(text))
+    path = tmp_path / "c.csv"
+    if csv_text is not None:
+        path.write_text(csv_text)
+    args = SimpleNamespace(top=3, candidates=str(path), max_csv_age_days=0,
                            quality_max_pvalue=None, system="persistent")
-    return r.select_pairs_or_manage_only(args, logging.getLogger("t"), seed_leg_count=None,
-                                         reentry_pairs=set())
+    picks = r.select_pairs_or_manage_only(args, logging.getLogger("t"), seed_leg_count=None,
+                                          reentry_pairs=set())
+    return picks, alerts
 
 
-def test_a_refused_selection_still_manages_open_positions(monkeypatch, tmp_path):
-    """Dying here leaves held live pairs with no stop and no exit."""
-    held = {"A/B": {"state": {"position": "LONG_SPREAD", "legs": [1, 2]}}}
-    picks = _manage_only(monkeypatch, tmp_path, held)
+_HELD = {"A/B": {"state": {"position": "LONG_SPREAD", "legs": [1, 2]}}}
+_FLAT = {"A/B": {"state": {"position": "FLAT", "legs": []}}}
+_EMPTY_LIST = ("symbol_a,symbol_b,correlation,hedge_ratio,coint_pvalue,half_life_days,"
+               "spread_vol_pct,last_data_date\n")
+
+
+@pytest.mark.parametrize("csv_text", [None, "", "symbol_a,symbol_b\nA,B\n", _EMPTY_LIST],
+                         ids=["missing", "truncated-to-nothing", "missing-columns", "empty-list"])
+def test_a_refused_selection_still_manages_open_positions_and_pages(monkeypatch, tmp_path, csv_text):
+    """Dying here leaves held live pairs with no stop and no exit. A quiet log
+    line would leave the book idle for days with nobody told."""
+    picks, alerts = _manage_only(monkeypatch, tmp_path, _HELD, csv_text)
     assert picks.empty and {"symbol_a", "symbol_b"} <= set(picks.columns)
+    assert len(alerts) == 1 and "MANAGE-ONLY" in alerts[0]
 
 
-def test_a_refused_selection_with_nothing_held_still_fails_loud(monkeypatch, tmp_path):
-    flat = {"A/B": {"state": {"position": "FLAT", "legs": []}}}
+def test_an_empty_list_with_nothing_held_is_an_idle_day_not_a_crash(monkeypatch, tmp_path):
+    """A crash here would latch HALT_ALL over a legitimately empty list."""
+    picks, alerts = _manage_only(monkeypatch, tmp_path, _FLAT, _EMPTY_LIST)
+    assert picks.empty and len(alerts) == 1
+
+
+def test_a_missing_list_with_nothing_held_still_fails_loud(monkeypatch, tmp_path):
     with pytest.raises(FileNotFoundError):
-        _manage_only(monkeypatch, tmp_path, flat)
+        _manage_only(monkeypatch, tmp_path, _FLAT)
+
+
+def test_the_alert_never_logs_the_bot_token(monkeypatch, caplog):
+    import logging
+
+    import runners.run_paper_pairs as r
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "SECRET-TOKEN")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
+
+    def boom(url, **k):
+        raise OSError(f"failed: {url}")
+
+    monkeypatch.setattr(r.urllib.request, "urlopen", boom)
+    r.alert_operator(logging.getLogger("t"), "x")
+    assert "SECRET-TOKEN" not in caplog.text and "OSError" in caplog.text
+
+
+def test_a_nan_hedge_ratio_fails_closed():
+    stub = SimpleNamespace(
+        allow_new_entries=True, hedge_ratio=float("nan"), symbol_a="A", symbol_b="B",
+        state=SimpleNamespace(position="FLAT", unwind_pending=False, legs=[]),
+        _is_in_stop_cooldown=lambda: pytest.fail("must stop before any entry check"),
+    )
+    assert PairTradingStrategy.scan_and_propose(stub) == []
 
 
 def test_a_saved_negative_beta_cannot_open_a_new_position():
@@ -202,15 +249,25 @@ def test_a_saved_negative_beta_cannot_open_a_new_position():
     assert PairTradingStrategy.scan_and_propose(stub) == []
 
 
-def test_a_list_the_gate_empties_keeps_the_old_file(monkeypatch, tmp_path):
-    """Baseline runs first under `set -e`, so its exit 0 lets the live list
-    still refresh; the persistent step is last and fails loud."""
+def test_a_list_the_gate_empties_replaces_the_old_file(monkeypatch, tmp_path):
+    """Yesterday's rows carry yesterday's numbers and would pass again, so they
+    must not outlive a screen that rejected them. Baseline runs first under
+    `set -e`, so its exit 0 lets the live list refresh; persistent fails loud."""
     out = tmp_path / "pair_candidates.csv"
     out.write_text("old")
     monkeypatch.setattr(sp, "load_front_month_panel", lambda *a, **k: _panel())
     monkeypatch.setattr(sp, "QUALITY_MIN_CORR", 1.01)
     monkeypatch.setattr("sys.argv", ["screen_pairs", "--output", str(out)])
     assert sp.main() == 0
+    written = pd.read_csv(out)
+    assert written.empty and "hedge_ratio" in written.columns
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_screen_that_could_not_judge_keeps_the_old_file_and_fails_loud(monkeypatch, tmp_path):
+    out = tmp_path / "pair_candidates.csv"
+    out.write_text("old")
+    monkeypatch.setattr(sp, "load_front_month_panel", lambda *a, **k: _panel(n=60))
     monkeypatch.setattr("sys.argv", ["screen_pairs", "--output", str(out),
                                      "--persistence-min", "2"])
     assert sp.main() == 1

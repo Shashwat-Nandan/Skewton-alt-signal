@@ -101,10 +101,12 @@ Default baseline floor:
 
 Candidate gate (both CSVs, owner decision 2026-11-05): a row with `β ≤ 0` or
 `corr < 0.75` is not written, and the runner refuses one from an older CSV.
-A held pair that fails it is managed to exit and not re-entered. With no
-candidates the old file stays: the persistent step exits 1, the baseline step
-logs an error and exits 0 so the persistent step still runs. If selection then
-refuses at start-up and positions are open, the runner starts manage-only.
+A held pair that fails it is managed to exit and not re-entered. If the gate
+rejects every row an empty list is written, so yesterday's rows stop trading; if
+the screen could not judge (archive too shallow), the old file stays. The
+persistent step exits 1 either way; baseline logs an error and exits 0 so the
+persistent step still runs. If selection refuses at start-up with positions
+open, or the list is empty, the runner pages and starts manage-only.
 
 Persistent floor (stricter):
 - `corr ≥ 0.75`
