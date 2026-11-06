@@ -37,6 +37,8 @@ import re
 import signal
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -413,15 +415,76 @@ def setup_logging(today: date, system: str = "baseline") -> logging.Logger:
     return logging.getLogger("run_paper_pairs")
 
 
+def pair_id(a: str, b: str) -> frozenset:
+    """A pair's identity. The screen's Error-Ratio direction choice can list it
+    as A/B one day and B/A the next; both trade the same two contracts."""
+    return frozenset((a, b))
+
+
+class NoTradeablePairs(RuntimeError):
+    """Selection ran on a current list and no pair passed."""
+
+
+def alert_operator(log: logging.Logger, text: str) -> None:
+    """Best-effort Telegram page; TELEGRAM_* come from the unit's .env. Only the
+    exception's type is logged, because its text can hold the bot-token URL."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        log.warning("Telegram not configured; alert not sent")
+        return
+    try:
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=urllib.parse.urlencode({"chat_id": chat, "text": text}).encode(),
+            timeout=10,
+        ).close()
+    except Exception as e:
+        log.error("Telegram alert failed to send (%s)", type(e).__name__)
+
+
+def select_pairs_or_manage_only(args, log: logging.Logger, *,
+                                seed_leg_count: dict[str, int] | None,
+                                reentry_pairs: set) -> pd.DataFrame:
+    """Today's picks. If selection refuses and positions are open, start with no
+    picks instead of dying: orphans still get stops and exits, and no new entry
+    opens. With nothing held, an empty list means no trades today (an idle
+    session, not a crash that would latch HALT_ALL); a missing, stale or
+    unreadable list still fails, and that alert fires. Either kept session pages
+    the operator: it can go on for days with nothing else saying so."""
+    try:
+        return select_pairs(args.top, log,
+                            candidates_path=Path(args.candidates),
+                            max_age_days=args.max_csv_age_days,
+                            max_pvalue=args.quality_max_pvalue,
+                            seed_leg_count=seed_leg_count,
+                            reentry_pairs=reentry_pairs)
+    # ValueError covers a truncated CSV (pandas' EmptyDataError, ParserError);
+    # KeyError a missing column.
+    except (FileNotFoundError, RuntimeError, ValueError, KeyError) as e:
+        held = [key for key, blob in load_prior_state(args.system, log).items()
+                if blob.get("state", {}).get("position", "FLAT") != "FLAT"
+                or blob.get("state", {}).get("legs")]
+        if not held and not isinstance(e, NoTradeablePairs):
+            raise
+        msg = (f"Pair selection refused ({e}). MANAGE-ONLY session [{args.system}]: "
+               f"no new entries; {len(held)} held pair(s) keep their exits: "
+               f"{', '.join(held) or 'none'}")
+        log.critical(msg)
+        alert_operator(log, msg)
+        return pd.DataFrame(columns=["symbol_a", "symbol_b", "hedge_ratio"])
+
+
 def select_pairs(top: int, log: logging.Logger,
                  candidates_path: Path = CANDIDATES_PATH,
                  max_age_days: float = 7.0,
                  *,
                  max_pvalue: float | None = None,
-                 seed_leg_count: dict[str, int] | None = None) -> pd.DataFrame:
+                 seed_leg_count: dict[str, int] | None = None,
+                 reentry_pairs: set | None = None) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
-      1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
+      1) Tradeable hedge ratio: β > 0 and |β| ∈ [HEDGE_RATIO_MIN,
+         HEDGE_RATIO_MAX].
       2) Quality floor: corr ≥ QUALITY_MIN_CORR AND half_life ≤
          QUALITY_MAX_HALFLIFE AND p ≤ QUALITY_MAX_PVALUE (the p ceiling is
          overridable via `max_pvalue` — the persistent system passes 0.05).
@@ -439,6 +502,11 @@ def select_pairs(top: int, log: logging.Logger,
     `max_age_days` is a safety check: if the CSV's mtime is older than this
     many days, refuse to load it. Protects against a failed weekly screen
     leaving the runner trading on stale hedge ratios. Set to 0 to disable.
+
+    `reentry_pairs`, if given, receives `pair_id(a, b)` for each row that passed
+    every filter and was skipped only for --top: a held pair among them may
+    re-enter after closing (build_orphan_strategies). A leg_cap row may not, or
+    it would take a symbol past the concentration cap.
     """
     if not candidates_path.exists():
         raise FileNotFoundError(
@@ -492,6 +560,10 @@ def select_pairs(top: int, log: logging.Logger,
         max_pvalue=max_pvalue,
         seed_leg_count=seed_leg_count,
     )
+    if reentry_pairs is not None:
+        ranked_out = annotated[annotated["skip_reason"] == "cutoff"]
+        reentry_pairs.update(pair_id(a, b) for a, b in
+                             zip(ranked_out["symbol_a"], ranked_out["symbol_b"]))
     picks = (
         annotated[annotated["processing_rank"].notna()]
         .sort_values("processing_rank")
@@ -500,7 +572,7 @@ def select_pairs(top: int, log: logging.Logger,
     )
 
     if picks.empty:
-        raise RuntimeError(
+        raise NoTradeablePairs(
             "No tradeable pairs after β + quality + concentration filters")
     if len(picks) < top:
         log.warning("Selected only %d of %d requested pairs "
@@ -1028,14 +1100,17 @@ def build_orphan_strategies(
     spread_panel: Optional[pd.DataFrame] = None,
     signal_publisher=None,
     halt_path: Optional[Path] = None,
+    reentry_pairs: Optional[set] = None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
     be orphaned when the screener drops the pair — no one would manage it to
     exit.
 
-    Orphans use the saved hedge_ratio and the saved state; they don't get
-    new entries because their position is already open."""
+    Orphans use the saved hedge_ratio and the saved state. After closing, one
+    can re-enter only if it is in `reentry_pairs` (select_pairs): a pair that
+    passed every filter and only ranked below --top or hit the leg cap keeps
+    trading; one the screen dropped or the filters refused does not."""
     from strategies.pair_trading import PairTradingStrategy
     orphans = []
     for key, blob in prior_state.items():
@@ -1063,6 +1138,7 @@ def build_orphan_strategies(
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
             s.signal_system_tag = args.system
+            s.allow_new_entries = pair_id(sa, sb) in (reentry_pairs or set())
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z
@@ -1076,8 +1152,10 @@ def build_orphan_strategies(
             orphans.append(s)
             log.info(
                 "[%s] ORPHAN — held position is not in today's candidates; "
-                "loaded for management-to-exit (position=%s legs=%d β=%.4f)",
+                "loaded for management-to-exit (position=%s legs=%d β=%.4f "
+                "re-entry=%s)",
                 key, s.state.position, len(s.state.legs), saved_beta,
+                "allowed" if s.allow_new_entries else "blocked",
             )
         except Exception as e:
             log.exception(
@@ -1661,11 +1739,9 @@ def main():
     if args.quality_max_pvalue is not None:
         log.info("Quality p-value ceiling overridden: %.3f (default %.3f)",
                  args.quality_max_pvalue, QUALITY_MAX_PVALUE)
-    pairs = select_pairs(args.top, log,
-                          candidates_path=Path(args.candidates),
-                          max_age_days=args.max_csv_age_days,
-                          max_pvalue=args.quality_max_pvalue,
-                          seed_leg_count=cross_runner_counts)
+    reentry_pairs: set = set()
+    pairs = select_pairs_or_manage_only(args, log, seed_leg_count=cross_runner_counts,
+                                        reentry_pairs=reentry_pairs)
     log.info("Selected %d pair(s):", len(pairs))
     for _, row in pairs.iterrows():
         log.info("  %s/%s  β=%.4f  z=%.2f  half-life=%.1fd  p=%.4f",
@@ -1841,7 +1917,16 @@ def main():
         spread_panel=spread_panel,
         signal_publisher=signal_publisher,
         halt_path=naked_halt if args.mode == "live" else None,
+        reentry_pairs=reentry_pairs,
     )
+    # A pick listed B/A while A/B is still held trades the same two contracts:
+    # it must not stack a second position on the orphan.
+    held_ids = {pair_id(o.symbol_a, o.symbol_b) for o in orphans}
+    for s in strategies:
+        if pair_id(s.symbol_a, s.symbol_b) in held_ids:
+            s.allow_new_entries = False
+            log.warning("[%s/%s] held in the other order; no new entries today.",
+                        s.symbol_a, s.symbol_b)
     strategies = strategies + orphans
 
     # Must be computed AFTER orphans are folded in: a pair represented by any
@@ -1861,6 +1946,10 @@ def main():
         # The broker answered: a leftover unreadable-broker halt from an
         # earlier session no longer applies.
         clear_broker_unreadable_halt(log, broker_unreadable_halt_path(args.system))
+
+    if not strategies:
+        log.warning("No pairs to trade or manage today; the broker book matches. Exiting.")
+        return 0
 
     now = datetime.now()
     open_ts = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)

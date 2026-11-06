@@ -162,6 +162,14 @@ def _aggregate_book_notional(data_cache: Optional[Path] = None, *,
     return total
 
 
+def _log_entry_refusal_once(strategy, why: str) -> None:
+    """The daily log is the audit trail: say once why a flat pair never trades."""
+    if not getattr(strategy, "_entry_refusal_logged", False):
+        strategy._entry_refusal_logged = True
+        logger.info("[%s/%s] no new entries: %s.",
+                    strategy.symbol_a, strategy.symbol_b, why)
+
+
 def _finite_or_none(x) -> Optional[float]:
     """float(x) if it is a finite number, else None (never raises)."""
     try:
@@ -297,6 +305,10 @@ class PairState:
 class PairTradingStrategy(BaseStrategy):
 
     name = "pair_trading"
+
+    # False for a pair held over but no longer a candidate: manage it to exit,
+    # never open it again (build_orphan_strategies).
+    allow_new_entries: bool = True
 
     def __init__(
         self,
@@ -563,6 +575,15 @@ class PairTradingStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         if self.state.position != "FLAT":
+            return []
+        if not self.allow_new_entries:
+            _log_entry_refusal_once(self, "not eligible for new entries today")
+            return []
+        # Owner rule 2026-11-05. A held pair keeps its saved β for the session
+        # (restore_matching_strategies), and that β can be negative even when
+        # today's screen lists the pair with a positive one.
+        if not self.hedge_ratio > 0:          # NaN fails closed too
+            _log_entry_refusal_once(self, f"hedge ratio {self.hedge_ratio:.4f} is not positive")
             return []
         # Naked-leg latch: never open a new spread on top of a stray leg.
         if self.state.unwind_pending or self.state.legs:

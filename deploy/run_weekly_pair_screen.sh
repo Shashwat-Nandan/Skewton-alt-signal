@@ -43,10 +43,10 @@ PY="$PROJECT_DIR/.venv/bin/python"
 
   echo
   # Persistence screen: only admits pairs that pass p<0.05 in ≥2 rolling
-  # 130d windows AND in the most recent one. Falls back to empty CSV when
-  # the bhavcopy archive is too shallow for the rolling windows (the
-  # screener logs an error and exits 0; the persistent runner then
-  # gracefully reports an empty book). See tasks/todo.md (2026-05-17).
+  # 130d windows AND in the most recent one. With no candidates the screener
+  # logs an error and exits 1: an empty CSV if the owner's β/correlation gate
+  # dropped every row; the old CSV if the archive is too shallow to judge. See
+  # tasks/todo.md (2026-05-17, 2026-11-06).
   echo "[3/3] Screening cointegrated pairs (persistent: ≥2 of N windows)..."
   "$PY" -m core.screen_pairs \
       --persistence-min 2 \
