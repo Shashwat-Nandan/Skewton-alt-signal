@@ -1,3 +1,20 @@
+# Kotak tapes replay: a master per session — 2026-11-06
+
+The Kotak tapes had no instrument master, so `load_captured_tape` refused them, and
+expired contracts are gone from the scrip master.
+
+- [x] The recorder saves the day's master before polling; a failure keeps recording
+      and exits 1 at the close.
+- [x] `scripts/backfill_tape_masters.py` rebuilds from the header and bhavcopy, with
+      no broker call. Ran for 2026-10-20..11-06.
+- [x] A header-only tape (2026-10-20..27, HTTP 400) is an empty frame, not a KeyError.
+- [x] All 8 tapes with data replay: 38,352 rows, 376 minutes, 102 symbols, no NaN
+      strike, lot 65.
+- [ ] Before using them: a few option rows have last_price 0 (10, 19, 19 on
+      2026-11-03..05; on 11-05 four strikes, 09:15-09:19), the quote LTP of a strike
+      not yet traded. The options test must not read those as prices.
+- [ ] Owner review. Point the capture timer at the main checkout after merge.
+
 # Options expression of the ADX breakout (owner-approved 2026-10-16): STOPPED at the model check
 
 Owner request 2026-10-16: "Test the options breakout idea". Same entries

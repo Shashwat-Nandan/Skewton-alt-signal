@@ -709,6 +709,16 @@ def load_captured_tape(
               .reset_index()
         )
 
+    if df.empty:
+        # A stillborn capture: a header and no ticks (2026-10-20..27, every Kotak
+        # poll rejected). Callers skip an empty frame (autoresearch_loop's
+        # pre-flight); the joins below would raise KeyError and kill a sweep.
+        logger.warning("ticks-%s: no ticks in this session's tape.", date_iso)
+        return pd.DataFrame(columns=[
+            "timestamp", "symbol", "underlying_price", "strike", "option_type",
+            "expiry", "last_price", "bid", "ask", "lot_size", "iv",
+        ])
+
     # Join the NFO instrument master for strike/expiry/lot_size on
     # derivatives, then patch the spot token (which lives on NSE and
     # isn't in the NFO master) from the JSONL session header.
