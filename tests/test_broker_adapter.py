@@ -523,6 +523,50 @@ class TestKotakClient:
         client.session.request.return_value = resp
         assert client.positions() == {"net": [], "day": []}
 
+    def test_quote_without_ltp_names_the_key_and_is_still_an_order_error(self):
+        """The tick recorder sets the named key aside instead of splitting
+        the batch; the pair runner still stops on BrokerOrderError."""
+        from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [{
+            "instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE",
+            "name": "NIFTY", "instrument_type": "CE", "lot_size": 75,
+            "exchange": "NFO",
+        }]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"exchange_token": "Nifty 50", "exchange": "nse_cm", "ltp": "22500.5"},
+            {"exchange_token": "999", "exchange": "nse_fo"},
+        ]
+        client.session.request.return_value = resp
+        with pytest.raises(BrokerQuoteMissingError) as err:
+            client.quote(["NSE:NIFTY 50", "NFO:NIFTY25SEP25000CE"])
+        assert err.value.key == "NFO:NIFTY25SEP25000CE"
+        assert isinstance(err.value, BrokerOrderError)
+
+    def test_quote_never_sends_kotak_50_symbols(self):
+        """Kotak answers 50 symbols with HTTP 400 "Please set the Neo symbol
+        max value to 50" (49 is accepted). Sending 50 failed every pass of
+        the tick recorder for a week."""
+        from urllib.parse import unquote
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [{
+            "instrument_token": 1000 + i, "tradingsymbol": f"NIFTY25SEP{25000 + i}CE",
+            "name": "NIFTY", "instrument_type": "CE", "lot_size": 75, "exchange": "NFO",
+        } for i in range(85)]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": str(1000 + i), "exchange": "nse_fo",
+                                   "ltp": "10"} for i in range(85)]
+        client.session.request.return_value = resp
+        quoted = client.quote([f"NFO:NIFTY25SEP{25000 + i}CE" for i in range(85)])
+        assert len(quoted) == 85
+        sizes = [unquote(c[0][1]).count("nse_fo|") for c in client.session.request.call_args_list]
+        assert sum(sizes) == 85 and max(sizes) < 50
+
     def test_quote_depth_is_kite_shaped_numbers(self):
         client = self._client()
         client._instruments_by_exchange["NSE"] = [{

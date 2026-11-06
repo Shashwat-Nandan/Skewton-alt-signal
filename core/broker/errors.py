@@ -32,6 +32,19 @@ class BrokerOrderError(BrokerError):
     """Broker-side reject (margin, validation, exchange). Do not retry."""
 
 
+class BrokerQuoteMissingError(BrokerOrderError):
+    """A quote came back without an LTP for `key`.
+
+    A subclass, so every caller that stops on BrokerOrderError still does.
+    The tick recorder catches it to set the one key aside instead of
+    splitting the batch into more calls on the shared quote quota.
+    """
+
+    def __init__(self, message: str, key: str):
+        super().__init__(message)
+        self.key = key
+
+
 class BrokerNotImplementedError(BrokerError):
     """Broker is registered in the factory but not live-wired.
 
