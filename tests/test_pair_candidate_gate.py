@@ -93,14 +93,14 @@ def test_a_closed_orphan_does_not_re_enter():
     """The screen dropped this pair while it was held. Once flat, a fresh z
     signal must not open it again."""
     stub = SimpleNamespace(
-        allow_new_entries=False, hedge_ratio=1.0,
+        allow_new_entries=False, hedge_ratio=1.0, symbol_a="A", symbol_b="B",
         state=SimpleNamespace(position="FLAT", unwind_pending=False, legs=[]),
         _is_in_stop_cooldown=lambda: pytest.fail("must stop before any entry check"),
     )
     assert PairTradingStrategy.scan_and_propose(stub) == []
 
 
-def _orphan(monkeypatch, beta=-0.123, candidate_rows=None):
+def _orphan(monkeypatch, beta=-0.123, reentry_pairs=None):
     import logging
 
     import runners.run_paper_pairs as r
@@ -125,7 +125,7 @@ def _orphan(monkeypatch, beta=-0.123, candidate_rows=None):
             "state": {"position": "SHORT_SPREAD", "legs": [{"x": 1}, {"x": 2}]}}
     return r.build_orphan_strategies(
         {"KOTAKBANK/HINDUNILVR": blob}, set(), args, None, "config.ini",
-        logging.getLogger("t"), candidate_rows=candidate_rows)
+        logging.getLogger("t"), reentry_pairs=reentry_pairs)
 
 
 def test_an_orphan_the_screen_dropped_is_managed_but_cannot_re_enter(monkeypatch):
@@ -135,37 +135,84 @@ def test_an_orphan_the_screen_dropped_is_managed_but_cannot_re_enter(monkeypatch
     assert orphans[0].allow_new_entries is False
 
 
-def test_an_orphan_that_only_missed_the_cutoff_keeps_trading(monkeypatch):
-    """Below --top or at the leg cap is not the owner's rule: the block must
-    not remove trades the rule does not ask to remove."""
-    orphans = _orphan(monkeypatch, beta=1.2, candidate_rows={"KOTAKBANK/HINDUNILVR"})
+def test_an_orphan_that_only_missed_the_cutoff_keeps_trading_in_either_order(monkeypatch):
+    """Below --top or at the leg cap is not the owner's rule. The screen can
+    also list the pair the other way round on a later day."""
+    import runners.run_paper_pairs as r
+    orphans = _orphan(monkeypatch, beta=1.2, reentry_pairs={r.pair_id("HINDUNILVR", "KOTAKBANK")})
     assert orphans[0].allow_new_entries is True
 
 
-def test_candidate_keys_lists_only_rows_that_pass_the_rule():
-    df = pd.DataFrame([_row("GOOD", "PAIR"), _row("NEG", "BETA", beta=-1.0),
-                       _row("WEAK", "CORR", corr=0.7)])
-    assert sp.candidate_keys(df) == {"GOOD/PAIR"}
-    assert sp.candidate_keys(pd.DataFrame()) == set()
+def _select(tmp_path, rows, top):
+    import logging
+
+    import runners.run_paper_pairs as r
+    csv = tmp_path / "c.csv"
+    pd.DataFrame(rows).assign(latest_z_score=0.0).to_csv(csv, index=False)
+    out = set()
+    picks = r.select_pairs(top, logging.getLogger("t"), candidates_path=csv,
+                           max_age_days=0, reentry_pairs=out)
+    return r, picks, out
+
+
+def test_only_rows_skipped_by_ranking_may_re_enter(tmp_path):
+    """A row the quality filters refused (half-life, p-value) must not get back
+    in through the orphan path, outside the floor, --top and the leg cap."""
+    rows = [_row("TOP", "ONE"), _row("NEXT", "TWO"),
+            {**_row("SLOW", "HL"), "half_life_days": 12.0},
+            _row("NEG", "BETA", beta=-1.0), _row("WEAK", "CORR", corr=0.7)]
+    r, picks, out = _select(tmp_path, rows, top=1)
+    assert len(picks) == 1
+    assert len(out) == 1
+    assert out < {r.pair_id("TOP", "ONE"), r.pair_id("NEXT", "TWO")}
+
+
+def _manage_only(monkeypatch, tmp_path, prior):
+    import logging
+
+    import runners.run_paper_pairs as r
+    monkeypatch.setattr(r, "load_prior_state", lambda *a: prior)
+    args = SimpleNamespace(top=3, candidates=str(tmp_path / "missing.csv"), max_csv_age_days=4,
+                           quality_max_pvalue=None, system="persistent")
+    return r.select_pairs_or_manage_only(args, logging.getLogger("t"), seed_leg_count=None,
+                                         reentry_pairs=set())
+
+
+def test_a_refused_selection_still_manages_open_positions(monkeypatch, tmp_path):
+    """Dying here leaves held live pairs with no stop and no exit."""
+    held = {"A/B": {"state": {"position": "LONG_SPREAD", "legs": [1, 2]}}}
+    picks = _manage_only(monkeypatch, tmp_path, held)
+    assert picks.empty and {"symbol_a", "symbol_b"} <= set(picks.columns)
+
+
+def test_a_refused_selection_with_nothing_held_still_fails_loud(monkeypatch, tmp_path):
+    flat = {"A/B": {"state": {"position": "FLAT", "legs": []}}}
+    with pytest.raises(FileNotFoundError):
+        _manage_only(monkeypatch, tmp_path, flat)
 
 
 def test_a_saved_negative_beta_cannot_open_a_new_position():
     """Today's screen can list a held pair with β +0.4 while the position was
     opened at -0.5. It keeps the saved β, so once flat it must not re-open."""
     stub = SimpleNamespace(
-        allow_new_entries=True, hedge_ratio=-0.5,
+        allow_new_entries=True, hedge_ratio=-0.5, symbol_a="A", symbol_b="B",
         state=SimpleNamespace(position="FLAT", unwind_pending=False, legs=[]),
         _is_in_stop_cooldown=lambda: pytest.fail("must stop before any entry check"),
     )
     assert PairTradingStrategy.scan_and_propose(stub) == []
 
 
-def test_a_list_the_gate_empties_fails_loud_and_keeps_the_old_file(monkeypatch, tmp_path):
+def test_a_list_the_gate_empties_keeps_the_old_file(monkeypatch, tmp_path):
+    """Baseline runs first under `set -e`, so its exit 0 lets the live list
+    still refresh; the persistent step is last and fails loud."""
     out = tmp_path / "pair_candidates.csv"
     out.write_text("old")
     monkeypatch.setattr(sp, "load_front_month_panel", lambda *a, **k: _panel())
     monkeypatch.setattr(sp, "QUALITY_MIN_CORR", 1.01)
     monkeypatch.setattr("sys.argv", ["screen_pairs", "--output", str(out)])
+    assert sp.main() == 0
+    monkeypatch.setattr("sys.argv", ["screen_pairs", "--output", str(out),
+                                     "--persistence-min", "2"])
     assert sp.main() == 1
     assert out.read_text() == "old"
 

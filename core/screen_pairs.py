@@ -763,11 +763,12 @@ def main():
         df = drop_untradeable_candidates(df)
 
     if df.empty:
-        # Fail loud: the old file stays on disk, and exit 0 would make that
-        # look like a fresh list. The runners' CSV-age limit stops them
-        # trading on it for long.
+        # The old file stays on disk either way. Persistent is the last step of
+        # the screen scripts and the live book's list, so it fails loud. Baseline
+        # runs first under `set -e`: exit 1 there would stop the live list
+        # refreshing over a paper-only result.
         logger.error("No candidates; %s left unchanged", args.output)
-        return 1
+        return 1 if args.persistence_min is not None else 0
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False)
@@ -823,15 +824,6 @@ def _candidate_rule(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     beta = pd.to_numeric(df["hedge_ratio"], errors="coerce")
     corr = pd.to_numeric(df["correlation"], errors="coerce")
     return beta > 0, corr >= QUALITY_MIN_CORR
-
-
-def candidate_keys(df: pd.DataFrame) -> set[str]:
-    """"A/B" for each row that passes the owner's rule."""
-    if df.empty:
-        return set()
-    beta_ok, corr_ok = _candidate_rule(df)
-    ok = df[beta_ok & corr_ok]
-    return {f"{a}/{b}" for a, b in zip(ok["symbol_a"], ok["symbol_b"])}
 
 
 def drop_untradeable_candidates(df: pd.DataFrame) -> pd.DataFrame:

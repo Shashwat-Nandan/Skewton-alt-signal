@@ -86,7 +86,6 @@ from core.screen_pairs import (  # noqa: F401  (re-exported)
     QUALITY_MAX_HALFLIFE,
     QUALITY_MAX_PVALUE,
     QUALITY_MIN_CORR,
-    candidate_keys,
     classify_pair_candidates,
 )
 
@@ -414,15 +413,49 @@ def setup_logging(today: date, system: str = "baseline") -> logging.Logger:
     return logging.getLogger("run_paper_pairs")
 
 
+def pair_id(a: str, b: str) -> frozenset:
+    """A pair's identity. The screen's Error-Ratio direction choice can list it
+    as A/B one day and B/A the next; both trade the same two contracts."""
+    return frozenset((a, b))
+
+
+def select_pairs_or_manage_only(args, log: logging.Logger, *,
+                                seed_leg_count: dict[str, int] | None,
+                                reentry_pairs: set) -> pd.DataFrame:
+    """Today's picks. If selection refuses (CSV missing or stale, no pair
+    passes) and positions are open, start with no picks instead of dying:
+    orphans still get stops and exits, and no new entry opens. Nothing held:
+    the refusal stands, and the failure alert fires."""
+    try:
+        return select_pairs(args.top, log,
+                            candidates_path=Path(args.candidates),
+                            max_age_days=args.max_csv_age_days,
+                            max_pvalue=args.quality_max_pvalue,
+                            seed_leg_count=seed_leg_count,
+                            reentry_pairs=reentry_pairs)
+    except (FileNotFoundError, RuntimeError) as e:
+        held = [key for key, blob in load_prior_state(args.system, log).items()
+                if blob.get("state", {}).get("position", "FLAT") != "FLAT"
+                or blob.get("state", {}).get("legs")]
+        if not held:
+            raise
+        log.critical(
+            "Pair selection refused (%s). MANAGE-ONLY session: no new entries; "
+            "%d held pair(s) keep their exits: %s", e, len(held), ", ".join(held))
+        return pd.DataFrame(columns=["symbol_a", "symbol_b", "hedge_ratio"])
+
+
 def select_pairs(top: int, log: logging.Logger,
                  candidates_path: Path = CANDIDATES_PATH,
                  max_age_days: float = 7.0,
                  *,
                  max_pvalue: float | None = None,
-                 seed_leg_count: dict[str, int] | None = None) -> pd.DataFrame:
+                 seed_leg_count: dict[str, int] | None = None,
+                 reentry_pairs: set | None = None) -> pd.DataFrame:
     """Pick up to `top` pairs from pair_candidates.csv via four layered passes:
 
-      1) Tradeable hedge ratio: |β| ∈ [HEDGE_RATIO_MIN, HEDGE_RATIO_MAX].
+      1) Tradeable hedge ratio: β > 0 and |β| ∈ [HEDGE_RATIO_MIN,
+         HEDGE_RATIO_MAX].
       2) Quality floor: corr ≥ QUALITY_MIN_CORR AND half_life ≤
          QUALITY_MAX_HALFLIFE AND p ≤ QUALITY_MAX_PVALUE (the p ceiling is
          overridable via `max_pvalue` — the persistent system passes 0.05).
@@ -440,6 +473,10 @@ def select_pairs(top: int, log: logging.Logger,
     `max_age_days` is a safety check: if the CSV's mtime is older than this
     many days, refuse to load it. Protects against a failed weekly screen
     leaving the runner trading on stale hedge ratios. Set to 0 to disable.
+
+    `reentry_pairs`, if given, receives `pair_id(a, b)` for each row that passed
+    every filter and was skipped only for --top or the leg cap: a held pair
+    among them may re-enter after closing (build_orphan_strategies).
     """
     if not candidates_path.exists():
         raise FileNotFoundError(
@@ -493,6 +530,10 @@ def select_pairs(top: int, log: logging.Logger,
         max_pvalue=max_pvalue,
         seed_leg_count=seed_leg_count,
     )
+    if reentry_pairs is not None:
+        ranked_out = annotated[annotated["skip_reason"].isin(["cutoff", "leg_cap"])]
+        reentry_pairs.update(pair_id(a, b) for a, b in
+                             zip(ranked_out["symbol_a"], ranked_out["symbol_b"]))
     picks = (
         annotated[annotated["processing_rank"].notna()]
         .sort_values("processing_rank")
@@ -1029,7 +1070,7 @@ def build_orphan_strategies(
     spread_panel: Optional[pd.DataFrame] = None,
     signal_publisher=None,
     halt_path: Optional[Path] = None,
-    candidate_rows: Optional[set] = None,
+    reentry_pairs: Optional[set] = None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
@@ -1037,9 +1078,9 @@ def build_orphan_strategies(
     exit.
 
     Orphans use the saved hedge_ratio and the saved state. After closing, one
-    can re-enter only if it is in `candidate_rows` ("A/B" rows of today's CSV
-    that pass the owner's rule): a pair that merely ranked below --top or hit
-    the leg cap keeps trading, and one the screen dropped does not."""
+    can re-enter only if it is in `reentry_pairs` (select_pairs): a pair that
+    passed every filter and only ranked below --top or hit the leg cap keeps
+    trading; one the screen dropped or the filters refused does not."""
     from strategies.pair_trading import PairTradingStrategy
     orphans = []
     for key, blob in prior_state.items():
@@ -1067,7 +1108,7 @@ def build_orphan_strategies(
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
             s.signal_system_tag = args.system
-            s.allow_new_entries = key in (candidate_rows or set())
+            s.allow_new_entries = pair_id(sa, sb) in (reentry_pairs or set())
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z
@@ -1081,8 +1122,10 @@ def build_orphan_strategies(
             orphans.append(s)
             log.info(
                 "[%s] ORPHAN — held position is not in today's candidates; "
-                "loaded for management-to-exit (position=%s legs=%d β=%.4f)",
+                "loaded for management-to-exit (position=%s legs=%d β=%.4f "
+                "re-entry=%s)",
                 key, s.state.position, len(s.state.legs), saved_beta,
+                "allowed" if s.allow_new_entries else "blocked",
             )
         except Exception as e:
             log.exception(
@@ -1666,11 +1709,9 @@ def main():
     if args.quality_max_pvalue is not None:
         log.info("Quality p-value ceiling overridden: %.3f (default %.3f)",
                  args.quality_max_pvalue, QUALITY_MAX_PVALUE)
-    pairs = select_pairs(args.top, log,
-                          candidates_path=Path(args.candidates),
-                          max_age_days=args.max_csv_age_days,
-                          max_pvalue=args.quality_max_pvalue,
-                          seed_leg_count=cross_runner_counts)
+    reentry_pairs: set = set()
+    pairs = select_pairs_or_manage_only(args, log, seed_leg_count=cross_runner_counts,
+                                        reentry_pairs=reentry_pairs)
     log.info("Selected %d pair(s):", len(pairs))
     for _, row in pairs.iterrows():
         log.info("  %s/%s  β=%.4f  z=%.2f  half-life=%.1fd  p=%.4f",
@@ -1846,8 +1887,16 @@ def main():
         spread_panel=spread_panel,
         signal_publisher=signal_publisher,
         halt_path=naked_halt if args.mode == "live" else None,
-        candidate_rows=candidate_keys(pd.read_csv(args.candidates)),
+        reentry_pairs=reentry_pairs,
     )
+    # A pick listed B/A while A/B is still held trades the same two contracts:
+    # it must not stack a second position on the orphan.
+    held_ids = {pair_id(o.symbol_a, o.symbol_b) for o in orphans}
+    for s in strategies:
+        if pair_id(s.symbol_a, s.symbol_b) in held_ids:
+            s.allow_new_entries = False
+            log.warning("[%s/%s] held in the other order; no new entries today.",
+                        s.symbol_a, s.symbol_b)
     strategies = strategies + orphans
 
     # Must be computed AFTER orphans are folded in: a pair represented by any

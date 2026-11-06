@@ -63,7 +63,7 @@ quality-floor knobs.
 | State file | `data_cache/pair_paper_state_baseline.json` | `data_cache/pair_paper_state_persistent.json` |
 | EOD sidecar | `pair_paper_eod_<date>.json` | `pair_paper_persistent_eod_<date>.json` |
 | Log | `logs/paper-pairs-YYYY-MM-DD.log` | `logs/paper-pairs-persistent-YYYY-MM-DD.log` |
-| Quality floor | Looser — accepts up to 12 pairs | Tighter (corr≥0.65, HL≤5d, p≤0.025); usually 1–3 pairs |
+| Quality floor | Looser — accepts up to 12 pairs | Tighter (β>0, corr≥0.75, HL≤5d, p≤0.025); usually 1–3 pairs |
 | Intent | Broad coverage; tolerates marginal pairs for signal volume | High-conviction subset; volume-light by design |
 
 The two runners share `data_cache/` and `.kite_session.json` — the
@@ -533,7 +533,7 @@ From `tasks/live-readiness-deferred.md` Highs section:
   follow-up.
 
 - **Persistent candidates often select only 1 pair** — quality floor
-  (corr≥0.65, HL≤5d, p≤0.025) is strict. On many sessions, only 1 of
+  (β>0, corr≥0.75, HL≤5d, p≤0.025) is strict. On many sessions, only 1 of
   12 requested pairs passes (concentration risk). Recent example: on
   2026-05-25 the persistent runner selected only M&M/MARUTI.
 
