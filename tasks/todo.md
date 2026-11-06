@@ -401,6 +401,21 @@ Jev path, train only:
 Trail rungs 80, 150, 250, and 400 were on the ladder and were not run.
 A wider trail needs a new pre-registered pass. These gates were not
 loosened after the numbers.
+# Pair candidate gate: β > 0, correlation ≥ 0.75 — 2026-11-05
+
+Owner rule: no pair with a negative hedge ratio or correlation below 0.75
+trades, or is even a candidate.
+
+**Safety rule 3 exception (recorded):** the owner directed this for live on
+2026-11-05 ("Please deploy the fix") without a backtest or paper run. It only
+narrows entries; its effect on returns is unmeasured.
+
+- [x] Screen output, runner selection, saved-negative-β entries (PR #26).
+- [x] Review fixes: the `__main__` guard crash; a saved negative β refused at
+      entry; the re-entry block limited to pairs failing the rule; an emptied
+      list exits 1; one definition of the rule; the gate re-ranks.
+- [ ] Measure: `research.backtest_pairs` at 0.65 vs 0.75 with the sign rule.
+- [ ] Owner review and merge. Deployed as an uncommitted patch until then.
 
 # Dispersion dashboard page + second review — 2026-10-02
 

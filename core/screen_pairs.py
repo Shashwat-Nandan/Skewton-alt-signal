@@ -665,8 +665,10 @@ def screen_pairs_persistent(
     # stats). Persistence is a separate admission filter, not a rank component —
     # the runner's classify_pair_candidates does its own composite rerank, and
     # we want the downstream code to see a familiar shape.
-    df["rank_score"] = _composite_rank(df)
-    df = df.sort_values("rank_score").reset_index(drop=True)
+    df = drop_untradeable_candidates(df)
+    if df.empty:
+        logger.warning("No persistent pair has β > 0 and corr >= %.2f", QUALITY_MIN_CORR)
+        return df
 
     logger.info(
         "Persistence screen admitted %d pair(s) (≥%d / %d windows)",
@@ -758,12 +760,33 @@ def main():
             min_hedge_ratio=args.min_hedge_ratio,
             max_hedge_ratio=args.max_hedge_ratio,
         )
+        df = drop_untradeable_candidates(df)
+
+    # Replace in one step: a crash mid-write must not leave a truncated list.
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    def write_list() -> None:
+        tmp = output.with_name(output.name + ".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(output)
 
     if df.empty:
-        return 0
+        # The gate rejected every row (they carry columns): write the empty
+        # list, or yesterday's rows, which today's data rejects, stay tradeable
+        # until the age limit. No columns means the screen could not judge
+        # (archive too shallow, nothing cointegrated): the old file stays.
+        if len(df.columns):
+            write_list()
+            logger.error("No pair passes the gate; wrote an empty %s", output)
+        else:
+            logger.error("Screen produced nothing; %s left unchanged", output)
+        # Persistent is the last step of the screen scripts and the live book's
+        # list, so it fails loud. Baseline runs first under `set -e`: exit 1
+        # there would stop the live list refreshing over a paper-only result.
+        return 1 if args.persistence_min is not None else 0
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.output, index=False)
+    write_list()
     logger.info("Wrote %d candidates to %s", len(df), args.output)
 
     has_persistence = "persistence_count" in df.columns
@@ -788,10 +811,6 @@ def main():
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 # ──────────────────────────────────────────────────────────
 # Candidate classification (audit 3.8: moved here from run_paper_pairs so
 # backtests/sweeps can import the screen logic without importing the live
@@ -800,10 +819,11 @@ if __name__ == "__main__":
 
 # Quality floor — pairs below any of these may be statistically cointegrated
 # but are economically untradeable: half-life longer than max_holding_days
-# rules out reversion in window; correlation below 0.65 means the relationship
-# is too weak to anchor the spread; p above 0.025 (tighter than the screener's
-# default 0.05) cuts the false-positive rate across a multi-pair book.
-QUALITY_MIN_CORR = 0.65
+# rules out reversion in window; correlation below 0.75 means the relationship
+# is too weak to anchor the spread (owner decision 2026-11-05, was 0.65); p above
+# 0.025 (tighter than the screener's default 0.05) cuts the false-positive rate
+# across a multi-pair book.
+QUALITY_MIN_CORR = 0.75
 QUALITY_MAX_HALFLIFE = 5.0   # days
 QUALITY_MAX_PVALUE = 0.025
 
@@ -811,6 +831,43 @@ QUALITY_MAX_PVALUE = 0.025
 # many pairs in the book. Prevents one stock's idiosyncratic move from
 # driving multiple positions' P&L in the same direction.
 LEG_CONCENTRATION_CAP = 2
+
+
+def _candidate_rule(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """The owner's rule as two masks: (β > 0, corr >= QUALITY_MIN_CORR). The
+    single definition behind the screen's gate and the runner's selection."""
+    beta = pd.to_numeric(df["hedge_ratio"], errors="coerce")
+    corr = pd.to_numeric(df["correlation"], errors="coerce")
+    return beta > 0, corr >= QUALITY_MIN_CORR
+
+
+def drop_untradeable_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows pair trading must never see: a negative hedge ratio, or
+    correlation below QUALITY_MIN_CORR (owner decision 2026-11-05).
+
+    Applied to the final candidate rows, not inside screen_pairs(): each
+    rolling window of the persistence test keeps its own `min_correlation`
+    prefilter, so this does not change what "persistent" means. `correlation`
+    is |corr| of prices, but OLS β and corr share a sign on one window, so
+    β > 0 and |corr| >= floor is signed corr >= floor. NaN is dropped.
+
+    Survivors are re-ranked and sorted, so percentile scores are over the rows
+    that are actually candidates."""
+    if df.empty:
+        return df
+    beta_ok, corr_ok = _candidate_rule(df)
+    keep = beta_ok & corr_ok
+    if not keep.all():
+        logger.info(
+            "Candidate gate (β > 0, corr >= %.2f) dropped %d of %d: %s",
+            QUALITY_MIN_CORR, int((~keep).sum()), len(df),
+            ", ".join(f"{a}/{b}" for a, b in zip(df.loc[~keep, "symbol_a"],
+                                                 df.loc[~keep, "symbol_b"])))
+    kept = df[keep].copy()
+    if kept.empty:
+        return kept.reset_index(drop=True)
+    kept["rank_score"] = _composite_rank(kept)
+    return kept.sort_values("rank_score").reset_index(drop=True)
 
 
 def classify_pair_candidates(
@@ -831,7 +888,7 @@ def classify_pair_candidates(
          excluded/β/quality before scoring).
       - `processing_rank`: 1..N admit order (NaN if not admitted).
       - `skip_reason`: '' for admitted, otherwise one of {'excluded', 'beta',
-         'quality', 'leg_cap', 'cutoff'}.
+         'quality', 'leg_cap', 'cutoff'}. 'beta' covers a negative hedge ratio.
 
     Optional rule overrides (defaults preserve live runner behavior):
       - `exclude_symbols`: skip any pair where either leg is in this set
@@ -888,21 +945,25 @@ def classify_pair_candidates(
     else:
         excluded_mask = pd.Series(False, index=out.index)
 
+    # A CSV written before the candidate gate, or by hand, can still hold a
+    # negative β: refuse it here too, since this is what the runner trades from.
     abs_beta = out["hedge_ratio"].abs()
+    beta_positive, corr_floor = _candidate_rule(out)
     beta_mask = (
         ~excluded_mask
+        & beta_positive
         & (abs_beta >= HEDGE_RATIO_MIN)
         & (abs_beta <= beta_upper)
     )
     beta_dropped = ~excluded_mask & ~beta_mask
     out.loc[beta_dropped, "skip_reason"] = "beta"
     if log is not None and beta_dropped.any():
-        log.info("Skipped %d candidate(s) outside |β| in [%.2f, %.2f]",
+        log.info("Skipped %d candidate(s): β negative or |β| outside [%.2f, %.2f]",
                  int(beta_dropped.sum()), HEDGE_RATIO_MIN, beta_upper)
 
     quality_mask = (
         beta_mask
-        & (out["correlation"] >= QUALITY_MIN_CORR)
+        & corr_floor
         & (out["half_life_days"] <= QUALITY_MAX_HALFLIFE)
         & (out["coint_pvalue"] <= pvalue_ceiling)
     )
@@ -959,3 +1020,7 @@ def classify_pair_candidates(
         leg_count[b] = leg_count.get(b, 0) + 1
 
     return out
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -162,6 +162,14 @@ def _aggregate_book_notional(data_cache: Optional[Path] = None, *,
     return total
 
 
+def _log_entry_refusal_once(strategy, why: str) -> None:
+    """The daily log is the audit trail: say once why a flat pair never trades."""
+    if not getattr(strategy, "_entry_refusal_logged", False):
+        strategy._entry_refusal_logged = True
+        logger.info("[%s/%s] no new entries: %s.",
+                    strategy.symbol_a, strategy.symbol_b, why)
+
+
 def _finite_or_none(x) -> Optional[float]:
     """float(x) if it is a finite number, else None (never raises)."""
     try:
@@ -297,6 +305,10 @@ class PairState:
 class PairTradingStrategy(BaseStrategy):
 
     name = "pair_trading"
+
+    # False for a pair held over but no longer a candidate: manage it to exit,
+    # never open it again (build_orphan_strategies).
+    allow_new_entries: bool = True
 
     def __init__(
         self,
@@ -563,6 +575,15 @@ class PairTradingStrategy(BaseStrategy):
 
     def scan_and_propose(self) -> List[TradeProposal]:
         if self.state.position != "FLAT":
+            return []
+        if not self.allow_new_entries:
+            _log_entry_refusal_once(self, "not eligible for new entries today")
+            return []
+        # Owner rule 2026-11-05. A held pair keeps its saved β for the session
+        # (restore_matching_strategies), and that β can be negative even when
+        # today's screen lists the pair with a positive one.
+        if not self.hedge_ratio > 0:          # NaN fails closed too
+            _log_entry_refusal_once(self, f"hedge ratio {self.hedge_ratio:.4f} is not positive")
             return []
         # Naked-leg latch: never open a new spread on top of a stray leg.
         if self.state.unwind_pending or self.state.legs:
@@ -2447,6 +2468,10 @@ class PairTradingStrategy(BaseStrategy):
         # double-count.
         threshold = 3
         cap = 60
+        # Not a broker refusal: arming the backoff would hold off the retry that
+        # adopts the fill once the order can be read.
+        if result.get("status") == "UNKNOWN":
+            return
         if result.get("status") == "COMPLETE":
             if self._place_order_fail_streak:
                 logger.info("%s/%s: place_order recovered — clearing streak",
@@ -2471,6 +2496,14 @@ class PairTradingStrategy(BaseStrategy):
             )
             self._place_order_skip_window = min(self._place_order_skip_window * 2, cap)
             self._place_order_fail_streak = 0
+
+    def settle_unknown_orders(self) -> List[str]:
+        """Contracts blocked by an order whose outcome is unknown, for any pair
+        on this runner, after reading this pair's own once more."""
+        from .order_executor import blocked_contracts
+
+        executor = getattr(self, "_live_order_executor", None)
+        return executor.settle_unresolved() if executor is not None else blocked_contracts()
 
     def _order_tag(self, prop: TradeProposal) -> str:
         # Kite tag limit is 20 chars. Short symbol prefixes so the broker
