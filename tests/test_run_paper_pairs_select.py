@@ -27,7 +27,7 @@ def _row(last_data_date: str) -> str:
     # One quality-passing row; only `last_data_date` is parametrised so
     # the freshness check has a controllable knob.
     return (
-        "COALINDIA,ITC,0.92,-0.54,0.0024,2.22,3.56,607.73,10.81,608.45,"
+        "COALINDIA,ITC,0.92,0.54,0.0024,2.22,3.56,607.73,10.81,608.45,"
         f"0.066,442.35,305.25,{last_data_date},121,0.220"
     )
 
@@ -143,7 +143,7 @@ def test_legacy_csv_without_last_data_date_falls_back_to_mtime(tmp_path, log, ca
                      "half_life_days,spread_vol_pct,spread_mean,spread_std,"
                      "latest_spread,latest_z_score,last_close_a,last_close_b,"
                      "n_obs,rank_score")
-    legacy_row = ("COALINDIA,ITC,0.92,-0.54,0.0024,2.22,3.56,607.73,10.81,"
+    legacy_row = ("COALINDIA,ITC,0.92,0.54,0.0024,2.22,3.56,607.73,10.81,"
                   "608.45,0.066,442.35,305.25,121,0.220")
     csv.write_text(legacy_header + "\n" + legacy_row + "\n")
     caplog.set_level(logging.WARNING)

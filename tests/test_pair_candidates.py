@@ -19,7 +19,7 @@ from backend.routers import pair_candidates as pc_router
 FULL_CSV = textwrap.dedent(
     """\
     symbol_a,symbol_b,correlation,hedge_ratio,coint_pvalue,half_life_days,spread_vol_pct,spread_mean,spread_std,latest_spread,latest_z_score,last_close_a,last_close_b,last_data_date,n_obs,rank_score
-    COALINDIA,ITC,0.92,-0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220
+    COALINDIA,ITC,0.92,0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220
     ADANIPORTS,LT,0.88,1.42,0.0300,2.80,4.10,150.00,12.00,184.00,2.83,1280.00,3450.00,2026-04-20,121,0.554
     """
 )
@@ -27,7 +27,7 @@ FULL_CSV = textwrap.dedent(
 LEGACY_CSV = textwrap.dedent(
     """\
     symbol_a,symbol_b,correlation,hedge_ratio,coint_pvalue,half_life_days,spread_vol_pct,spread_mean,spread_std,n_obs,rank_score
-    COALINDIA,ITC,0.92,-0.54,0.0024,2.22,3.56,607.73,10.81,121,0.220
+    COALINDIA,ITC,0.92,0.54,0.0024,2.22,3.56,607.73,10.81,121,0.220
     """
 )
 
@@ -38,16 +38,16 @@ LEGACY_CSV = textwrap.dedent(
 PERSISTENT_CSV = textwrap.dedent(
     """\
     symbol_a,symbol_b,correlation,hedge_ratio,coint_pvalue,half_life_days,spread_vol_pct,spread_mean,spread_std,latest_spread,latest_z_score,last_close_a,last_close_b,last_data_date,n_obs,rank_score,persistence_count,persistence_windows
-    COALINDIA,ITC,0.92,-0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220,3,"6,7,8"
-    APOLLOHOSP,HCLTECH,0.90,-1.80,0.0406,3.60,3.60,100.0,10.0,100.5,0.50,1200.0,1500.0,2026-04-20,121,0.300,2,"0,1,8"
+    COALINDIA,ITC,0.92,0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220,3,"6,7,8"
+    APOLLOHOSP,HCLTECH,0.90,1.80,0.0406,3.60,3.60,100.0,10.0,100.5,0.50,1200.0,1500.0,2026-04-20,121,0.300,2,"0,1,8"
     """
 )
 
 MALFORMED_CSV = textwrap.dedent(
     """\
     symbol_a,symbol_b,correlation,hedge_ratio,coint_pvalue,half_life_days,spread_vol_pct,spread_mean,spread_std,latest_spread,latest_z_score,last_close_a,last_close_b,last_data_date,n_obs,rank_score
-    COALINDIA,ITC,0.92,-0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220
-    BAD,ROW,not-a-float,-0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220
+    COALINDIA,ITC,0.92,0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220
+    BAD,ROW,not-a-float,0.54,0.0024,2.22,3.56,607.73,10.81,608.45,0.066,442.35,305.25,2026-04-20,121,0.220
     """
 )
 

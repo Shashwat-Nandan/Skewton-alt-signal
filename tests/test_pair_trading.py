@@ -337,13 +337,27 @@ class TestEntry:
             else {syms[0]: {"last_price": 1800.0}}
         )
 
+    def _build_negative_beta(self, s):
+        """The builder directly: scan_and_propose refuses β <= 0 (owner rule
+        2026-11-05, below), but the structure and the cap are still worth
+        pinning for a position already held at a negative β."""
+        spread, prices = s._observe_spread()
+        return s._build_entry_proposals(direction="LONG_SPREAD", z=s._z_score(spread),
+                                        spread=spread, prices=prices)
+
+    def test_a_negative_hedge_ratio_never_opens_a_position(self):
+        """Same-side legs are a directional bet, not a hedge."""
+        s = _make_strategy(hedge_ratio=-0.5)
+        self._negative_beta_long_entry(s)
+        assert s.scan_and_propose() == []
+
     def test_same_side_entry_has_no_offsetting_leg(self):
         """Pins what the cap exists to bound: with both legs the same way the
         position is a leveraged directional basket, not a hedge. The z-score stop
         bounds SPREAD divergence and does nothing about market drawdown."""
         s = _make_strategy(hedge_ratio=-0.5)
         self._negative_beta_long_entry(s)
-        props = s.scan_and_propose()
+        props = self._build_negative_beta(s)
         assert len(props) == 2
         assert all(p.transaction_type == "BUY" for p in props)
         gross = sum(p.price * p.lot_size * p.quantity for p in props)
@@ -355,7 +369,7 @@ class TestEntry:
         """Armed, the cap refuses the same-side structure."""
         s = _make_strategy(hedge_ratio=-0.5, max_net_exposure_pct=0.5)
         self._negative_beta_long_entry(s)
-        assert s.scan_and_propose() == []
+        assert self._build_negative_beta(s) == []
 
     def test_exposure_cap_leaves_a_hedged_entry_alone(self):
         """The same armed cap must still admit a genuinely opposed pair, or it is
@@ -369,7 +383,7 @@ class TestEntry:
         LIVE money. Arming the cap is an operator decision."""
         s = _make_strategy(hedge_ratio=-0.5)
         self._negative_beta_long_entry(s)
-        assert len(s.scan_and_propose()) == 2
+        assert len(self._build_negative_beta(s)) == 2
 
     def test_negative_hedge_ratio_flips_leg_b_side(self):
         # With β<0, LONG_SPREAD wants both legs BUY (since "−β·B" with β<0 means +|β|·B)
@@ -386,7 +400,7 @@ class TestEntry:
             {syms[0]: {"last_price": 80.0}} if "AAA" in syms[0]
             else {syms[0]: {"last_price": 1800.0}}
         )
-        proposals = s.scan_and_propose()
+        proposals = self._build_negative_beta(s)
         assert len(proposals) == 2
         a_leg = next(p for p in proposals if p.tradingsymbol == "AAA26APRFUT")
         b_leg = next(p for p in proposals if p.tradingsymbol == "BBB26APRFUT")

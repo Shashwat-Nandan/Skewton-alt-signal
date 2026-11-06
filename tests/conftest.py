@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 # Anything reasonable; only TestClient sees these.
 os.environ["DASHBOARD_PASSWORD"] = "test-password"
 os.environ["DASHBOARD_SESSION_SECRET"] = (
@@ -42,3 +44,14 @@ except Exception:
 # Login helper now lives in tests/_helpers.py so sibling test modules can
 # import it directly (conftest is autoloaded by pytest but not importable
 # as a regular module).
+
+
+@pytest.fixture(autouse=True)
+def _no_blocked_contracts_between_tests():
+    """strategies.order_executor keeps blocked contracts per process, as the
+    runner needs. A test's unknown order must not block the next test."""
+    from strategies import order_executor
+
+    order_executor._UNRESOLVED.clear()
+    yield
+    order_executor._UNRESOLVED.clear()

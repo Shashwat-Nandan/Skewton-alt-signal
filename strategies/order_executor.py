@@ -21,9 +21,12 @@ pair_trading._live_execute —
     {"order_id", "status", "filled_lots", "average_price", "mode": "live",
      ["error"]}
 and "COMPLETE" is the only status on which a caller may mutate state
-(C-1 whitelist). Anything else means the order did NOT settle: the
-executor has already cancelled / reversed whatever reached the broker, or
-logged CRITICAL telling the operator to square off manually.
+(C-1 whitelist). "FAILED" means the order did NOT settle: the executor has
+already cancelled / reversed whatever reached the broker, or logged CRITICAL
+telling the operator to square off manually. "UNKNOWN" means the outcome could
+not be read: it may have filled. Nothing more is sent on that contract until
+it is read (settle_unresolved), and the caller should stop opening new
+exposure.
 """
 from __future__ import annotations
 
@@ -67,6 +70,30 @@ _NETWORK_ERRORS = (_NetworkException, BrokerNetworkError)
 _ORDER_ERRORS = (_OrderException, BrokerOrderError)
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL = ("COMPLETE", "REJECTED", "CANCELLED")
+_POST_CANCEL_READS = 3   # re-reads of an order after its timeout cancel
+# A late-read fill is adopted only by a retry of that same order. Later than
+# this, the proposal may be a new decision, not the retry, and adopting would
+# book a leg the broker does not hold.
+ADOPT_MAX_AGE_S = 300.0
+# A lost send may not show in the order book at once. Only a miss this long
+# after the send counts as "never reached the broker".
+LOST_SEND_CLEAR_S = 120.0
+
+# Contract -> an order whose outcome could not be read: owner (its executor),
+# order_id (None until the order book finds cid), cid, side, shares, since, row
+# (its terminal read once it shows a fill). No executor in this process sends on
+# that contract while it is here, or a retry could fill a second time, and
+# another pair on the same contract could add to it (2026-11-06: the extra
+# BRITANNIA lot, then BRITANNIA/MARUTI on top). One process runs one book. Lost on
+# restart; the start-up reconcile is the backstop.
+_UNRESOLVED: Dict[str, Dict] = {}
+
+
+def blocked_contracts() -> List[str]:
+    """Contracts on which nothing may be sent, for any pair in this process."""
+    return sorted(_UNRESOLVED)
 
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 _last_cid_ms = [-1]
@@ -248,6 +275,9 @@ class OrderExecutor:
             return {"order_id": None, "status": "FAILED",
                     "filled_lots": 0, "average_price": 0.0,
                     "error": f"validation: {e}", "mode": "live"}
+        resolved = self._resolve_unresolved(prop)
+        if resolved is not None:
+            return resolved
         limit_price = self._protective_limit_price(
             prop.tradingsymbol, prop.transaction_type, prop.price,
         )
@@ -270,16 +300,21 @@ class OrderExecutor:
                 tag=cid,
             )
 
+        lookup_failed = False
+
         def _placed_earlier():
             """Order id of an earlier attempt of THIS order that reached the
             broker even though its response was lost; None if none or
             unknowable. Read-only."""
+            nonlocal lookup_failed
+            lookup_failed = False
             finder = getattr(self.client, "find_order_by_tag", None)
             if finder is None:
                 return None
             try:
                 found = finder(cid)
             except Exception as fe:
+                lookup_failed = True
                 logger.warning("order-book lookup for %s (%s) failed: %s",
                                prop.tradingsymbol, cid, fe)
                 return None
@@ -295,7 +330,13 @@ class OrderExecutor:
                     "%s: %s, but client order id %s is in the order book as "
                     "%s — adopting it (no second order sent)",
                     prop.tradingsymbol, reason, cid, found)
-                return self._poll_until_terminal(found, prop)
+                return self._poll_until_terminal(found, prop, cid)
+            if lookup_failed:
+                # The send may have reached the broker and the book cannot say.
+                # The next attempt would use a new cid, so the broker's
+                # duplicate check could not stop a second order.
+                return self._remember_unknown(
+                    None, cid, prop, f"{reason}: {err}; order book unreadable")
             return {"order_id": None, "status": "FAILED",
                     "filled_lots": 0, "average_price": 0.0,
                     "error": f"{reason}: {err}", "mode": "live"}
@@ -365,38 +406,209 @@ class OrderExecutor:
                     "filled_lots": 0, "average_price": 0.0,
                     "error": f"place_order: {e}", "mode": "live"}
 
-        return self._poll_until_terminal(order_id, prop)
+        return self._poll_until_terminal(order_id, prop, cid)
 
-    def _poll_until_terminal(self, order_id, prop: TradeProposal) -> Dict:
+    def _read_order(self, order_id) -> Optional[Dict]:
+        """The order's latest row, or None if it could not be read. A rejected
+        token is refreshed once: nothing else would refresh it while a contract
+        is blocked, because no order goes out on it."""
+        def _once() -> Dict:
+            history = self.client.order_history(order_id)
+            latest = history[-1] if history else {}
+            status = latest.get("status", "PENDING")
+            filled = int(latest.get("filled_quantity", 0))
+            if status == "COMPLETE" and filled <= 0:
+                # Contradictory: the Kotak adapter defaults a missing fldQty to
+                # 0. Taken as "nothing filled", a real fill would be sent again.
+                raise ValueError(f"COMPLETE with filled_quantity={filled}")
+            return {
+                "status": status,
+                "filled": filled,
+                "average_price": float(latest.get("average_price") or 0.0),
+                # Zerodha's human-readable reject/cancel reason (e.g.
+                # "Insufficient funds. Margin required: ..."). Surfaced in the
+                # failure path so the reason lands in the runner logs instead
+                # of requiring a manual kite.orders() lookup.
+                "message": (latest.get("status_message")
+                            or latest.get("status_message_raw") or ""),
+            }
+        try:
+            try:
+                return _once()
+            except _TOKEN_ERRORS as e:
+                if not self._try_refresh_broker("order_history", str(order_id), e):
+                    return None
+                return _once()
+        except Exception as e:
+            logger.warning("order_history poll failed for %s: %s", order_id, e)
+            return None
+
+    def _cancel(self, order_id) -> None:
+        """Best effort. A refusal is expected if it already filled: the caller
+        reads the order next and goes by that, not by this."""
+        try:
+            self.client.cancel_order(
+                variety=self.client.VARIETY_REGULAR, order_id=order_id,
+            )
+        except Exception as e:
+            logger.warning("cancel_order failed for %s: %s", order_id, e)
+
+    def _remember_unknown(self, order_id, cid, prop: TradeProposal, why: str) -> Dict:
+        _UNRESOLVED[prop.tradingsymbol] = {
+            "owner": self,
+            "order_id": order_id, "cid": cid, "side": prop.transaction_type,
+            "shares": abs(prop.quantity) * prop.lot_size,
+            "since": time.monotonic(), "row": None,
+        }
+        logger.critical(
+            "%s: outcome of order %s is unknown (%s); no new order on this "
+            "contract until it is read", prop.tradingsymbol, order_id or cid, why)
+        return {"order_id": order_id, "status": "UNKNOWN", "filled_lots": 0,
+                "average_price": 0.0, "error": why, "mode": "live"}
+
+    def _settle_one(self, symbol: str, pending: Dict) -> None:
+        """Move one unresolved order forward: find it, re-send its cancel if it
+        is still open, and clear it if it did not fill. A fill stays recorded."""
+        if pending["row"] is not None:
+            return
+        if pending["order_id"] is None:
+            try:
+                found = self.client.find_order_by_tag(pending["cid"])
+            except Exception as e:
+                logger.warning("order-book lookup for %s failed: %s", symbol, e)
+                return
+            if not (isinstance(found, str) and found):
+                if time.monotonic() - pending["since"] >= LOST_SEND_CLEAR_S:
+                    del _UNRESOLVED[symbol]
+                    logger.warning("%s: order %s never reached the broker; "
+                                   "contract unblocked", symbol, pending["cid"])
+                return
+            pending["order_id"] = found
+        row = self._read_order(pending["order_id"])
+        if row is None or row["status"] not in _TERMINAL:
+            self._cancel(pending["order_id"])
+            return
+        if row["filled"] == 0:
+            del _UNRESOLVED[symbol]
+            logger.warning("%s: order %s ended %s with nothing filled; contract "
+                           "unblocked", symbol, pending["order_id"], row["status"])
+            return
+        pending["row"] = row
+        logger.critical(
+            "%s: order %s %s %d shares (%s). A retry of that same order adopts "
+            "it; otherwise this contract stays blocked until an operator checks "
+            "the book and restarts the runner.", symbol, pending["order_id"],
+            pending["side"], row["filled"], row["status"])
+
+    def settle_unresolved(self) -> List[str]:
+        """Read this executor's unresolved orders and return every contract
+        still blocked. For a host's tick, so an order is read even if nothing
+        retries it."""
+        for symbol, pending in list(_UNRESOLVED.items()):
+            if pending["owner"] is self:
+                self._settle_one(symbol, pending)
+        return blocked_contracts()
+
+    def _resolve_unresolved(self, prop: TradeProposal) -> Optional[Dict]:
+        """None if nothing blocks this contract, or the earlier order did not
+        fill. Otherwise the result for this proposal: its fill if this is a
+        retry of that same order (same side and size, recent), else UNKNOWN
+        with nothing sent. It never sends an order to repair a late fill: size
+        and intent have moved on, and that is an operator's call."""
+        symbol = prop.tradingsymbol
+        pending = _UNRESOLVED.get(symbol)
+        if pending is None:
+            return None
+        if pending["owner"] is not self:
+            error = (f"contract blocked: another pair's order "
+                     f"{pending['order_id'] or pending['cid']} is unresolved")
+            logger.critical("%s: nothing sent: %s", symbol, error)
+            return {"order_id": None, "status": "UNKNOWN", "filled_lots": 0,
+                    "average_price": 0.0, "error": error, "mode": "live"}
+        self._settle_one(symbol, pending)
+        pending = _UNRESOLVED.get(symbol)
+        if pending is None:
+            return None
+        order_id = pending["order_id"]
+        row = pending["row"]
+        if row is None:
+            error = f"unresolved order {order_id or pending['cid']}: outcome unknown"
+        elif (row["status"] == "COMPLETE"
+              and prop.transaction_type == pending["side"]
+              and abs(prop.quantity) * prop.lot_size == pending["shares"] == row["filled"]
+              and time.monotonic() - pending["since"] <= ADOPT_MAX_AGE_S):
+            del _UNRESOLVED[symbol]
+            logger.critical("%s: order %s had filled; adopting it (no second "
+                            "order sent)", symbol, order_id)
+            return {"order_id": order_id, "status": "COMPLETE",
+                    "filled_lots": row["filled"] // prop.lot_size,
+                    "average_price": row["average_price"], "mode": "live"}
+        else:
+            error = (f"order {order_id} {pending['side']} filled {row['filled']} "
+                     f"shares ({row['status']}) and this is not its retry: "
+                     "operator check needed")
+        logger.critical("%s: nothing sent: %s", symbol, error)
+        return {"order_id": order_id, "status": "UNKNOWN", "filled_lots": 0,
+                "average_price": 0.0, "error": error, "mode": "live"}
+
+    def _poll_until_terminal(self, order_id, prop: TradeProposal,
+                             cid: Optional[str] = None) -> Dict:
         # Poll order_history until terminal (COMPLETE / REJECTED /
         # CANCELLED) or timeout. On COMPLETE we report the actual fill
-        # (filled_quantity / average_price); on anything else we cancel
-        # best-effort and return FAILED so the caller skips its fill
-        # booking and (if entry batch) triggers a reversal sweep.
-        deadline = time.monotonic() + self.poll_timeout_s
+        # (filled_quantity / average_price). At timeout we cancel, then read
+        # the order again: a cancel can lose the race to a fill, and FAILED
+        # tells the caller nothing filled, so it would send the order again.
+        # 2026-11-06: a BRITANNIA exit filled while its status read timed out,
+        # the cancel was refused with "order is completed", FAILED came back,
+        # and the retry bought a second lot.
         final_status = "PENDING"
         filled_qty = 0
         avg_price = 0.0
         status_message = ""
+
+        def _read() -> bool:
+            """True once the order is terminal. A failed read is not."""
+            nonlocal final_status, filled_qty, avg_price, status_message
+            row = self._read_order(order_id)
+            if row is None:
+                return False
+            final_status = row["status"]
+            filled_qty = row["filled"]
+            avg_price = row["average_price"]
+            status_message = row["message"]
+            return final_status in _TERMINAL
+
+        deadline = time.monotonic() + self.poll_timeout_s
+        terminal = False
         while time.monotonic() < deadline:
-            try:
-                history = self.client.order_history(order_id)
-                latest = history[-1] if history else {}
-                final_status = latest.get("status", "PENDING")
-                filled_qty = int(latest.get("filled_quantity", 0))
-                avg_price = float(latest.get("average_price") or 0.0)
-                # Zerodha's human-readable reject/cancel reason (e.g.
-                # "Insufficient funds. Margin required: ..."). Surfaced in the
-                # failure path below so the reason lands in the runner logs
-                # instead of requiring a manual kite.orders() lookup.
-                status_message = (latest.get("status_message")
-                                  or latest.get("status_message_raw") or "")
-                if final_status in ("COMPLETE", "REJECTED", "CANCELLED"):
-                    break
-            except Exception as e:
-                logger.warning("order_history poll failed for %s: %s",
-                               order_id, e)
+            terminal = _read()
+            if terminal:
+                break
             time.sleep(self.poll_interval_s)
+
+        timed_out = not terminal
+        if timed_out:
+            logger.warning("Order %s not terminal after %.1fs (last status=%s); "
+                           "cancelling", order_id, self.poll_timeout_s, final_status)
+            self._cancel(order_id)
+            for _ in range(_POST_CANCEL_READS):
+                terminal = _read()
+                if terminal:
+                    break
+                time.sleep(self.poll_interval_s)
+            if not terminal:
+                return self._remember_unknown(
+                    order_id, cid, prop,
+                    f"non-terminal after {self.poll_timeout_s}s and its cancel: "
+                    f"status={final_status}")
+
+        if final_status != "COMPLETE" and filled_qty > 0:
+            # Part-filled, then cancelled or rejected: the same exposure as H7.
+            logger.error("Order %s %s with %d shares filled",
+                         order_id, final_status, filled_qty)
+            return self._settle_partial(
+                order_id, cid, prop, filled_qty,
+                f"partial-fill {filled_qty} then {final_status}")
 
         requested_shares = abs(prop.quantity) * prop.lot_size
         if final_status == "COMPLETE":
@@ -419,19 +631,20 @@ class OrderExecutor:
                     "shares (lot %d) — treating as FAILED",
                     order_id, filled_qty, requested_shares, prop.lot_size,
                 )
-                if filled_qty > 0:
-                    self._emergency_reverse_partial(prop, filled_qty, order_id)
-                return {"order_id": order_id, "status": "FAILED",
-                        "filled_lots": 0, "average_price": 0.0,
-                        "error": f"partial-fill {filled_qty}/{requested_shares}",
-                        "mode": "live"}
+                return self._settle_partial(
+                    order_id, cid, prop, filled_qty,
+                    f"partial-fill {filled_qty}/{requested_shares}")
             filled_lots = filled_qty // prop.lot_size
             return {"order_id": order_id, "status": "COMPLETE",
                     "filled_lots": filled_lots, "average_price": avg_price,
                     "mode": "live"}
 
         reason = status_message or "(no status_message from broker)"
-        if final_status in ("REJECTED", "CANCELLED"):
+        if timed_out:
+            logger.warning("Order %s %s after its timeout cancel: %s",
+                           order_id, final_status, reason)
+            error = f"non-terminal after {self.poll_timeout_s}s: {final_status}"
+        else:
             # Terminal broker rejection/cancel — the order settled fast, so
             # don't mislabel it "non-terminal after Ns". Log and propagate the
             # exchange reason so the caller's failure log carries it too.
@@ -440,35 +653,58 @@ class OrderExecutor:
                 order_id, final_status, reason,
             )
             error = f"{final_status}: {reason}"
-        else:
-            # Still open at timeout: best-effort cancel so it doesn't fill late.
-            try:
-                self.client.cancel_order(
-                    variety=self.client.VARIETY_REGULAR, order_id=order_id,
-                )
-                logger.warning(
-                    "Order %s cancelled after %.1fs (last status=%s)",
-                    order_id, self.poll_timeout_s, final_status,
-                )
-            except Exception as e:
-                logger.warning("cancel_order failed for %s: %s",
-                               order_id, e)
-            error = (f"non-terminal after {self.poll_timeout_s}s: "
-                     f"status={final_status}")
         return {"order_id": order_id, "status": "FAILED",
                 "filled_lots": 0, "average_price": 0.0,
                 "error": error, "mode": "live"}
 
+    def _settle_partial(self, order_id, cid, prop: TradeProposal, filled: int,
+                        error: str) -> Dict:
+        """FAILED only if the reversal is confirmed filled: FAILED lets the
+        caller send the full size again. Otherwise the contract stays blocked
+        for an operator, with the fill on record so it is never adopted."""
+        if self._emergency_reverse_partial(prop, filled, order_id):
+            return {"order_id": order_id, "status": "FAILED",
+                    "filled_lots": 0, "average_price": 0.0,
+                    "error": error, "mode": "live"}
+        result = self._remember_unknown(
+            order_id, cid, prop, f"{error}; its reversal is not confirmed")
+        _UNRESOLVED[prop.tradingsymbol]["row"] = {
+            "status": "PARTIAL", "filled": filled, "average_price": 0.0, "message": error,
+        }
+        return result
+
+    def _reversal_filled(self, reverse_id, shares: int) -> bool:
+        """Poll a reversal like any order; cancel it if still open at timeout."""
+        def _filled() -> Optional[bool]:
+            row = self._read_order(reverse_id)
+            if row is None or row["status"] not in _TERMINAL:
+                return None
+            return row["status"] == "COMPLETE" and row["filled"] == shares
+
+        deadline = time.monotonic() + self.poll_timeout_s
+        while time.monotonic() < deadline:
+            done = _filled()
+            if done is not None:
+                return done
+            time.sleep(self.poll_interval_s)
+        self._cancel(reverse_id)
+        for _ in range(_POST_CANCEL_READS):
+            done = _filled()
+            if done is not None:
+                return done
+            time.sleep(self.poll_interval_s)
+        return False
+
     def _emergency_reverse_partial(self, prop: TradeProposal,
                                     filled_shares: int,
-                                    original_order_id: str) -> None:
+                                    original_order_id: str) -> bool:
         # H7 follow-up: place an opposite-side order for the partial
         # quantity sitting on the broker after we treated the original
         # order as FAILED. Marketable LIMIT, same as execute() — the API
         # rejects naked MARKET orders. Best-effort: if this raises, we
         # cannot recover automatically — log CRITICAL so notify-failure@
         # alerts surface the orphan and the operator squares it manually
-        # before reopen.
+        # before reopen. True only once the reversal is read as fully filled.
         reverse_type = "SELL" if prop.transaction_type == "BUY" else "BUY"
         reverse_side = (
             self.client.TRANSACTION_TYPE_SELL if reverse_type == "SELL"
@@ -501,3 +737,12 @@ class OrderExecutor:
                 "next session. err=%s",
                 filled_shares, prop.tradingsymbol, original_order_id, e,
             )
+            return False
+        if self._reversal_filled(reverse_id, filled_shares):
+            return True
+        logger.critical(
+            "H7 PARTIAL ORPHAN: reversal %s of %d shares of %s (order %s) is not "
+            "confirmed filled. MANUAL CHECK REQUIRED.", reverse_id, filled_shares,
+            prop.tradingsymbol, original_order_id,
+        )
+        return False

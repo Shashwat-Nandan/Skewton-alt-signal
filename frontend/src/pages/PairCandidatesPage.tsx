@@ -64,8 +64,8 @@ function columnsFor(variant: PairVariant): Column[] {
 }
 
 const SKIP_REASON_LABEL: Record<PairSkipReason, string> = {
-  beta: "|β| outside [0.1, 10] — untradeable hedge ratio",
-  quality: "below quality floor (corr < 0.65 OR half-life > 5d OR p > 0.025)",
+  beta: "β negative or |β| outside [0.1, 10] — untradeable hedge ratio",
+  quality: "below quality floor (corr < 0.75 OR half-life > 5d OR p > 0.025)",
   leg_cap: "a leg is already at the concentration cap (2× in book)",
   cutoff: "survived filters but ranked below the --top cutoff",
 };
