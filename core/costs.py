@@ -14,6 +14,7 @@ suite monkeypatches to fake costs, and a strategy call site that imported
 ``core.costs`` directly would silently escape those fakes. Research and
 other non-strategy code imports ``core.costs``.
 """
+from typing import Optional
 
 # NSE equity-futures exchange transaction charge ≈ ₹190/cr = 0.0019% of
 # turnover (corrected 2026-06-19 from a ~10x-too-high 0.0002). Exposed as a
@@ -29,6 +30,8 @@ def estimate_transaction_cost(
     price: float, quantity: int, lot_size: int, transaction_type: str,
     instrument_type: str = "OPT",
     fut_exchange_rate: float = _FUT_EXCHANGE_RATE,
+    stt_rate: Optional[float] = None,
+    slippage_rate: Optional[float] = None,
 ) -> float:
     """
     Estimate total transaction costs for an Indian options/futures order.
@@ -40,6 +43,9 @@ def estimate_transaction_cost(
         lot_size: units per lot
         transaction_type: "BUY" or "SELL"
         instrument_type: "OPT" for options, "FUT" for futures
+        stt_rate: sell-side STT in place of the current rate below (a
+            backtest of an earlier date). None keeps the current rate.
+        slippage_rate: slippage in place of the default below. None keeps it.
 
     Returns:
         Total estimated cost in INR (always positive).
@@ -60,12 +66,10 @@ def estimate_transaction_cost(
     # paid by the purchaser at settlement) is NOT modeled here — this is a
     # per-order estimate; positions are closed/flattened before settlement.
     stt = 0.0
-    if instrument_type == "FUT":
-        if transaction_type == "SELL":
-            stt = turnover * 0.0005
-    else:
-        if transaction_type == "SELL":
-            stt = turnover * 0.0015
+    if stt_rate is None:
+        stt_rate = 0.0005 if instrument_type == "FUT" else 0.0015
+    if transaction_type == "SELL":
+        stt = turnover * stt_rate
 
     # Exchange transaction charges differ by product
     if instrument_type == "FUT":
@@ -90,10 +94,9 @@ def estimate_transaction_cost(
         stamp = turnover * 0.00003
 
     # Slippage: futures are more liquid, lower slippage
-    if instrument_type == "FUT":
-        slippage = turnover * 0.0002  # 0.02%
-    else:
-        slippage = turnover * 0.0005  # 0.05%
+    if slippage_rate is None:
+        slippage_rate = 0.0002 if instrument_type == "FUT" else 0.0005  # 0.02% / 0.05%
+    slippage = turnover * slippage_rate
 
     return brokerage + stt + exchange_charges + sebi + gst + stamp + slippage
 
