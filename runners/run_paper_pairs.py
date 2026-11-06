@@ -750,6 +750,20 @@ def has_stray_legs(strategy) -> bool:
             or (getattr(st, "position", None) == "FLAT" and len(legs) > 0))
 
 
+def latch_on_unknown_order(strategy, log: logging.Logger,
+                           halt_path: Optional[Path]) -> bool:
+    """Read this pair's unknown-outcome orders. While any remain, this runner
+    opens nothing: an unknown order may be an untracked fill (2026-11-06)."""
+    settle = getattr(strategy, "settle_unknown_orders", None)
+    contracts = settle() if settle is not None else None
+    if not (isinstance(contracts, list) and contracts):
+        return False
+    latch_halt_new_entries(
+        log, f"[{strategy.symbol_a}/{strategy.symbol_b}] order outcome unknown "
+             f"on {contracts}", halt_path)
+    return True
+
+
 def tick_one(strategy, log: logging.Logger,
              halt_all: bool = False,
              halt_new_entries: bool = False,
@@ -765,6 +779,9 @@ def tick_one(strategy, log: logging.Logger,
     pair_label = f"{strategy.symbol_a}/{strategy.symbol_b}"
     if halt_all:
         return TickOutcome(attempted_execution=False, errored=False)
+
+    if latch_on_unknown_order(strategy, log, halt_path):
+        halt_new_entries = True
 
     # 2026-10-07 naked-leg incident: a stray leg is closed before anything
     # else, and no pair on this runner opens new exposure until it is gone.
@@ -803,6 +820,9 @@ def tick_one(strategy, log: logging.Logger,
     except Exception as e:
         error_count += 1
         log.exception("[%s] check_and_rehedge failed: %s", pair_label, e)
+
+    if attempted_execution:
+        latch_on_unknown_order(strategy, log, halt_path)
 
     return TickOutcome(attempted_execution=attempted_execution,
                        errored=error_count > 0)

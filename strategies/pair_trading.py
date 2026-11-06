@@ -2468,6 +2468,10 @@ class PairTradingStrategy(BaseStrategy):
         # double-count.
         threshold = 3
         cap = 60
+        # Not a broker refusal: arming the backoff would hold off the retry that
+        # adopts the fill once the order can be read.
+        if result.get("status") == "UNKNOWN":
+            return
         if result.get("status") == "COMPLETE":
             if self._place_order_fail_streak:
                 logger.info("%s/%s: place_order recovered — clearing streak",
@@ -2492,6 +2496,14 @@ class PairTradingStrategy(BaseStrategy):
             )
             self._place_order_skip_window = min(self._place_order_skip_window * 2, cap)
             self._place_order_fail_streak = 0
+
+    def settle_unknown_orders(self) -> List[str]:
+        """Contracts blocked by an order whose outcome is unknown, for any pair
+        on this runner, after reading this pair's own once more."""
+        from .order_executor import blocked_contracts
+
+        executor = getattr(self, "_live_order_executor", None)
+        return executor.settle_unresolved() if executor is not None else blocked_contracts()
 
     def _order_tag(self, prop: TradeProposal) -> str:
         # Kite tag limit is 20 chars. Short symbol prefixes so the broker
