@@ -93,27 +93,23 @@ def test_a_closed_orphan_does_not_re_enter():
     """The screen dropped this pair while it was held. Once flat, a fresh z
     signal must not open it again."""
     stub = SimpleNamespace(
-        allow_new_entries=False,
+        allow_new_entries=False, hedge_ratio=1.0,
         state=SimpleNamespace(position="FLAT", unwind_pending=False, legs=[]),
         _is_in_stop_cooldown=lambda: pytest.fail("must stop before any entry check"),
     )
     assert PairTradingStrategy.scan_and_propose(stub) == []
 
 
-def test_build_orphan_strategies_blocks_entries(monkeypatch):
+def _orphan(monkeypatch, beta=-0.123, candidate_rows=None):
     import logging
 
     import runners.run_paper_pairs as r
-
-    built = []
 
     class _Fake:
         def __init__(self, **kw):
             self.symbol_a, self.symbol_b = kw["symbol_a"], kw["symbol_b"]
             self.hedge_ratio = kw["hedge_ratio"]
-            self.allow_new_entries = True
             self.state = SimpleNamespace(position="SHORT_SPREAD", legs=[1, 2])
-            built.append(self)
 
         def restore_state(self, blob):
             pass
@@ -125,14 +121,62 @@ def test_build_orphan_strategies_blocks_entries(monkeypatch):
     args = SimpleNamespace(system="persistent", entry_z=2.0, exit_z=0.75, stop_z=4.0,
                            lookback_days=60, max_holding_days=7, lots_per_leg=1,
                            max_leg_notional=1e6, stop_cooldown_minutes=60, mode="paper")
-    blob = {"pair": ["KOTAKBANK", "HINDUNILVR"], "hedge_ratio": -0.123,
+    blob = {"pair": ["KOTAKBANK", "HINDUNILVR"], "hedge_ratio": beta,
             "state": {"position": "SHORT_SPREAD", "legs": [{"x": 1}, {"x": 2}]}}
-    orphans = r.build_orphan_strategies(
+    return r.build_orphan_strategies(
         {"KOTAKBANK/HINDUNILVR": blob}, set(), args, None, "config.ini",
-        logging.getLogger("t"))
+        logging.getLogger("t"), candidate_rows=candidate_rows)
+
+
+def test_an_orphan_the_screen_dropped_is_managed_but_cannot_re_enter(monkeypatch):
+    orphans = _orphan(monkeypatch)
     assert [s.symbol_a for s in orphans] == ["KOTAKBANK"]
     assert orphans[0].hedge_ratio == -0.123       # still managed on its saved β
     assert orphans[0].allow_new_entries is False
+
+
+def test_an_orphan_that_only_missed_the_cutoff_keeps_trading(monkeypatch):
+    """Below --top or at the leg cap is not the owner's rule: the block must
+    not remove trades the rule does not ask to remove."""
+    orphans = _orphan(monkeypatch, beta=1.2, candidate_rows={"KOTAKBANK/HINDUNILVR"})
+    assert orphans[0].allow_new_entries is True
+
+
+def test_candidate_keys_lists_only_rows_that_pass_the_rule():
+    df = pd.DataFrame([_row("GOOD", "PAIR"), _row("NEG", "BETA", beta=-1.0),
+                       _row("WEAK", "CORR", corr=0.7)])
+    assert sp.candidate_keys(df) == {"GOOD/PAIR"}
+    assert sp.candidate_keys(pd.DataFrame()) == set()
+
+
+def test_a_saved_negative_beta_cannot_open_a_new_position():
+    """Today's screen can list a held pair with β +0.4 while the position was
+    opened at -0.5. It keeps the saved β, so once flat it must not re-open."""
+    stub = SimpleNamespace(
+        allow_new_entries=True, hedge_ratio=-0.5,
+        state=SimpleNamespace(position="FLAT", unwind_pending=False, legs=[]),
+        _is_in_stop_cooldown=lambda: pytest.fail("must stop before any entry check"),
+    )
+    assert PairTradingStrategy.scan_and_propose(stub) == []
+
+
+def test_a_list_the_gate_empties_fails_loud_and_keeps_the_old_file(monkeypatch, tmp_path):
+    out = tmp_path / "pair_candidates.csv"
+    out.write_text("old")
+    monkeypatch.setattr(sp, "load_front_month_panel", lambda *a, **k: _panel())
+    monkeypatch.setattr(sp, "QUALITY_MIN_CORR", 1.01)
+    monkeypatch.setattr("sys.argv", ["screen_pairs", "--output", str(out)])
+    assert sp.main() == 1
+    assert out.read_text() == "old"
+
+
+def test_survivors_are_re_ranked_over_the_rows_that_remain():
+    df = pd.DataFrame([{**_row("A", "A1"), "coint_pvalue": 0.04, "rank_score": 0.1},
+                       {**_row("B", "B1"), "coint_pvalue": 0.01, "rank_score": 0.9},
+                       _row("NEG", "BETA", beta=-1.0)])
+    kept = sp.drop_untradeable_candidates(df)
+    assert list(kept["symbol_a"]) == ["B", "A"]
+    assert kept["rank_score"].tolist() == sorted(kept["rank_score"])
 
 
 def test_the_module_entry_point_comes_after_everything_main_needs():

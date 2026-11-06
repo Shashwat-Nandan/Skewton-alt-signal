@@ -1,3 +1,19 @@
+# Pair candidate gate: β > 0, correlation ≥ 0.75 — 2026-11-05
+
+Owner rule: no pair with a negative hedge ratio or correlation below 0.75
+trades, or is even a candidate.
+
+**Safety rule 3 exception (recorded):** the owner directed this for live on
+2026-11-05 ("Please deploy the fix") without a backtest or paper run. It only
+narrows entries; its effect on returns is unmeasured.
+
+- [x] Screen output, runner selection, saved-negative-β entries (PR #26).
+- [x] Review fixes: the `__main__` guard crash; a saved negative β refused at
+      entry; the re-entry block limited to pairs failing the rule; an emptied
+      list exits 1; one definition of the rule; the gate re-ranks.
+- [ ] Measure: `research.backtest_pairs` at 0.65 vs 0.75 with the sign rule.
+- [ ] Owner review and merge. Deployed as an uncommitted patch until then.
+
 # Dispersion dashboard page + second review — 2026-10-02
 
 - [x] `GET /api/dispersion-paper` (read-only, session-gated): each book's

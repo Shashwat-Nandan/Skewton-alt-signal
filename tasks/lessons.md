@@ -1,5 +1,13 @@
 # Lessons
 
+## Verify a CLI the way production invokes it
+
+- 2026-11-05: a helper added below a mid-file `__main__` guard made
+  `python -m core.screen_pairs` raise NameError. Unit tests and an "end to end"
+  check called `main()` after a full import, so all passed, and I reported it
+  verified. A review caught it hours before the nightly screen.
+- Run the exact command the unit runs (`-m`), not a wrapper that imports first.
+
 ## Read the whole function's locals before naming a new one in it
 
 - 2026-10-02: the dispersion gamma attribution got a new `held` dict (basket

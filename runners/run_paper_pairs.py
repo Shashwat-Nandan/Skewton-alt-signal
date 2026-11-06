@@ -86,6 +86,7 @@ from core.screen_pairs import (  # noqa: F401  (re-exported)
     QUALITY_MAX_HALFLIFE,
     QUALITY_MAX_PVALUE,
     QUALITY_MIN_CORR,
+    candidate_keys,
     classify_pair_candidates,
 )
 
@@ -1028,15 +1029,17 @@ def build_orphan_strategies(
     spread_panel: Optional[pd.DataFrame] = None,
     signal_publisher=None,
     halt_path: Optional[Path] = None,
+    candidate_rows: Optional[set] = None,
 ):
     """Build strategies for prior-state pairs with an OPEN position that are
     NOT in today's candidate list. Without this, a held position would simply
     be orphaned when the screener drops the pair — no one would manage it to
     exit.
 
-    Orphans use the saved hedge_ratio and the saved state. They never get new
-    entries, including after their position closes mid-session: a pair the
-    screen dropped is not a candidate."""
+    Orphans use the saved hedge_ratio and the saved state. After closing, one
+    can re-enter only if it is in `candidate_rows` ("A/B" rows of today's CSV
+    that pass the owner's rule): a pair that merely ranked below --top or hit
+    the leg cap keeps trading, and one the screen dropped does not."""
     from strategies.pair_trading import PairTradingStrategy
     orphans = []
     for key, blob in prior_state.items():
@@ -1064,7 +1067,7 @@ def build_orphan_strategies(
             if max_book_notional > 0:
                 s.max_book_notional = max_book_notional
             s.signal_system_tag = args.system
-            s.allow_new_entries = False
+            s.allow_new_entries = key in (candidate_rows or set())
             s.entry_z = args.entry_z
             s.exit_z = args.exit_z
             s.stop_z = args.stop_z
@@ -1843,6 +1846,7 @@ def main():
         spread_panel=spread_panel,
         signal_publisher=signal_publisher,
         halt_path=naked_halt if args.mode == "live" else None,
+        candidate_rows=candidate_keys(pd.read_csv(args.candidates)),
     )
     strategies = strategies + orphans
 

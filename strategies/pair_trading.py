@@ -570,6 +570,11 @@ class PairTradingStrategy(BaseStrategy):
             return []
         if not self.allow_new_entries:
             return []
+        # Owner rule 2026-11-05. A held pair keeps its saved β for the session
+        # (restore_matching_strategies), and that β can be negative even when
+        # today's screen lists the pair with a positive one.
+        if self.hedge_ratio <= 0:
+            return []
         # Naked-leg latch: never open a new spread on top of a stray leg.
         if self.state.unwind_pending or self.state.legs:
             return []

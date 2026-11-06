@@ -669,8 +669,6 @@ def screen_pairs_persistent(
     if df.empty:
         logger.warning("No persistent pair has β > 0 and corr >= %.2f", QUALITY_MIN_CORR)
         return df
-    df["rank_score"] = _composite_rank(df)
-    df = df.sort_values("rank_score").reset_index(drop=True)
 
     logger.info(
         "Persistence screen admitted %d pair(s) (≥%d / %d windows)",
@@ -762,16 +760,14 @@ def main():
             min_hedge_ratio=args.min_hedge_ratio,
             max_hedge_ratio=args.max_hedge_ratio,
         )
-        # Before the rank, as in screen_pairs_persistent, so percentile
-        # scores are over the rows that are actually candidates.
         df = drop_untradeable_candidates(df)
-        if not df.empty:
-            df["rank_score"] = _composite_rank(df)
-            df = df.sort_values("rank_score").reset_index(drop=True)
 
     if df.empty:
-        logger.warning("No candidates; %s left unchanged", args.output)
-        return 0
+        # Fail loud: the old file stays on disk, and exit 0 would make that
+        # look like a fresh list. The runners' CSV-age limit stops them
+        # trading on it for long.
+        logger.error("No candidates; %s left unchanged", args.output)
+        return 1
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False)
@@ -821,6 +817,23 @@ QUALITY_MAX_PVALUE = 0.025
 LEG_CONCENTRATION_CAP = 2
 
 
+def _candidate_rule(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """The owner's rule as two masks: (β > 0, corr >= QUALITY_MIN_CORR). The
+    single definition behind the screen's gate and the runner's selection."""
+    beta = pd.to_numeric(df["hedge_ratio"], errors="coerce")
+    corr = pd.to_numeric(df["correlation"], errors="coerce")
+    return beta > 0, corr >= QUALITY_MIN_CORR
+
+
+def candidate_keys(df: pd.DataFrame) -> set[str]:
+    """"A/B" for each row that passes the owner's rule."""
+    if df.empty:
+        return set()
+    beta_ok, corr_ok = _candidate_rule(df)
+    ok = df[beta_ok & corr_ok]
+    return {f"{a}/{b}" for a, b in zip(ok["symbol_a"], ok["symbol_b"])}
+
+
 def drop_untradeable_candidates(df: pd.DataFrame) -> pd.DataFrame:
     """Remove rows pair trading must never see: a negative hedge ratio, or
     correlation below QUALITY_MIN_CORR (owner decision 2026-11-05).
@@ -829,19 +842,25 @@ def drop_untradeable_candidates(df: pd.DataFrame) -> pd.DataFrame:
     rolling window of the persistence test keeps its own `min_correlation`
     prefilter, so this does not change what "persistent" means. `correlation`
     is |corr| of prices, but OLS β and corr share a sign on one window, so
-    β > 0 and |corr| >= floor is signed corr >= floor. NaN is dropped."""
+    β > 0 and |corr| >= floor is signed corr >= floor. NaN is dropped.
+
+    Survivors are re-ranked and sorted, so percentile scores are over the rows
+    that are actually candidates."""
     if df.empty:
         return df
-    beta = pd.to_numeric(df["hedge_ratio"], errors="coerce")
-    corr = pd.to_numeric(df["correlation"], errors="coerce")
-    keep = (beta > 0) & (corr >= QUALITY_MIN_CORR)
+    beta_ok, corr_ok = _candidate_rule(df)
+    keep = beta_ok & corr_ok
     if not keep.all():
         logger.info(
             "Candidate gate (β > 0, corr >= %.2f) dropped %d of %d: %s",
             QUALITY_MIN_CORR, int((~keep).sum()), len(df),
             ", ".join(f"{a}/{b}" for a, b in zip(df.loc[~keep, "symbol_a"],
                                                  df.loc[~keep, "symbol_b"])))
-    return df[keep].reset_index(drop=True)
+    kept = df[keep].copy()
+    if kept.empty:
+        return kept.reset_index(drop=True)
+    kept["rank_score"] = _composite_rank(kept)
+    return kept.sort_values("rank_score").reset_index(drop=True)
 
 
 def classify_pair_candidates(
@@ -922,9 +941,10 @@ def classify_pair_candidates(
     # A CSV written before the candidate gate, or by hand, can still hold a
     # negative β: refuse it here too, since this is what the runner trades from.
     abs_beta = out["hedge_ratio"].abs()
+    beta_positive, corr_floor = _candidate_rule(out)
     beta_mask = (
         ~excluded_mask
-        & (out["hedge_ratio"] > 0)
+        & beta_positive
         & (abs_beta >= HEDGE_RATIO_MIN)
         & (abs_beta <= beta_upper)
     )
@@ -936,7 +956,7 @@ def classify_pair_candidates(
 
     quality_mask = (
         beta_mask
-        & (out["correlation"] >= QUALITY_MIN_CORR)
+        & corr_floor
         & (out["half_life_days"] <= QUALITY_MAX_HALFLIFE)
         & (out["coint_pvalue"] <= pvalue_ceiling)
     )
