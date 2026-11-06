@@ -16,6 +16,7 @@ that protect real money:
   rest in the book unfilled, which is exactly the 2026-05-21 incident.
 """
 
+from core.broker.errors import BrokerNetworkError, BrokerOrderError
 from strategies.order_executor import (
     OrderExecutor,
     _NetworkException,
@@ -271,3 +272,110 @@ class TestValidation:
         assert result["status"] == "FAILED"
         assert "validation" in result["error"]
         assert kite.placed == []
+
+
+class _Scripted(FakeKite):
+    """order_history answers from a script: a row list, or an Exception to
+    raise. The last entry repeats. cancel_order can refuse, as Kotak does for
+    an order that has already filled."""
+
+    def __init__(self, reads, cancel_raises=None):
+        super().__init__()
+        self.reads = list(reads)
+        self.cancel_raises = cancel_raises
+
+    def order_history(self, order_id):
+        step = self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    def cancel_order(self, variety, order_id):
+        self.cancelled.append(order_id)
+        if self.cancel_raises:
+            raise self.cancel_raises
+
+
+_OPEN = [{"status": "PENDING", "filled_quantity": 0, "average_price": 0.0}]
+_DONE = [{"status": "COMPLETE", "filled_quantity": 50, "average_price": 101.5}]
+_GONE = [{"status": "CANCELLED", "filled_quantity": 0, "average_price": 0.0}]
+_TIMEOUT = BrokerNetworkError("read timed out")
+_REFUSED = BrokerOrderError("order is completed")
+
+
+class TestAFillIsNeverReportedAsFailed:
+    """2026-11-06, BRITANNIA: an exit filled while its status read timed out.
+    The cancel was refused with "order is completed", FAILED came back, the
+    next tick sent the exit again, and the book was left 125 shares long on
+    real money. FAILED must mean nothing filled."""
+
+    def _timed_out(self, later):
+        # poll_timeout_s=0 skips the poll loop: the order is "still open at
+        # timeout", the state today's status read timeout produced.
+        return _Scripted(later, cancel_raises=_REFUSED)
+
+    def test_order_found_filled_after_the_refused_cancel_is_a_fill(self):
+        kite = self._timed_out([_DONE])
+        result = _executor(kite, poll_timeout_s=0).execute(_prop())
+        assert result["status"] == "COMPLETE"
+        assert result["filled_lots"] == 2 and result["average_price"] == 101.5
+        assert len(kite.placed) == 1
+
+    def test_an_unreadable_outcome_blocks_the_resend_and_adopts_the_fill(self):
+        """Exactly today's retry: the next tick's same order must not reach
+        the broker once the first one is known to have filled."""
+        kite = self._timed_out([_TIMEOUT, _TIMEOUT, _TIMEOUT, _DONE])
+        ex = _executor(kite, poll_timeout_s=0)
+        first = ex.execute(_prop())
+        assert first["status"] == "FAILED" and "unknown" in first["error"]
+        second = ex.execute(_prop())
+        assert second["status"] == "COMPLETE" and second["order_id"] == "OID1"
+        assert second["average_price"] == 101.5
+        assert len(kite.placed) == 1
+
+    def test_still_unreadable_sends_nothing(self):
+        kite = self._timed_out([_TIMEOUT])
+        ex = _executor(kite, poll_timeout_s=0)
+        ex.execute(_prop())
+        assert ex.execute(_prop())["status"] == "FAILED"
+        assert len(kite.placed) == 1
+
+    def test_a_confirmed_cancel_does_allow_the_retry(self):
+        """The guard must not freeze exits: nothing filled, so resend."""
+        kite = _Scripted([_GONE])
+        ex = _executor(kite, poll_timeout_s=0)
+        assert ex.execute(_prop())["status"] == "FAILED"
+        assert ex.execute(_prop())["status"] == "FAILED"
+        assert len(kite.placed) == 2
+
+    def test_unresolved_order_that_did_not_fill_allows_the_retry(self):
+        kite = _Scripted([_TIMEOUT, _TIMEOUT, _TIMEOUT, _GONE, _DONE])
+        ex = _executor(kite, poll_timeout_s=0)
+        ex.execute(_prop())
+        assert ex.execute(_prop())["status"] == "COMPLETE"
+        assert len(kite.placed) == 2
+
+    def test_another_contract_is_not_blocked(self):
+        kite = _Scripted([_TIMEOUT])
+        ex = _executor(kite, poll_timeout_s=0)
+        ex.execute(_prop())
+        other = _prop()
+        other.tradingsymbol = "NIFTY26403PE22000"
+        kite.reads = [_DONE]
+        assert ex.execute(other)["status"] == "COMPLETE"
+
+    def test_part_filled_then_cancelled_is_reversed_not_left_open(self):
+        kite = _Scripted([[{"status": "CANCELLED", "filled_quantity": 25,
+                            "average_price": 100.0}]])
+        result = _executor(kite, poll_timeout_s=0).execute(_prop("BUY"))
+        assert result["status"] == "FAILED"
+        assert [o["transaction_type"] for o in kite.placed] == ["BUY", "SELL"]
+        assert kite.placed[1]["quantity"] == 25
+
+    def test_a_fill_on_the_other_side_is_not_adopted(self):
+        kite = _Scripted([_TIMEOUT, _TIMEOUT, _TIMEOUT, _DONE])
+        ex = _executor(kite, poll_timeout_s=0)
+        ex.execute(_prop("BUY"))
+        result = ex.execute(_prop("SELL"))
+        assert result["status"] == "FAILED" and "other side" in result["error"]
+        assert len(kite.placed) == 1
