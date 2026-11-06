@@ -46,6 +46,19 @@ class TestReExportContract:
         assert costs.estimate_transaction_cost(100.0, -5, 50, "SELL") == 0.0
 
 
+    def test_rate_overrides_replace_only_their_own_component(self):
+        """A backtest of a 2025 option exit must pay that year's STT, and a
+        research harness that prices spread itself must drop core's
+        slippage. Each override moves exactly its own term, so the live
+        callers, which pass neither, keep today's rates."""
+        base = costs.estimate_transaction_cost(100.0, 1, 75, "SELL", "OPT")
+        stt = costs.estimate_transaction_cost(100.0, 1, 75, "SELL", "OPT", stt_rate=0.001)
+        assert abs((base - stt) - 7500 * (0.0015 - 0.001)) < 1e-9
+        no_slip = costs.estimate_transaction_cost(100.0, 1, 75, "SELL", "OPT", slippage_rate=0.0)
+        assert abs((base - no_slip) - 7500 * 0.0005) < 1e-9
+        buy = costs.estimate_transaction_cost(100.0, 1, 75, "BUY", "OPT", stt_rate=0.5)
+        assert buy == costs.estimate_transaction_cost(100.0, 1, 75, "BUY", "OPT")
+
 class TestEquityCost:
     """core.costs.estimate_equity_cost — the shared equity-cash model the
     varsity-swing and buy-on-gap strategies migrated onto (§4.1)."""
