@@ -18,9 +18,11 @@ that protect real money:
 
 import time as time_module
 
+from strategies import order_executor
 from core.broker.errors import BrokerNetworkError, BrokerOrderError, BrokerTokenError
 from strategies.order_executor import (
     ADOPT_MAX_AGE_S,
+    LOST_SEND_CLEAR_S,
     OrderExecutor,
     _NetworkException,
     _OrderException,
@@ -174,13 +176,16 @@ class TestPartialFill:
         assert reverse["quantity"] == 25
 
     def test_zero_fill_complete_is_failed_without_reverse(self):
+        # Contradictory, and how a missing fldQty reads through the Kotak
+        # adapter: it may be a real fill, so it must not allow a resend.
         kite = FakeKite(history=[
             {"status": "COMPLETE", "filled_quantity": 0,
              "average_price": 0.0},
         ])
-        result = _executor(kite).execute(_prop())
-        assert result["status"] == "FAILED"
-        assert len(kite.placed) == 1  # no reverse for nothing filled
+        ex = _executor(kite)
+        assert ex.execute(_prop())["status"] == "UNKNOWN"
+        assert ex.execute(_prop())["status"] == "UNKNOWN"
+        assert len(kite.placed) == 1  # no reverse, and no second order
 
 
 class TestNonTerminal:
@@ -303,6 +308,7 @@ _OPEN = [{"status": "PENDING", "filled_quantity": 0, "average_price": 0.0}]
 _DONE = [{"status": "COMPLETE", "filled_quantity": 50, "average_price": 101.5}]
 _GONE = [{"status": "CANCELLED", "filled_quantity": 0, "average_price": 0.0}]
 _PART = [{"status": "CANCELLED", "filled_quantity": 25, "average_price": 100.0}]
+_REVERSED = [{"status": "COMPLETE", "filled_quantity": 25, "average_price": 100.0}]
 _TIMEOUT = BrokerNetworkError("read timed out")
 _REFUSED = BrokerOrderError("order is completed")
 
@@ -368,7 +374,7 @@ class TestAFillIsNeverReportedAsFailed:
         assert ex.execute(other)["status"] == "COMPLETE"
 
     def test_part_filled_then_cancelled_after_the_timeout_is_reversed(self):
-        kite, ex = self._ex([_PART])
+        kite, ex = self._ex([_PART, _REVERSED])
         result = ex.execute(_prop("BUY"))
         assert result["status"] == "FAILED"
         assert [o["transaction_type"] for o in kite.placed] == ["BUY", "SELL"]
@@ -376,7 +382,7 @@ class TestAFillIsNeverReportedAsFailed:
 
     def test_part_filled_then_cancelled_inside_the_poll_window_is_reversed(self):
         """Otherwise FAILED, then the next tick resends the full order on top."""
-        kite = _Scripted([_PART])
+        kite = _Scripted([_PART, _REVERSED])
         result = _executor(kite).execute(_prop("BUY"))
         assert result["status"] == "FAILED"
         assert [o["transaction_type"] for o in kite.placed] == ["BUY", "SELL"]
@@ -398,7 +404,7 @@ class TestAFillIsNeverReportedAsFailed:
         broker does not hold while the sibling leg really goes out."""
         kite, ex = self._ex([_TIMEOUT, _TIMEOUT, _TIMEOUT, _DONE])
         ex.execute(_prop())
-        ex._unresolved[_prop().tradingsymbol]["since"] -= ADOPT_MAX_AGE_S + 1
+        order_executor._UNRESOLVED[_prop().tradingsymbol]["since"] -= ADOPT_MAX_AGE_S + 1
         result = ex.execute(_prop())
         assert result["status"] == "UNKNOWN"
         assert len(kite.placed) == 1
@@ -466,10 +472,78 @@ class TestAFillIsNeverReportedAsFailed:
         time_module.sleep = lambda _s: None
         try:
             assert ex.execute(_prop())["status"] == "UNKNOWN"
+            order_executor._UNRESOLVED[_prop().tradingsymbol]["since"] -= LOST_SEND_CLEAR_S + 1
             assert ex.execute(_prop())["status"] == "COMPLETE"
         finally:
             time_module.sleep = monkey_sleep
         assert len(kite.placed) == 1
+
+    def test_one_miss_right_after_a_lost_send_does_not_unblock(self):
+        """The book may not show an in-flight order yet. A retry under a new
+        client id would not be refused as a duplicate, and both would fill."""
+        kite = _Scripted([_DONE], place_raises=[_TIMEOUT, _TIMEOUT])
+        lookups = [_TIMEOUT, _TIMEOUT, None]
+
+        def finder(cid):
+            step = lookups.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            return step
+
+        kite.find_order_by_tag = finder
+        ex = _executor(kite, poll_timeout_s=0)
+        monkey_sleep = time_module.sleep
+        time_module.sleep = lambda _s: None
+        try:
+            ex.execute(_prop())
+        finally:
+            time_module.sleep = monkey_sleep
+        assert ex.settle_unresolved() == [_prop().tradingsymbol]
+        assert kite.placed == []
+
+    def test_another_pair_on_the_contract_is_blocked_too(self):
+        """The incident's second half: BRITANNIA/MARUTI opened +125 on the
+        contract with the unread order. Its fill is not that pair's to adopt."""
+        kite, first = self._ex([_TIMEOUT, _TIMEOUT, _TIMEOUT, _DONE])
+        first.execute(_prop())
+        other_kite = _Scripted([_DONE])
+        other = _executor(other_kite, poll_timeout_s=0)
+        result = other.execute(_prop())
+        assert result["status"] == "UNKNOWN" and "another pair" in result["error"]
+        assert other_kite.placed == []
+        assert other.settle_unresolved() == [_prop().tradingsymbol]
+        assert first.execute(_prop())["status"] == "COMPLETE"     # the owner adopts
+
+    def test_complete_with_nothing_filled_is_not_taken_as_no_fill(self):
+        bad = [{"status": "COMPLETE", "filled_quantity": 0, "average_price": 0.0}]
+        kite, ex = self._ex([_TIMEOUT, _TIMEOUT, _TIMEOUT, bad, bad])
+        ex.execute(_prop())
+        assert ex.settle_unresolved() == [_prop().tradingsymbol]
+
+    def test_an_unconfirmed_reversal_blocks_instead_of_allowing_a_full_resend(self):
+        """FAILED would resend the full size on a book already holding the part."""
+        kite, ex = self._ex([_PART])                 # the reversal never reads as filled
+        result = ex.execute(_prop("BUY"))
+        assert result["status"] == "UNKNOWN" and "not confirmed" in result["error"]
+        for _ in range(2):
+            assert ex.execute(_prop("BUY"))["status"] == "UNKNOWN"
+        assert len(kite.placed) == 2                 # the order and its reversal only
+
+    def test_a_reversal_that_cannot_be_sent_blocks_too(self):
+        kite, ex = self._ex([_PART])
+        real_place = kite.place_order
+        calls = []
+
+        def place(**kw):
+            calls.append(kw)
+            if len(calls) == 2:
+                raise _TIMEOUT
+            return real_place(**kw)
+
+        kite.place_order = place
+        assert ex.execute(_prop("BUY"))["status"] == "UNKNOWN"
+        assert ex.execute(_prop("BUY"))["status"] == "UNKNOWN"
+        assert len(calls) == 2
 
     def test_a_lookup_that_recovers_says_the_send_never_arrived(self):
         """A failed lookup before the resend must not outlive a good one after."""

@@ -2477,10 +2477,12 @@ class PairTradingStrategy(BaseStrategy):
             self._place_order_fail_streak = 0
 
     def settle_unknown_orders(self) -> List[str]:
-        """Contracts blocked by an order whose outcome is unknown, after reading
-        those orders once more. Empty in paper mode or with no live order yet."""
+        """Contracts blocked by an order whose outcome is unknown, for any pair
+        on this runner, after reading this pair's own once more."""
+        from .order_executor import blocked_contracts
+
         executor = getattr(self, "_live_order_executor", None)
-        return executor.settle_unresolved() if executor is not None else []
+        return executor.settle_unresolved() if executor is not None else blocked_contracts()
 
     def _order_tag(self, prop: TradeProposal) -> str:
         # Kite tag limit is 20 chars. Short symbol prefixes so the broker

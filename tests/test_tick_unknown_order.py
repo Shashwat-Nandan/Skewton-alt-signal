@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from runners import run_paper_pairs as r
+from strategies import order_executor
 from strategies.pair_trading import PairTradingStrategy
 
 LOG = logging.getLogger("t")
@@ -68,3 +69,10 @@ def test_unknown_results_do_not_arm_the_backoff():
 def test_paper_or_no_order_yet_has_nothing_to_settle():
     s = SimpleNamespace()
     assert PairTradingStrategy.settle_unknown_orders(s) == []
+
+
+def test_a_pair_with_no_order_yet_still_sees_another_pairs_block(tmp_path):
+    """The latch must stop it this tick: the halt flag was read at tick start,
+    so a sibling's unknown order earlier in the loop would not otherwise count."""
+    order_executor._UNRESOLVED["BRITANNIA26NOVFUT"] = {}
+    assert PairTradingStrategy.settle_unknown_orders(SimpleNamespace()) == ["BRITANNIA26NOVFUT"]
