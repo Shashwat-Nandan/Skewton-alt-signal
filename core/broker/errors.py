@@ -45,6 +45,17 @@ class BrokerQuoteMissingError(BrokerOrderError):
         self.key = key
 
 
+class BrokerScripMissingError(BrokerOrderError):
+    """`key` names no contract in the broker's scrip master: a wrong symbol or a
+    master that is behind, not an illiquid strike. A sibling of
+    BrokerQuoteMissingError, not a subclass, so a handler that sets aside a key
+    with no LTP never sets this aside by accident."""
+
+    def __init__(self, message: str, key: str):
+        super().__init__(message)
+        self.key = key
+
+
 class BrokerNotImplementedError(BrokerError):
     """Broker is registered in the factory but not live-wired.
 

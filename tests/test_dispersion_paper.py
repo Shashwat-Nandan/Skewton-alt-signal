@@ -23,11 +23,17 @@ from research.backtest_dispersion import (
     futures_hedge_lots,
     option_order_cost,
 )
+from core.broker.errors import (
+    BrokerNetworkError,
+    BrokerQuoteMissingError,
+    BrokerScripMissingError,
+)
 from runners.run_paper_dispersion import (
     SHORT_VOL_STATE_FILE,
     STATE_FILE,
     _state_file,
     build_parser,
+    QUOTE_MAX_SYMBOLS,
     build_session_view,
     front_from_rows,
     in_decision_window,
@@ -598,7 +604,7 @@ def test_chain_quote_uses_a_positive_last_and_the_future_when_cash_is_missing(ca
         "NFO:AAA26NOV100CE": 5.0,
         "NFO:AAA26NOV100PE": 5.0,
         "NFO:BBB26OCTFUT": 100.0,
-        "NSE:BBB-EQ": 100.0,
+        "NSE:BBB": 100.0,
         "NFO:BBB26NOV100CE": 5.0,
         "NFO:BBB26NOV100PE": 5.0,
     }
@@ -608,14 +614,10 @@ def test_chain_quote_uses_a_positive_last_and_the_future_when_cash_is_missing(ca
         def instruments(self, exchange=None):
             return rows
 
-        def quote(self, keys):
+        def quote(self, keys, omit_missing=False):
             asked.extend(keys)
-            out = {}
-            for key in keys:
-                if key not in book:
-                    raise RuntimeError(key)
-                out[key] = {"last_price": book[key]}
-            return out
+            assert omit_missing           # the runner must not fail a batch per strike
+            return {k: {"last_price": book[k]} for k in keys if k in book}
 
         def place_order(self, *args, **kwargs):
             raise AssertionError("quote path called place_order")
@@ -683,7 +685,7 @@ def test_one_view_quotes_the_chain_when_either_book_is_flat():
         def instruments(self, exchange=None):
             return rows
 
-        def quote(self, keys):
+        def quote(self, keys, omit_missing=False):
             return {k: {"last_price": 5.0 if k.endswith(("CE", "PE")) else 100.0} for k in keys}
 
     open_book = SimpleNamespace(legs=[SimpleNamespace(symbol="AAA")])
@@ -760,3 +762,149 @@ def test_silent_fail_exits_with_the_code_the_unit_will_not_restart(tmp_path, mon
     code = r.main(["--force", "--once", "--ignore-entry-window", "--config", _cfg(tmp_path)])
     assert code == r.SILENT_FAIL_EXIT
     assert (tmp_path / "SF").exists()
+
+
+class _CountingClient:
+    """Kotak-shaped quotes. omit_missing leaves out a key with no price or no
+    scrip, as the real client does; without it an unknown scrip raises before
+    any request. A 429 fails the call; `fail_on_call` fails only that call."""
+
+    def __init__(self, rows, prices, rate_limited=False, unknown=(), fail_chain=False,
+                 fail_on_call=None):
+        self.rows, self.prices, self.rate_limited = rows, prices, rate_limited
+        self.unknown, self.fail_chain, self.fail_on_call = set(unknown), fail_chain, fail_on_call
+        self.calls = []
+
+    def instruments(self, exchange=None):
+        return self.rows
+
+    def quote(self, keys, omit_missing=False):
+        if not omit_missing:
+            for k in keys:
+                if k in self.unknown:
+                    raise BrokerScripMissingError(f"No Kotak scrip token for {k}", k)
+        self.calls.append(list(keys))
+        if (self.rate_limited or len(self.calls) == self.fail_on_call
+                or (self.fail_chain and any(k.endswith(("CE", "PE")) for k in keys))):
+            raise BrokerNetworkError("Kotak rate-limited (429)")
+        if not omit_missing:
+            for k in keys:
+                if k not in self.prices:
+                    raise BrokerQuoteMissingError(f"no LTP for {k}", k)
+        return {k: {"last_price": self.prices[k]} for k in keys
+                if k in self.prices and k not in self.unknown}
+
+
+def _held_names(n, chain=False):
+    from types import SimpleNamespace
+    expiry = date(2026, 11, 23)
+    rows, prices = [], {"NSE:NIFTY 50": 25000.0}
+    names = [f"N{i:02d}" for i in range(n)]
+    for name in names:
+        rows.append({"name": name, "instrument_type": "FUT", "expiry": expiry, "strike": 0,
+                     "tradingsymbol": f"{name}26NOVFUT", "lot_size": 10})
+        prices[f"NFO:{name}26NOVFUT"] = 100.0
+        prices[f"NSE:{name}"] = 99.0
+        if chain:
+            for strike in range(90, 110, 2):
+                for kind in ("CE", "PE"):
+                    sym = f"{name}26NOV{strike}{kind}"
+                    rows.append({"name": name, "instrument_type": kind, "expiry": expiry,
+                                 "strike": float(strike), "tradingsymbol": sym, "lot_size": 10})
+                    if strike % 4 == 0:            # half the strikes have not printed
+                        prices[f"NFO:{sym}"] = 3.0
+    if chain:                       # the index lists the expiry too, or it is no roll
+        for strike in range(24900, 25150, 50):
+            for kind in ("CE", "PE"):
+                sym = f"NIFTY26NOV{strike}{kind}"
+                rows.append({"name": "NIFTY", "instrument_type": kind, "expiry": expiry,
+                             "strike": float(strike), "tradingsymbol": sym, "lot_size": 65})
+                prices[f"NFO:{sym}"] = 150.0
+    book = SimpleNamespace(legs=[SimpleNamespace(symbol=s) for s in names])
+    return rows, prices, book, names
+
+
+def _close_view(client, names, books, roll=False):
+    session, previous = (date(2026, 10, 28), date(2026, 10, 27)) if roll else (
+        date(2026, 11, 18), date(2026, 11, 23))
+    return build_session_view(client, session, previous, names, books=books, min_names=2)
+
+
+def test_a_close_quotes_in_a_few_batched_calls_not_one_per_key():
+    """2026-11-18: about three single-key calls per held name, ~150 a minute,
+    drew 547 rate-limit errors and left the hedge unmarked."""
+    rows, prices, book, names = _held_names(50)
+    client = _CountingClient(rows, prices)
+    view = _close_view(client, names, [book])
+    assert len(client.calls) == 3                       # 100 keys at 40 a call
+    assert max(len(c) for c in client.calls) <= QUOTE_MAX_SYMBOLS
+    assert view.names["N07"].future_price == 100.0 and view.names["N07"].spot == 99.0
+    assert not view.incomplete
+    assert not any(k.endswith("-EQ") for c in client.calls for k in c)
+
+
+def test_a_rate_limit_stops_the_round_but_keeps_what_priced():
+    """A 429 on chunk 3 used to discard chunks 1 and 2 and leave the book
+    unmarked. Nothing more is sent, the priced names are kept, and the view is
+    flagged so the pass counts as an error."""
+    rows, prices, book, names = _held_names(50)
+    client = _CountingClient(rows, prices, fail_on_call=3)
+    view = _close_view(client, names, [book])
+    # Keys go futures first, then spots: chunks 1-2 priced all 50 futures and 30
+    # spots, chunk 3 (the last 20 spots) failed. Those fall back to the future.
+    assert len(client.calls) == 3 and view.incomplete
+    assert all(n.future_price == 100.0 for n in view.names.values())
+    own_spot = [s for s, n in view.names.items() if n.spot == 99.0]
+    assert len(own_spot) == 30
+
+
+def test_a_rate_limit_on_the_first_call_sends_nothing_more():
+    rows, prices, book, names = _held_names(50)
+    client = _CountingClient(rows, prices, rate_limited=True)
+    view = _close_view(client, names, [book])
+    assert len(client.calls) == 1 and view.incomplete
+
+
+def test_a_roll_with_many_unprinted_strikes_costs_no_extra_calls(caplog):
+    """On a roll many single-stock strikes have not printed. Failing a 40-key
+    call per such strike was the unbounded storm; omit_missing makes it one
+    request per 40 keys, and the gaps are counted in one warning."""
+    rows, prices, _, names = _held_names(20, chain=True)
+    client = _CountingClient(rows, prices)
+    with caplog.at_level("WARNING"):
+        view = _close_view(client, names, [None], roll=True)
+    assert view.is_roll and not view.incomplete
+    # Two rounds (futures+spots, then the chain), each one request per 40 keys.
+    is_chain = [any(k.endswith(("CE", "PE")) for k in c) for c in client.calls]
+    first = sum(len(c) for c, ch in zip(client.calls, is_chain) if not ch)
+    chain = sum(len(c) for c, ch in zip(client.calls, is_chain) if ch)
+    assert chain > 200
+    assert len(client.calls) == -(-first // QUOTE_MAX_SYMBOLS) + -(-chain // QUOTE_MAX_SYMBOLS)
+    assert view.names["N03"].quotes
+    assert any("have no price" in r.message for r in caplog.records)
+
+
+def test_unknown_scrips_cost_nothing_and_a_missing_spot_falls_back_to_the_future():
+    """Kotak resolves symbols before any request, so an unknown one costs no
+    call. A cash name in another series (say -BE) is no reason to drop the
+    close: the spot falls back to the future, as before."""
+    rows, prices, book, names = _held_names(10)
+    unknown = {f"NSE:N{i:02d}" for i in range(6)}
+    client = _CountingClient(rows, prices, unknown=unknown)
+    view = _close_view(client, names, [book])
+    assert len(client.calls) == 1 and not view.incomplete
+    assert view.names["N02"].spot == view.names["N02"].future_price == 100.0
+    assert view.names["N08"].spot == 99.0
+
+
+def test_a_failed_chain_round_still_marks_the_held_book_and_fails_the_pass():
+    """The held book's prices are already in hand when the chain hits a 429;
+    keep them. A whole window of failed chains must still reach the alert, not
+    pass as "ok" and lose the month's entry unnoticed."""
+    from types import SimpleNamespace
+    rows, prices, _, names = _held_names(4, chain=True)
+    held = SimpleNamespace(legs=[SimpleNamespace(symbol="N01")])
+    client = _CountingClient(rows, prices, fail_chain=True)
+    view = _close_view(client, names, [held, None], roll=True)
+    assert view.names["N01"].future_price == 100.0
+    assert not view.names["N02"].quotes and view.incomplete

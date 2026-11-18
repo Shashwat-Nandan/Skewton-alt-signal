@@ -78,6 +78,10 @@ class SessionView:
     previous_front: Optional[date]
     front_expiry: Optional[date]
     names: Dict[str, NameSurface]
+    # Some quotes failed (a rate limit mid-round, a failed chain round). The
+    # names that priced are still marked; the runner counts the pass as an
+    # error so a window of failures reaches the silent-fail alert.
+    incomplete: bool = False
 
     @property
     def is_roll(self) -> bool:

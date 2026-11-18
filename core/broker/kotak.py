@@ -42,6 +42,7 @@ from .errors import (
     BrokerNetworkError,
     BrokerOrderError,
     BrokerQuoteMissingError,
+    BrokerScripMissingError,
     BrokerTokenError,
 )
 from .kotak_instruments import ensure_index_rows, match_scrip_url, parse_scrip_csv
@@ -561,19 +562,35 @@ class KotakNeoClient:
         kite_rows.reverse()
         return kite_rows
 
-    def quote(self, keys) -> dict:
+    def quote(self, keys, *, omit_missing: bool = False) -> dict:
         """Official Quotes API: gateway + `segment|instrument_token`.
 
         Index spots (`NSE:NIFTY 50`) use the index name as the token.
         Everything else looks up `pSymbol` from the scrip master. Hits
         `LOGIN_BASE` with consumer_key only — not the order `base_url`.
+
+        A key with no LTP fails the whole call (BrokerQuoteMissingError), and a
+        key naming no scrip fails it before any request
+        (BrokerScripMissingError), as the order path expects.
+        `omit_missing=True` leaves both out of the result instead, so a batch
+        costs one request however many strikes have not printed; the caller
+        sees which keys are absent. An empty scrip master or a malformed key
+        raises either way.
         """
         if isinstance(keys, str):
             keys = [keys]
         identities = []
         for key in keys:
             exchange, symbol = _split_quote_key(key)
-            seg, token = self._quote_identity(exchange, symbol)
+            try:
+                seg, token = self._quote_identity(exchange, symbol)
+            except BrokerScripMissingError as e:
+                if omit_missing:
+                    continue
+                # Re-keyed to the caller's own spelling of the key. Only this
+                # case: an empty scrip master or a malformed key still raises
+                # as before, not as one missing key.
+                raise BrokerScripMissingError(str(e), key) from e
             identities.append((key, seg, token))
         out: Dict[str, dict] = {}
         for i in range(0, len(identities), QUOTE_MAX_SYMBOLS):
@@ -596,9 +613,17 @@ class KotakNeoClient:
                 by_token[(seg, tok)] = row
             for key, seg, tok in batch:
                 row = by_token.get((seg.lower(), str(tok))) or by_token.get(("", str(tok)))
-                if row is None and len(rows) == 1:
+                # The unmatched-row fallbacks are for a one-key request, whose
+                # response shape varies. In a batch they would hand a key with
+                # no row of its own another contract's price.
+                if row is None and len(batch) == 1 and len(rows) == 1:
                     row = rows[0]
-                ltp = _extract_ltp(row) if row is not None else _extract_ltp(data)
+                if row is not None:
+                    ltp = _extract_ltp(row)
+                else:
+                    ltp = _extract_ltp(data) if len(batch) == 1 else None
+                if ltp is None and omit_missing:
+                    continue
                 if ltp is None:
                     raise BrokerQuoteMissingError(
                         f"Kotak quote for {key} ({seg}|{tok}) had no LTP", key
@@ -780,9 +805,10 @@ class KotakNeoClient:
                 tok = r.get("instrument_token")
                 if tok:
                     return str(tok)
-        raise BrokerOrderError(
+        raise BrokerScripMissingError(
             f"No Kotak scrip token for {exchange}:{tradingsymbol}. "
-            "Scrip master loaded but the contract is missing."
+            "Scrip master loaded but the contract is missing.",
+            f"{exchange}:{tradingsymbol}",
         )
 
     def _row_for_token(self, token: int) -> tuple[dict, str]:

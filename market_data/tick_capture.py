@@ -261,6 +261,9 @@ def _poll_quotes(client, pairs, dead, budget=MAX_NEW_DEAD_PER_PASS):
             try:
                 quoted = client.quote([key for _, key in batch]) or {}
             except BrokerQuoteMissingError as e:
+                # Only a missing LTP. A key naming no scrip
+                # (BrokerScripMissingError, a sibling) propagates and fails the
+                # pass: a wrong symbol or stale master, not an illiquid strike.
                 if e.key not in {key for _, key in batch}:
                     raise
                 if budget <= 0:

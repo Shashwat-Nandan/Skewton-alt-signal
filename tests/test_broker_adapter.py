@@ -567,6 +567,92 @@ class TestKotakClient:
         sizes = [unquote(c[0][1]).count("nse_fo|") for c in client.session.request.call_args_list]
         assert sum(sizes) == 85 and max(sizes) < 50
 
+    def test_an_unknown_scrip_names_its_key_and_is_still_an_order_error(self):
+        """Callers that batch keys drop the named one; the pair runner still
+        stops on BrokerOrderError as before."""
+        from core.broker.errors import BrokerOrderError, BrokerScripMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NSE"] = [{"instrument_token": 1, "tradingsymbol": "TCS"}]
+        with pytest.raises(BrokerScripMissingError) as err:
+            client.quote(["NSE:ITC-EQ"])
+        assert err.value.key == "NSE:ITC-EQ"
+        assert isinstance(err.value, BrokerOrderError)
+        client.session.request.assert_not_called()
+
+    def test_an_empty_scrip_master_is_not_reported_as_one_missing_key(self):
+        """A system-wide failure must not be dropped one key at a time."""
+        from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError
+
+        client = self._client()
+        client._scrip_csv_text = lambda segment: ""
+        with pytest.raises(BrokerOrderError) as err:
+            client.quote(["NSE:ITC"])
+        assert not isinstance(err.value, BrokerQuoteMissingError)
+
+    def test_omit_missing_returns_what_printed_in_one_request(self):
+        """The default still fails the call, as the order path expects."""
+        from core.broker.errors import BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [
+            {"instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE", "name": "NIFTY",
+             "instrument_type": "CE", "lot_size": 75, "exchange": "NFO"},
+            {"instrument_token": 998, "tradingsymbol": "NIFTY25SEP25000PE", "name": "NIFTY",
+             "instrument_type": "PE", "lot_size": 75, "exchange": "NFO"}]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": "999", "exchange": "nse_fo", "ltp": "12"},
+                                  {"exchange_token": "998", "exchange": "nse_fo"}]
+        client.session.request.return_value = resp
+        keys = ["NFO:NIFTY25SEP25000CE", "NFO:NIFTY25SEP25000PE"]
+        assert set(client.quote(keys, omit_missing=True)) == {"NFO:NIFTY25SEP25000CE"}
+        assert client.session.request.call_count == 1
+        with pytest.raises(BrokerQuoteMissingError):
+            client.quote(keys)
+
+    def test_a_batch_key_with_no_row_never_takes_another_contracts_price(self):
+        """The one-row and whole-payload fallbacks are for a one-key request. In a
+        batch they gave a key with no row of its own a sibling's price."""
+        from core.broker.errors import BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [
+            {"instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE", "name": "NIFTY",
+             "instrument_type": "CE", "lot_size": 75, "exchange": "NFO"},
+            {"instrument_token": 998, "tradingsymbol": "NIFTY25SEP25000PE", "name": "NIFTY",
+             "instrument_type": "PE", "lot_size": 75, "exchange": "NFO"}]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": "999", "exchange": "nse_fo", "ltp": "12"}]
+        client.session.request.return_value = resp
+        keys = ["NFO:NIFTY25SEP25000CE", "NFO:NIFTY25SEP25000PE"]
+        assert client.quote(keys, omit_missing=True) == {
+            "NFO:NIFTY25SEP25000CE": {"last_price": 12.0}}
+        with pytest.raises(BrokerQuoteMissingError) as err:
+            client.quote(keys)
+        assert err.value.key == "NFO:NIFTY25SEP25000PE"
+
+    def test_omit_missing_also_leaves_out_an_unknown_scrip(self):
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [
+            {"instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE", "name": "NIFTY",
+             "instrument_type": "CE", "lot_size": 75, "exchange": "NFO"}]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": "999", "exchange": "nse_fo", "ltp": "12"}]
+        client.session.request.return_value = resp
+        got = client.quote(["NFO:NIFTY25SEP25000CE", "NFO:NOPE"], omit_missing=True)
+        assert set(got) == {"NFO:NIFTY25SEP25000CE"}
+
+    def test_an_unknown_scrip_is_not_a_missing_ltp(self):
+        """A sibling, so a handler that sets aside a key with no LTP never sets
+        aside a wrong symbol by accident."""
+        from core.broker.errors import (BrokerOrderError, BrokerQuoteMissingError,
+                                        BrokerScripMissingError)
+        assert issubclass(BrokerScripMissingError, BrokerOrderError)
+        assert not issubclass(BrokerScripMissingError, BrokerQuoteMissingError)
+
     def test_quote_depth_is_kite_shaped_numbers(self):
         client = self._client()
         client._instruments_by_exchange["NSE"] = [{

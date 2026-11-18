@@ -16,6 +16,7 @@ from .errors import (
     BrokerNotImplementedError,
     BrokerOrderError,
     BrokerQuoteMissingError,
+    BrokerScripMissingError,
     BrokerTokenError,
 )
 from .factory import (
@@ -35,6 +36,7 @@ __all__ = [
     "BrokerNotImplementedError",
     "BrokerOrderError",
     "BrokerQuoteMissingError",
+    "BrokerScripMissingError",
     "BrokerTokenError",
     "SUPPORTED",
     "get_broker",
