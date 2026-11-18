@@ -573,7 +573,14 @@ class KotakNeoClient:
         identities = []
         for key in keys:
             exchange, symbol = _split_quote_key(key)
-            seg, token = self._quote_identity(exchange, symbol)
+            try:
+                seg, token = self._quote_identity(exchange, symbol)
+            except BrokerQuoteMissingError:
+                raise
+            except BrokerOrderError as e:
+                # Named, so a caller can drop this key and quote the rest.
+                # Still a BrokerOrderError for everyone else.
+                raise BrokerQuoteMissingError(str(e), key) from e
             identities.append((key, seg, token))
         out: Dict[str, dict] = {}
         for i in range(0, len(identities), QUOTE_MAX_SYMBOLS):

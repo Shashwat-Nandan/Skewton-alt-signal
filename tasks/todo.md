@@ -1,3 +1,20 @@
+# Dispersion paper: hedge marks lost to Kotak rate limits — 2026-11-18
+
+The dispersion paper book skipped its close mark on 11 of 16 sessions ("no future
+for MARUTI while the hedge is -8 — not marking this close"). On 2026-11-18 its
+15:00–15:20 window drew 547 Kotak 429s: every future and spot was its own call
+(about three per held name, ~150 a minute), the spot tried a `-EQ` form Kotak does
+not have first, and a failed batch fell back to one call per key.
+
+- [x] One batched quote round per close for futures and spots (40 keys a call),
+      one more for the chain on a roll. Real held book: 1 call for 16 names.
+- [x] No `-EQ` key (probed: Kotak has none).
+- [x] `safe_quote` drops only a key Kotak names as unquotable; a 429 propagates
+      with one call, and the pass retries next minute.
+- [x] Kotak names an unknown scrip as `BrokerQuoteMissingError` (a
+      `BrokerOrderError`), so a batch can drop it.
+- [ ] Owner review; deploy before the next 14:55 run.
+
 # Kotak tapes replay: a master per session — 2026-11-06
 
 The Kotak tapes had no instrument master, so `load_captured_tape` refused them, and

@@ -567,6 +567,19 @@ class TestKotakClient:
         sizes = [unquote(c[0][1]).count("nse_fo|") for c in client.session.request.call_args_list]
         assert sum(sizes) == 85 and max(sizes) < 50
 
+    def test_an_unknown_scrip_names_its_key_and_is_still_an_order_error(self):
+        """Callers that batch keys drop the named one; the pair runner still
+        stops on BrokerOrderError as before."""
+        from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NSE"] = []
+        with pytest.raises(BrokerQuoteMissingError) as err:
+            client.quote(["NSE:ITC-EQ"])
+        assert err.value.key == "NSE:ITC-EQ"
+        assert isinstance(err.value, BrokerOrderError)
+        client.session.request.assert_not_called()
+
     def test_quote_depth_is_kite_shaped_numbers(self):
         client = self._client()
         client._instruments_by_exchange["NSE"] = [{

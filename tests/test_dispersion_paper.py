@@ -23,11 +23,13 @@ from research.backtest_dispersion import (
     futures_hedge_lots,
     option_order_cost,
 )
+from core.broker.errors import BrokerNetworkError, BrokerQuoteMissingError
 from runners.run_paper_dispersion import (
     SHORT_VOL_STATE_FILE,
     STATE_FILE,
     _state_file,
     build_parser,
+    QUOTE_MAX_SYMBOLS,
     build_session_view,
     front_from_rows,
     in_decision_window,
@@ -598,7 +600,7 @@ def test_chain_quote_uses_a_positive_last_and_the_future_when_cash_is_missing(ca
         "NFO:AAA26NOV100CE": 5.0,
         "NFO:AAA26NOV100PE": 5.0,
         "NFO:BBB26OCTFUT": 100.0,
-        "NSE:BBB-EQ": 100.0,
+        "NSE:BBB": 100.0,
         "NFO:BBB26NOV100CE": 5.0,
         "NFO:BBB26NOV100PE": 5.0,
     }
@@ -612,8 +614,8 @@ def test_chain_quote_uses_a_positive_last_and_the_future_when_cash_is_missing(ca
             asked.extend(keys)
             out = {}
             for key in keys:
-                if key not in book:
-                    raise RuntimeError(key)
+                if key not in book:     # as Kotak does: the call fails, naming the key
+                    raise BrokerQuoteMissingError(f"no LTP for {key}", key)
                 out[key] = {"last_price": book[key]}
             return out
 
@@ -760,3 +762,70 @@ def test_silent_fail_exits_with_the_code_the_unit_will_not_restart(tmp_path, mon
     code = r.main(["--force", "--once", "--ignore-entry-window", "--config", _cfg(tmp_path)])
     assert code == r.SILENT_FAIL_EXIT
     assert (tmp_path / "SF").exists()
+
+
+class _CountingClient:
+    """Kotak-shaped quotes: a call fails naming its first unquotable key, and a
+    429 fails the whole call."""
+
+    def __init__(self, rows, prices, rate_limited=False):
+        self.rows, self.prices, self.rate_limited = rows, prices, rate_limited
+        self.calls = []
+
+    def instruments(self, exchange=None):
+        return self.rows
+
+    def quote(self, keys):
+        self.calls.append(list(keys))
+        if self.rate_limited:
+            raise BrokerNetworkError("Kotak rate-limited (429)")
+        for k in keys:
+            if k not in self.prices:
+                raise BrokerQuoteMissingError(f"no LTP for {k}", k)
+        return {k: {"last_price": self.prices[k]} for k in keys}
+
+
+def _held_names(n):
+    from types import SimpleNamespace
+    expiry = date(2026, 11, 23)
+    rows, prices = [], {"NSE:NIFTY 50": 25000.0}
+    names = [f"N{i:02d}" for i in range(n)]
+    for name in names:
+        rows.append({"name": name, "instrument_type": "FUT", "expiry": expiry, "strike": 0,
+                     "tradingsymbol": f"{name}26NOVFUT", "lot_size": 10})
+        prices[f"NFO:{name}26NOVFUT"] = 100.0
+        prices[f"NSE:{name}"] = 99.0
+    book = SimpleNamespace(legs=[SimpleNamespace(symbol=s) for s in names])
+    return rows, prices, book, names
+
+
+def test_a_close_quotes_in_a_few_batched_calls_not_one_per_key():
+    """2026-11-18: about three single-key calls per held name, ~150 a minute,
+    drew 547 rate-limit errors and left the hedge unmarked."""
+    rows, prices, book, names = _held_names(50)
+    client = _CountingClient(rows, prices)
+    view = build_session_view(client, date(2026, 11, 18), date(2026, 11, 23), names,
+                              books=[book], min_names=2)
+    assert len(client.calls) == 3                       # 100 keys at 40 a call
+    assert max(len(c) for c in client.calls) <= QUOTE_MAX_SYMBOLS
+    assert view.names["N07"].future_price == 100.0 and view.names["N07"].spot == 99.0
+    assert not any(k.endswith("-EQ") for c in client.calls for k in c)
+
+
+def test_a_rate_limit_is_one_call_not_a_storm():
+    rows, prices, book, names = _held_names(50)
+    client = _CountingClient(rows, prices, rate_limited=True)
+    with pytest.raises(BrokerNetworkError):
+        build_session_view(client, date(2026, 11, 18), date(2026, 11, 23), names,
+                           books=[book], min_names=2)
+    assert len(client.calls) == 1
+
+
+def test_an_unquotable_key_costs_one_extra_call_and_keeps_the_rest():
+    rows, prices, book, names = _held_names(10)
+    del prices["NFO:N0326NOVFUT"]
+    client = _CountingClient(rows, prices)
+    view = build_session_view(client, date(2026, 11, 18), date(2026, 11, 23), names,
+                              books=[book], min_names=2)
+    assert len(client.calls) == 2
+    assert view.names["N03"].future_price is None and view.names["N04"].future_price == 100.0

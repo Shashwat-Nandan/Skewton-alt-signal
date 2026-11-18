@@ -34,6 +34,7 @@ import os
 import re
 import signal
 import sys
+from dataclasses import replace
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
@@ -41,6 +42,8 @@ from typing import Dict, List, Mapping, Optional, Sequence
 import pandas as pd
 from dotenv import load_dotenv
 
+from core.broker.errors import BrokerQuoteMissingError
+from core.broker.kotak import QUOTE_MAX_SYMBOLS
 from core.data_cache_io import find_tables, read_table, table_columns
 from core.runner_common import (
     HALT_ALL_PATH,
@@ -288,24 +291,25 @@ def previous_front(raw_dir: Path, session: date, universe: Sequence[str],
 
 
 def safe_quote(client, keys: Sequence[str]) -> dict:
-    """Quote in batches of 50. A key with no last price is dropped, not fatal.
-
-    Kotak's quote() raises when any key in the batch has no LTP, which would
-    otherwise throw away the strikes that did print.
-    """
+    """Quote in batches of QUOTE_MAX_SYMBOLS. A key Kotak names as unquotable
+    (no last price, or no scrip) is dropped and its batch re-sent without it,
+    one extra call per such key. Any other failure, a rate limit above all,
+    propagates: the old fallback re-sent every key of a failed batch on its own,
+    so a 429 became dozens more calls on the quota the live pair runner shares
+    (547 429s in the 2026-11-18 window)."""
     ordered = list(dict.fromkeys(k for k in keys if k))
     out: dict = {}
-    for i in range(0, len(ordered), 50):
-        chunk = ordered[i:i + 50]
-        try:
-            out.update(client.quote(chunk))
-        except Exception as e:                                # noqa: BLE001
-            logger.info("quote batch failed (%s) — one key at a time", e)
-            for key in chunk:
-                try:
-                    out.update(client.quote([key]))
-                except Exception as one:                      # noqa: BLE001
-                    logger.info("no quote for %s (%s)", key, one)
+    for i in range(0, len(ordered), QUOTE_MAX_SYMBOLS):
+        chunk = ordered[i:i + QUOTE_MAX_SYMBOLS]
+        while chunk:
+            try:
+                out.update(client.quote(chunk))
+                break
+            except BrokerQuoteMissingError as e:
+                if e.key not in chunk:
+                    raise
+                logger.info("no quote for %s (%s)", e.key, e)
+                chunk = [k for k in chunk if k != e.key]
     return out
 
 
@@ -356,12 +360,16 @@ def _option_pairs(rows: Sequence[dict], name: str, expiry: date):
     return by_strike, lot
 
 
-def _spot_price(client, symbol: str, future_px: Optional[float]) -> float:
-    keys = ["NSE:NIFTY 50"] if symbol == INDEX else [f"NSE:{symbol}-EQ", f"NSE:{symbol}"]
-    for key in keys:
-        px = _ltp(safe_quote(client, [key]).get(key))
-        if px is not None:
-            return px
+def _spot_key(symbol: str) -> str:
+    """Kotak lists cash equities as NSE:<symbol>; it has no -EQ form (probed
+    2026-11-18), so that key only ever cost a failed call."""
+    return "NSE:NIFTY 50" if symbol == INDEX else f"NSE:{symbol}"
+
+
+def _spot_price(quoted: Mapping[str, dict], symbol: str, future_px: Optional[float]) -> float:
+    px = _ltp(quoted.get(_spot_key(symbol)))
+    if px is not None:
+        return px
     if future_px is not None and future_px > 0:
         if symbol not in _SPOT_FALLBACK_LOGGED:
             logger.warning(
@@ -373,13 +381,8 @@ def _spot_price(client, symbol: str, future_px: Optional[float]) -> float:
     return 0.0
 
 
-def _chain_quotes(client, by_strike: Mapping[float, dict], spot: float):
-    """ATM band only. Kotak quotes carry last price and no volume.
-
-    A positive last is the traded test the replay applied to bhavcopy
-    volume. The quote tuple therefore stores 1 when the last printed and
-    0 when it did not. This is not a volume filter.
-    """
+def _chain_band(by_strike: Mapping[float, dict], spot: float) -> List[tuple]:
+    """(strike, CE symbol, PE symbol) for the ATM band, nearest first."""
     band = []
     for strike, pair in by_strike.items():
         if "CE" not in pair or "PE" not in pair:
@@ -389,45 +392,26 @@ def _chain_quotes(client, by_strike: Mapping[float, dict], spot: float):
             continue
         band.append(strike)
     band.sort(key=lambda strike: (abs(strike - spot), strike))
+    return [(strike, by_strike[strike]["CE"]["tradingsymbol"],
+             by_strike[strike]["PE"]["tradingsymbol"])
+            for strike in band[:MAX_QUOTED_STRIKES]]
+
+
+def _chain_quotes(quoted: Mapping[str, dict], band: Sequence[tuple]):
+    """Kotak quotes carry last price and no volume.
+
+    A positive last is the traded test the replay applied to bhavcopy
+    volume. The quote tuple therefore stores 1 when the last printed and
+    0 when it did not. This is not a volume filter.
+    """
     quotes = []
     symbols: Dict[float, Dict[str, str]] = {}
-    for strike in band[:MAX_QUOTED_STRIKES]:
-        pair = by_strike[strike]
-        ce_sym = pair["CE"]["tradingsymbol"]
-        pe_sym = pair["PE"]["tradingsymbol"]
-        quoted = safe_quote(client, [f"NFO:{ce_sym}", f"NFO:{pe_sym}"])
+    for strike, ce_sym, pe_sym in band:
         ce = _ltp(quoted.get(f"NFO:{ce_sym}")) or 0.0
         pe = _ltp(quoted.get(f"NFO:{pe_sym}")) or 0.0
         quotes.append((strike, ce, pe, 1.0 if ce > 0 else 0.0, 1.0 if pe > 0 else 0.0))
         symbols[strike] = {"CE": ce_sym, "PE": pe_sym}
     return quotes, symbols
-
-
-def _build_surface(client, rows, symbol: str, session: date, front: Optional[date],
-                   need_chain: bool) -> NameSurface:
-    fut = _nearest_future(rows, symbol, session)
-    fut_px = 0.0
-    fut_lot = 0
-    fut_sym = ""
-    if fut is not None:
-        fut_sym = str(fut["tradingsymbol"])
-        fut_lot = int(fut["lot_size"])
-        fut_px = _ltp(safe_quote(client, [f"NFO:{fut_sym}"]).get(f"NFO:{fut_sym}")) or 0.0
-    spot = _spot_price(client, symbol, fut_px if fut_px > 0 else None)
-    quotes: tuple = ()
-    opt_symbols: Dict[float, Dict[str, str]] = {}
-    opt_lot = 0
-    if need_chain and front is not None and spot > 0:
-        by_strike, opt_lot = _option_pairs(rows, symbol, front)
-        quotes, opt_symbols = _chain_quotes(client, by_strike, spot)
-    elif need_chain and front is not None:
-        _, opt_lot = _option_pairs(rows, symbol, front)
-    return NameSurface(
-        symbol=symbol, spot=spot, quotes=tuple(quotes),
-        future_price=fut_px if fut_px > 0 else None,
-        future_lot=fut_lot, future_symbol=fut_sym,
-        option_symbols=opt_symbols, option_lot=opt_lot,
-    )
 
 
 def build_session_view(client, session: date, previous: Optional[date],
@@ -454,10 +438,38 @@ def build_session_view(client, session: date, previous: Optional[date],
     for sym in symbols:
         if sym not in seen:
             seen.append(sym)
-    names = {
-        sym: _build_surface(client, rows, sym, session, front, need_chain)
-        for sym in seen
-    }
+
+    # One batched round for every future and spot, then one for the chain on a
+    # roll: about 4 calls for ~50 names, where a call per key was ~150 a minute
+    # and ran into Kotak's rate limit (2026-11-18).
+    futs = {sym: _nearest_future(rows, sym, session) for sym in seen}
+    keys = [f"NFO:{f['tradingsymbol']}" for f in futs.values() if f is not None]
+    keys += [_spot_key(sym) for sym in seen]
+    quoted = safe_quote(client, keys)
+    names: Dict[str, NameSurface] = {}
+    bands: Dict[str, List[tuple]] = {}
+    for sym in seen:
+        fut = futs[sym]
+        fut_sym = str(fut["tradingsymbol"]) if fut is not None else ""
+        fut_px = (_ltp(quoted.get(f"NFO:{fut_sym}")) or 0.0) if fut is not None else 0.0
+        spot = _spot_price(quoted, sym, fut_px if fut_px > 0 else None)
+        opt_lot = 0
+        if need_chain and front is not None:
+            by_strike, opt_lot = _option_pairs(rows, sym, front)
+            if spot > 0:
+                bands[sym] = _chain_band(by_strike, spot)
+        names[sym] = NameSurface(
+            symbol=sym, spot=spot, quotes=(),
+            future_price=fut_px if fut_px > 0 else None,
+            future_lot=int(fut["lot_size"]) if fut is not None else 0,
+            future_symbol=fut_sym, option_symbols={}, option_lot=opt_lot,
+        )
+    if bands:
+        chain_keys = [f"NFO:{s}" for band in bands.values() for _, ce, pe in band for s in (ce, pe)]
+        chain = safe_quote(client, chain_keys)
+        for sym, band in bands.items():
+            quotes, opt_symbols = _chain_quotes(chain, band)
+            names[sym] = replace(names[sym], quotes=tuple(quotes), option_symbols=opt_symbols)
     return SessionView(
         session=session, previous_front=previous, front_expiry=front, names=names,
     )
