@@ -353,9 +353,11 @@ def test_the_kiteticker_path_also_fails_the_day_without_a_master(monkeypatch, tm
     assert tc.main() == 0
 
 
-def _on_day(monkeypatch, tmp_path, day, argv=("--cached-session",)):
-    """Run main() at 10:00 IST on `day`; return (exit code, whether it polled)."""
+def _on_day(monkeypatch, tmp_path, day, argv=("--cached-session",), calendar=None):
+    """Run main() at 10:00 IST on `day`; return (exit code, whether it polled).
+    `calendar` replaces market_data/holidays.csv when given."""
     import core.broker as broker
+    import core.runner_common as rc
 
     class _Client:
         def profile(self):
@@ -366,11 +368,14 @@ def _on_day(monkeypatch, tmp_path, day, argv=("--cached-session",)):
     monkeypatch.setattr(broker, "get_trading_client", lambda *a, **k: _Client())
     monkeypatch.setattr(broker, "read_broker_name", lambda *_: "kotak")
     monkeypatch.setattr(tc, "resolve_instruments", lambda *a, **k: ([1], {1: "NIFTY 50"}))
-    monkeypatch.setattr(tc, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(tc, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(tc, "TICKS_DIR", tmp_path / "ticks")
     monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
     monkeypatch.setattr(tc, "_run_quote_poll", lambda *a, **k: polled.append(1) or True)
     monkeypatch.setattr(sys, "argv", ["tick_capture", *argv])
+    cal = tmp_path / "holidays.csv"
+    cal.write_text(calendar if calendar is not None else _FRESH_CALENDAR)
+    monkeypatch.setattr(rc, "HOLIDAYS_PATH", cal)
 
     class _At(tc.datetime):
         @classmethod
@@ -381,12 +386,25 @@ def _on_day(monkeypatch, tmp_path, day, argv=("--cached-session",)):
     return tc.main(), bool(polled)
 
 
+# A calendar that passes assert_holiday_data_fresh on the test dates: 2026-11-10
+# listed, more than 8 for the year, and an entry > 30 days ahead.
+_FRESH_CALENDAR = "\n".join(
+    ["2026-01-26", "2026-03-04", "2026-03-31", "2026-04-03", "2026-05-01",
+     "2026-08-15", "2026-10-02", "2026-11-10", "2026-12-25", "2027-01-26"]) + "\n"
+
+
 def test_an_nse_holiday_records_nothing(monkeypatch, tmp_path):
     """2026-11-10 (Diwali-Balipratipada): the timer fired and the recorder polled
-    a closed market all day, stale quotes with no bhavcopy behind them."""
+    a closed market all day, stale quotes with no bhavcopy behind them. A no-op
+    day must not leave a ticks-<date>.log that reads like a session either."""
     from datetime import date
     assert _on_day(monkeypatch, tmp_path, date(2026, 11, 10)) == (0, False)
-    assert not (tmp_path / "ticks").exists()
+    assert not (tmp_path / "ticks").exists() and not (tmp_path / "logs").exists()
+
+
+def test_a_weekend_records_nothing(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 14)) == (0, False)
 
 
 def test_a_trading_day_records(monkeypatch, tmp_path):
@@ -394,16 +412,41 @@ def test_a_trading_day_records(monkeypatch, tmp_path):
     assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11)) == (0, True)
 
 
-def test_force_records_a_special_session(monkeypatch, tmp_path):
-    """Muhurat trading is a session on a listed holiday."""
+def test_force_records_a_special_session_inside_market_hours(monkeypatch, tmp_path):
     from datetime import date
     assert _on_day(monkeypatch, tmp_path, date(2026, 11, 10),
                    ("--cached-session", "--force")) == (0, True)
 
 
-def test_the_next_listed_holiday_is_in_the_calendar():
-    """The guard is only as good as market_data/holidays.csv."""
+def test_validate_still_runs_on_a_holiday(monkeypatch, tmp_path):
+    """A pre-market sanity check must not silently do nothing."""
+    from datetime import date
+    rc, _ = _on_day(monkeypatch, tmp_path, date(2026, 11, 10),
+                    ("--cached-session", "--validate"))
+    assert rc == 0 and (tmp_path / "logs").exists()
+
+
+def test_a_stale_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
+    """No 2027 dates: every weekday after late November reads as trading. Losing
+    a real session's tape over it would be worse, so record and page."""
+    from datetime import date
+    stale = "\n".join(_FRESH_CALENDAR.split("\n")[:-2]) + "\n"     # drop 2027-01-26
+    assert _on_day(monkeypatch, tmp_path, date(2026, 12, 1), calendar=stale) == (1, True)
+
+
+def test_a_malformed_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11),
+                   calendar=_FRESH_CALENDAR + "2026-13-05\n") == (1, True)
+
+
+def test_the_shipped_calendar_is_fresh_today():
+    """The calendar every runner reads must reach 30 days ahead with enough
+    entries for the year, or the runners refuse to start and the recorder pages.
+    This fails, correctly, until the next year's NSE holidays are added."""
+    import logging
     from datetime import date
 
-    from core.runner_common import HOLIDAYS_PATH, load_holidays
-    assert date(2026, 11, 24) in load_holidays(HOLIDAYS_PATH)
+    from core.runner_common import HOLIDAYS_PATH, assert_holiday_data_fresh, load_holidays
+    assert_holiday_data_fresh(load_holidays(HOLIDAYS_PATH), date.today(),
+                              logging.getLogger("t"))

@@ -442,8 +442,10 @@ def main():
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Record on a weekend or a date in market_data/holidays.csv (a "
-             "special session such as Muhurat). Without it those days are a no-op.",
+        help="Record on a weekend or a date in market_data/holidays.csv, for a "
+             "special session inside 09:15-15:30. Without it those days are a "
+             "no-op. A session after 15:30 (e.g. an evening Muhurat) cannot be "
+             "recorded: the recorder stops at 15:30.",
     )
     parser.add_argument(
         "--poll-seconds", type=float, default=2.0,
@@ -468,20 +470,31 @@ def main():
         return 2
 
     today = datetime.now(IST).date()
+
+    # 2026-11-10 (Diwali-Balipratipada): the timer fired on a holiday and the
+    # recorder polled a closed market all day, a tape of stale quotes with no
+    # bhavcopy to rebuild its master from. Decided before setup_logging, so a
+    # no-op day leaves no ticks-<date>.log that reads like a session; the
+    # no-op line goes to the journal. A broken or stale calendar does not cost
+    # a trading day's tape: record, and exit 1 at the close so the alert fires.
+    from core.runner_common import trading_day_gate
+    gate_log = logging.getLogger("tick_capture.gate")
+    if not gate_log.handlers:
+        gate_log.addHandler(logging.StreamHandler())
+        gate_log.setLevel(logging.INFO)
+    run_today, calendar_problem = trading_day_gate(
+        today, gate_log, force=args.force or args.validate)
+    if not run_today:
+        return 1 if calendar_problem else 0
+
     _LOG = setup_logging(today)
+    if calendar_problem:
+        _LOG.error("Holiday calendar problem; recording anyway and failing the "
+                   "run at the close: %s", calendar_problem)
 
     now_ist = datetime.now(IST)
     if not args.validate and now_ist.time() >= dtime(15, 30):
         _LOG.info("Started after 15:30 IST — nothing to capture today.")
-        return 0
-
-    # 2026-11-10 (Diwali-Balipratipada): the timer fired on a holiday and the
-    # recorder polled a closed market all day, a tape of stale quotes with no
-    # bhavcopy to rebuild its master from. Same rule as the pair runners.
-    from core.runner_common import HOLIDAYS_PATH, is_trading_day, load_holidays
-    trading, why = is_trading_day(today, load_holidays(HOLIDAYS_PATH))
-    if not trading and not args.validate and not args.force:
-        _LOG.info("No-op: %s. Nothing to capture.", why)
         return 0
 
     _LOG.info("Authenticating...")
@@ -554,7 +567,7 @@ def main():
                 _OUT_FILE.close()
             except Exception:
                 pass
-        return 0 if ok and masters_ok else 1
+        return 0 if ok and masters_ok and not calendar_problem else 1
 
     from kiteconnect import KiteTicker
     ticker = KiteTicker(api_key=kite.api_key, access_token=kite.access_token)
@@ -598,7 +611,7 @@ def main():
         except Exception:
             pass
     _LOG.info("Session complete. %d ticks captured. Exiting cleanly.", _TICK_COUNT)
-    if not masters_ok:
+    if not masters_ok or calendar_problem:
         return 1
     return 0
 

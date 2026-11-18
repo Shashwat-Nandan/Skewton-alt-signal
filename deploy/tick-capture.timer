@@ -7,7 +7,8 @@ Documentation=man:systemd.timer(5)
 # up to 60 s), so the cached session --cached-session reads is today's,
 # and before the 09:15 open, so the tape has the opening prints. The
 # capture never logs in itself. market_data/tick_capture.py self-gates on
-# 15:30.
+# 15:30, and is a no-op on weekends and dates in market_data/holidays.csv
+# (--force to record a special session inside market hours).
 OnCalendar=Mon..Fri *-*-* 09:14:00 Asia/Kolkata
 
 # If the VPS was asleep or systemd missed the window, run once to catch up.

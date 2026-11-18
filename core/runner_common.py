@@ -28,7 +28,7 @@ import signal
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 HERE = Path(__file__).resolve().parent.parent
 DATA_CACHE = HERE / "data_cache"
@@ -281,6 +281,33 @@ def assert_holiday_data_fresh(holidays: set[date], today: date,
                f"Refusing to start — update from the NSE circular.")
         log.error(msg)
         raise RuntimeError(msg)
+
+
+def trading_day_gate(today: date, log: logging.Logger, *,
+                     force: bool = False) -> tuple[bool, Optional[str]]:
+    """(run today?, calendar problem or None), from market_data/holidays.csv.
+
+    The one check for a recorder-style process: load the calendar, require it to
+    be fresh, and decide the day. A broken or stale calendar is reported, not
+    raised, so the caller picks its policy; with no usable calendar only the
+    weekend rule applies. Not trading and not `force`: logs the no-op, False.
+    The pair runners keep their own sequence: they refuse to start on a stale
+    calendar, which is the stricter policy for something that trades."""
+    problem: Optional[str] = None
+    try:
+        holidays = load_holidays(HOLIDAYS_PATH)
+    except ValueError as e:
+        holidays, problem = set(), str(e)
+    if problem is None:
+        try:
+            assert_holiday_data_fresh(holidays, today, log)
+        except RuntimeError as e:
+            problem = str(e)
+    trading, why = is_trading_day(today, holidays)
+    if not trading and not force:
+        log.info("No-op: %s.", why)
+        return False, problem
+    return True, problem
 
 
 def sleep_until(target: datetime, log: logging.Logger):
