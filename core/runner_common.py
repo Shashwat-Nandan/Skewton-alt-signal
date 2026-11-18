@@ -28,7 +28,7 @@ import signal
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 HERE = Path(__file__).resolve().parent.parent
 DATA_CACHE = HERE / "data_cache"
@@ -254,33 +254,67 @@ def assert_disk_space_ok(paths: List[Path], log: logging.Logger,
         )
 
 
-def assert_holiday_data_fresh(holidays: set[date], today: date,
-                              log: logging.Logger) -> None:
-    # holidays.csv is hand-maintained from the NSE circular; a partial
-    # or expired list silently treats lunar holidays (Holi, Diwali, etc.)
-    # as trading days. Fail loud per CLAUDE.md Rule 12.
+def holiday_data_problem(holidays: set[date], today: date) -> Optional[str]:
+    """What is wrong with the calendar, or None. holidays.csv is hand-maintained
+    from the NSE circular; a partial or expired list silently treats lunar
+    holidays (Holi, Diwali, etc.) as trading days."""
     if not holidays:
-        msg = ("holidays.csv loaded zero entries — refusing to start. "
-               "Populate from the NSE 'Holidays — Trading' circular.")
-        log.error(msg)
-        raise RuntimeError(msg)
+        return ("holidays.csv loaded zero entries. Populate it from the NSE "
+                "'Holidays — Trading' circular.")
     last = max(holidays)
-    horizon = today + timedelta(days=HOLIDAY_HORIZON_DAYS)
-    if last < horizon:
-        msg = (f"holidays.csv last entry is {last}, less than "
-               f"{HOLIDAY_HORIZON_DAYS} days past today ({today}). "
-               f"Refusing to start — update from the NSE circular and "
-               f"redeploy.")
-        log.error(msg)
-        raise RuntimeError(msg)
+    if last < today + timedelta(days=HOLIDAY_HORIZON_DAYS):
+        return (f"holidays.csv last entry is {last}, less than "
+                f"{HOLIDAY_HORIZON_DAYS} days past today ({today}). Add the next "
+                f"holidays from the NSE circular.")
     this_year_count = sum(1 for h in holidays if h.year == today.year)
     if this_year_count < HOLIDAYS_PER_YEAR_FLOOR:
-        msg = (f"holidays.csv has only {this_year_count} entries for "
-               f"{today.year}; NSE typically has 13-17 per year. The list "
-               f"is likely missing lunar holidays (Holi, Diwali, etc.). "
-               f"Refusing to start — update from the NSE circular.")
+        return (f"holidays.csv has only {this_year_count} entries for {today.year}; "
+                f"NSE typically has 13-17 per year. The list is likely missing lunar "
+                f"holidays (Holi, Diwali, etc.).")
+    return None
+
+
+def assert_holiday_data_fresh(holidays: set[date], today: date,
+                              log: logging.Logger) -> None:
+    """A trading runner refuses to start on a stale calendar. Fail loud per
+    CLAUDE.md Rule 12."""
+    problem = holiday_data_problem(holidays, today)
+    if problem:
+        msg = f"{problem} Refusing to start."
         log.error(msg)
         raise RuntimeError(msg)
+
+
+def require_trading_day(today: date, log: logging.Logger, *, force: bool = False) -> bool:
+    """The trading runners' start gate, in one place: load the calendar, refuse
+    to start on a stale or malformed one (raises), and decide the day. False
+    means a weekend or holiday without `force`; the no-op is already logged."""
+    holidays = load_holidays(HOLIDAYS_PATH)
+    assert_holiday_data_fresh(holidays, today, log)
+    ok, reason = is_trading_day(today, holidays)
+    if not ok and not force:
+        log.info("No-op: %s. Exiting.", reason)
+        return False
+    return True
+
+
+def trading_day_gate(today: date, log: logging.Logger, *,
+                     force: bool = False) -> tuple[bool, Optional[str]]:
+    """(run today?, calendar problem or None): the recorder's gate. Unlike
+    require_trading_day a broken, unreadable or stale calendar is reported, not
+    raised, so a recorder can keep a trading day's tape and fail at the close.
+    With no usable calendar only the weekend rule applies. Not trading and not
+    `force`: logs the no-op, False."""
+    try:
+        holidays = load_holidays(HOLIDAYS_PATH)
+        problem = holiday_data_problem(holidays, today)
+    except (ValueError, OSError) as e:
+        holidays, problem = set(), f"holidays.csv is unreadable: {e}"
+    trading, why = is_trading_day(today, holidays)
+    if not trading and not force:
+        log.info("No-op: %s.", why)
+        return False, problem
+    return True, problem
 
 
 def sleep_until(target: datetime, log: logging.Logger):

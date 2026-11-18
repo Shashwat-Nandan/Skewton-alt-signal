@@ -282,7 +282,7 @@ def _full_main(monkeypatch, tmp_path, *, masters_ok, poll_ok=True):
     class _MidSession(tc.datetime):        # past 15:30 main() exits before any of this
         @classmethod
         def now(cls, tz=None):
-            return cls(2026, 11, 9, 10, 0, tzinfo=tz)
+            return cls(2026, 11, 9, 10, 0, tzinfo=tz)      # a Monday, not a holiday
 
     monkeypatch.setattr(tc, "datetime", _MidSession)
     return tc.main()
@@ -351,3 +351,140 @@ def test_the_kiteticker_path_also_fails_the_day_without_a_master(monkeypatch, tm
     assert tc.main() == 1
     monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
     assert tc.main() == 0
+
+
+def _on_day(monkeypatch, tmp_path, day, argv=("--cached-session",), calendar=None):
+    """Run main() at 10:00 IST on `day`; return (exit code, whether it polled).
+    `calendar` replaces market_data/holidays.csv when given."""
+    import core.broker as broker
+    import core.runner_common as rc
+
+    class _Client:
+        def profile(self):
+            return {"user_name": "u", "user_id": "x"}
+
+    polled = []
+    monkeypatch.setattr(broker, "get_market_client", lambda *a, **k: _Client())
+    monkeypatch.setattr(broker, "get_trading_client", lambda *a, **k: _Client())
+    monkeypatch.setattr(broker, "read_broker_name", lambda *_: "kotak")
+    monkeypatch.setattr(tc, "resolve_instruments", lambda *a, **k: ([1], {1: "NIFTY 50"}))
+    monkeypatch.setattr(tc, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(tc, "TICKS_DIR", tmp_path / "ticks")
+    monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
+    monkeypatch.setattr(tc, "_run_quote_poll", lambda *a, **k: polled.append(1) or True)
+    monkeypatch.setattr(sys, "argv", ["tick_capture", *argv])
+    cal = tmp_path / "holidays.csv"
+    cal.write_text(calendar if calendar is not None else _FRESH_CALENDAR)
+    monkeypatch.setattr(rc, "HOLIDAYS_PATH", cal)
+
+    class _At(tc.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(day.year, day.month, day.day, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(tc, "datetime", _At)
+    return tc.main(), bool(polled)
+
+
+# A calendar that passes assert_holiday_data_fresh on the test dates: 2026-11-10
+# listed, more than 8 for the year, and an entry > 30 days ahead.
+_FRESH_CALENDAR = "\n".join(
+    ["2026-01-26", "2026-03-04", "2026-03-31", "2026-04-03", "2026-05-01",
+     "2026-08-15", "2026-10-02", "2026-11-10", "2026-12-25", "2027-01-26"]) + "\n"
+
+
+def test_an_nse_holiday_records_nothing(monkeypatch, tmp_path):
+    """2026-11-10 (Diwali-Balipratipada): the timer fired and the recorder polled
+    a closed market all day, stale quotes with no bhavcopy behind them. A no-op
+    day must not leave a ticks-<date>.log that reads like a session either."""
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 10)) == (0, False)
+    assert not (tmp_path / "ticks").exists() and not (tmp_path / "logs").exists()
+
+
+def test_a_weekend_records_nothing(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 14)) == (0, False)
+
+
+def test_a_trading_day_records(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11)) == (0, True)
+
+
+def test_force_records_a_special_session_inside_market_hours(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 10),
+                   ("--cached-session", "--force")) == (0, True)
+
+
+def test_validate_still_runs_on_a_holiday(monkeypatch, tmp_path):
+    """A pre-market sanity check must not silently do nothing."""
+    from datetime import date
+    rc, _ = _on_day(monkeypatch, tmp_path, date(2026, 11, 10),
+                    ("--cached-session", "--validate"))
+    assert rc == 0 and (tmp_path / "logs").exists()
+
+
+def test_a_stale_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
+    """No 2027 dates: every weekday after late November reads as trading. Losing
+    a real session's tape over it would be worse, so record and page."""
+    from datetime import date
+    stale = "\n".join(_FRESH_CALENDAR.split("\n")[:-2]) + "\n"     # drop 2027-01-26
+    assert _on_day(monkeypatch, tmp_path, date(2026, 12, 1), calendar=stale) == (1, True)
+
+
+def test_a_malformed_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11),
+                   calendar=_FRESH_CALENDAR + "2026-13-05\n") == (1, True)
+
+
+def test_validate_and_a_late_start_report_a_broken_calendar(monkeypatch, tmp_path):
+    """Both would otherwise say all is well on a day the real run exits 1."""
+    from datetime import date
+    bad = _FRESH_CALENDAR + "2026-13-05\n"
+    rc, _ = _on_day(monkeypatch, tmp_path, date(2026, 11, 11),
+                    ("--cached-session", "--validate"), calendar=bad)
+    assert rc == 1
+
+
+def test_an_unreadable_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
+    """A permissions error must not crash away a trading day's tape."""
+    import core.runner_common as rc_mod
+    from datetime import date
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(rc_mod, "load_holidays", unreadable)
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11)) == (1, True)
+
+
+def test_the_recorder_gate_does_not_say_it_refuses_to_start(monkeypatch, tmp_path, caplog):
+    """It records anyway; a "Refusing to start" line would read as a runner
+    that did not run."""
+    from datetime import date
+    stale = "\n".join(_FRESH_CALENDAR.split("\n")[:-2]) + "\n"
+    with caplog.at_level("INFO"):
+        _on_day(monkeypatch, tmp_path, date(2026, 12, 1), calendar=stale)
+    assert "Refusing to start" not in caplog.text and "recording anyway" in caplog.text
+
+
+def test_the_no_op_line_is_logged_once(monkeypatch, tmp_path, capsys):
+    """With a root handler configured (any harness, or a second main() in one
+    process) the gate's own handler and root would both print it."""
+    import logging
+    from datetime import date
+    gate = logging.getLogger("tick_capture.gate")
+    # main() builds the gate's handler once per process, on the stderr of the
+    # time; start this test from none so it writes to the captured stderr.
+    monkeypatch.setattr(gate, "handlers", [])
+    root = logging.getLogger()
+    extra = logging.StreamHandler()
+    root.addHandler(extra)
+    try:
+        _on_day(monkeypatch, tmp_path, date(2026, 11, 10))
+    finally:
+        root.removeHandler(extra)
+    assert capsys.readouterr().err.count("No-op") == 1

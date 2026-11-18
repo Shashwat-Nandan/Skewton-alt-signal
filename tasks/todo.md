@@ -15,9 +15,9 @@ expired contracts are gone from the scrip master.
       `instruments_cache_path`, raw tapes only, the KiteTicker exit tested.
 - [x] Backfilled to 2026-11-17: 15 tapes with data replay (38,352 rows, 102
       symbols, no NaN strike, lot 65).
-- [ ] 2026-11-10 was an NSE holiday and the recorder ran anyway: a closed market's
-      quotes. No bhavcopy, so no master; do not use that tape. The recorder needs
-      a holiday check.
+- [x] 2026-11-10 was an NSE holiday and the recorder ran anyway: a closed market's
+      quotes. No bhavcopy, so no master; do not use that tape. The recorder now
+      no-ops on weekends and holidays (`--force` to override).
 - [ ] 2026-11-18: rerun the backfill once tonight's bhavcopy is in.
 - [ ] 2026-11-13: the capture was stopped at 11:25 IST and restarted in the same
       second (cause unknown); the tape has two headers and replays normally.

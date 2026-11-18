@@ -48,13 +48,10 @@ DATA_CACHE = HERE / "data_cache"
 DELIV_CACHE = DATA_CACHE / "equity_delivery"
 
 from core.runner_common import (  # noqa: E402
-    HOLIDAYS_PATH,
+    require_trading_day,
     acquire_lock,
     assert_disk_space_ok,
-    assert_holiday_data_fresh,
     assert_timezone_ist,
-    is_trading_day,
-    load_holidays,
 )
 
 # EQ-FU-2: shared fill-filter constants (re-exported by the strategy module
@@ -447,11 +444,7 @@ def main() -> int:
     assert_timezone_ist(log)
     assert_disk_space_ok([LOG_DIR, DATA_CACHE], log)
 
-    holidays = load_holidays(HOLIDAYS_PATH)
-    assert_holiday_data_fresh(holidays, today, log)
-    ok, reason = is_trading_day(today, holidays)
-    if not ok and not args.force:
-        log.info("No-op: %s. Exiting.", reason)
+    if not require_trading_day(today, log, force=args.force):
         return 0
 
     _lock_fd = acquire_lock(  # noqa: F841

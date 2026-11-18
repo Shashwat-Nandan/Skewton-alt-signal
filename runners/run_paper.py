@@ -40,7 +40,7 @@ from core._state_backup import archive_state_backup, assert_no_orphan_backups
 # session-time constants; point it at the one scaffold so they can't drift,
 # and pick up the disk/tz pre-flights + single-instance lock it lacked.
 from core.runner_common import (
-    HOLIDAYS_PATH,
+    require_trading_day,
     HARD_STOP,
     MARKET_OPEN,
     SESSION_END_AT,
@@ -49,11 +49,8 @@ from core.runner_common import (
     HeartbeatTracker,
     acquire_lock,
     assert_disk_space_ok,
-    assert_holiday_data_fresh,
     assert_timezone_ist,
     install_signal_handlers,
-    is_trading_day,
-    load_holidays,
     sleep_until,
 )
 
@@ -353,11 +350,7 @@ def main():
     assert_timezone_ist(log)
     assert_disk_space_ok([DATA_CACHE, LOG_DIR], log)
 
-    holidays = load_holidays(HOLIDAYS_PATH)
-    assert_holiday_data_fresh(holidays, today, log)
-    ok, reason = is_trading_day(today, holidays)
-    if not ok and not args.force:
-        log.info("No-op: %s. Exiting.", reason)
+    if not require_trading_day(today, log, force=args.force):
         return 0
 
     # Single-instance lock — a second concurrent run of the SAME underlying would

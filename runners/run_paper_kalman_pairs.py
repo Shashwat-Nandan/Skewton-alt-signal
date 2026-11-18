@@ -55,6 +55,7 @@ from typing import Callable, Dict, List, Optional
 import pandas as pd
 
 from core.runner_common import (
+    require_trading_day,
     HOLIDAYS_PATH,
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
@@ -69,7 +70,6 @@ from core.runner_common import (
     assert_timezone_ist,
     durable_write_text,
     install_signal_handlers,
-    is_trading_day,
     load_holidays,
     sleep_until,
 )
@@ -752,12 +752,9 @@ def main() -> int:
     log = _setup_logging(today)
     assert_timezone_ist(log)
     assert_disk_space_ok([DATA_CACHE, LOG_DIR], log)
+    if not require_trading_day(today, log, force=args.force):
+        return 0
     holidays = load_holidays(HOLIDAYS_PATH)
-    if not args.force:
-        ok, reason = is_trading_day(today, holidays)
-        if not ok:
-            log.info("Not a trading day (%s) — exiting.", reason)
-            return 0
 
     # Hard-stop guard BEFORE auth. A post-15:30 invocation — e.g. an evening
     # `systemctl enable --now` catch-up fire (timer is Persistent=true) — must

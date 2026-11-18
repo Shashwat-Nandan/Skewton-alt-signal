@@ -41,6 +41,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from core.runner_common import (
+    require_trading_day,
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
     HARD_STOP,
@@ -50,7 +51,6 @@ from core.runner_common import (
     HeartbeatTracker,
     acquire_lock,
     assert_disk_space_ok,
-    assert_holiday_data_fresh,
     assert_timezone_ist,
     durable_write_text,
     install_signal_handlers,
@@ -300,12 +300,9 @@ def main(argv=None) -> int:
     # Pre-flight gates — all fail loud.
     assert_timezone_ist(logger)
     assert_disk_space_ok([DATA_CACHE, LOG_DIR], logger)
-    holidays = load_holidays(HOLIDAYS_PATH)
-    assert_holiday_data_fresh(holidays, today, logger)
-    ok, reason = is_trading_day(today, holidays)
-    if not ok and not args.force:
-        logger.info("No-op: %s. Exiting.", reason)
+    if not require_trading_day(today, logger, force=args.force):
         return 0
+    holidays = load_holidays(HOLIDAYS_PATH)
     if HALT_ALL_PATH.exists():
         logger.warning("HALT_ALL present — exiting")
         return 0

@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 
 from core._state_backup import archive_state_backup, assert_no_orphan_backups
 from core.runner_common import (
-    HOLIDAYS_PATH,
+    require_trading_day,
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
     HARD_STOP,
@@ -58,11 +58,8 @@ from core.runner_common import (
     HeartbeatTracker,
     acquire_lock,
     assert_disk_space_ok,
-    assert_holiday_data_fresh,
     assert_timezone_ist,
     install_signal_handlers,
-    is_trading_day,
-    load_holidays,
     sleep_until,
 )
 
@@ -432,11 +429,7 @@ def main():
     # Pre-flight gates — all fail loud.
     assert_timezone_ist(log)
     assert_disk_space_ok([DATA_CACHE, LOG_DIR], log)
-    holidays = load_holidays(HOLIDAYS_PATH)
-    assert_holiday_data_fresh(holidays, today, log)
-    ok, reason = is_trading_day(today, holidays)
-    if not ok and not args.force:
-        log.info("No-op: %s. Exiting.", reason)
+    if not require_trading_day(today, log, force=args.force):
         return 0
 
     _runner_lock_fd = acquire_runner_lock(args.system, log)  # noqa: F841
