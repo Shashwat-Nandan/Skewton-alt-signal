@@ -42,7 +42,6 @@ from typing import Dict, List, Mapping, Optional, Sequence
 import pandas as pd
 from dotenv import load_dotenv
 
-from core.broker.errors import BrokerScripMissingError
 from core.broker.kotak import QUOTE_MAX_SYMBOLS
 from core.data_cache_io import find_tables, read_table, table_columns
 from core.runner_common import (
@@ -103,8 +102,6 @@ ENTRY_WINDOW_END = dtime(15, 20)
 # Closest strikes inside the replay's 0.85–1.15 band. Quoting the whole
 # board on an entry day is hundreds of contracts past what ATM selection uses.
 MAX_QUOTED_STRIKES = 9
-# Keys naming no scrip, re-sent around in one quote round before it fails.
-MAX_UNKNOWN_SCRIPS = 5
 _PREV_COLS = ("TradDt", "TckrSymb", "FinInstrmTp", "XpryDt", "TtlTradgVol")
 _FILE_DAY = re.compile(r"bhavcopy_fo_(\d{8})")
 # Logged once per name so a cash-quote miss does not fill the close log.
@@ -292,37 +289,33 @@ def previous_front(raw_dir: Path, session: date, universe: Sequence[str],
     return None
 
 
-def safe_quote(client, keys: Sequence[str], what: str = "quotes") -> dict:
-    """One request per QUOTE_MAX_SYMBOLS keys. A key with no last price is left
-    out by Kotak (omit_missing) at no extra cost: on a roll day many single-stock
-    strikes have not printed, and dropping them one failed call at a time would
-    be a call per strike. A key naming no scrip costs one re-send, at most
-    MAX_UNKNOWN_SCRIPS a round, then raises. Any other failure, a rate limit
-    above all, propagates after one call: the old fallback re-sent every key of
-    a failed batch on its own (547 429s on 2026-11-18). Keys left unpriced are
-    counted in one warning."""
+def safe_quote(client, keys: Sequence[str], what: str = "quotes") -> tuple:
+    """(prices, error or None), one request per QUOTE_MAX_SYMBOLS keys.
+
+    Kotak leaves out a key with no last price or no scrip (omit_missing), at no
+    extra request: on a roll day many single-stock strikes have not printed, and
+    dropping them one failed call at a time was a call per strike. On any error,
+    a rate limit above all, no further request is sent; the prices already in
+    hand are kept and the error is returned (the old fallback re-sent every key
+    of a failed batch on its own: 547 429s on 2026-11-18). This runner sends its
+    own chunks, not one call over all keys, so a failure keeps what priced.
+    Absent keys are counted in one warning."""
     ordered = list(dict.fromkeys(k for k in keys if k))
     out: dict = {}
-    unknown: List[str] = []
+    error: Optional[Exception] = None
     for i in range(0, len(ordered), QUOTE_MAX_SYMBOLS):
-        chunk = ordered[i:i + QUOTE_MAX_SYMBOLS]
-        while chunk:
-            try:
-                out.update(client.quote(chunk, omit_missing=True))
-                break
-            except BrokerScripMissingError as e:
-                if e.key not in chunk or len(unknown) >= MAX_UNKNOWN_SCRIPS:
-                    raise
-                unknown.append(e.key)
-                chunk = [k for k in chunk if k != e.key]
+        try:
+            out.update(client.quote(ordered[i:i + QUOTE_MAX_SYMBOLS], omit_missing=True))
+        except Exception as e:                                # noqa: BLE001
+            error = e
+            logger.error("%s: quote request failed, %d of %d keys not asked: %s",
+                         what, len(ordered) - i, len(ordered), e)
+            break
     unpriced = [k for k in ordered if _ltp(out.get(k)) is None]
-    if unknown:
-        logger.warning("%s: %d key(s) are in no Kotak scrip master: %s",
-                       what, len(unknown), ", ".join(unknown))
     if unpriced:
         logger.warning("%s: %d of %d keys have no price (e.g. %s)", what,
                        len(unpriced), len(ordered), ", ".join(unpriced[:5]))
-    return out
+    return out, error
 
 
 def _ltp(row) -> Optional[float]:
@@ -457,7 +450,8 @@ def build_session_view(client, session: date, previous: Optional[date],
     futs = {sym: _nearest_future(rows, sym, session) for sym in seen}
     keys = [f"NFO:{f['tradingsymbol']}" for f in futs.values() if f is not None]
     keys += [_spot_key(sym) for sym in seen]
-    quoted = safe_quote(client, keys, "futures and spots")
+    quoted, error = safe_quote(client, keys, "futures and spots")
+    incomplete = error is not None
     names: Dict[str, NameSurface] = {}
     bands: Dict[str, List[tuple]] = {}
     for sym in seen:
@@ -478,20 +472,21 @@ def build_session_view(client, session: date, previous: Optional[date],
         )
     if bands:
         chain_keys = [f"NFO:{s}" for band in bands.values() for _, ce, pe in band for s in (ce, pe)]
-        try:
-            chain = safe_quote(client, chain_keys, "entry chain")
-        except Exception:                                     # noqa: BLE001
+        chain, chain_error = safe_quote(client, chain_keys, "entry chain")
+        if chain_error is not None:
             # The held book's futures and spots are already in hand: mark them.
-            # With no chain the flat book builds no entry this pass and the
-            # roll retries next minute; a month is only skipped after a missed
-            # settlement, never for a failed quote.
-            logger.exception("entry chain quotes failed; marking without it")
-            chain = None
+            # A partial chain could build the entry from a part of the basket,
+            # so none is used: the flat book builds no entry this pass and the
+            # roll retries next minute. The pass counts as an error, so a whole
+            # window of failures reaches the silent-fail alert instead of the
+            # month's entry passing unnoticed.
+            incomplete, chain = True, None
         for sym, band in (bands.items() if chain is not None else ()):
             quotes, opt_symbols = _chain_quotes(chain, band)
             names[sym] = replace(names[sym], quotes=tuple(quotes), option_symbols=opt_symbols)
     return SessionView(
         session=session, previous_front=previous, front_expiry=front, names=names,
+        incomplete=incomplete,
     )
 
 
@@ -666,6 +661,10 @@ def main(argv=None) -> int:
                 except Exception:                             # noqa: BLE001
                     logger.exception("[%s] close failed", strategy.name)
                     outcome = "error"
+            if view.incomplete:
+                logger.error("close view incomplete: some quotes failed; marked "
+                             "what priced")
+                outcome = "error"
             return outcome
 
         def account(outcome: str) -> None:

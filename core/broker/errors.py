@@ -45,10 +45,15 @@ class BrokerQuoteMissingError(BrokerOrderError):
         self.key = key
 
 
-class BrokerScripMissingError(BrokerQuoteMissingError):
-    """`key` names no contract in the broker's scrip master: a wrong symbol or
-    a master that is behind, not an illiquid strike. Callers that set aside a
-    key with no LTP must decide separately what this means for them."""
+class BrokerScripMissingError(BrokerOrderError):
+    """`key` names no contract in the broker's scrip master: a wrong symbol or a
+    master that is behind, not an illiquid strike. A sibling of
+    BrokerQuoteMissingError, not a subclass, so a handler that sets aside a key
+    with no LTP never sets this aside by accident."""
+
+    def __init__(self, message: str, key: str):
+        super().__init__(message)
+        self.key = key
 
 
 class BrokerNotImplementedError(BrokerError):

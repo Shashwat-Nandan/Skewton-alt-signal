@@ -41,12 +41,7 @@ from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from pathlib import Path
 
-from core.broker.errors import (
-    BrokerOrderError,
-    BrokerQuoteMissingError,
-    BrokerScripMissingError,
-    BrokerTokenError,
-)
+from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError, BrokerTokenError
 from core.broker.kotak import QUOTE_MAX_SYMBOLS
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -265,11 +260,10 @@ def _poll_quotes(client, pairs, dead, budget=MAX_NEW_DEAD_PER_PASS):
         while batch:
             try:
                 quoted = client.quote([key for _, key in batch]) or {}
-            except BrokerScripMissingError:
-                # Not an illiquid strike: a wrong symbol or a stale master.
-                # Setting it aside would drop it from every tape unnoticed.
-                raise
             except BrokerQuoteMissingError as e:
+                # Only a missing LTP. A key naming no scrip
+                # (BrokerScripMissingError, a sibling) propagates and fails the
+                # pass: a wrong symbol or stale master, not an illiquid strike.
                 if e.key not in {key for _, key in batch}:
                     raise
                 if budget <= 0:

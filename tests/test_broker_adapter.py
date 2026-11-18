@@ -611,6 +611,48 @@ class TestKotakClient:
         with pytest.raises(BrokerQuoteMissingError):
             client.quote(keys)
 
+    def test_a_batch_key_with_no_row_never_takes_another_contracts_price(self):
+        """The one-row and whole-payload fallbacks are for a one-key request. In a
+        batch they gave a key with no row of its own a sibling's price."""
+        from core.broker.errors import BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [
+            {"instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE", "name": "NIFTY",
+             "instrument_type": "CE", "lot_size": 75, "exchange": "NFO"},
+            {"instrument_token": 998, "tradingsymbol": "NIFTY25SEP25000PE", "name": "NIFTY",
+             "instrument_type": "PE", "lot_size": 75, "exchange": "NFO"}]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": "999", "exchange": "nse_fo", "ltp": "12"}]
+        client.session.request.return_value = resp
+        keys = ["NFO:NIFTY25SEP25000CE", "NFO:NIFTY25SEP25000PE"]
+        assert client.quote(keys, omit_missing=True) == {
+            "NFO:NIFTY25SEP25000CE": {"last_price": 12.0}}
+        with pytest.raises(BrokerQuoteMissingError) as err:
+            client.quote(keys)
+        assert err.value.key == "NFO:NIFTY25SEP25000PE"
+
+    def test_omit_missing_also_leaves_out_an_unknown_scrip(self):
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [
+            {"instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE", "name": "NIFTY",
+             "instrument_type": "CE", "lot_size": 75, "exchange": "NFO"}]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": "999", "exchange": "nse_fo", "ltp": "12"}]
+        client.session.request.return_value = resp
+        got = client.quote(["NFO:NIFTY25SEP25000CE", "NFO:NOPE"], omit_missing=True)
+        assert set(got) == {"NFO:NIFTY25SEP25000CE"}
+
+    def test_an_unknown_scrip_is_not_a_missing_ltp(self):
+        """A sibling, so a handler that sets aside a key with no LTP never sets
+        aside a wrong symbol by accident."""
+        from core.broker.errors import (BrokerOrderError, BrokerQuoteMissingError,
+                                        BrokerScripMissingError)
+        assert issubclass(BrokerScripMissingError, BrokerOrderError)
+        assert not issubclass(BrokerScripMissingError, BrokerQuoteMissingError)
+
     def test_quote_depth_is_kite_shaped_numbers(self):
         client = self._client()
         client._instruments_by_exchange["NSE"] = [{
