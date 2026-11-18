@@ -339,6 +339,29 @@ def _tape_broker(header: dict) -> str:
     return name
 
 
+_TAPE_FRAME_COLUMNS = ["timestamp", "symbol", "underlying_price", "strike", "option_type",
+                       "expiry", "last_price", "bid", "ask", "lot_size", "iv"]
+
+
+def _tape_has_ticks(tick_path: Path) -> bool:
+    """Whether a tape holds anything past its header. Cheap: a raw tape reads two
+    lines, a parquet tape one row. A .zst archive is assumed to (they come from
+    full sessions), and the full load still counts what it finds."""
+    if tick_path.suffix == ".jsonl":
+        with open(tick_path) as f:
+            f.readline()
+            return any(line.strip() for line in f)
+    if tick_path.suffix == ".parquet":
+        import duckdb
+        con = duckdb.connect()
+        try:
+            return con.execute("SELECT 1 FROM read_parquet(?) LIMIT 1",
+                               [str(tick_path)]).fetchone() is not None
+        finally:
+            con.close()
+    return True
+
+
 def _find_instruments_csv(
     date_iso: str, underlying: str = "NIFTY", broker: str = _LEGACY_TAPE_BROKER,
 ) -> Optional[Path]:
@@ -348,6 +371,11 @@ def _find_instruments_csv(
     file of the SAME broker. A file from another broker is never a
     fallback: Kotak pSymbols do not match Kite instrument tokens, and a
     numeric collision would label the leg with the wrong strike.
+
+    A Kotak tape takes only its own day's master. The recorder saves one each
+    session, and a rebuilt one (scripts/backfill_tape_masters.py) holds only
+    that day's recorded contracts: borrowed by another day, every strike outside
+    its band would drop out of the replay without an error.
     """
     target = date_iso.replace("-", "")
     cache = Path("data_cache")
@@ -355,6 +383,9 @@ def _find_instruments_csv(
         return None
     candidates = sorted(cache.glob(f"instruments_{underlying}_*.csv"))
     same = [p for p in candidates if _instruments_file_broker(p) == broker]
+    if broker == "kotak":
+        exact = [p for p in same if p.stem.split("_")[-1] == target]
+        return exact[0] if exact else None
     on_or_before = [p for p in same if p.stem.split("_")[-1] <= target]
     if on_or_before:
         return on_or_before[-1]
@@ -610,6 +641,12 @@ def load_captured_tape(
             "underlying_price (Rule 12: fail here, not there)"
         )
     broker = _tape_broker(header)
+    if not _tape_has_ticks(tick_path):
+        # A stillborn capture: a header and no ticks (2026-10-20..27, every Kotak
+        # poll rejected). Callers skip an empty frame (autoresearch_loop's
+        # pre-flight). Checked before the master, which such a tape may lack.
+        logger.warning("ticks-%s: no ticks in this session's tape.", date_iso)
+        return pd.DataFrame(columns=_TAPE_FRAME_COLUMNS)
     instr_csv = _find_instruments_csv(date_iso, underlying, broker)
     if instr_csv is None:
         raise FileNotFoundError(
@@ -710,14 +747,10 @@ def load_captured_tape(
         )
 
     if df.empty:
-        # A stillborn capture: a header and no ticks (2026-10-20..27, every Kotak
-        # poll rejected). Callers skip an empty frame (autoresearch_loop's
-        # pre-flight); the joins below would raise KeyError and kill a sweep.
-        logger.warning("ticks-%s: no ticks in this session's tape.", date_iso)
-        return pd.DataFrame(columns=[
-            "timestamp", "symbol", "underlying_price", "strike", "option_type",
-            "expiry", "last_price", "bid", "ask", "lot_size", "iv",
-        ])
+        # Ticks, but none inside the session date (all epoch-zero snapshots):
+        # the joins below would raise KeyError and kill a sweep.
+        logger.warning("ticks-%s: no ticks inside the session date.", date_iso)
+        return pd.DataFrame(columns=_TAPE_FRAME_COLUMNS)
 
     # Join the NFO instrument master for strike/expiry/lot_size on
     # derivatives, then patch the spot token (which lives on NSE and

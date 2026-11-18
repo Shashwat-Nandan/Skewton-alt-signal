@@ -86,19 +86,27 @@ def fetch_instrument_master(kite, underlying: str = "NIFTY") -> pd.DataFrame:
         )
 
     logger.info("Fetching NFO instrument master (%s)...", broker)
-    instruments = kite.instruments("NFO")
-    df = pd.DataFrame(instruments)
+    return save_instrument_master(kite.instruments("NFO"), underlying, broker)
 
-    # Filter to underlying
+
+def save_instrument_master(instruments, underlying: str, broker: str) -> pd.DataFrame:
+    """Write today's dated master for `underlying` from NFO rows already in hand
+    (the tick recorder resolved them a moment earlier). Replaces the file in one
+    step, so a crash cannot leave a truncated master."""
+    df = pd.DataFrame(instruments)
     df = df[df["name"] == underlying].copy()
+    if df.empty:
+        raise ValueError(f"no {underlying} rows in the NFO instrument list")
     df["expiry"] = pd.to_datetime(df["expiry"])
     df["strike"] = df["strike"].astype(float)
     df["broker"] = broker
 
+    cache_file = instruments_cache_path(underlying, broker)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(cache_file, index=False)
+    tmp = cache_file.with_name(cache_file.name + ".tmp")
+    df.to_csv(tmp, index=False)
+    tmp.replace(cache_file)
     logger.info("Cached %d instruments to %s", len(df), cache_file)
-
     return df
 
 

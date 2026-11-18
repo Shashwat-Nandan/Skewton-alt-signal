@@ -244,20 +244,11 @@ def test_cached_session_never_starts_a_login(monkeypatch, tmp_path):
     assert seen == {"cached_only": True}
 
 
-class _MasterClient:
-    broker_name = "kotak"
-
-    def __init__(self, fail=False):
-        self.fail = fail
-
-    def instruments(self, exchange=None):
-        if self.fail:
-            raise BrokerNetworkError("scrip master down")
-        return [{"instrument_token": 7, "tradingsymbol": "NIFTY26N0924000CE", "name": "NIFTY",
+_NFO_ROWS = [{"instrument_token": 7, "tradingsymbol": "NIFTY26N0924000CE", "name": "NIFTY",
                  "expiry": "2026-11-09", "strike": 24000.0, "instrument_type": "CE",
                  "lot_size": 65},
                 {"instrument_token": 8, "tradingsymbol": "TCS26NOVFUT", "name": "TCS",
-                 "expiry": "2026-11-24", "strike": 0.0, "instrument_type": "FUT", "lot_size": 175}]
+              "expiry": "2026-11-24", "strike": 0.0, "instrument_type": "FUT", "lot_size": 175}]
 
 
 def test_a_tape_gets_a_same_broker_master_from_its_own_day(monkeypatch, tmp_path):
@@ -265,7 +256,7 @@ def test_a_tape_gets_a_same_broker_master_from_its_own_day(monkeypatch, tmp_path
     the scrip master. Every tape to 2026-11-06 was captured this way."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("market_data.fetch_historical_data.CACHE_DIR", tmp_path)
-    assert tc.save_instrument_masters(_MasterClient(), ["NIFTY"]) is True
+    assert tc.save_instrument_masters(_NFO_ROWS, ["NIFTY"], "kotak") is True
     files = list(tmp_path.glob("instruments_NIFTY_kotak_*.csv"))
     assert len(files) == 1
     text = files[0].read_text()
@@ -305,4 +296,58 @@ def test_a_failed_master_keeps_recording_but_fails_the_day(monkeypatch, tmp_path
 
 def test_a_master_failure_is_reported_not_raised(monkeypatch, tmp_path):
     monkeypatch.setattr("market_data.fetch_historical_data.CACHE_DIR", tmp_path)
-    assert tc.save_instrument_masters(_MasterClient(fail=True), ["NIFTY"]) is False
+    assert tc.save_instrument_masters(_NFO_ROWS, ["BANKNIFTY"], "kotak") is False
+
+
+def test_the_master_comes_from_the_rows_resolution_fetched(monkeypatch, tmp_path):
+    """A second NFO download before the first poll spends the runners' quota and,
+    with no timeout, could hang past the open: no tape at all."""
+    class _Kite:
+        calls = 0
+
+        def instruments(self, exchange):
+            _Kite.calls += 1
+            return _NFO_ROWS
+
+    out = []
+    monkeypatch.setattr(tc, "resolve_instruments_for", lambda *a, **k: ([1], {1: "NIFTY 50"}))
+    tc.resolve_instruments(_Kite(), tc._LOG, ["NIFTY"], nfo_out=out)
+    assert out == _NFO_ROWS and _Kite.calls == 1
+
+
+def test_the_kiteticker_path_also_fails_the_day_without_a_master(monkeypatch, tmp_path):
+    import types
+
+    class _Ticker:
+        def __init__(self, **kw):
+            pass
+
+        def connect(self, threaded=False):
+            return None
+
+    monkeypatch.setitem(sys.modules, "kiteconnect", types.SimpleNamespace(KiteTicker=_Ticker))
+    import core.broker as broker
+
+    class _Client:
+        api_key, access_token = "k", "t"
+
+        def profile(self):
+            return {"user_name": "u", "user_id": "x"}
+
+    monkeypatch.setattr(broker, "get_trading_client", lambda *a, **k: _Client())
+    monkeypatch.setattr(broker, "read_broker_name", lambda *_: "zerodha")
+    monkeypatch.setattr(tc, "resolve_instruments", lambda *a, **k: ([1], {1: "NIFTY 50"}))
+    monkeypatch.setattr(tc, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(tc, "TICKS_DIR", tmp_path / "ticks")
+    monkeypatch.setattr(sys, "argv", ["tick_capture"])
+
+    class _MidSession(tc.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 9, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(tc, "datetime", _MidSession)
+    monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: False)
+    assert tc.main() == 1
+    monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
+    assert tc.main() == 0

@@ -118,3 +118,58 @@ def test_a_tape_with_no_ticks_is_an_empty_frame_not_a_crash(cache):
     assert bf.backfill(dirs=_dirs(cache), cache=cache) == 0
     out = load_captured_tape(DAY)
     assert out.empty and {"symbol", "strike", "last_price"} <= set(out.columns)
+
+
+def test_an_existing_master_is_kept_without_reading_any_bhavcopy(cache, capsys):
+    """The recorder saves a full master each day; a routine run mid-session has no
+    bhavcopy for today yet and must not call that a failure."""
+    (cache / f"instruments_NIFTY_kotak_{YMD}.csv").write_text("real master")
+    assert bf.backfill(dirs=_dirs(cache), cache=cache) == 0
+    assert "keep" in capsys.readouterr().out
+
+
+def test_one_bad_tape_does_not_stop_the_others(cache, capsys):
+    _bhav(cache / "bhavcopy_raw" / f"bhavcopy_fo_{YMD}.parquet", [CE, PE, FUT])
+    (cache / "ticks" / "ticks-2026-10-28.jsonl").write_text("not json\n")
+    assert bf.backfill(dirs=_dirs(cache), cache=cache) == 1
+    assert "FAILED 2026-10-28" in capsys.readouterr().out
+    assert (cache / f"instruments_NIFTY_kotak_{YMD}.csv").exists()
+
+
+def test_the_lot_comes_from_the_sessions_own_file(cache):
+    """A neighbouring day can be across an NSE lot revision."""
+    _bhav(cache / "bhavcopy_raw" / f"bhavcopy_fo_{YMD}.parquet", [FUT])
+    nxt = cache / "bhavcopy_raw" / "bhavcopy_fo_20261030.parquet"
+    _bhav(nxt, [CE, PE, FUT])
+    df = pd.read_parquet(nxt)
+    df.loc[df["TckrSymb"] == "NIFTY", "NewBrdLotQty"] = 75
+    df.to_parquet(nxt)
+    assert bf.backfill(dirs=_dirs(cache), cache=cache) == 0
+    master = pd.read_csv(cache / f"instruments_NIFTY_kotak_{YMD}.csv")
+    assert set(master["lot_size"]) == {65}
+
+
+def test_no_bhavcopy_for_the_session_is_not_guessed(cache):
+    _bhav(cache / "bhavcopy_raw" / "bhavcopy_fo_20261030.parquet", [CE, PE, FUT])
+    assert bf.backfill(dirs=_dirs(cache), cache=cache) == 1
+    assert not list(cache.glob("instruments_*.csv"))
+
+
+def test_a_kotak_tape_never_borrows_another_days_master(cache):
+    """A rebuilt master holds only that day's recorded band; borrowed by a later
+    day, every strike outside it would drop from the replay without an error."""
+    pd.DataFrame([{"instrument_token": 502, "tradingsymbol": CE, "name": "NIFTY",
+                   "expiry": "2026-11-03", "strike": 22100.0, "lot_size": 65,
+                   "instrument_type": "CE", "broker": "kotak"}]).to_csv(
+        cache / "instruments_NIFTY_kotak_20261028.csv", index=False)
+    assert _find_instruments_csv(DAY, "NIFTY", "kotak") is None
+    with pytest.raises(FileNotFoundError):
+        load_captured_tape(DAY)
+
+
+def test_an_empty_tape_with_no_master_is_still_an_empty_frame(cache):
+    """The stillborn tapes need no master to be skipped."""
+    tape = cache / "ticks" / f"ticks-{DAY}.jsonl"
+    tape.write_text(tape.read_text().splitlines()[0] + "\n")
+    out = load_captured_tape(DAY)
+    assert out.empty and "strike" in out.columns

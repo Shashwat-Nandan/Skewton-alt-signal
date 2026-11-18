@@ -152,17 +152,25 @@ quote fails the whole call when one instrument has no LTP and names it
 
 ## Instrument master
 
-Replay joins a tape to `data_cache/instruments_<UNDERLYING>_kotak_<YYYYMMDD>.csv`
-for strike, expiry and lot; a Kotak tape joins by tradingsymbol. The recorder
-saves that day's master before it starts polling. Once a contract expires the
-scrip master no longer lists it, so a later fetch cannot replace this. If the save
-fails the tape keeps recording and the run exits 1 at the close.
+Replay joins a Kotak tape to its own day's
+`data_cache/instruments_<UNDERLYING>_kotak_<YYYYMMDD>.csv`, by tradingsymbol, for
+strike, expiry and lot; it never borrows another day's. The recorder saves that
+day's master before it starts polling, from the NFO list instrument resolution
+already fetched. Once a contract expires the scrip master no longer lists it, so a
+later fetch cannot replace this. If the save fails the tape keeps recording and
+the run exits 1 at the close.
 
 `python scripts/backfill_tape_masters.py [--dry-run]` rebuilds a missing one with
-no broker call: token and symbol from the tape header, expiry, strike and lot from
-the bhavcopy, whose `FinInstrmNm` is the same symbol. It holds only the recorded
-contracts, never overwrites a master, and writes nothing for a session with a
-contract it cannot find. It also serves a day whose save failed.
+no broker call: token and symbol from the tape header, expiry and strike from the
+bhavcopy (whose `FinInstrmNm` is the same symbol), the lot from the session's own
+bhavcopy. It holds only the recorded contracts and never overwrites a master. A
+session it cannot rebuild (no bhavcopy for that day yet, a contract not found
+within 5 sessions, a corrupt tape) is reported and writes nothing; the rest still
+run. It reads raw `.jsonl` tapes only. It also serves a day whose save failed.
+
+The recorder has no holiday check: on 2026-11-10 (Diwali-Balipratipada) it
+recorded a closed market's quotes. There is no bhavcopy for that day, so the
+backfill refuses it, and the tape should not be used.
 
 ## WebSocket lifecycle
 

@@ -149,12 +149,17 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None,
     return tokens, token_to_symbol
 
 
-def resolve_instruments(kite, log, underlyings, strikes_each_side=STRIKES_EACH_SIDE):
+def resolve_instruments(kite, log, underlyings, strikes_each_side=STRIKES_EACH_SIDE,
+                        nfo_out=None):
     """Resolve subscribe sets for every requested underlying and merge into
     one (tokens, token_to_symbol) pair. NFO master is fetched once and shared
     across underlyings. A failure on any underlying raises and aborts capture
-    for the day — running partial would silently drop a leg from the dataset."""
+    for the day — running partial would silently drop a leg from the dataset.
+    `nfo_out`, if given, receives that NFO list, so the day's master can be
+    saved without fetching it again on the runners' quota."""
     nfo_cache = kite.instruments("NFO")
+    if nfo_out is not None:
+        nfo_out.extend(nfo_cache)
     all_tokens: list[int] = []
     all_token_to_symbol: dict[int, str] = {}
     for u in underlyings:
@@ -384,18 +389,20 @@ def _run_quote_poll(client, tokens, sym_map, poll_seconds=2.0):
     return True
 
 
-def save_instrument_masters(kite, underlyings) -> bool:
-    """Write today's same-broker master for each underlying. Replay joins a tape
-    to it for strike, expiry and lot, and once a contract expires the scrip
-    master no longer lists it, so a tape with no master from its own day may
-    never join. True if all were written. A failure must not cost the tape: the
-    caller keeps recording and reports it at the end."""
-    from market_data.fetch_historical_data import fetch_instrument_master
+def save_instrument_masters(nfo_rows, underlyings, broker_name) -> bool:
+    """Write today's same-broker master for each underlying, from the NFO rows
+    instrument resolution already fetched: no second download, nothing to hang
+    before the open. Replay joins a tape to it for strike, expiry and lot, and
+    once a contract expires the scrip master no longer lists it, so a tape with
+    no master from its own day may never join. True if all were written. A
+    failure must not cost the tape: the caller keeps recording and reports it at
+    the end."""
+    from market_data.fetch_historical_data import save_instrument_master
 
     ok = True
     for underlying in underlyings:
         try:
-            fetch_instrument_master(kite, underlying)
+            save_instrument_master(nfo_rows, underlying, broker_name)
         except Exception as e:
             ok = False
             _LOG.error("Could not save the %s instrument master; this tape will "
@@ -486,8 +493,10 @@ def main():
 
     _LOG.info("Resolving instruments for: %s (±%d strikes/side)",
               ",".join(underlyings), args.strikes_each_side)
+    nfo_rows: list = []
     tokens, sym_map = resolve_instruments(
-        kite, _LOG, underlyings, strikes_each_side=args.strikes_each_side)
+        kite, _LOG, underlyings, strikes_each_side=args.strikes_each_side,
+        nfo_out=nfo_rows)
     _SUBSCRIBE_TOKENS = tokens
     _TOKEN_TO_SYMBOL = sym_map
 
@@ -495,7 +504,7 @@ def main():
         _LOG.info("--validate: skipping WebSocket; exiting cleanly.")
         return 0
 
-    masters_ok = save_instrument_masters(kite, underlyings)
+    masters_ok = save_instrument_masters(nfo_rows, underlyings, broker_name)
 
     TICKS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = TICKS_DIR / f"ticks-{today.isoformat()}.jsonl"
