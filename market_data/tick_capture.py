@@ -441,6 +441,11 @@ def main():
              "fresh Kotak login replaces the token the live runners hold.",
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help="Record on a weekend or a date in market_data/holidays.csv (a "
+             "special session such as Muhurat). Without it those days are a no-op.",
+    )
+    parser.add_argument(
         "--poll-seconds", type=float, default=2.0,
         help="Seconds between quote passes on a polling broker (Kotak). "
              "The quote API's quota is shared with the runners.",
@@ -468,6 +473,15 @@ def main():
     now_ist = datetime.now(IST)
     if not args.validate and now_ist.time() >= dtime(15, 30):
         _LOG.info("Started after 15:30 IST — nothing to capture today.")
+        return 0
+
+    # 2026-11-10 (Diwali-Balipratipada): the timer fired on a holiday and the
+    # recorder polled a closed market all day, a tape of stale quotes with no
+    # bhavcopy to rebuild its master from. Same rule as the pair runners.
+    from core.runner_common import HOLIDAYS_PATH, is_trading_day, load_holidays
+    trading, why = is_trading_day(today, load_holidays(HOLIDAYS_PATH))
+    if not trading and not args.validate and not args.force:
+        _LOG.info("No-op: %s. Nothing to capture.", why)
         return 0
 
     _LOG.info("Authenticating...")

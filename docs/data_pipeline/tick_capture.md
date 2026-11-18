@@ -168,9 +168,11 @@ session it cannot rebuild (no bhavcopy for that day yet, a contract not found
 within 5 sessions, a corrupt tape) is reported and writes nothing; the rest still
 run. It reads raw `.jsonl` tapes only. It also serves a day whose save failed.
 
-The recorder has no holiday check: on 2026-11-10 (Diwali-Balipratipada) it
-recorded a closed market's quotes. There is no bhavcopy for that day, so the
-backfill refuses it, and the tape should not be used.
+On a weekend or a date in `market_data/holidays.csv` the recorder is a no-op and
+exits 0, like the pair runners; `--force` records anyway (a special session such
+as Muhurat). Before this, on 2026-11-10 (Diwali-Balipratipada), it recorded a
+closed market's quotes. There is no bhavcopy for that day, so the backfill refuses
+it, and that tape should not be used.
 
 ## WebSocket lifecycle
 

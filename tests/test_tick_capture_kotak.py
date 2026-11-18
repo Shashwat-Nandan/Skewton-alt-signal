@@ -282,7 +282,7 @@ def _full_main(monkeypatch, tmp_path, *, masters_ok, poll_ok=True):
     class _MidSession(tc.datetime):        # past 15:30 main() exits before any of this
         @classmethod
         def now(cls, tz=None):
-            return cls(2026, 11, 9, 10, 0, tzinfo=tz)
+            return cls(2026, 11, 9, 10, 0, tzinfo=tz)      # a Monday, not a holiday
 
     monkeypatch.setattr(tc, "datetime", _MidSession)
     return tc.main()
@@ -351,3 +351,59 @@ def test_the_kiteticker_path_also_fails_the_day_without_a_master(monkeypatch, tm
     assert tc.main() == 1
     monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
     assert tc.main() == 0
+
+
+def _on_day(monkeypatch, tmp_path, day, argv=("--cached-session",)):
+    """Run main() at 10:00 IST on `day`; return (exit code, whether it polled)."""
+    import core.broker as broker
+
+    class _Client:
+        def profile(self):
+            return {"user_name": "u", "user_id": "x"}
+
+    polled = []
+    monkeypatch.setattr(broker, "get_market_client", lambda *a, **k: _Client())
+    monkeypatch.setattr(broker, "get_trading_client", lambda *a, **k: _Client())
+    monkeypatch.setattr(broker, "read_broker_name", lambda *_: "kotak")
+    monkeypatch.setattr(tc, "resolve_instruments", lambda *a, **k: ([1], {1: "NIFTY 50"}))
+    monkeypatch.setattr(tc, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(tc, "TICKS_DIR", tmp_path / "ticks")
+    monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
+    monkeypatch.setattr(tc, "_run_quote_poll", lambda *a, **k: polled.append(1) or True)
+    monkeypatch.setattr(sys, "argv", ["tick_capture", *argv])
+
+    class _At(tc.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(day.year, day.month, day.day, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(tc, "datetime", _At)
+    return tc.main(), bool(polled)
+
+
+def test_an_nse_holiday_records_nothing(monkeypatch, tmp_path):
+    """2026-11-10 (Diwali-Balipratipada): the timer fired and the recorder polled
+    a closed market all day, stale quotes with no bhavcopy behind them."""
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 10)) == (0, False)
+    assert not (tmp_path / "ticks").exists()
+
+
+def test_a_trading_day_records(monkeypatch, tmp_path):
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11)) == (0, True)
+
+
+def test_force_records_a_special_session(monkeypatch, tmp_path):
+    """Muhurat trading is a session on a listed holiday."""
+    from datetime import date
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 10),
+                   ("--cached-session", "--force")) == (0, True)
+
+
+def test_the_next_listed_holiday_is_in_the_calendar():
+    """The guard is only as good as market_data/holidays.csv."""
+    from datetime import date
+
+    from core.runner_common import HOLIDAYS_PATH, load_holidays
+    assert date(2026, 11, 24) in load_holidays(HOLIDAYS_PATH)
