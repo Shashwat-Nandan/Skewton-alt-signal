@@ -56,6 +56,7 @@ from core._state_backup import archive_state_backup, assert_no_orphan_backups
 # runner) keep working unchanged. Behaviour is byte-identical — these were
 # extracted verbatim from this file.
 from core.runner_common import (  # noqa: F401  (re-exported)
+    require_trading_day,
     HOLIDAYS_PATH,
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
@@ -1726,12 +1727,9 @@ def main():
     assert_timezone_ist(log)
     assert_disk_space_ok([DATA_CACHE, HERE / "logs"], log)
 
-    holidays = load_holidays(HOLIDAYS_PATH)
-    assert_holiday_data_fresh(holidays, today, log)
-    ok, reason = is_trading_day(today, holidays)
-    if not ok and not args.force:
-        log.info("No-op: %s. Exiting.", reason)
+    if not require_trading_day(today, log, force=args.force):
         return 0
+    holidays = load_holidays(HOLIDAYS_PATH)
 
     # H9: refuse to start a second runner with the same --system tag.
     # Assigned to a local that lives for main()'s scope so the FD stays

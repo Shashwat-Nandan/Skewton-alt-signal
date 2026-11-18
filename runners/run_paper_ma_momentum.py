@@ -37,6 +37,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 from core.runner_common import (
+    require_trading_day,
     HALT_ALL_PATH,
     HALT_NEW_ENTRIES_PATH,
     HOLIDAYS_PATH,
@@ -45,7 +46,6 @@ from core.runner_common import (
     HeartbeatTracker,
     acquire_lock,
     assert_disk_space_ok,
-    assert_holiday_data_fresh,
     assert_timezone_ist,
     install_signal_handlers,
     is_trading_day,
@@ -471,12 +471,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     assert_timezone_ist(logger)
     assert_disk_space_ok([DATA_CACHE, LOG_DIR], logger)
     today = date.today()
-    holidays = load_holidays(HOLIDAYS_PATH)
-    assert_holiday_data_fresh(holidays, today, logger)
-    ok, why = is_trading_day(today, holidays)
-    if not ok and not args.force:
-        logger.info("Not a trading day (%s) — exiting.", why)
+    if not require_trading_day(today, logger, force=args.force):
         return 0
+    # False only on a --force run on a weekend or holiday: no flatten, no EOD.
+    ok, _ = is_trading_day(today, load_holidays(HOLIDAYS_PATH))
     if HALT_ALL_PATH.exists():
         logger.warning("HALT_ALL present — exiting")
         return 0

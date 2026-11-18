@@ -36,7 +36,7 @@ import argparse
 import logging
 import math
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -51,26 +51,11 @@ DATA_CACHE = HERE / "data_cache"
 # holiday helpers (left in place — private, different signatures) but
 # lacked the tz/disk pre-flights and a single-instance lock; add those.
 from core.runner_common import (  # noqa: E402
-    HOLIDAYS_PATH,
+    require_trading_day,
     acquire_lock,
     assert_disk_space_ok,
     assert_timezone_ist,
 )
-
-
-def _load_holidays() -> set:
-    if not HOLIDAYS_PATH.exists():
-        return set()
-    out: set = set()
-    for raw in HOLIDAYS_PATH.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            out.add(date.fromisoformat(line.split(",", 1)[0].strip()))
-        except ValueError:
-            continue
-    return out
 
 
 def _setup_logging(today: date) -> logging.Logger:
@@ -83,47 +68,6 @@ def _setup_logging(today: date) -> logging.Logger:
         force=True,
     )
     return logging.getLogger("run_equity_swing")
-
-
-def _is_trading_day(today: date) -> tuple[bool, str]:
-    if today.weekday() >= 5:
-        return False, f"{today} is a weekend"
-    if today in _load_holidays():
-        return False, f"{today} is an NSE holiday"
-    return True, ""
-
-
-_HOLIDAY_HORIZON_DAYS = 30
-_HOLIDAYS_PER_YEAR_FLOOR = 8
-
-
-def _assert_holiday_data_fresh(today: date, log: logging.Logger) -> None:
-    # holidays.csv is hand-maintained from the NSE circular; a partial
-    # or expired list silently treats lunar holidays (Holi, Diwali, etc.)
-    # as trading days. Fail loud per CLAUDE.md Rule 12.
-    holidays = _load_holidays()
-    if not holidays:
-        msg = ("holidays.csv loaded zero entries — refusing to start. "
-               "Populate from the NSE 'Holidays — Trading' circular.")
-        log.error(msg)
-        raise RuntimeError(msg)
-    last = max(holidays)
-    horizon = today + timedelta(days=_HOLIDAY_HORIZON_DAYS)
-    if last < horizon:
-        msg = (f"holidays.csv last entry is {last}, less than "
-               f"{_HOLIDAY_HORIZON_DAYS} days past today ({today}). "
-               f"Refusing to start — update from the NSE circular and "
-               f"redeploy.")
-        log.error(msg)
-        raise RuntimeError(msg)
-    this_year_count = sum(1 for h in holidays if h.year == today.year)
-    if this_year_count < _HOLIDAYS_PER_YEAR_FLOOR:
-        msg = (f"holidays.csv has only {this_year_count} entries for "
-               f"{today.year}; NSE typically has 13-17 per year. The list "
-               f"is likely missing lunar holidays (Holi, Diwali, etc.). "
-               f"Refusing to start — update from the NSE circular.")
-        log.error(msg)
-        raise RuntimeError(msg)
 
 
 def _load_open_positions_into_strategy(strategy, log: logging.Logger) -> int:
@@ -480,10 +424,7 @@ def main() -> int:
     assert_timezone_ist(log)
     assert_disk_space_ok([LOG_DIR, DATA_CACHE], log)
 
-    _assert_holiday_data_fresh(today, log)
-    ok, reason = _is_trading_day(today)
-    if not ok and not args.force:
-        log.info("No-op: %s. Exiting.", reason)
+    if not require_trading_day(today, log, force=args.force):
         return 0
 
     # Single-instance lock, keyed by scan kind: two concurrent same-kind

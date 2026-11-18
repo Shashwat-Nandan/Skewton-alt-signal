@@ -43,20 +43,17 @@ from dotenv import load_dotenv
 
 from core.data_cache_io import find_tables, read_table, table_columns
 from core.runner_common import (
+    require_trading_day,
     HALT_ALL_PATH,
     HARD_STOP,
-    HOLIDAYS_PATH,
     SILENT_FAIL_THRESHOLD,
     TICK_SECONDS,
     HeartbeatTracker,
     acquire_lock,
     assert_disk_space_ok,
-    assert_holiday_data_fresh,
     assert_timezone_ist,
     durable_write_text,
     install_signal_handlers,
-    is_trading_day,
-    load_holidays,
     sleep_until,
 )
 from market_data.fetch_bhavcopy import has_fallback_marker
@@ -526,11 +523,7 @@ def main(argv=None) -> int:
     try:
         assert_timezone_ist(logger)
         assert_disk_space_ok([DATA_CACHE, LOG_DIR], logger)
-        holidays = load_holidays(HOLIDAYS_PATH)
-        assert_holiday_data_fresh(holidays, today, logger)
-        ok, reason = is_trading_day(today, holidays)
-        if not ok and not args.force:
-            logger.info("No-op: %s. Exiting.", reason)
+        if not require_trading_day(today, logger, force=args.force):
             return 0
         if HALT_ALL_PATH.exists():
             logger.warning("HALT_ALL present — exiting without a quote")

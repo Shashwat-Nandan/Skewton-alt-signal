@@ -480,8 +480,12 @@ def main():
     from core.runner_common import trading_day_gate
     gate_log = logging.getLogger("tick_capture.gate")
     if not gate_log.handlers:
-        gate_log.addHandler(logging.StreamHandler())
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s [%(name)s] %(message)s"))
+        gate_log.addHandler(handler)
         gate_log.setLevel(logging.INFO)
+        gate_log.propagate = False          # its own handler; not again via root
     run_today, calendar_problem = trading_day_gate(
         today, gate_log, force=args.force or args.validate)
     if not run_today:
@@ -495,7 +499,7 @@ def main():
     now_ist = datetime.now(IST)
     if not args.validate and now_ist.time() >= dtime(15, 30):
         _LOG.info("Started after 15:30 IST — nothing to capture today.")
-        return 0
+        return 1 if calendar_problem else 0
 
     _LOG.info("Authenticating...")
     from core.broker import get_market_client, get_trading_client, read_broker_name
@@ -529,7 +533,8 @@ def main():
 
     if args.validate:
         _LOG.info("--validate: skipping WebSocket; exiting cleanly.")
-        return 0
+        # The pre-open check must not pass when the real run will exit 1.
+        return 1 if calendar_problem else 0
 
     masters_ok = save_instrument_masters(nfo_rows, underlyings, broker_name)
 

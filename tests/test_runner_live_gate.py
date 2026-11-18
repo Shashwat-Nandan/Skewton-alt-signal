@@ -48,10 +48,8 @@ def gated_main(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(run_paper_pairs, "assert_timezone_ist", lambda log: None)
     monkeypatch.setattr(run_paper_pairs, "assert_disk_space_ok", lambda dirs, log: None)
-    monkeypatch.setattr(run_paper_pairs, "assert_holiday_data_fresh",
-                        lambda holidays, today, log: None)
-    monkeypatch.setattr(run_paper_pairs, "is_trading_day",
-                        lambda today, holidays: (False, "test: non-trading day"))
+    monkeypatch.setattr(run_paper_pairs, "require_trading_day",
+                        lambda today, log, force=False: force)      # a non-trading day
     # Host .env sets ALLOW_LIVE_MODE=true in production — every test must
     # pin the env explicitly or it inherits whatever the shell has.
     monkeypatch.delenv("ALLOW_LIVE_MODE", raising=False)

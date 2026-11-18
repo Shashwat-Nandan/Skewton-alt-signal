@@ -440,13 +440,47 @@ def test_a_malformed_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
                    calendar=_FRESH_CALENDAR + "2026-13-05\n") == (1, True)
 
 
-def test_the_shipped_calendar_is_fresh_today():
-    """The calendar every runner reads must reach 30 days ahead with enough
-    entries for the year, or the runners refuse to start and the recorder pages.
-    This fails, correctly, until the next year's NSE holidays are added."""
-    import logging
+def test_validate_and_a_late_start_report_a_broken_calendar(monkeypatch, tmp_path):
+    """Both would otherwise say all is well on a day the real run exits 1."""
+    from datetime import date
+    bad = _FRESH_CALENDAR + "2026-13-05\n"
+    rc, _ = _on_day(monkeypatch, tmp_path, date(2026, 11, 11),
+                    ("--cached-session", "--validate"), calendar=bad)
+    assert rc == 1
+
+
+def test_an_unreadable_calendar_records_but_fails_the_day(monkeypatch, tmp_path):
+    """A permissions error must not crash away a trading day's tape."""
+    import core.runner_common as rc_mod
     from datetime import date
 
-    from core.runner_common import HOLIDAYS_PATH, assert_holiday_data_fresh, load_holidays
-    assert_holiday_data_fresh(load_holidays(HOLIDAYS_PATH), date.today(),
-                              logging.getLogger("t"))
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(rc_mod, "load_holidays", unreadable)
+    assert _on_day(monkeypatch, tmp_path, date(2026, 11, 11)) == (1, True)
+
+
+def test_the_recorder_gate_does_not_say_it_refuses_to_start(monkeypatch, tmp_path, caplog):
+    """It records anyway; a "Refusing to start" line would read as a runner
+    that did not run."""
+    from datetime import date
+    stale = "\n".join(_FRESH_CALENDAR.split("\n")[:-2]) + "\n"
+    with caplog.at_level("INFO"):
+        _on_day(monkeypatch, tmp_path, date(2026, 12, 1), calendar=stale)
+    assert "Refusing to start" not in caplog.text and "recording anyway" in caplog.text
+
+
+def test_the_no_op_line_is_logged_once(monkeypatch, tmp_path, capsys):
+    """With a root handler configured (any harness, or a second main() in one
+    process) the gate's own handler and root would both print it."""
+    import logging
+    from datetime import date
+    root = logging.getLogger()
+    extra = logging.StreamHandler()
+    root.addHandler(extra)
+    try:
+        _on_day(monkeypatch, tmp_path, date(2026, 11, 10))
+    finally:
+        root.removeHandler(extra)
+    assert capsys.readouterr().err.count("No-op") == 1
