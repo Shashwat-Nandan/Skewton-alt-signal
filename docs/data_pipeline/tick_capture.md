@@ -150,6 +150,28 @@ quote fails the whole call when one instrument has no LTP and names it
   the rest of the day is still recorded. Gaps are counted in the
   closing log line.
 
+## Instrument master
+
+Replay joins a Kotak tape to its own day's
+`data_cache/instruments_<UNDERLYING>_kotak_<YYYYMMDD>.csv`, by tradingsymbol, for
+strike, expiry and lot; it never borrows another day's. The recorder saves that
+day's master before it starts polling, from the NFO list instrument resolution
+already fetched. Once a contract expires the scrip master no longer lists it, so a
+later fetch cannot replace this. If the save fails the tape keeps recording and
+the run exits 1 at the close.
+
+`python scripts/backfill_tape_masters.py [--dry-run]` rebuilds a missing one with
+no broker call: token and symbol from the tape header, expiry and strike from the
+bhavcopy (whose `FinInstrmNm` is the same symbol), the lot from the session's own
+bhavcopy. It holds only the recorded contracts and never overwrites a master. A
+session it cannot rebuild (no bhavcopy for that day yet, a contract not found
+within 5 sessions, a corrupt tape) is reported and writes nothing; the rest still
+run. It reads raw `.jsonl` tapes only. It also serves a day whose save failed.
+
+The recorder has no holiday check: on 2026-11-10 (Diwali-Balipratipada) it
+recorded a closed market's quotes. There is no bhavcopy for that day, so the
+backfill refuses it, and the tape should not be used.
+
 ## WebSocket lifecycle
 
 `KiteTicker` callbacks set up around line 150+:
@@ -230,6 +252,7 @@ Failure alerts: nonzero exit triggers `notify-failure@tick-capture.service`
 | `deploy/tick-capture.timer` | 09:14 IST Mon–Fri |
 | `deploy/notify-failure@.service` | Failure alert |
 | `research/backtest.py` | `load_captured_tape` consumer |
+| `scripts/backfill_tape_masters.py` | Rebuilds a missing tape master from the header and bhavcopy |
 | `research/replay_2026_05_06.py` | One-off incident replay |
 | `scripts/replay_missed_bars.py` | Bars-from-ticks fallback |
 | `tasks/lessons.md` | 2026-05-12 `ProtectHome` incident write-up |

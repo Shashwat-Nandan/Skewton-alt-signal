@@ -149,12 +149,17 @@ def resolve_instruments_for(kite, log, underlying, nfo_cache=None,
     return tokens, token_to_symbol
 
 
-def resolve_instruments(kite, log, underlyings, strikes_each_side=STRIKES_EACH_SIDE):
+def resolve_instruments(kite, log, underlyings, strikes_each_side=STRIKES_EACH_SIDE,
+                        nfo_out=None):
     """Resolve subscribe sets for every requested underlying and merge into
     one (tokens, token_to_symbol) pair. NFO master is fetched once and shared
     across underlyings. A failure on any underlying raises and aborts capture
-    for the day — running partial would silently drop a leg from the dataset."""
+    for the day — running partial would silently drop a leg from the dataset.
+    `nfo_out`, if given, receives that NFO list, so the day's master can be
+    saved without fetching it again on the runners' quota."""
     nfo_cache = kite.instruments("NFO")
+    if nfo_out is not None:
+        nfo_out.extend(nfo_cache)
     all_tokens: list[int] = []
     all_token_to_symbol: dict[int, str] = {}
     for u in underlyings:
@@ -384,6 +389,27 @@ def _run_quote_poll(client, tokens, sym_map, poll_seconds=2.0):
     return True
 
 
+def save_instrument_masters(nfo_rows, underlyings, broker_name) -> bool:
+    """Write today's same-broker master for each underlying, from the NFO rows
+    instrument resolution already fetched: no second download, nothing to hang
+    before the open. Replay joins a tape to it for strike, expiry and lot, and
+    once a contract expires the scrip master no longer lists it, so a tape with
+    no master from its own day may never join. True if all were written. A
+    failure must not cost the tape: the caller keeps recording and reports it at
+    the end."""
+    from market_data.fetch_historical_data import save_instrument_master
+
+    ok = True
+    for underlying in underlyings:
+        try:
+            save_instrument_master(nfo_rows, underlying, broker_name)
+        except Exception as e:
+            ok = False
+            _LOG.error("Could not save the %s instrument master; this tape will "
+                       "not replay without one: %s", underlying, e)
+    return ok
+
+
 def main():
     global _OUT_FILE, _LOG, _STOP_EPOCH, _SUBSCRIBE_TOKENS, _TOKEN_TO_SYMBOL
 
@@ -467,14 +493,18 @@ def main():
 
     _LOG.info("Resolving instruments for: %s (±%d strikes/side)",
               ",".join(underlyings), args.strikes_each_side)
+    nfo_rows: list = []
     tokens, sym_map = resolve_instruments(
-        kite, _LOG, underlyings, strikes_each_side=args.strikes_each_side)
+        kite, _LOG, underlyings, strikes_each_side=args.strikes_each_side,
+        nfo_out=nfo_rows)
     _SUBSCRIBE_TOKENS = tokens
     _TOKEN_TO_SYMBOL = sym_map
 
     if args.validate:
         _LOG.info("--validate: skipping WebSocket; exiting cleanly.")
         return 0
+
+    masters_ok = save_instrument_masters(nfo_rows, underlyings, broker_name)
 
     TICKS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = TICKS_DIR / f"ticks-{today.isoformat()}.jsonl"
@@ -510,7 +540,7 @@ def main():
                 _OUT_FILE.close()
             except Exception:
                 pass
-        return 0 if ok else 1
+        return 0 if ok and masters_ok else 1
 
     from kiteconnect import KiteTicker
     ticker = KiteTicker(api_key=kite.api_key, access_token=kite.access_token)
@@ -554,6 +584,8 @@ def main():
         except Exception:
             pass
     _LOG.info("Session complete. %d ticks captured. Exiting cleanly.", _TICK_COUNT)
+    if not masters_ok:
+        return 1
     return 0
 
 
