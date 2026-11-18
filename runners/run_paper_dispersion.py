@@ -42,7 +42,7 @@ from typing import Dict, List, Mapping, Optional, Sequence
 import pandas as pd
 from dotenv import load_dotenv
 
-from core.broker.errors import BrokerQuoteMissingError
+from core.broker.errors import BrokerScripMissingError
 from core.broker.kotak import QUOTE_MAX_SYMBOLS
 from core.data_cache_io import find_tables, read_table, table_columns
 from core.runner_common import (
@@ -103,6 +103,8 @@ ENTRY_WINDOW_END = dtime(15, 20)
 # Closest strikes inside the replay's 0.85–1.15 band. Quoting the whole
 # board on an entry day is hundreds of contracts past what ATM selection uses.
 MAX_QUOTED_STRIKES = 9
+# Keys naming no scrip, re-sent around in one quote round before it fails.
+MAX_UNKNOWN_SCRIPS = 5
 _PREV_COLS = ("TradDt", "TckrSymb", "FinInstrmTp", "XpryDt", "TtlTradgVol")
 _FILE_DAY = re.compile(r"bhavcopy_fo_(\d{8})")
 # Logged once per name so a cash-quote miss does not fill the close log.
@@ -290,26 +292,36 @@ def previous_front(raw_dir: Path, session: date, universe: Sequence[str],
     return None
 
 
-def safe_quote(client, keys: Sequence[str]) -> dict:
-    """Quote in batches of QUOTE_MAX_SYMBOLS. A key Kotak names as unquotable
-    (no last price, or no scrip) is dropped and its batch re-sent without it,
-    one extra call per such key. Any other failure, a rate limit above all,
-    propagates: the old fallback re-sent every key of a failed batch on its own,
-    so a 429 became dozens more calls on the quota the live pair runner shares
-    (547 429s in the 2026-11-18 window)."""
+def safe_quote(client, keys: Sequence[str], what: str = "quotes") -> dict:
+    """One request per QUOTE_MAX_SYMBOLS keys. A key with no last price is left
+    out by Kotak (omit_missing) at no extra cost: on a roll day many single-stock
+    strikes have not printed, and dropping them one failed call at a time would
+    be a call per strike. A key naming no scrip costs one re-send, at most
+    MAX_UNKNOWN_SCRIPS a round, then raises. Any other failure, a rate limit
+    above all, propagates after one call: the old fallback re-sent every key of
+    a failed batch on its own (547 429s on 2026-11-18). Keys left unpriced are
+    counted in one warning."""
     ordered = list(dict.fromkeys(k for k in keys if k))
     out: dict = {}
+    unknown: List[str] = []
     for i in range(0, len(ordered), QUOTE_MAX_SYMBOLS):
         chunk = ordered[i:i + QUOTE_MAX_SYMBOLS]
         while chunk:
             try:
-                out.update(client.quote(chunk))
+                out.update(client.quote(chunk, omit_missing=True))
                 break
-            except BrokerQuoteMissingError as e:
-                if e.key not in chunk:
+            except BrokerScripMissingError as e:
+                if e.key not in chunk or len(unknown) >= MAX_UNKNOWN_SCRIPS:
                     raise
-                logger.info("no quote for %s (%s)", e.key, e)
+                unknown.append(e.key)
                 chunk = [k for k in chunk if k != e.key]
+    unpriced = [k for k in ordered if _ltp(out.get(k)) is None]
+    if unknown:
+        logger.warning("%s: %d key(s) are in no Kotak scrip master: %s",
+                       what, len(unknown), ", ".join(unknown))
+    if unpriced:
+        logger.warning("%s: %d of %d keys have no price (e.g. %s)", what,
+                       len(unpriced), len(ordered), ", ".join(unpriced[:5]))
     return out
 
 
@@ -445,7 +457,7 @@ def build_session_view(client, session: date, previous: Optional[date],
     futs = {sym: _nearest_future(rows, sym, session) for sym in seen}
     keys = [f"NFO:{f['tradingsymbol']}" for f in futs.values() if f is not None]
     keys += [_spot_key(sym) for sym in seen]
-    quoted = safe_quote(client, keys)
+    quoted = safe_quote(client, keys, "futures and spots")
     names: Dict[str, NameSurface] = {}
     bands: Dict[str, List[tuple]] = {}
     for sym in seen:
@@ -466,8 +478,16 @@ def build_session_view(client, session: date, previous: Optional[date],
         )
     if bands:
         chain_keys = [f"NFO:{s}" for band in bands.values() for _, ce, pe in band for s in (ce, pe)]
-        chain = safe_quote(client, chain_keys)
-        for sym, band in bands.items():
+        try:
+            chain = safe_quote(client, chain_keys, "entry chain")
+        except Exception:                                     # noqa: BLE001
+            # The held book's futures and spots are already in hand: mark them.
+            # With no chain the flat book builds no entry this pass and the
+            # roll retries next minute; a month is only skipped after a missed
+            # settlement, never for a failed quote.
+            logger.exception("entry chain quotes failed; marking without it")
+            chain = None
+        for sym, band in (bands.items() if chain is not None else ()):
             quotes, opt_symbols = _chain_quotes(chain, band)
             names[sym] = replace(names[sym], quotes=tuple(quotes), option_symbols=opt_symbols)
     return SessionView(

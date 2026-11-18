@@ -9,10 +9,15 @@ not have first, and a failed batch fell back to one call per key.
 - [x] One batched quote round per close for futures and spots (40 keys a call),
       one more for the chain on a roll. Real held book: 1 call for 16 names.
 - [x] No `-EQ` key (probed: Kotak has none).
-- [x] `safe_quote` drops only a key Kotak names as unquotable; a 429 propagates
-      with one call, and the pass retries next minute.
-- [x] Kotak names an unknown scrip as `BrokerQuoteMissingError` (a
-      `BrokerOrderError`), so a batch can drop it.
+- [x] `KotakNeoClient.quote(omit_missing=True)` leaves out keys with no LTP:
+      one request per 40 keys however many strikes have not printed. Default
+      unchanged for the order path.
+- [x] `safe_quote` re-sends only around a key naming no scrip
+      (`BrokerScripMissingError`, at most 5), warns with a count of unpriced
+      keys, and lets a 429 propagate after one call.
+- [x] A failed chain round no longer drops the held book's mark.
+- [x] The tick recorder fails the pass on an unknown scrip instead of setting it
+      aside as "no LTP".
 - [ ] Owner review; deploy before the next 14:55 run.
 
 # Kotak tapes replay: a master per session — 2026-11-06

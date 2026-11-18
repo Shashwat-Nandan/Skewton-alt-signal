@@ -351,3 +351,21 @@ def test_the_kiteticker_path_also_fails_the_day_without_a_master(monkeypatch, tm
     assert tc.main() == 1
     monkeypatch.setattr(tc, "save_instrument_masters", lambda *a: True)
     assert tc.main() == 0
+
+
+def test_an_unknown_scrip_fails_the_pass_instead_of_being_set_aside():
+    """A wrong symbol or a stale master is not an illiquid strike. Set aside as
+    "no LTP", it would vanish from every tape without anyone told."""
+    from core.broker.errors import BrokerScripMissingError
+
+    class _Client:
+        calls = 0
+
+        def quote(self, keys):
+            _Client.calls += 1
+            raise BrokerScripMissingError("No Kotak scrip token", keys[0])
+
+    dead = set()
+    with pytest.raises(BrokerScripMissingError):
+        tc._poll_quotes(_Client(), PAIRS, dead)
+    assert not dead and _Client.calls == 1

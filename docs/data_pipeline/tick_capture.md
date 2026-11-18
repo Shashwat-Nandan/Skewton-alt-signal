@@ -142,6 +142,9 @@ quote fails the whole call when one instrument has no LTP and names it
 - Every 60 s up to 5 set-aside instruments, taken in turn, are quoted
   again (at most 6 calls) and rejoin when their LTP returns. A failed
   re-check does not skip the main pass.
+- A key naming no contract in the scrip master (`BrokerScripMissingError`)
+  fails the pass: it is a wrong symbol or a stale master, not an illiquid
+  strike, and setting it aside would drop it from every tape unnoticed.
 - Any other error (429, timeout, a 4xx or Not_Ok reject) fails the pass
   with that one call. Failed passes back off from `--poll-seconds`,
   doubling to 60 s, never past 15:30, and the poll carries on.

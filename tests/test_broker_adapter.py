@@ -570,15 +570,46 @@ class TestKotakClient:
     def test_an_unknown_scrip_names_its_key_and_is_still_an_order_error(self):
         """Callers that batch keys drop the named one; the pair runner still
         stops on BrokerOrderError as before."""
-        from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError
+        from core.broker.errors import BrokerOrderError, BrokerScripMissingError
 
         client = self._client()
-        client._instruments_by_exchange["NSE"] = []
-        with pytest.raises(BrokerQuoteMissingError) as err:
+        client._instruments_by_exchange["NSE"] = [{"instrument_token": 1, "tradingsymbol": "TCS"}]
+        with pytest.raises(BrokerScripMissingError) as err:
             client.quote(["NSE:ITC-EQ"])
         assert err.value.key == "NSE:ITC-EQ"
         assert isinstance(err.value, BrokerOrderError)
         client.session.request.assert_not_called()
+
+    def test_an_empty_scrip_master_is_not_reported_as_one_missing_key(self):
+        """A system-wide failure must not be dropped one key at a time."""
+        from core.broker.errors import BrokerOrderError, BrokerQuoteMissingError
+
+        client = self._client()
+        client._scrip_csv_text = lambda segment: ""
+        with pytest.raises(BrokerOrderError) as err:
+            client.quote(["NSE:ITC"])
+        assert not isinstance(err.value, BrokerQuoteMissingError)
+
+    def test_omit_missing_returns_what_printed_in_one_request(self):
+        """The default still fails the call, as the order path expects."""
+        from core.broker.errors import BrokerQuoteMissingError
+
+        client = self._client()
+        client._instruments_by_exchange["NFO"] = [
+            {"instrument_token": 999, "tradingsymbol": "NIFTY25SEP25000CE", "name": "NIFTY",
+             "instrument_type": "CE", "lot_size": 75, "exchange": "NFO"},
+            {"instrument_token": 998, "tradingsymbol": "NIFTY25SEP25000PE", "name": "NIFTY",
+             "instrument_type": "PE", "lot_size": 75, "exchange": "NFO"}]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"exchange_token": "999", "exchange": "nse_fo", "ltp": "12"},
+                                  {"exchange_token": "998", "exchange": "nse_fo"}]
+        client.session.request.return_value = resp
+        keys = ["NFO:NIFTY25SEP25000CE", "NFO:NIFTY25SEP25000PE"]
+        assert set(client.quote(keys, omit_missing=True)) == {"NFO:NIFTY25SEP25000CE"}
+        assert client.session.request.call_count == 1
+        with pytest.raises(BrokerQuoteMissingError):
+            client.quote(keys)
 
     def test_quote_depth_is_kite_shaped_numbers(self):
         client = self._client()
