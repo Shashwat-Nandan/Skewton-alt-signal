@@ -476,6 +476,10 @@ def test_the_no_op_line_is_logged_once(monkeypatch, tmp_path, capsys):
     process) the gate's own handler and root would both print it."""
     import logging
     from datetime import date
+    gate = logging.getLogger("tick_capture.gate")
+    # main() builds the gate's handler once per process, on the stderr of the
+    # time; start this test from none so it writes to the captured stderr.
+    monkeypatch.setattr(gate, "handlers", [])
     root = logging.getLogger()
     extra = logging.StreamHandler()
     root.addHandler(extra)
